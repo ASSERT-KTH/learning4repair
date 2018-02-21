@@ -1,14 +1,13 @@
-private static boolean DEFAULT_DO_SYNC = false;
-
-package org.apache.lucene.store;
+List<SSTableReader> sstables = doAntiCompaction(cfs, originalSSTables, StorageService.instance.getLocalRanges(cfs.getTable().name), null);
 
 /**
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -19,655 +18,636 @@ package org.apache.lucene.store;
  * limitations under the License.
  */
 
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
+package org.apache.cassandra.db;
+
 import java.io.IOException;
-import java.io.RandomAccessFile;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
-import java.util.Hashtable;
+import java.io.File;
+import java.lang.management.ManagementFactory;
+import java.util.*;
+import java.util.concurrent.Callable;
+import java.util.concurrent.Future;
+import javax.management.*;
 
-import org.apache.lucene.index.IndexFileNameFilter;
+import org.apache.log4j.Logger;
 
-// Used only for WRITE_LOCK_NAME in deprecated create=true case:
-import org.apache.lucene.index.IndexWriter;
+import org.apache.cassandra.concurrent.DebuggableThreadPoolExecutor;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.io.*;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.service.AntiEntropyService;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.utils.FBUtilities;
+import org.cliffc.high_scale_lib.NonBlockingHashMap;
 
-/**
- * Straightforward implementation of {@link Directory} as a directory of files.
- * Locking implementation is by default the {@link SimpleFSLockFactory}, but
- * can be changed either by passing in a {@link LockFactory} instance to
- * <code>getDirectory</code>, or specifying the LockFactory class by setting
- * <code>org.apache.lucene.store.FSDirectoryLockFactoryClass</code> Java system
- * property, or by calling {@link #setLockFactory} after creating
- * the Directory.
+import java.net.InetAddress;
 
- * <p>Directories are cached, so that, for a given canonical
- * path, the same FSDirectory instance will always be
- * returned by <code>getDirectory</code>.  This permits
- * synchronization on directories.</p>
- *
- * @see Directory
- * @author Doug Cutting
- */
-public class FSDirectory extends Directory {
-    
-  /** This cache of directories ensures that there is a unique Directory
-   * instance per path, so that synchronization on the Directory can be used to
-   * synchronize access between readers and writers.  We use
-   * refcounts to ensure when the last use of an FSDirectory
-   * instance for a given canonical path is closed, we remove the
-   * instance from the cache.  See LUCENE-776
-   * for some relevant discussion.
-   */
-  private static final Hashtable DIRECTORIES = new Hashtable();
+import org.apache.commons.lang.StringUtils;
+import org.apache.commons.collections.iterators.FilterIterator;
+import org.apache.commons.collections.iterators.CollatingIterator;
+import org.apache.commons.collections.PredicateUtils;
 
-  private static boolean disableLocks = false;
+public class CompactionManager implements CompactionManagerMBean
+{
+    public static final String MBEAN_OBJECT_NAME = "org.apache.cassandra.db:type=CompactionManager";
+    private static final Logger logger = Logger.getLogger(CompactionManager.class);
+    public static final CompactionManager instance;
 
-  private static boolean DEFAULT_DO_SYNC = true;
+    private static volatile boolean gcRequested;
 
-  // True if we should call sync() before closing a file.
-  // This improves chances that index will still be
-  // consistent if the machine or OS abruptly crashes.  See
-  // LUCENE-1044.
-  private boolean doSync = DEFAULT_DO_SYNC;
+    private int minimumCompactionThreshold = 4; // compact this many sstables min at a time
+    private int maximumCompactionThreshold = 32; // compact this many sstables max at a time
 
-  // TODO: should this move up to the Directory base class?  Also: should we
-  // make a per-instance (in addition to the static "default") version?
-
-  /**
-   * Set whether Lucene's use of lock files is disabled. By default, 
-   * lock files are enabled. They should only be disabled if the index
-   * is on a read-only medium like a CD-ROM.
-   */
-  public static void setDisableLocks(boolean doDisableLocks) {
-    FSDirectory.disableLocks = doDisableLocks;
-  }
-
-  /**
-   * Returns whether Lucene's use of lock files is disabled.
-   * @return true if locks are disabled, false if locks are enabled.
-   */
-  public static boolean getDisableLocks() {
-    return FSDirectory.disableLocks;
-  }
-
-  /**
-   * Directory specified by <code>org.apache.lucene.lockDir</code>
-   * or <code>java.io.tmpdir</code> system property.
-
-   * @deprecated As of 2.1, <code>LOCK_DIR</code> is unused
-   * because the write.lock is now stored by default in the
-   * index directory.  If you really want to store locks
-   * elsewhere you can create your own {@link
-   * SimpleFSLockFactory} (or {@link NativeFSLockFactory},
-   * etc.) passing in your preferred lock directory.  Then,
-   * pass this <code>LockFactory</code> instance to one of
-   * the <code>getDirectory</code> methods that take a
-   * <code>lockFactory</code> (for example, {@link #getDirectory(String, LockFactory)}).
-   */
-  public static final String LOCK_DIR = System.getProperty("org.apache.lucene.lockDir",
-                                                           System.getProperty("java.io.tmpdir"));
-
-  /** The default class which implements filesystem-based directories. */
-  private static Class IMPL;
-  static {
-    try {
-      String name =
-        System.getProperty("org.apache.lucene.FSDirectory.class",
-                           FSDirectory.class.getName());
-      IMPL = Class.forName(name);
-    } catch (ClassNotFoundException e) {
-      throw new RuntimeException("cannot load FSDirectory class: " + e.toString(), e);
-    } catch (SecurityException se) {
-      try {
-        IMPL = Class.forName(FSDirectory.class.getName());
-      } catch (ClassNotFoundException e) {
-        throw new RuntimeException("cannot load default FSDirectory class: " + e.toString(), e);
-      }
-    }
-  }
-
-  private static MessageDigest DIGESTER;
-
-  static {
-    try {
-      DIGESTER = MessageDigest.getInstance("MD5");
-    } catch (NoSuchAlgorithmException e) {
-        throw new RuntimeException(e.toString(), e);
-    }
-  }
-
-  /** A buffer optionally used in renameTo method */
-  private byte[] buffer = null;
-
-  /** Returns the directory instance for the named location.
-   * @param path the path to the directory.
-   * @return the FSDirectory for the named file.  */
-  public static FSDirectory getDirectory(String path)
-      throws IOException {
-    return getDirectory(new File(path), null, DEFAULT_DO_SYNC);
-  }
-
-  /** Returns the directory instance for the named location.
-   * @param path the path to the directory.
-   * @param lockFactory instance of {@link LockFactory} providing the
-   *        locking implementation.  If null, the default
-   *        {@link SimpleFSLockFactory} is used.
-   * @return the FSDirectory for the named file.  */
-  public static FSDirectory getDirectory(String path, LockFactory lockFactory)
-      throws IOException {
-    return getDirectory(new File(path), lockFactory, DEFAULT_DO_SYNC);
-  }
-
-  /** Returns the directory instance for the named location.
-   * @param path the path to the directory.
-   * @param lockFactory instance of {@link LockFactory} providing the
-   *        locking implementation.  If null, the default
-   *        {@link SimpleFSLockFactory} is used.
-   * @param doSync if true (the default), sync() is called
-   *        on all file descriptors before close().  This
-   *        improves the likelihood that the index will
-   *        remain consistent when the OS or machine crashes
-   *        or the power cord is pulled.
-   * @return the FSDirectory for the named file.  */
-  public static FSDirectory getDirectory(String path, LockFactory lockFactory, boolean doSync)
-      throws IOException {
-    return getDirectory(new File(path), lockFactory, doSync);
-  }
-
-  /** Returns the directory instance for the named location.
-   * @param file the path to the directory.
-   * @return the FSDirectory for the named file.  */
-  public static FSDirectory getDirectory(File file)
-    throws IOException {
-    return getDirectory(file, null, DEFAULT_DO_SYNC);
-  }
-
-  /** Returns the directory instance for the named location.
-   * @param file the path to the directory.
-   * @param lockFactory instance of {@link LockFactory} providing the
-   *        locking implementation.  If null, the default
-   *        {@link SimpleFSLockFactory} is used.
-   * @return the FSDirectory for the named file.  */
-  public static FSDirectory getDirectory(File file, LockFactory lockFactory)
-      throws IOException {
-    return getDirectory(file, lockFactory, DEFAULT_DO_SYNC);
-  }
-
-  /** Returns the directory instance for the named location.
-   * @param file the path to the directory.
-   * @param lockFactory instance of {@link LockFactory} providing the
-   *        locking implementation.  If null, the default
-   *        {@link SimpleFSLockFactory} is used.
-   * @param doSync if true (the default), sync() is called
-   *        on all file descriptors before close().  This
-   *        improves the likelihood that the index will
-   *        remain consistent when the OS or machine crashes
-   *        or the power cord is pulled.
-   * @return the FSDirectory for the named file.  */
-  public static FSDirectory getDirectory(File file, LockFactory lockFactory, boolean doSync)
-    throws IOException
-  {
-    file = new File(file.getCanonicalPath());
-
-    if (file.exists() && !file.isDirectory())
-      throw new IOException(file + " not a directory");
-
-    if (!file.exists())
-      if (!file.mkdirs())
-        throw new IOException("Cannot create directory: " + file);
-
-    FSDirectory dir;
-    synchronized (DIRECTORIES) {
-      dir = (FSDirectory)DIRECTORIES.get(file);
-      if (dir == null) {
-        try {
-          dir = (FSDirectory)IMPL.newInstance();
-        } catch (Exception e) {
-          throw new RuntimeException("cannot load FSDirectory class: " + e.toString(), e);
+    static
+    {
+        instance = new CompactionManager();
+        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+        try
+        {
+            mbs.registerMBean(instance, new ObjectName(MBEAN_OBJECT_NAME));
         }
-        dir.init(file, lockFactory, doSync);
-        DIRECTORIES.put(file, dir);
-      } else {
-        // Catch the case where a Directory is pulled from the cache, but has a
-        // different LockFactory instance.
-        if (lockFactory != null && lockFactory != dir.getLockFactory()) {
-          throw new IOException("Directory was previously created with a different LockFactory instance; please pass null as the lockFactory instance and use setLockFactory to change it");
-        }
-      }
-    }
-    synchronized (dir) {
-      dir.refCount++;
-    }
-    return dir;
-  }
-
-
-  /** Returns the directory instance for the named location.
-   *
-   * @deprecated Use IndexWriter's create flag, instead, to
-   * create a new index.
-   *
-   * @param path the path to the directory.
-   * @param create if true, create, or erase any existing contents.
-   * @return the FSDirectory for the named file.  */
-  public static FSDirectory getDirectory(String path, boolean create)
-      throws IOException {
-    return getDirectory(new File(path), create);
-  }
-
-  /** Returns the directory instance for the named location.
-   *
-   * @deprecated Use IndexWriter's create flag, instead, to
-   * create a new index.
-   *
-   * @param file the path to the directory.
-   * @param create if true, create, or erase any existing contents.
-   * @return the FSDirectory for the named file.  */
-  public static FSDirectory getDirectory(File file, boolean create)
-    throws IOException
-  {
-    FSDirectory dir = getDirectory(file, null);
-
-    // This is now deprecated (creation should only be done
-    // by IndexWriter):
-    if (create) {
-      dir.create();
-    }
-
-    return dir;
-  }
-
-  private void create() throws IOException {
-    if (directory.exists()) {
-      String[] files = directory.list(IndexFileNameFilter.getFilter());            // clear old files
-      if (files == null)
-        throw new IOException("cannot read directory " + directory.getAbsolutePath() + ": list() returned null");
-      for (int i = 0; i < files.length; i++) {
-        File file = new File(directory, files[i]);
-        if (!file.delete())
-          throw new IOException("Cannot delete " + file);
-      }
-    }
-    lockFactory.clearLock(IndexWriter.WRITE_LOCK_NAME);
-  }
-
-  private File directory = null;
-  private int refCount;
-
-  protected FSDirectory() {};                     // permit subclassing
-
-  private void init(File path, LockFactory lockFactory, boolean doSync) throws IOException {
-
-    // Set up lockFactory with cascaded defaults: if an instance was passed in,
-    // use that; else if locks are disabled, use NoLockFactory; else if the
-    // system property org.apache.lucene.store.FSDirectoryLockFactoryClass is set,
-    // instantiate that; else, use SimpleFSLockFactory:
-
-    directory = path;
-    this.doSync = doSync;
-
-    boolean doClearLockID = false;
-
-    if (lockFactory == null) {
-
-      if (disableLocks) {
-        // Locks are disabled:
-        lockFactory = NoLockFactory.getNoLockFactory();
-      } else {
-        String lockClassName = System.getProperty("org.apache.lucene.store.FSDirectoryLockFactoryClass");
-
-        if (lockClassName != null && !lockClassName.equals("")) {
-          Class c;
-
-          try {
-            c = Class.forName(lockClassName);
-          } catch (ClassNotFoundException e) {
-            throw new IOException("unable to find LockClass " + lockClassName);
-          }
-
-          try {
-            lockFactory = (LockFactory) c.newInstance();          
-          } catch (IllegalAccessException e) {
-            throw new IOException("IllegalAccessException when instantiating LockClass " + lockClassName);
-          } catch (InstantiationException e) {
-            throw new IOException("InstantiationException when instantiating LockClass " + lockClassName);
-          } catch (ClassCastException e) {
-            throw new IOException("unable to cast LockClass " + lockClassName + " instance to a LockFactory");
-          }
-
-          if (lockFactory instanceof NativeFSLockFactory) {
-            ((NativeFSLockFactory) lockFactory).setLockDir(path);
-          } else if (lockFactory instanceof SimpleFSLockFactory) {
-            ((SimpleFSLockFactory) lockFactory).setLockDir(path);
-          }
-        } else {
-          // Our default lock is SimpleFSLockFactory;
-          // default lockDir is our index directory:
-          lockFactory = new SimpleFSLockFactory(path);
-          doClearLockID = true;
-        }
-      }
-    }
-
-    setLockFactory(lockFactory);
-
-    if (doClearLockID) {
-      // Clear the prefix because write.lock will be
-      // stored in our directory:
-      lockFactory.setLockPrefix(null);
-    }
-  }
-
-  /** Returns an array of strings, one for each Lucene index file in the directory. */
-  public String[] list() {
-    return directory.list(IndexFileNameFilter.getFilter());
-  }
-
-  /** Returns true iff a file with the given name exists. */
-  public boolean fileExists(String name) {
-    File file = new File(directory, name);
-    return file.exists();
-  }
-
-  /** Returns the time the named file was last modified. */
-  public long fileModified(String name) {
-    File file = new File(directory, name);
-    return file.lastModified();
-  }
-
-  /** Returns the time the named file was last modified. */
-  public static long fileModified(File directory, String name) {
-    File file = new File(directory, name);
-    return file.lastModified();
-  }
-
-  /** Set the modified time of an existing file to now. */
-  public void touchFile(String name) {
-    File file = new File(directory, name);
-    file.setLastModified(System.currentTimeMillis());
-  }
-
-  /** Returns the length in bytes of a file in the directory. */
-  public long fileLength(String name) {
-    File file = new File(directory, name);
-    return file.length();
-  }
-
-  /** Removes an existing file in the directory. */
-  public void deleteFile(String name) throws IOException {
-    File file = new File(directory, name);
-    if (!file.delete())
-      throw new IOException("Cannot delete " + file);
-  }
-
-  /** Renames an existing file in the directory. 
-   * Warning: This is not atomic.
-   * @deprecated 
-   */
-  public synchronized void renameFile(String from, String to)
-      throws IOException {
-    File old = new File(directory, from);
-    File nu = new File(directory, to);
-
-    /* This is not atomic.  If the program crashes between the call to
-       delete() and the call to renameTo() then we're screwed, but I've
-       been unable to figure out how else to do this... */
-
-    if (nu.exists())
-      if (!nu.delete())
-        throw new IOException("Cannot delete " + nu);
-
-    // Rename the old file to the new one. Unfortunately, the renameTo()
-    // method does not work reliably under some JVMs.  Therefore, if the
-    // rename fails, we manually rename by copying the old file to the new one
-    if (!old.renameTo(nu)) {
-      java.io.InputStream in = null;
-      java.io.OutputStream out = null;
-      try {
-        in = new FileInputStream(old);
-        out = new FileOutputStream(nu);
-        // see if the buffer needs to be initialized. Initialization is
-        // only done on-demand since many VM's will never run into the renameTo
-        // bug and hence shouldn't waste 1K of mem for no reason.
-        if (buffer == null) {
-          buffer = new byte[1024];
-        }
-        int len;
-        while ((len = in.read(buffer)) >= 0) {
-          out.write(buffer, 0, len);
+        catch (Exception e)
+        {
+            throw new RuntimeException(e);
         }
 
-        // delete the old file.
-        old.delete();
-      }
-      catch (IOException ioe) {
-        IOException newExc = new IOException("Cannot rename " + old + " to " + nu);
-        newExc.initCause(ioe);
-        throw newExc;
-      }
-      finally {
-        try {
-          if (in != null) {
-            try {
-              in.close();
-            } catch (IOException e) {
-              throw new RuntimeException("Cannot close input stream: " + e.toString(), e);
+        /**
+         * thread that requests GCs to clean out obsolete sstables, sleeping rpc timeout first so that most in-progress ops can complete
+         * (thus, no longer reference the sstables in question)
+         */
+        new Thread(new Runnable()
+        {
+            final long gcDelay = DatabaseDescriptor.getRpcTimeout();
+
+            public void run()
+            {
+                while (true)
+                {
+                    try
+                    {
+                        Thread.sleep(gcDelay * 10);
+                        if (gcRequested)
+                        {
+                            Thread.sleep(gcDelay);
+                            System.gc();
+                            gcRequested = false;
+                        }
+                    }
+                    catch (InterruptedException e)
+                    {
+                        throw new AssertionError(e);
+                    }
+                }
             }
-          }
-        } finally {
-          if (out != null) {
-            try {
-              out.close();
-            } catch (IOException e) {
-              throw new RuntimeException("Cannot close output stream: " + e.toString(), e);
-            }
-          }
-        }
-      }
-    }
-  }
-
-  /** Creates a new, empty file in the directory with the given name.
-      Returns a stream writing this file. */
-  public IndexOutput createOutput(String name) throws IOException {
-
-    File file = new File(directory, name);
-    if (file.exists() && !file.delete())          // delete existing, if any
-      throw new IOException("Cannot overwrite: " + file);
-
-    return new FSIndexOutput(file, doSync);
-  }
-
-  // Inherit javadoc
-  public IndexInput openInput(String name) throws IOException {
-    return new FSIndexInput(new File(directory, name));
-  }
-
-  // Inherit javadoc
-  public IndexInput openInput(String name, int bufferSize) throws IOException {
-    return new FSIndexInput(new File(directory, name), bufferSize);
-  }
-
-  /**
-   * So we can do some byte-to-hexchar conversion below
-   */
-  private static final char[] HEX_DIGITS =
-  {'0','1','2','3','4','5','6','7','8','9','a','b','c','d','e','f'};
-
-  
-  public String getLockID() {
-    String dirName;                               // name to be hashed
-    try {
-      dirName = directory.getCanonicalPath();
-    } catch (IOException e) {
-      throw new RuntimeException(e.toString(), e);
+        }, "COMPACTION-GC-INVOKER").start();
     }
 
-    byte digest[];
-    synchronized (DIGESTER) {
-      digest = DIGESTER.digest(dirName.getBytes());
-    }
-    StringBuffer buf = new StringBuffer();
-    buf.append("lucene-");
-    for (int i = 0; i < digest.length; i++) {
-      int b = digest[i];
-      buf.append(HEX_DIGITS[(b >> 4) & 0xf]);
-      buf.append(HEX_DIGITS[b & 0xf]);
-    }
+    private CompactionExecutor executor = new CompactionExecutor();
+    private Map<ColumnFamilyStore, Integer> estimatedCompactions = new NonBlockingHashMap<ColumnFamilyStore, Integer>();
 
-    return buf.toString();
-  }
-
-  /** Closes the store to future operations. */
-  public synchronized void close() {
-    if (--refCount <= 0) {
-      synchronized (DIRECTORIES) {
-        DIRECTORIES.remove(directory);
-      }
-    }
-  }
-
-  public File getFile() {
-    return directory;
-  }
-
-  /** For debug output. */
-  public String toString() {
-    return this.getClass().getName() + "@" + directory;
-  }
-
-  protected static class FSIndexInput extends BufferedIndexInput {
-  
-    private static class Descriptor extends RandomAccessFile {
-      // remember if the file is open, so that we don't try to close it
-      // more than once
-      private boolean isOpen;
-      long position;
-      final long length;
-      
-      public Descriptor(File file, String mode) throws IOException {
-        super(file, mode);
-        isOpen=true;
-        length=length();
-      }
-  
-      public void close() throws IOException {
-        if (isOpen) {
-          isOpen=false;
-          super.close();
-        }
-      }
-  
-      protected void finalize() throws Throwable {
-        try {
-          close();
-        } finally {
-          super.finalize();
-        }
-      }
-    }
-  
-    private final Descriptor file;
-    boolean isClone;
-  
-    public FSIndexInput(File path) throws IOException {
-      this(path, BufferedIndexInput.BUFFER_SIZE);
-    }
-  
-    public FSIndexInput(File path, int bufferSize) throws IOException {
-      super(bufferSize);
-      file = new Descriptor(path, "r");
-    }
-  
-    /** IndexInput methods */
-    protected void readInternal(byte[] b, int offset, int len)
-         throws IOException {
-      synchronized (file) {
-        long position = getFilePointer();
-        if (position != file.position) {
-          file.seek(position);
-          file.position = position;
-        }
-        int total = 0;
-        do {
-          int i = file.read(b, offset+total, len-total);
-          if (i == -1)
-            throw new IOException("read past EOF");
-          file.position += i;
-          total += i;
-        } while (total < len);
-      }
-    }
-  
-    public void close() throws IOException {
-      // only close the file if this is not a clone
-      if (!isClone) file.close();
-    }
-  
-    protected void seekInternal(long position) {
-    }
-  
-    public long length() {
-      return file.length;
-    }
-  
-    public Object clone() {
-      FSIndexInput clone = (FSIndexInput)super.clone();
-      clone.isClone = true;
-      return clone;
-    }
-  
-    /** Method used for testing. Returns true if the underlying
-     *  file descriptor is valid.
+    /**
+     * Call this whenever a compaction might be needed on the given columnfamily.
+     * It's okay to over-call (within reason) since the compactions are single-threaded,
+     * and if a call is unnecessary, it will just be no-oped in the bucketing phase.
      */
-    boolean isFDValid() throws IOException {
-      return file.getFD().valid();
+    public Future<Integer> submitMinorIfNeeded(final ColumnFamilyStore cfs)
+    {
+        Callable<Integer> callable = new Callable<Integer>()
+        {
+            public Integer call() throws IOException
+            {
+                if (minimumCompactionThreshold <= 0 || maximumCompactionThreshold <= 0)
+                {
+                    logger.debug("Compaction is currently disabled.");
+                    return 0;
+                }
+                logger.debug("Checking to see if compaction of " + cfs.columnFamily_ + " would be useful");
+                Set<List<SSTableReader>> buckets = getCompactionBuckets(cfs.getSSTables(), 50L * 1024L * 1024L);
+                updateEstimateFor(cfs, buckets);
+                
+                for (List<SSTableReader> sstables : buckets)
+                {
+                    if (sstables.size() >= minimumCompactionThreshold)
+                    {
+                        // if we have too many to compact all at once, compact older ones first -- this avoids
+                        // re-compacting files we just created.
+                        Collections.sort(sstables);
+                        return doCompaction(cfs, sstables.subList(0, Math.min(sstables.size(), maximumCompactionThreshold)), getDefaultGCBefore());
+                    }
+                }
+                return 0;
+            }
+        };
+        return executor.submit(callable);
     }
-  }
 
-  protected static class FSIndexOutput extends BufferedIndexOutput {
-    RandomAccessFile file = null;
-  
-    // remember if the file is open, so that we don't try to close it
-    // more than once
-    private boolean isOpen;
-    private boolean doSync;
-
-    public FSIndexOutput(File path, boolean doSync) throws IOException {
-      file = new RandomAccessFile(path, "rw");
-
-      isOpen = true;
-      this.doSync = doSync;
-    }
-  
-    /** output methods: */
-    public void flushBuffer(byte[] b, int offset, int size) throws IOException {
-      file.write(b, offset, size);
-    }
-    public void close() throws IOException {
-      // only close the file if it has not been closed yet
-      if (isOpen) {
-        try {
-          super.close();
-          if (doSync)
-            file.getFD().sync();
-        } finally {
-          file.close();
-          isOpen = false;
+    private void updateEstimateFor(ColumnFamilyStore cfs, Set<List<SSTableReader>> buckets)
+    {
+        int n = 0;
+        for (List<SSTableReader> sstables : buckets)
+        {
+            if (sstables.size() >= minimumCompactionThreshold)
+            {
+                n += 1 + sstables.size() / (maximumCompactionThreshold - minimumCompactionThreshold);
+            }
         }
-      }
+        estimatedCompactions.put(cfs, n);
     }
-  
-    /** Random-access methods */
-    public void seek(long pos) throws IOException {
-      super.seek(pos);
-      file.seek(pos);
+
+    public Future<Object> submitCleanup(final ColumnFamilyStore cfStore)
+    {
+        Callable<Object> runnable = new Callable<Object>()
+        {
+            public Object call() throws IOException
+            {
+                doCleanupCompaction(cfStore);
+                return this;
+            }
+        };
+        return executor.submit(runnable);
     }
-    public long length() throws IOException {
-      return file.length();
+
+    public Future<List<SSTableReader>> submitAnticompaction(final ColumnFamilyStore cfStore, final Collection<Range> ranges, final InetAddress target)
+    {
+        Callable<List<SSTableReader>> callable = new Callable<List<SSTableReader>>()
+        {
+            public List<SSTableReader> call() throws IOException
+            {
+                return doAntiCompaction(cfStore, cfStore.getSSTables(), ranges, target);
+            }
+        };
+        return executor.submit(callable);
     }
-  
-  }
+
+    public Future submitMajor(final ColumnFamilyStore cfStore)
+    {
+        return submitMajor(cfStore, 0, getDefaultGCBefore());
+    }
+
+    public Future submitMajor(final ColumnFamilyStore cfStore, final long skip, final int gcBefore)
+    {
+        Callable<Object> callable = new Callable<Object>()
+        {
+            public Object call() throws IOException
+            {
+                Collection<SSTableReader> sstables;
+                if (skip > 0)
+                {
+                    sstables = new ArrayList<SSTableReader>();
+                    for (SSTableReader sstable : cfStore.getSSTables())
+                    {
+                        if (sstable.length() < skip * 1024L * 1024L * 1024L)
+                        {
+                            sstables.add(sstable);
+                        }
+                    }
+                }
+                else
+                {
+                    sstables = cfStore.getSSTables();
+                }
+
+                doCompaction(cfStore, sstables, gcBefore);
+                return this;
+            }
+        };
+        return executor.submit(callable);
+    }
+
+    public Future submitReadonly(final ColumnFamilyStore cfStore, final InetAddress initiator)
+    {
+        Callable<Object> callable = new Callable<Object>()
+        {
+            public Object call() throws IOException
+            {
+                doReadonlyCompaction(cfStore, initiator);
+                return this;
+            }
+        };
+        return executor.submit(callable);
+    }
+
+    /**
+     * Gets the minimum number of sstables in queue before compaction kicks off
+     */
+    public int getMinimumCompactionThreshold()
+    {
+        return minimumCompactionThreshold;
+    }
+
+    /**
+     * Sets the minimum number of sstables in queue before compaction kicks off
+     */
+    public void setMinimumCompactionThreshold(int threshold)
+    {
+        minimumCompactionThreshold = threshold;
+    }
+
+    /**
+     * Gets the maximum number of sstables in queue before compaction kicks off
+     */
+    public int getMaximumCompactionThreshold()
+    {
+        return maximumCompactionThreshold;
+    }
+
+    /**
+     * Sets the maximum number of sstables in queue before compaction kicks off
+     */
+    public void setMaximumCompactionThreshold(int threshold)
+    {
+        maximumCompactionThreshold = threshold;
+    }
+
+    public void disableAutoCompaction()
+    {
+        minimumCompactionThreshold = 0;
+        maximumCompactionThreshold = 0;
+    }
+
+    /**
+     * For internal use and testing only.  The rest of the system should go through the submit* methods,
+     * which are properly serialized.
+     */
+    int doCompaction(ColumnFamilyStore cfs, Collection<SSTableReader> sstables, int gcBefore) throws IOException
+    {
+        // The collection of sstables passed may be empty (but not null); even if
+        // it is not empty, it may compact down to nothing if all rows are deleted.
+        Table table = cfs.getTable();
+        if (DatabaseDescriptor.isSnapshotBeforeCompaction())
+            table.snapshot("compact-" + cfs.columnFamily_);
+        logger.info("Compacting [" + StringUtils.join(sstables, ",") + "]");
+        String compactionFileLocation = table.getDataFileLocation(cfs.getExpectedCompactedFileSize(sstables));
+        // If the compaction file path is null that means we have no space left for this compaction.
+        // try again w/o the largest one.
+        if (compactionFileLocation == null)
+        {
+            SSTableReader maxFile = cfs.getMaxSizeFile(sstables);
+            List<SSTableReader> smallerSSTables = new ArrayList<SSTableReader>(sstables);
+            smallerSSTables.remove(maxFile);
+            return doCompaction(cfs, smallerSSTables, gcBefore);
+        }
+
+        // new sstables from flush can be added during a compaction, but only the compaction can remove them,
+        // so in our single-threaded compaction world this is a valid way of determining if we're compacting
+        // all the sstables (that existed when we started)
+        boolean major = cfs.isCompleteSSTables(sstables);
+
+        long startTime = System.currentTimeMillis();
+        long totalkeysWritten = 0;
+
+        // TODO the int cast here is potentially buggy
+        int expectedBloomFilterSize = Math.max(SSTableReader.indexInterval(), (int)SSTableReader.getApproximateKeyCount(sstables));
+        if (logger.isDebugEnabled())
+          logger.debug("Expected bloom filter size : " + expectedBloomFilterSize);
+
+        SSTableWriter writer;
+        CompactionIterator ci = new CompactionIterator(sstables, gcBefore, major); // retain a handle so we can call close()
+        Iterator<CompactionIterator.CompactedRow> nni = new FilterIterator(ci, PredicateUtils.notNullPredicate());
+        executor.beginCompaction(cfs, ci);
+
+        try
+        {
+            if (!nni.hasNext())
+            {
+                // don't mark compacted in the finally block, since if there _is_ nondeleted data,
+                // we need to sync it (via closeAndOpen) first, so there is no period during which
+                // a crash could cause data loss.
+                cfs.markCompacted(sstables);
+                return 0;
+            }
+
+            String newFilename = new File(compactionFileLocation, cfs.getTempSSTableFileName()).getAbsolutePath();
+            writer = new SSTableWriter(newFilename, expectedBloomFilterSize, StorageService.getPartitioner());
+
+            // validate the CF as we iterate over it
+            AntiEntropyService.IValidator validator = AntiEntropyService.instance.getValidator(table.name, cfs.getColumnFamilyName(), null, major);
+            validator.prepare();
+            while (nni.hasNext())
+            {
+                CompactionIterator.CompactedRow row = nni.next();
+                writer.append(row.key, row.buffer);
+                validator.add(row);
+                totalkeysWritten++;
+            }
+            validator.complete();
+        }
+        finally
+        {
+            ci.close();
+        }
+
+        SSTableReader ssTable = writer.closeAndOpenReader(DatabaseDescriptor.getKeysCachedFraction(table.name, cfs.getColumnFamilyName()));
+        cfs.replaceCompactedSSTables(sstables, Arrays.asList(ssTable));
+        gcRequested = true;
+        submitMinorIfNeeded(cfs);
+
+        String format = "Compacted to %s.  %d/%d bytes for %d keys.  Time: %dms.";
+        long dTime = System.currentTimeMillis() - startTime;
+        logger.info(String.format(format, writer.getFilename(), SSTable.getTotalBytes(sstables), ssTable.length(), totalkeysWritten, dTime));
+        return sstables.size();
+    }
+
+    /**
+     * This function is used to do the anti compaction process , it spits out the file which has keys that belong to a given range
+     * If the target is not specified it spits out the file as a compacted file with the unecessary ranges wiped out.
+     *
+     * @param cfs
+     * @param sstables
+     * @param ranges
+     * @param target
+     * @return
+     * @throws java.io.IOException
+     */
+    private List<SSTableReader> doAntiCompaction(ColumnFamilyStore cfs, Collection<SSTableReader> sstables, Collection<Range> ranges, InetAddress target)
+            throws IOException
+    {
+        Table table = cfs.getTable();
+        logger.info("AntiCompacting [" + StringUtils.join(sstables, ",") + "]");
+        // Calculate the expected compacted filesize
+        long expectedRangeFileSize = cfs.getExpectedCompactedFileSize(sstables) / 2;
+        String compactionFileLocation = DatabaseDescriptor.getDataFileLocationForTable(table.name, expectedRangeFileSize);
+        if (compactionFileLocation == null)
+        {
+            throw new UnsupportedOperationException("disk full");
+        }
+        if (target != null)
+        {
+            // compacting for streaming: send to subdirectory
+            compactionFileLocation = compactionFileLocation + File.separator + DatabaseDescriptor.STREAMING_SUBDIR;
+        }
+        List<SSTableReader> results = new ArrayList<SSTableReader>();
+
+        long startTime = System.currentTimeMillis();
+        long totalkeysWritten = 0;
+
+        int expectedBloomFilterSize = Math.max(SSTableReader.indexInterval(), (int)(SSTableReader.getApproximateKeyCount(sstables) / 2));
+        if (logger.isDebugEnabled())
+          logger.debug("Expected bloom filter size : " + expectedBloomFilterSize);
+
+        SSTableWriter writer = null;
+        CompactionIterator ci = new AntiCompactionIterator(sstables, ranges, getDefaultGCBefore(), cfs.isCompleteSSTables(sstables));
+        Iterator<CompactionIterator.CompactedRow> nni = new FilterIterator(ci, PredicateUtils.notNullPredicate());
+        executor.beginCompaction(cfs, ci);
+
+        try
+        {
+            if (!nni.hasNext())
+            {
+                return results;
+            }
+
+            while (nni.hasNext())
+            {
+                CompactionIterator.CompactedRow row = nni.next();
+                if (writer == null)
+                {
+                    FileUtils.createDirectory(compactionFileLocation);
+                    String newFilename = new File(compactionFileLocation, cfs.getTempSSTableFileName()).getAbsolutePath();
+                    writer = new SSTableWriter(newFilename, expectedBloomFilterSize, StorageService.getPartitioner());
+                }
+                writer.append(row.key, row.buffer);
+                totalkeysWritten++;
+            }
+        }
+        finally
+        {
+            ci.close();
+        }
+
+        if (writer != null)
+        {
+            results.add(writer.closeAndOpenReader(DatabaseDescriptor.getKeysCachedFraction(table.name, cfs.getColumnFamilyName())));
+            String format = "AntiCompacted to %s.  %d/%d bytes for %d keys.  Time: %dms.";
+            long dTime = System.currentTimeMillis() - startTime;
+            logger.info(String.format(format, writer.getFilename(), SSTable.getTotalBytes(sstables), results.get(0).length(), totalkeysWritten, dTime));
+        }
+
+        return results;
+    }
+
+    /**
+     * This function goes over each file and removes the keys that the node is not responsible for
+     * and only keeps keys that this node is responsible for.
+     *
+     * @throws IOException
+     */
+    private void doCleanupCompaction(ColumnFamilyStore cfs) throws IOException
+    {
+        Collection<SSTableReader> originalSSTables = cfs.getSSTables();
+        List<SSTableReader> sstables = doAntiCompaction(cfs, originalSSTables, StorageService.instance.getLocalRanges(), null);
+        if (!sstables.isEmpty())
+        {
+            cfs.replaceCompactedSSTables(originalSSTables, sstables);
+        }
+        gcRequested = true;
+    }
+
+    /**
+     * Performs a readonly "compaction" of all sstables in order to validate complete rows,
+     * but without writing the merge result
+     */
+    private void doReadonlyCompaction(ColumnFamilyStore cfs, InetAddress initiator) throws IOException
+    {
+        Collection<SSTableReader> sstables = cfs.getSSTables();
+        CompactionIterator ci = new CompactionIterator(sstables, getDefaultGCBefore(), true);
+        executor.beginCompaction(cfs, ci);
+        try
+        {
+            Iterator<CompactionIterator.CompactedRow> nni = new FilterIterator(ci, PredicateUtils.notNullPredicate());
+
+            // validate the CF as we iterate over it
+            AntiEntropyService.IValidator validator = AntiEntropyService.instance.getValidator(cfs.getTable().name, cfs.getColumnFamilyName(), initiator, true);
+            validator.prepare();
+            while (nni.hasNext())
+            {
+                CompactionIterator.CompactedRow row = nni.next();
+                validator.add(row);
+            }
+            validator.complete();
+        }
+        finally
+        {
+            ci.close();
+        }
+    }
+
+    /*
+    * Group files of similar size into buckets.
+    */
+    static Set<List<SSTableReader>> getCompactionBuckets(Iterable<SSTableReader> files, long min)
+    {
+        Map<List<SSTableReader>, Long> buckets = new HashMap<List<SSTableReader>, Long>();
+        for (SSTableReader sstable : files)
+        {
+            long size = sstable.length();
+
+            boolean bFound = false;
+            // look for a bucket containing similar-sized files:
+            // group in the same bucket if it's w/in 50% of the average for this bucket,
+            // or this file and the bucket are all considered "small" (less than `min`)
+            for (List<SSTableReader> bucket : buckets.keySet())
+            {
+                long averageSize = buckets.get(bucket);
+                if ((size > averageSize / 2 && size < 3 * averageSize / 2)
+                    || (size < min && averageSize < min))
+                {
+                    // remove and re-add because adding changes the hash
+                    buckets.remove(bucket);
+                    averageSize = (averageSize + size) / 2;
+                    bucket.add(sstable);
+                    buckets.put(bucket, averageSize);
+                    bFound = true;
+                    break;
+                }
+            }
+            // no similar bucket found; put it in a new one
+            if (!bFound)
+            {
+                ArrayList<SSTableReader> bucket = new ArrayList<SSTableReader>();
+                bucket.add(sstable);
+                buckets.put(bucket, size);
+            }
+        }
+
+        return buckets.keySet();
+    }
+
+    public static int getDefaultGCBefore()
+    {
+        return (int)(System.currentTimeMillis() / 1000) - DatabaseDescriptor.getGcGraceInSeconds();
+    }
+
+    private static class AntiCompactionIterator extends CompactionIterator
+    {
+        private Set<SSTableScanner> scanners;
+
+        public AntiCompactionIterator(Collection<SSTableReader> sstables, Collection<Range> ranges, int gcBefore, boolean isMajor)
+                throws IOException
+        {
+            super(getCollatedRangeIterator(sstables, ranges), gcBefore, isMajor);
+        }
+
+        private static Iterator getCollatedRangeIterator(Collection<SSTableReader> sstables, final Collection<Range> ranges)
+                throws IOException
+        {
+            org.apache.commons.collections.Predicate rangesPredicate = new org.apache.commons.collections.Predicate()
+            {
+                public boolean evaluate(Object row)
+                {
+                    return Range.isTokenInRanges(((IteratingRow)row).getKey().token, ranges);
+                }
+            };
+            CollatingIterator iter = FBUtilities.<IteratingRow>getCollatingIterator();
+            for (SSTableReader sstable : sstables)
+            {
+                SSTableScanner scanner = sstable.getScanner(FILE_BUFFER_SIZE);
+                iter.addIterator(new FilterIterator(scanner, rangesPredicate));
+            }
+            return iter;
+        }
+
+        public Iterable<SSTableScanner> getScanners()
+        {
+            if (scanners == null)
+            {
+                scanners = new HashSet<SSTableScanner>();
+                for (Object o : ((CollatingIterator)source).getIterators())
+                {
+                    scanners.add((SSTableScanner)((FilterIterator)o).getIterator());
+                }
+            }
+            return scanners;
+        }
+    }
+
+    public void checkAllColumnFamilies() throws IOException
+    {
+        // perform estimates
+        for (final ColumnFamilyStore cfs : ColumnFamilyStore.all())
+        {
+            Runnable runnable = new Runnable()
+            {
+                public void run ()
+                {
+                    logger.debug("Estimating compactions for " + cfs.columnFamily_);
+                    final Set<List<SSTableReader>> buckets = getCompactionBuckets(cfs.getSSTables(), 50L * 1024L * 1024L);
+                    updateEstimateFor(cfs, buckets);
+                }
+            };
+            executor.submit(runnable);
+        }
+
+        // actually schedule compactions.  done in a second pass so all the estimates occur before we
+        // bog down the executor in actual compactions.
+        for (ColumnFamilyStore cfs : ColumnFamilyStore.all())
+        {
+            submitMinorIfNeeded(cfs);
+        }
+    }
+
+    private class CompactionExecutor extends DebuggableThreadPoolExecutor
+    {
+        private volatile ColumnFamilyStore cfs;
+        private volatile CompactionIterator ci;
+
+        public CompactionExecutor()
+        {
+            super("COMPACTION-POOL");
+        }
+
+        @Override
+        public void afterExecute(Runnable r, Throwable t)
+        {
+            super.afterExecute(r, t);
+            cfs = null;
+            ci = null;
+        }
+
+        void beginCompaction(ColumnFamilyStore cfs, CompactionIterator ci)
+        {
+            this.cfs = cfs;
+            this.ci = ci;
+        }
+
+        public String getColumnFamilyName()
+        {
+            return cfs == null ? null : cfs.getColumnFamilyName();
+        }
+
+        public Long getBytesTotal()
+        {
+            return ci == null ? null : ci.getTotalBytes();
+        }
+
+        public Long getBytesCompleted()
+        {
+            return ci == null ? null : ci.getBytesRead();
+        }
+    }
+
+    public String getColumnFamilyInProgress()
+    {
+        return executor.getColumnFamilyName();
+    }
+
+    public Long getBytesTotalInProgress()
+    {
+        return executor.getBytesTotal();
+    }
+
+    public Long getBytesCompacted()
+    {
+        return executor.getBytesCompleted();
+    }
+
+    public int getPendingTasks()
+    {
+        int n = 0;
+        for (Integer i : estimatedCompactions.values())
+        {
+            n += i;
+        }
+        return n;
+    }
 }

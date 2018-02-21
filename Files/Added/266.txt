@@ -1,14 +1,13 @@
-assert postingsFormat != null: "formatName=" + formatName + " returned null PostingsFormat impl; this=" + PerFieldPostingsFormat.this;
-
-package org.apache.lucene.index.codecs.perfield;
+if (logger_.isDebugEnabled())
 
 /**
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -19,299 +18,236 @@ package org.apache.lucene.index.codecs.perfield;
  * limitations under the License.
  */
 
-import java.io.Closeable;
+package org.apache.cassandra.service;
+
 import java.io.IOException;
 import java.util.HashMap;
-import java.util.Iterator;
+import java.util.List;
+import java.util.ArrayList;
 import java.util.Map;
-import java.util.Set;
-import java.util.TreeMap;
-
-import org.apache.lucene.index.FieldInfo;
-import org.apache.lucene.index.FieldsEnum;
-import org.apache.lucene.index.IndexFileNames;
-import org.apache.lucene.index.SegmentInfo;
-import org.apache.lucene.index.SegmentReadState;
-import org.apache.lucene.index.SegmentWriteState;
-import org.apache.lucene.index.Terms;
-import org.apache.lucene.index.TermsEnum;
-import org.apache.lucene.index.codecs.FieldsConsumer;
-import org.apache.lucene.index.codecs.FieldsProducer;
-import org.apache.lucene.index.codecs.PostingsFormat;
-import org.apache.lucene.index.codecs.TermsConsumer;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.IOContext;
-import org.apache.lucene.store.IndexInput;
-import org.apache.lucene.store.IndexOutput;
-import org.apache.lucene.util.CodecUtil;
-import org.apache.lucene.util.IOUtils;
-
-// nocommit: should we allow embedding of PerField in
-// another?  it won't work now... because each PerField
-// thinks it's allowed to start assigning formats from
-// 0... if we made formatID a String then it could work
-// (each recursion could add _X to its incoming formatID);
-// why is it an int now...?
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.*;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.ReadCommand;
+import org.apache.cassandra.db.Row;
+import org.apache.cassandra.net.EndPoint;
+import org.apache.cassandra.net.IAsyncCallback;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.utils.LogUtil;
+import org.apache.log4j.Logger;
 
 /**
- * Enables per field format support.
- * 
- * @lucene.experimental
+ * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
  */
-// nocommit:
-// expose hook to lookup postings format by name
-// expose hook to get postingsformat for a field.
-// subclasses can deal with how they implement this (e.g. hashmap with default, solr schema, whatever)
-// this class can write its own private .per file with the mappings
-public abstract class PerFieldPostingsFormat extends PostingsFormat {
 
-  public static final String PER_FIELD_EXTENSION = "per";
-  public static final String PER_FIELD_NAME = "PerField";
-
-  public static final int VERSION_START = 0;
-  public static final int VERSION_LATEST = VERSION_START;
-
-  public PerFieldPostingsFormat() {
-    // nocommit should we allow caller to pass name in!?
-    super(PER_FIELD_NAME);
-  }
-
-  @Override
-  public FieldsConsumer fieldsConsumer(SegmentWriteState state)
-      throws IOException {
-    return new FieldsWriter(state);
-  }
-
-  // NOTE: not private to avoid $accessN at runtime!!
-  static class FieldsConsumerAndID implements Closeable {
-    final FieldsConsumer fieldsConsumer;
-    final int formatID;
-
-    public FieldsConsumerAndID(FieldsConsumer fieldsConsumer, int formatID) {
-      this.fieldsConsumer = fieldsConsumer;
-      this.formatID = formatID;
-    }
-
-    @Override
-    public void close() throws IOException {
-      fieldsConsumer.close();
-    }
-  };
+public class MultiQuorumResponseHandler implements IAsyncCallback
+{ 
+    private static Logger logger_ = Logger.getLogger( QuorumResponseHandler.class );
+    private Lock lock_ = new ReentrantLock();
+    private Condition condition_;
+    /* This maps the keys to the original data read messages */
+    private Map<String, ReadCommand> readMessages_ = new HashMap<String, ReadCommand>();
+    /* This maps the key to its set of replicas */
+    private Map<String, EndPoint[]> endpoints_ = new HashMap<String, EndPoint[]>();
+    /* This maps the groupId to the individual callback for the set of messages */
+    private Map<String, SingleQuorumResponseHandler> handlers_ = new HashMap<String, SingleQuorumResponseHandler>();
+    /* This should hold all the responses for the keys */
+    private List<Row> responses_ = new ArrayList<Row>();
+    private AtomicBoolean done_ = new AtomicBoolean(false);
     
-  private class FieldsWriter extends FieldsConsumer {
-
-    private final Map<String,FieldsConsumerAndID> formats = new HashMap<String,FieldsConsumerAndID>();
-
-    private final SegmentWriteState segmentWriteState;
-
-    public FieldsWriter(SegmentWriteState state) throws IOException {
-      segmentWriteState = state;
-    }
-
-    // nocommit -- pass formatID down to addField?
-
-    // nocommit -- should PostingsFormat have a name?
-
-    @Override
-    public TermsConsumer addField(FieldInfo field) throws IOException {
-      final String formatName = getPostingsFormatForField(field.name);
-      FieldsConsumerAndID format = formats.get(formatName);
-      if (format == null) {
-        // First time we are seeing this format -- assign
-        // next id and init it:
-        final int formatID = formats.size();
-        PostingsFormat postingsFormat = getPostingsFormat(formatName);
-        // nocommit: maybe the int formatID should be
-        // separate arg to .fieldsConsumer?  like we do for
-        // .files()
-        format = new FieldsConsumerAndID(postingsFormat.fieldsConsumer(new SegmentWriteState(segmentWriteState, formatID)),
-                                         formatID);
-        formats.put(formatName, format);
-      }
-      return format.fieldsConsumer.addField(field);
-    }
-
-    @Override
-    public void close() throws IOException {
-
-      // Close all subs
-      IOUtils.close(formats.values());
-
-      // Write _X.per:
-      final String mapFileName = IndexFileNames.segmentFileName(segmentWriteState.segmentName, segmentWriteState.formatId, PER_FIELD_EXTENSION);
-      final IndexOutput out = segmentWriteState.directory.createOutput(mapFileName, segmentWriteState.context);
-      boolean success = false;
-      try {
-        CodecUtil.writeHeader(out, PER_FIELD_NAME, VERSION_LATEST);
-        out.writeVInt(formats.size());
-        for(Map.Entry<String,FieldsConsumerAndID> ent : formats.entrySet()) {
-          out.writeVInt(ent.getValue().formatID);
-          out.writeString(ent.getKey());
+    /**
+     * This is used to handle the responses from the individual messages
+     * that are sent out to the replicas.
+     * @author alakshman
+     *
+    */
+    private class SingleQuorumResponseHandler implements IAsyncCallback
+    {
+        private Lock lock_ = new ReentrantLock();
+        private IResponseResolver<Row> responseResolver_;
+        private List<Message> responses_ = new ArrayList<Message>();
+        
+        SingleQuorumResponseHandler(IResponseResolver<Row> responseResolver)
+        {
+            responseResolver_ = responseResolver;
         }
-        success = true;
-      } finally {
-        if (!success) {
-          IOUtils.closeWhileHandlingException(formats.values());
-        } else {
-          IOUtils.close(out);
+        
+        public void attachContext(Object o)
+        {
+            throw new UnsupportedOperationException("This operation is not supported in this implementation");
         }
-      }
-    }
-  }
-
-  private class FieldsReader extends FieldsProducer {
-
-    private final Map<String,FieldsProducer> fields = new TreeMap<String,FieldsProducer>();
-    private final Map<String,FieldsProducer> formats = new HashMap<String,FieldsProducer>();
-
-    public FieldsReader(final SegmentReadState readState) throws IOException {
-
-      // Read _X.per and init each format:
-      boolean success = false;
-      try {
-        new VisitPerFieldFile(readState.dir, readState.segmentInfo.name) {
-          @Override
-          protected void visitOneFormat(String formatName, int formatID, PostingsFormat postingsFormat) throws IOException {
-            formats.put(formatName, postingsFormat.fieldsProducer(new SegmentReadState(readState, formatID)));
-          }
-        };
-        success = true;
-      } finally {
-        if (!success) {
-          IOUtils.closeWhileHandlingException(formats.values());
+        
+        public void response(Message response)
+        {
+            lock_.lock();
+            try
+            {
+                responses_.add(response);
+                int majority = (DatabaseDescriptor.getReplicationFactor() >> 1) + 1;                            
+                if ( responses_.size() >= majority && responseResolver_.isDataPresent(responses_))
+                {
+                    onCompletion();               
+                }
+            }
+            catch ( IOException ex )
+            {
+                logger_.info( LogUtil.throwableToString(ex) );
+            }
+            finally
+            {
+                lock_.unlock();
+            }
         }
-      }
-
-      // Map each field to its producer:
-      success = false;
-      try {
-        for (FieldInfo fi : readState.fieldInfos) {
-          if (fi.isIndexed) { 
-            String formatName = getPostingsFormatForField(fi.name);
-            FieldsProducer fieldsProducer = formats.get(formatName);
-            // Better be defined, because it was defined
-            // during indexing:
-            assert fieldsProducer != null;
-            fields.put(fi.name, fieldsProducer);
-          }
+        
+        private void onCompletion() throws IOException
+        {
+            try
+            {
+                Row row = responseResolver_.resolve(responses_);
+                MultiQuorumResponseHandler.this.onCompleteResponse(row);
+            }
+            catch ( DigestMismatchException ex )
+            {
+                /* 
+                 * The DigestMismatchException has the key for which the mismatch
+                 * occured bundled in it as context 
+                */
+                String key = ex.getMessage();
+                onDigestMismatch(key);
+            }
         }
-        success = true;
-      } finally {
-        if (!success) {
-          // If we hit exception (eg, IOE because writer was
-          // committing, or, for any other reason) we must
-          // go back and close all FieldsProducers we opened:
-          IOUtils.closeWhileHandlingException(formats.values());
+        
+        /**
+         * This method is invoked on a digest match. We pass in the key
+         * in order to retrieve the appropriate data message that needs
+         * to be sent out to the replicas. 
+         * 
+         * @param key for which the mismatch occured.
+        */
+        private void onDigestMismatch(String key) throws IOException
+        {
+            if ( DatabaseDescriptor.getConsistencyCheck())
+            {                                
+                ReadCommand readCommand = readMessages_.get(key);
+                readCommand.setDigestQuery(false);
+                Message messageRepair = readCommand.makeReadMessage();
+                EndPoint[] endpoints = MultiQuorumResponseHandler.this.endpoints_.get(readCommand.key);
+                Message[][] messages = new Message[][]{ {messageRepair, messageRepair, messageRepair} };
+                EndPoint[][] epList = new EndPoint[][]{ endpoints };
+                MessagingService.getMessagingInstance().sendRR(messages, epList, MultiQuorumResponseHandler.this);                
+            }
         }
-      }
     }
     
-
-    private final class FieldsIterator extends FieldsEnum {
-      private final Iterator<String> it;
-      private String current;
-
-      public FieldsIterator() {
-        it = fields.keySet().iterator();
-      }
-
-      @Override
-      public String next() {
-        if (it.hasNext()) {
-          current = it.next();
-        } else {
-          current = null;
-        }
-
-        return current;
-      }
-
-      @Override
-      public TermsEnum terms() throws IOException {
-        final Terms terms = fields.get(current).terms(current);
-        if (terms != null) {
-          return terms.iterator();
-        } else {
-          return TermsEnum.EMPTY;
-        }
-      }
-    }
-
-    @Override
-    public FieldsEnum iterator() throws IOException {
-      return new FieldsIterator();
-    }
-
-    @Override
-    public Terms terms(String field) throws IOException {
-      FieldsProducer fieldsProducer = fields.get(field);
-      return fieldsProducer == null ? null : fieldsProducer.terms(field);
+    public MultiQuorumResponseHandler(Map<String, ReadCommand> readMessages, Map<String, EndPoint[]> endpoints)
+    {        
+        condition_ = lock_.newCondition();
+        readMessages_ = readMessages;
+        endpoints_ = endpoints;
     }
     
-    @Override
-    public void close() throws IOException {
-      IOUtils.close(formats.values());
-    }
-  }
-
-  @Override
-  public FieldsProducer fieldsProducer(SegmentReadState state)
-      throws IOException {
-    return new FieldsReader(state);
-  }
-
-  private abstract class VisitPerFieldFile {
-    public VisitPerFieldFile(Directory dir, String segmentName) throws IOException {
-      // nocommit -- should formatID be a String not int?
-      // so we can embed one PFPF in another?  ie just keep
-      // appending _N to it...
-      final String mapFileName = IndexFileNames.segmentFileName(segmentName, 0, PER_FIELD_EXTENSION);
-      final IndexInput in = dir.openInput(mapFileName, IOContext.READONCE);
-      boolean success = false;
-      try {
-        CodecUtil.checkHeader(in, PER_FIELD_NAME, VERSION_START, VERSION_LATEST);
-        final int formatCount = in.readVInt();
-        for(int formatIDX=0;formatIDX<formatCount;formatIDX++) {
-          final int formatID = in.readVInt();
-          final String formatName = in.readString();
-          PostingsFormat postingsFormat = getPostingsFormat(formatName);
-          // Better be defined, because it was defined
-          // during indexing:
-          assert postingsFormat != null;
-          visitOneFormat(formatName, formatID, postingsFormat);
+    public Row[] get() throws TimeoutException
+    {
+        long startTime = System.currentTimeMillis();
+        lock_.lock();
+        try
+        {            
+            boolean bVal = true;            
+            try
+            {
+                if ( !done_.get() )
+                {                   
+                    bVal = condition_.await(DatabaseDescriptor.getRpcTimeout(), TimeUnit.MILLISECONDS);
+                }
+            }
+            catch ( InterruptedException ex )
+            {
+                logger_.debug( LogUtil.throwableToString(ex) );
+            }
+            
+            if ( !bVal && !done_.get() )
+            {
+                StringBuilder sb = new StringBuilder("");
+                for ( Row row : responses_ )
+                {
+                    sb.append(row.key());
+                    sb.append(":");
+                }                
+                throw new TimeoutException("Operation timed out - received only " +  responses_.size() + " responses from " + sb.toString() + " .");
+            }
         }
-        success = true;
-      } finally {
-        if (!success) {
-          IOUtils.closeWhileHandlingException(in);
-        } else {
-          IOUtils.close(in);
+        finally
+        {
+            lock_.unlock();
         }
-      }
+        
+        logger_.info("MultiQuorumResponseHandler: " + (System.currentTimeMillis() - startTime) + " ms.");
+        return responses_.toArray( new Row[0] );
     }
-
-    protected abstract void visitOneFormat(String formatName, int formatID, PostingsFormat format) throws IOException;
-  }
-
-  @Override
-  public void files(final Directory dir, final SegmentInfo info, int formatId, final Set<String> files)
-      throws IOException {
-
-    final String mapFileName = IndexFileNames.segmentFileName(info.name, formatId, PER_FIELD_EXTENSION);
-    files.add(mapFileName);
-
-    new VisitPerFieldFile(dir, info.name) {
-      @Override
-      protected void visitOneFormat(String formatName, int formatID, PostingsFormat format) throws IOException {
-        format.files(dir, info, formatID, files);
-      }
-    };
-  }
-
-  // nocommit: do we really need to pass fieldInfo here?
-  // sucks for 'outsiders' (like tests!) that want to peep at what format
-  // is being used for a field... changed to a String for now.. but lets revisit
-  public abstract String getPostingsFormatForField(String field);
-
-  public abstract PostingsFormat getPostingsFormat(String formatName);
+    
+    /**
+     * Invoked when a complete response has been obtained
+     * for one of the sub-groups a.k.a keys for the query 
+     * has been performed.
+     * 
+     * @param row obtained as a result of the response.
+     */
+    void onCompleteResponse(Row row)
+    {        
+        if ( !done_.get() )
+        {
+            responses_.add(row);
+            if ( responses_.size() == readMessages_.size() )
+            {
+                done_.set(true);
+                condition_.signal();                
+            }
+        }
+    }
+    
+    /**
+     * The handler of the response message that has been
+     * sent by one of the replicas for one of the keys.
+     * 
+     * @param message the reponse message for one of the
+     *        message that we sent out.
+     */
+    public void response(Message message)
+    {
+        lock_.lock();
+        try
+        {
+            SingleQuorumResponseHandler handler = handlers_.get(message.getMessageId());
+            handler.response(message);
+        }
+        finally
+        {
+            lock_.unlock();
+        }
+    }
+    
+    /**
+     * The context that is passed in for the query of
+     * multiple keys in the system. For each message 
+     * id in the context register a callback handler 
+     * for the same. This is done so that all responses
+     * for a given key use the same callback handler.
+     * 
+     * @param o the context which is an array of strings
+     *        corresponding to the message id's for each
+     *        key.
+     */
+    public void attachContext(Object o)
+    {
+        String[] gids = (String[])o;
+        for ( String gid : gids )
+        {
+            IResponseResolver<Row> responseResolver = new ReadResponseResolver();
+            SingleQuorumResponseHandler handler = new SingleQuorumResponseHandler(responseResolver);
+            handlers_.put(gid, handler);
+        }
+    }
 }

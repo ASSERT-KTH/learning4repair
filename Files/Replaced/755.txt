@@ -1,6 +1,6 @@
-disconnectedTimer = new Timer(true);
+public void close() throws IOException {
 
-package org.apache.solr.common.cloud;
+package org.apache.solr.store.hdfs;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,239 +19,173 @@ package org.apache.solr.common.cloud;
  * limitations under the License.
  */
 
-import java.util.Timer;
-import java.util.TimerTask;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeoutException;
+import java.io.IOException;
 
-import org.apache.solr.common.SolrException;
-import org.apache.zookeeper.WatchedEvent;
-import org.apache.zookeeper.Watcher;
-import org.apache.zookeeper.Watcher.Event.KeeperState;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FSDataOutputStream;
+import org.apache.hadoop.fs.FileAlreadyExistsException;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.ipc.RemoteException;
+import org.apache.lucene.store.Lock;
+import org.apache.lucene.store.LockFactory;
+import org.apache.lucene.store.LockReleaseFailedException;
+import org.apache.solr.util.IOUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public class ConnectionManager implements Watcher {
-  protected static final Logger log = LoggerFactory
-      .getLogger(ConnectionManager.class);
-
-  private final String name;
-  private final CountDownLatch clientConnected = new CountDownLatch(1);
+public class HdfsLockFactory extends LockFactory {
+  public static Logger log = LoggerFactory.getLogger(HdfsLockFactory.class);
   
-  private boolean connected = false;
-
-  private final ZkClientConnectionStrategy connectionStrategy;
-
-  private final String zkServerAddress;
-
-  private final SolrZkClient client;
-
-  private final OnReconnect onReconnect;
-  private final BeforeReconnect beforeReconnect;
-
-  private volatile KeeperState state = KeeperState.Disconnected;
-  private volatile boolean isClosed = false;
-  private volatile boolean likelyExpired = true;
+  private Path lockPath;
+  private Configuration configuration;
   
-  private volatile Timer disconnectedTimer;
-
-  public ConnectionManager(String name, SolrZkClient client, String zkServerAddress, ZkClientConnectionStrategy strat, OnReconnect onConnect, BeforeReconnect beforeReconnect) {
-    this.name = name;
-    this.client = client;
-    this.connectionStrategy = strat;
-    this.zkServerAddress = zkServerAddress;
-    this.onReconnect = onConnect;
-    this.beforeReconnect = beforeReconnect;
+  public HdfsLockFactory(Path lockPath, Configuration configuration) {
+    this.lockPath = lockPath;
+    this.configuration = configuration;
   }
   
-  private synchronized void connected() {
-    if (disconnectedTimer != null) {
-      disconnectedTimer.cancel();
-      disconnectedTimer = null;
-    }
-    connected = true;
-    likelyExpired = false;
-    notifyAll();
-  }
-
-  private synchronized void disconnected() {
-    if (disconnectedTimer != null) {
-      disconnectedTimer.cancel();
-      disconnectedTimer = null;
-    }
-    if (!isClosed) {
-      disconnectedTimer = new Timer();
-      disconnectedTimer.schedule(new TimerTask() {
-        
-        @Override
-        public void run() {
-          likelyExpired = true;
-        }
-        
-      }, (long) (client.getZkClientTimeout() * 0.90));
-    }
-    connected = false;
-    notifyAll();
-  }
-
   @Override
-  public void process(WatchedEvent event) {
-    if (log.isInfoEnabled()) {
-      log.info("Watcher " + this + " name:" + name + " got event " + event
-          + " path:" + event.getPath() + " type:" + event.getType());
+  public Lock makeLock(String lockName) {
+    
+    if (lockPrefix != null) {
+      lockName = lockPrefix + "-" + lockName;
     }
     
-    if (isClosed) {
-      log.info("Client->ZooKeeper status change trigger but we are already closed");
-      return;
-    }
+    HdfsLock lock = new HdfsLock(lockPath, lockName, configuration);
     
-    state = event.getState();
-    
-    if (state == KeeperState.SyncConnected) {
-      connected();
-      clientConnected.countDown();
-      connectionStrategy.connected();
-    } else if (state == KeeperState.Expired) {
-      if (disconnectedTimer != null) {
-        disconnectedTimer.cancel();
-        disconnectedTimer = null;
-      }
-      
-      connected = false;
-      likelyExpired = true;
-      
-      log.info("Our previous ZooKeeper session was expired. Attempting to reconnect to recover relationship with ZooKeeper...");
-      
-      if (beforeReconnect != null) {
-        beforeReconnect.command();
-      }
-      
-      try {
-        connectionStrategy.reconnect(zkServerAddress,
-            client.getZkClientTimeout(), this,
-            new ZkClientConnectionStrategy.ZkUpdate() {
-              @Override
-              public void update(SolrZooKeeper keeper) {
-                try {
-                  waitForConnected(Long.MAX_VALUE);
-                } catch (Exception e1) {
-                  closeKeeper(keeper);
-                  throw new RuntimeException(e1);
-                }
-                
-                log.info("Connection with ZooKeeper reestablished.");
-                try {
-                  client.updateKeeper(keeper);
-                } catch (InterruptedException e) {
-                  closeKeeper(keeper);
-                  Thread.currentThread().interrupt();
-                  // we must have been asked to stop
-                  throw new RuntimeException(e);
-                } catch (Throwable t) {
-                  closeKeeper(keeper);
-                  throw new RuntimeException(t);
-                }
-                
-                connected();
-                
-                if (onReconnect != null) {
-                  Thread thread = new Thread() {
-                    @Override
-                    public void run() {
-                      try {
-                        onReconnect.command();
-                      } catch (Exception e) {
-                        log.warn("Exception running onReconnect command", e);
-                      }
-                    }
-                  };
-                  thread.start();
-                }
-                
+    return lock;
+  }
+  
+  @Override
+  public void clearLock(String lockName) throws IOException {
+    FileSystem fs = null;
+    try {
+      fs = FileSystem.newInstance(lockPath.toUri(), configuration);
+      while (true) {
+        if (fs.exists(lockPath)) {
+          if (lockPrefix != null) {
+            lockName = lockPrefix + "-" + lockName;
+          }
+          
+          Path lockFile = new Path(lockPath, lockName);
+          try {
+            if (fs.exists(lockFile) && !fs.delete(lockFile, false)) {
+              throw new IOException("Cannot delete " + lockFile);
+            }
+          } catch (RemoteException e) {
+            if (e.getClassName().equals(
+                "org.apache.hadoop.hdfs.server.namenode.SafeModeException")) {
+              log.warn("The NameNode is in SafeMode - Solr will wait 5 seconds and try again.");
+              try {
+                Thread.sleep(5000);
+              } catch (InterruptedException e1) {
+                Thread.interrupted();
               }
-            });
-      } catch (Exception e) {
-        SolrException.log(log, "", e);
+              continue;
+            }
+            throw e;
+          }
+          break;
+        }
       }
-      log.info("Connected:" + connected);
-    } else if (state == KeeperState.Disconnected) {
-      log.info("zkClient has disconnected");
-      disconnected();
-      connectionStrategy.disconnected();
-    } else {
-      disconnected();
-    }
-  }
-
-  public synchronized boolean isConnected() {
-    return !isClosed && connected;
-  }
-  
-  // we use a volatile rather than sync
-  // to avoid deadlock on shutdown
-  public void close() {
-    this.isClosed = true;
-    this.likelyExpired = true;
-    try {
-      this.disconnectedTimer.cancel();
-    } catch (NullPointerException e) {
-      // fine
     } finally {
-      this.disconnectedTimer = null;
+      IOUtils.closeQuietly(fs);
     }
   }
   
-  public boolean isLikelyExpired() {
-    return likelyExpired;
+  public Path getLockPath() {
+    return lockPath;
   }
-
-  public synchronized void waitForConnected(long waitForConnection)
-      throws TimeoutException {
-    log.info("Waiting for client to connect to ZooKeeper");
-    long expire = System.currentTimeMillis() + waitForConnection;
-    long left = 1;
-    while (!connected && left > 0) {
-      if (isClosed) {
-        break;
-      }
+  
+  public void setLockPath(Path lockPath) {
+    this.lockPath = lockPath;
+  }
+  
+  static class HdfsLock extends Lock {
+    
+    private Path lockPath;
+    private String lockName;
+    private Configuration conf;
+    
+    public HdfsLock(Path lockPath, String lockName, Configuration conf) {
+      this.lockPath = lockPath;
+      this.lockName = lockName;
+      this.conf = conf;
+    }
+    
+    @Override
+    public boolean obtain() throws IOException {
+      FSDataOutputStream file = null;
+      FileSystem fs = FileSystem.newInstance(lockPath.toUri(), conf);
       try {
-        wait(500);
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-        throw new RuntimeException(e);
+        while (true) {
+          try {
+            if (!fs.exists(lockPath)) {
+              boolean success = fs.mkdirs(lockPath);
+              if (!success) {
+                throw new RuntimeException("Could not create directory: " + lockPath);
+              }
+            } else {
+              // just to check for safe mode
+              fs.mkdirs(lockPath);
+            }
+
+            
+            file = fs.create(new Path(lockPath, lockName), false);
+            break;
+          } catch (FileAlreadyExistsException e) {
+            return false;
+          } catch (RemoteException e) {
+            if (e.getClassName().equals(
+                "org.apache.hadoop.hdfs.server.namenode.SafeModeException")) {
+              log.warn("The NameNode is in SafeMode - Solr will wait 5 seconds and try again.");
+              try {
+                Thread.sleep(5000);
+              } catch (InterruptedException e1) {
+                Thread.interrupted();
+              }
+              continue;
+            }
+            log.error("Error creating lock file", e);
+            return false;
+          } catch (IOException e) {
+            log.error("Error creating lock file", e);
+            return false;
+          } finally {
+            IOUtils.closeQuietly(file);
+          }
+        }
+      } finally {
+        IOUtils.closeQuietly(fs);
       }
-      left = expire - System.currentTimeMillis();
+      return true;
     }
-    if (!connected) {
-      throw new TimeoutException("Could not connect to ZooKeeper " + zkServerAddress + " within " + waitForConnection + " ms");
+    
+    @Override
+    public void release() throws IOException {
+      FileSystem fs = FileSystem.newInstance(lockPath.toUri(), conf);
+      try {
+        if (fs.exists(new Path(lockPath, lockName))
+            && !fs.delete(new Path(lockPath, lockName), false)) throw new LockReleaseFailedException(
+            "failed to delete " + new Path(lockPath, lockName));
+      } finally {
+        IOUtils.closeQuietly(fs);
+      }
     }
-    log.info("Client is connected to ZooKeeper");
+    
+    @Override
+    public boolean isLocked() throws IOException {
+      boolean isLocked = false;
+      FileSystem fs = FileSystem.newInstance(lockPath.toUri(), conf);
+      try {
+        isLocked = fs.exists(new Path(lockPath, lockName));
+      } finally {
+        IOUtils.closeQuietly(fs);
+      }
+      return isLocked;
+    }
+    
   }
-
-  public synchronized void waitForDisconnected(long timeout)
-      throws InterruptedException, TimeoutException {
-    long expire = System.currentTimeMillis() + timeout;
-    long left = timeout;
-    while (connected && left > 0) {
-      wait(left);
-      left = expire - System.currentTimeMillis();
-    }
-    if (connected) {
-      throw new TimeoutException("Did not disconnect");
-    }
-  }
-
-  private void closeKeeper(SolrZooKeeper keeper) {
-    try {
-      keeper.close();
-    } catch (InterruptedException e) {
-      // Restore the interrupted status
-      Thread.currentThread().interrupt();
-      log.error("", e);
-      throw new ZooKeeperException(SolrException.ErrorCode.SERVER_ERROR,
-          "", e);
-    }
-  }
+  
 }
- No newline at end of file

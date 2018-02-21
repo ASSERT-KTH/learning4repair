@@ -1,4 +1,4 @@
-private static String d_columnTimestamp_  = "COLUMN_TIMESTAMP";
+private static class CompactionExecutor extends DebuggableThreadPoolExecutor
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one
@@ -18,436 +18,52 @@ private static String d_columnTimestamp_  = "COLUMN_TIMESTAMP";
  * limitations under the License.
  */
 
-package org.apache.cassandra.config;
+package org.apache.cassandra.db;
 
+import java.io.IOException;
+import java.io.File;
+import java.lang.management.ManagementFactory;
 import java.util.*;
-import java.io.*;
-import java.lang.reflect.InvocationTargetException;
-
-import javax.xml.transform.TransformerException;
+import java.util.Map.Entry;
+import java.util.concurrent.Callable;
+import java.util.concurrent.Future;
+import javax.management.*;
 
 import org.apache.log4j.Logger;
 
-import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.marshal.AbstractType;
-import org.apache.cassandra.db.marshal.AsciiType;
-import org.apache.cassandra.db.marshal.UTF8Type;
-import org.apache.cassandra.db.marshal.BytesType;
-import org.apache.cassandra.utils.FileUtils;
-import org.apache.cassandra.utils.XMLUtils;
-import org.w3c.dom.Node;
-import org.w3c.dom.NodeList;
+import org.apache.cassandra.concurrent.DebuggableThreadPoolExecutor;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.io.*;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.service.AntiEntropyService;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.utils.FBUtilities;
+import org.cliffc.high_scale_lib.NonBlockingHashMap;
 
+import java.net.InetAddress;
 
-/**
- * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
- */
+import org.apache.commons.lang.StringUtils;
+import org.apache.commons.collections.iterators.FilterIterator;
+import org.apache.commons.collections.iterators.CollatingIterator;
+import org.apache.commons.collections.PredicateUtils;
 
-public class DatabaseDescriptor
+public class CompactionManager implements CompactionManagerMBean
 {
-    private static Logger logger_ = Logger.getLogger(DatabaseDescriptor.class);
+    public static final String MBEAN_OBJECT_NAME = "org.apache.cassandra.db:type=CompactionManager";
+    private static final Logger logger = Logger.getLogger(CompactionManager.class);
+    public static final CompactionManager instance;
 
-    public static final String random_ = "RANDOM";
-    public static final String ophf_ = "OPHF";
-    private static int storagePort_ = 7000;
-    private static int controlPort_ = 7001;
-    private static int thriftPort_ = 9160;
-    private static String listenAddress_; // leave null so we can fall through to getLocalHost
-    private static String thriftAddress_;
-    private static String clusterName_ = "Test";
-    private static int replicationFactor_ = 3;
-    private static long rpcTimeoutInMillis_ = 2000;
-    private static Set<String> seeds_ = new HashSet<String>();
-    private static String snapshotDirectory_;
-    /* Keeps the list of data file directories */
-    private static String[] dataFileDirectories_;
-    /* Current index into the above list of directories */
-    private static int currentIndex_ = 0;
-    private static String logFileDirectory_;
-    private static String bootstrapFileDirectory_;
-    private static boolean rackAware_ = false;
-    private static int threadsPerPool_ = 4;
-    private static List<String> tables_ = new ArrayList<String>();
-    private static Set<String> applicationColumnFamilies_ = new HashSet<String>();
-
-    // Default descriptive names for use in CQL. The user can override
-    // these choices in the config file. These are not case sensitive.
-    // Hence, these are stored in UPPER case for easy comparison.
-    private static String d_rowKey_           = "ROW_KEY";
-    private static String d_superColumnMap_   = "SUPER_COLUMN_MAP";
-    private static String d_superColumnKey_   = "SUPER_COLUMN_KEY";
-    private static String d_columnMap_        = "COLUMN_MAP";
-    private static String d_columnKey_        = "COLUMN_KEY";
-    private static String d_columnValue_      = "COLUMN_VALUE";
-    private static String d_columnTimestamp_  = "ColumnIMESTAMP";
-
-    private static Map<String, Double> tableKeysCachedFractions_;
-    /*
-     * A map from table names to the set of column families for the table and the
-     * corresponding meta data for that column family.
-    */
-    private static Map<String, Map<String, CFMetaData>> tableToCFMetaDataMap_;
-    /* Hashing strategy Random or OPHF */
-    private static String partitionerClass_;
-    /* if the size of columns or super-columns are more than this, indexing will kick in */
-    private static int columnIndexSizeInKB_;
-    /* Number of hours to keep a memtable in memory */
-    private static int memtableLifetime_ = 6;
-    /* Size of the memtable in memory before it is dumped */
-    private static int memtableSize_ = 128;
-    /* Number of objects in millions in the memtable before it is dumped */
-    private static double memtableObjectCount_ = 1;
-    /* 
-     * This parameter enables or disables consistency checks. 
-     * If set to false the read repairs are disable for very
-     * high throughput on reads but at the cost of consistency.
-    */
-    private static boolean doConsistencyCheck_ = true;
-    /* Callout directories */
-    private static String calloutLocation_;
-    /* Job Jar Location */
-    private static String jobJarFileLocation_;
-    /* Address where to run the job tracker */
-    private static String jobTrackerHost_;    
-    /* time to wait before garbage collecting tombstones (deletion markers) */
-    private static int gcGraceInSeconds_ = 10 * 24 * 3600; // 10 days
-
-    // the path qualified config file (storage-conf.xml) name
-    private static String configFileName_;
-    /* initial token in the ring */
-    private static String initialToken_ = null;
+    private int minimumCompactionThreshold = 4; // compact this many sstables min at a time
+    private int maximumCompactionThreshold = 32; // compact this many sstables max at a time
 
     static
     {
+        instance = new CompactionManager();
+        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
         try
         {
-            configFileName_ = System.getProperty("storage-config") + File.separator + "storage-conf.xml";
-            if (logger_.isDebugEnabled())
-              logger_.debug("Loading settings from " + configFileName_);
-            XMLUtils xmlUtils = new XMLUtils(configFileName_);
-
-            /* Cluster Name */
-            clusterName_ = xmlUtils.getNodeValue("/Storage/ClusterName");
-
-            /* Hashing strategy */
-            partitionerClass_ = xmlUtils.getNodeValue("/Storage/Partitioner");
-            try
-            {
-                Class.forName(DatabaseDescriptor.getPartitionerClass());
-            }
-            catch (NullPointerException e)
-            {
-                throw new ConfigurationException("Missing partitioner directive /Storage/Partitioner");
-            }
-            catch (ClassNotFoundException e)
-            {
-                throw new ConfigurationException("Invalid partitioner class " + partitionerClass_);
-            }
-
-            /* Callout location */
-            calloutLocation_ = xmlUtils.getNodeValue("/Storage/CalloutLocation");
-
-            /* JobTracker address */
-            jobTrackerHost_ = xmlUtils.getNodeValue("/Storage/JobTrackerHost");
-
-            /* Job Jar file location */
-            jobJarFileLocation_ = xmlUtils.getNodeValue("/Storage/JobJarFileLocation");
-
-            String gcGrace = xmlUtils.getNodeValue("/Storage/GCGraceSeconds");
-            if ( gcGrace != null )
-                gcGraceInSeconds_ = Integer.parseInt(gcGrace);
-
-            initialToken_ = xmlUtils.getNodeValue("/Storage/InitialToken");
-
-            /* Data replication factor */
-            String replicationFactor = xmlUtils.getNodeValue("/Storage/ReplicationFactor");
-            if ( replicationFactor != null )
-                replicationFactor_ = Integer.parseInt(replicationFactor);
-
-            /* RPC Timeout */
-            String rpcTimeoutInMillis = xmlUtils.getNodeValue("/Storage/RpcTimeoutInMillis");
-            if ( rpcTimeoutInMillis != null )
-                rpcTimeoutInMillis_ = Integer.parseInt(rpcTimeoutInMillis);
-
-            /* Thread per pool */
-            String threadsPerPool = xmlUtils.getNodeValue("/Storage/ThreadsPerPool");
-            if ( threadsPerPool != null )
-                threadsPerPool_ = Integer.parseInt(threadsPerPool);
-
-            /* TCP port on which the storage system listens */
-            String port = xmlUtils.getNodeValue("/Storage/StoragePort");
-            if ( port != null )
-                storagePort_ = Integer.parseInt(port);
-
-            /* Local IP or hostname to bind services to */
-            String listenAddress = xmlUtils.getNodeValue("/Storage/ListenAddress");
-            if ( listenAddress != null)
-                listenAddress_ = listenAddress;
-            
-            /* Local IP or hostname to bind thrift server to */
-            String thriftAddress = xmlUtils.getNodeValue("/Storage/ThriftAddress");
-            if ( thriftAddress != null )
-                thriftAddress_ = thriftAddress;
-            
-            /* UDP port for control messages */
-            port = xmlUtils.getNodeValue("/Storage/ControlPort");
-            if ( port != null )
-                controlPort_ = Integer.parseInt(port);
-
-            /* get the thrift port from conf file */
-            port = xmlUtils.getNodeValue("/Storage/ThriftPort");
-            if (port != null)
-                thriftPort_ = Integer.parseInt(port);
-
-            /* Number of days to keep the memtable around w/o flushing */
-            String lifetime = xmlUtils.getNodeValue("/Storage/MemtableLifetimeInDays");
-            if ( lifetime != null )
-                memtableLifetime_ = Integer.parseInt(lifetime);
-
-            /* Size of the memtable in memory in MB before it is dumped */
-            String memtableSize = xmlUtils.getNodeValue("/Storage/MemtableSizeInMB");
-            if ( memtableSize != null )
-                memtableSize_ = Integer.parseInt(memtableSize);
-            /* Number of objects in millions in the memtable before it is dumped */
-            String memtableObjectCount = xmlUtils.getNodeValue("/Storage/MemtableObjectCountInMillions");
-            if ( memtableObjectCount != null )
-                memtableObjectCount_ = Double.parseDouble(memtableObjectCount);
-            if (memtableObjectCount_ <= 0)
-            {
-                throw new ConfigurationException("Memtable object count must be a positive double");
-            }
-
-            /* This parameter enables or disables consistency checks.
-             * If set to false the read repairs are disable for very
-             * high throughput on reads but at the cost of consistency.*/
-            String doConsistencyCheck = xmlUtils.getNodeValue("/Storage/DoConsistencyChecksBoolean");
-            if ( doConsistencyCheck != null )
-                doConsistencyCheck_ = Boolean.parseBoolean(doConsistencyCheck);
-
-            /* read the size at which we should do column indexes */
-            String columnIndexSizeInKB = xmlUtils.getNodeValue("/Storage/ColumnIndexSizeInKB");
-            if(columnIndexSizeInKB == null)
-            {
-                columnIndexSizeInKB_ = 64;
-            }
-            else
-            {
-                columnIndexSizeInKB_ = Integer.parseInt(columnIndexSizeInKB);
-            }
-
-            /* snapshot directory */
-            snapshotDirectory_ = xmlUtils.getNodeValue("/Storage/SnapshotDirectory");
-            if ( snapshotDirectory_ != null )
-                FileUtils.createDirectory(snapshotDirectory_);
-
-            /* data file directory */
-            dataFileDirectories_ = xmlUtils.getNodeValues("/Storage/DataFileDirectories/DataFileDirectory");
-            if (dataFileDirectories_.length == 0)
-            {
-                throw new ConfigurationException("At least one DataFileDirectory must be specified");
-            }
-            for ( String dataFileDirectory : dataFileDirectories_ )
-                FileUtils.createDirectory(dataFileDirectory);
-
-            /* bootstrap file directory */
-            bootstrapFileDirectory_ = xmlUtils.getNodeValue("/Storage/BootstrapFileDirectory");
-            if (bootstrapFileDirectory_ == null)
-            {
-                throw new ConfigurationException("BootstrapFileDirectory must be specified");
-            }
-            FileUtils.createDirectory(bootstrapFileDirectory_);
-
-            /* commit log directory */
-            logFileDirectory_ = xmlUtils.getNodeValue("/Storage/CommitLogDirectory");
-            if (logFileDirectory_ == null)
-            {
-                throw new ConfigurationException("CommitLogDirectory must be specified");
-            }
-            FileUtils.createDirectory(logFileDirectory_);
-
-            /* threshold after which commit log should be rotated. */
-            String value = xmlUtils.getNodeValue("/Storage/CommitLogRotationThresholdInMB");
-            if ( value != null)
-                CommitLog.setSegmentSize(Integer.parseInt(value) * 1024 * 1024);
-
-            tableToCFMetaDataMap_ = new HashMap<String, Map<String, CFMetaData>>();
-            tableKeysCachedFractions_ = new HashMap<String, Double>();
-
-            /* Rack Aware option */
-            value = xmlUtils.getNodeValue("/Storage/RackAware");
-            if ( value != null )
-                rackAware_ = Boolean.parseBoolean(value);
-
-            /* Read the table related stuff from config */
-            NodeList tables = xmlUtils.getRequestedNodeList("/Storage/Tables/Table");
-            int size = tables.getLength();
-            for ( int i = 0; i < size; ++i )
-            {
-                Node table = tables.item(i);
-
-                /* parsing out the table name */
-                String tName = XMLUtils.getAttributeValue(table, "Name");
-                if (tName == null)
-                {
-                    throw new ConfigurationException("Table name attribute is required");
-                }
-                if (tName.equalsIgnoreCase(Table.SYSTEM_TABLE))
-                {
-                    throw new ConfigurationException("'system' is a reserved table name for Cassandra internals");
-                }
-                tables_.add(tName);
-                tableToCFMetaDataMap_.put(tName, new HashMap<String, CFMetaData>());
-
-                String xqlCacheSize = "/Storage/Tables/Table[@Name='" + tName + "']/KeysCachedFraction";
-                value = xmlUtils.getNodeValue(xqlCacheSize);
-                if (value == null)
-                {
-                    tableKeysCachedFractions_.put(tName, 0.01);
-                }
-                else
-                {
-                    tableKeysCachedFractions_.put(tName, Double.valueOf(value));
-                }
-
-                String xqlTable = "/Storage/Tables/Table[@Name='" + tName + "']/";
-                NodeList columnFamilies = xmlUtils.getRequestedNodeList(xqlTable + "ColumnFamily");
-
-                // get name of the rowKey for this table
-                String n_rowKey = xmlUtils.getNodeValue(xqlTable + "RowKey");
-                if (n_rowKey == null)
-                    n_rowKey = d_rowKey_;
-
-                //NodeList columnFamilies = xmlUtils.getRequestedNodeList(table, "ColumnFamily");
-                int size2 = columnFamilies.getLength();
-
-                for ( int j = 0; j < size2; ++j )
-                {
-                    Node columnFamily = columnFamilies.item(j);
-                    String cfName = XMLUtils.getAttributeValue(columnFamily, "Name");
-                    if (cfName == null)
-                    {
-                        throw new ConfigurationException("ColumnFamily name attribute is required");
-                    }
-                    String xqlCF = xqlTable + "ColumnFamily[@Name='" + cfName + "']/";
-
-                    /* squirrel away the application column families */
-                    applicationColumnFamilies_.add(cfName);
-
-                    // Parse out the column type
-                    String rawColumnType = XMLUtils.getAttributeValue(columnFamily, "ColumnType");
-                    String columnType = ColumnFamily.getColumnType(rawColumnType);
-                    if (columnType == null)
-                    {
-                        throw new ConfigurationException("ColumnFamily " + cfName + " has invalid type " + rawColumnType);
-                    }
-
-                    if (XMLUtils.getAttributeValue(columnFamily, "ColumnSort") != null)
-                    {
-                        throw new ConfigurationException("ColumnSort is no longer an accepted attribute.  Use CompareWith instead.");
-                    }
-
-                    // Parse out the column comparator
-                    AbstractType columnComparator = getComparator(columnFamily, "CompareWith");
-                    AbstractType subcolumnComparator;
-                    if (columnType.equals("Super"))
-                    {
-                        subcolumnComparator = getComparator(columnFamily, "CompareSubcolumnsWith");
-                    }
-                    else if (XMLUtils.getAttributeValue(columnFamily, "CompareSubcolumnsWith") != null)
-                    {
-                        throw new ConfigurationException("CompareSubcolumnsWith is only a valid attribute on super columnfamilies (not regular columnfamily " + cfName + ")");
-                    }
-
-                    // see if flush period is set
-                    String flushPeriodInMinutes = XMLUtils.getAttributeValue(columnFamily, "FlushPeriodInMinutes");
-                    int flushPeriod=0;
-                    if ( flushPeriodInMinutes != null )
-                        flushPeriod = Integer.parseInt(flushPeriodInMinutes);
-
-                    
-                    // Parse out user-specified logical names for the various dimensions
-                    // of a the column family from the config.
-                    String n_superColumnMap = xmlUtils.getNodeValue(xqlCF + "SuperColumnMap");
-                    if (n_superColumnMap == null)
-                        n_superColumnMap = d_superColumnMap_;
-
-                    String n_superColumnKey = xmlUtils.getNodeValue(xqlCF + "SuperColumnKey");
-                    if (n_superColumnKey == null)
-                        n_superColumnKey = d_superColumnKey_;
-
-                    String n_columnMap = xmlUtils.getNodeValue(xqlCF + "ColumnMap");
-                    if (n_columnMap == null)
-                        n_columnMap = d_columnMap_;
-
-                    String n_columnKey = xmlUtils.getNodeValue(xqlCF + "ColumnKey");
-                    if (n_columnKey == null)
-                        n_columnKey = d_columnKey_;
-
-                    String n_columnValue = xmlUtils.getNodeValue(xqlCF + "ColumnValue");
-                    if (n_columnValue == null)
-                        n_columnValue = d_columnValue_;
-
-                    String n_columnTimestamp = xmlUtils.getNodeValue(xqlCF + "ColumnTimestamp");
-                    if (n_columnTimestamp == null)
-                        n_columnTimestamp = d_columnTimestamp_;
-
-                    // now populate the column family meta data and
-                    // insert it into the table dictionary.
-                    CFMetaData cfMetaData = new CFMetaData();
-
-                    cfMetaData.tableName = tName;
-                    cfMetaData.cfName = cfName;
-
-                    cfMetaData.columnType = columnType;
-                    cfMetaData.comparator = columnComparator;
-                    cfMetaData.subcolumnComparator = columnComparator;
-
-                    cfMetaData.n_rowKey = n_rowKey;
-                    cfMetaData.n_columnMap = n_columnMap;
-                    cfMetaData.n_columnKey = n_columnKey;
-                    cfMetaData.n_columnValue = n_columnValue;
-                    cfMetaData.n_columnTimestamp = n_columnTimestamp;
-                    if ("Super".equals(columnType))
-                    {
-                        cfMetaData.n_superColumnKey = n_superColumnKey;
-                        cfMetaData.n_superColumnMap = n_superColumnMap;
-                    }
-                    cfMetaData.flushPeriodInMinutes = flushPeriod;
-                    
-                    tableToCFMetaDataMap_.get(tName).put(cfName, cfMetaData);
-                }
-            }
-
-            // Hardcoded system tables
-            Map<String, CFMetaData> systemMetadata = new HashMap<String, CFMetaData>();
-
-            CFMetaData data = new CFMetaData();
-            data.comparator = new AsciiType();
-            systemMetadata.put(SystemTable.LOCATION_CF, data);
-
-            data = new CFMetaData();
-            data.columnType = "Super";
-            data.comparator = new UTF8Type();
-            data.subcolumnComparator = new BytesType();
-            systemMetadata.put(HintedHandOffManager.HINTS_CF, data);
-
-            tableToCFMetaDataMap_.put("system", systemMetadata);
-
-            /* make sure we have a directory for each table */
-            createTableDirectories();
-
-            /* Load the seeds for node contact points */
-            String[] seeds = xmlUtils.getNodeValues("/Storage/Seeds/Seed");
-            for( int i = 0; i < seeds.length; ++i )
-            {
-                seeds_.add( seeds[i] );
-            }
-        }
-        catch (ConfigurationException e)
-        {
-            logger_.error("Fatal error: " + e.getMessage());
-            System.err.println("Bad configuration; unable to start server");
-            System.exit(1);
+            mbs.registerMBean(instance, new ObjectName(MBEAN_OBJECT_NAME));
         }
         catch (Exception e)
         {
@@ -455,381 +71,553 @@ public class DatabaseDescriptor
         }
     }
 
-    private static AbstractType getComparator(Node columnFamily, String attr)
-    throws ConfigurationException, TransformerException, NoSuchMethodException, InvocationTargetException, IllegalAccessException, InstantiationException
-    {
-        Class<? extends AbstractType> typeClass;
-        String compareWith = XMLUtils.getAttributeValue(columnFamily, attr);
-        if (compareWith == null)
-        {
-            typeClass = AsciiType.class;
-        }
-        else
-        {
-            String className = compareWith.contains(".") ? compareWith : "org.apache.cassandra.db.marshal." + compareWith;
-            try
-            {
-                typeClass = (Class<? extends AbstractType>)Class.forName(className);
-            }
-            catch (ClassNotFoundException e)
-            {
-                throw new ConfigurationException("Unable to load class " + className + " for " + attr + " attribute");
-            }
-        }
-        return typeClass.getConstructor().newInstance();
-    }
+    private CompactionExecutor executor = new CompactionExecutor();
+    private Map<ColumnFamilyStore, Integer> estimatedCompactions = new NonBlockingHashMap<ColumnFamilyStore, Integer>();
 
     /**
-     * Create the table directory in each data directory
+     * Call this whenever a compaction might be needed on the given columnfamily.
+     * It's okay to over-call (within reason) since the compactions are single-threaded,
+     * and if a call is unnecessary, it will just be no-oped in the bucketing phase.
      */
-    public static void createTableDirectories() throws IOException
+    public Future<Integer> submitMinorIfNeeded(final ColumnFamilyStore cfs)
     {
-        for (String dataFile : dataFileDirectories_) 
+        Callable<Integer> callable = new Callable<Integer>()
         {
-            FileUtils.createDirectory(dataFile + File.separator + Table.SYSTEM_TABLE);
-            for (String table : tables_)
+            public Integer call() throws IOException
             {
-                FileUtils.createDirectory(dataFile + File.separator + table);
+                if (minimumCompactionThreshold <= 0 || maximumCompactionThreshold <= 0)
+                {
+                    logger.debug("Compaction is currently disabled.");
+                    return 0;
+                }
+                logger.debug("Checking to see if compaction of " + cfs.columnFamily_ + " would be useful");
+                Set<List<SSTableReader>> buckets = getBuckets(cfs.getSSTables(), 50L * 1024L * 1024L);
+                updateEstimateFor(cfs, buckets);
+                
+                for (List<SSTableReader> sstables : buckets)
+                {
+                    if (sstables.size() >= minimumCompactionThreshold)
+                    {
+                        // if we have too many to compact all at once, compact older ones first -- this avoids
+                        // re-compacting files we just created.
+                        Collections.sort(sstables);
+                        return doCompaction(cfs, sstables.subList(0, Math.min(sstables.size(), maximumCompactionThreshold)), getDefaultGCBefore());
+                    }
+                }
+                return 0;
             }
+        };
+        return executor.submit(callable);
+    }
+
+    private void updateEstimateFor(ColumnFamilyStore cfs, Set<List<SSTableReader>> buckets)
+    {
+        int n = 0;
+        for (List<SSTableReader> sstables : buckets)
+        {
+            if (sstables.size() >= minimumCompactionThreshold)
+            {
+                n += 1 + sstables.size() / (maximumCompactionThreshold - minimumCompactionThreshold);
+            }
+        }
+        estimatedCompactions.put(cfs, n);
+    }
+
+    public Future<Object> submitCleanup(final ColumnFamilyStore cfStore)
+    {
+        Callable<Object> runnable = new Callable<Object>()
+        {
+            public Object call() throws IOException
+            {
+                doCleanupCompaction(cfStore);
+                return this;
+            }
+        };
+        return executor.submit(runnable);
+    }
+
+    public Future<List<SSTableReader>> submitAnticompaction(final ColumnFamilyStore cfStore, final Collection<Range> ranges, final InetAddress target)
+    {
+        Callable<List<SSTableReader>> callable = new Callable<List<SSTableReader>>()
+        {
+            public List<SSTableReader> call() throws IOException
+            {
+                return doAntiCompaction(cfStore, cfStore.getSSTables(), ranges, target);
+            }
+        };
+        return executor.submit(callable);
+    }
+
+    public Future submitMajor(final ColumnFamilyStore cfStore)
+    {
+        return submitMajor(cfStore, 0, getDefaultGCBefore());
+    }
+
+    public Future submitMajor(final ColumnFamilyStore cfStore, final long skip, final int gcBefore)
+    {
+        Callable<Object> callable = new Callable<Object>()
+        {
+            public Object call() throws IOException
+            {
+                Collection<SSTableReader> sstables;
+                if (skip > 0)
+                {
+                    sstables = new ArrayList<SSTableReader>();
+                    for (SSTableReader sstable : cfStore.getSSTables())
+                    {
+                        if (sstable.length() < skip * 1024L * 1024L * 1024L)
+                        {
+                            sstables.add(sstable);
+                        }
+                    }
+                }
+                else
+                {
+                    sstables = cfStore.getSSTables();
+                }
+
+                doCompaction(cfStore, sstables, gcBefore);
+                return this;
+            }
+        };
+        return executor.submit(callable);
+    }
+
+    public Future submitReadonly(final ColumnFamilyStore cfStore, final InetAddress initiator)
+    {
+        Callable<Object> callable = new Callable<Object>()
+        {
+            public Object call() throws IOException
+            {
+                doReadonlyCompaction(cfStore, initiator);
+                return this;
+            }
+        };
+        return executor.submit(callable);
+    }
+
+    /**
+     * Gets the minimum number of sstables in queue before compaction kicks off
+     */
+    public int getMinimumCompactionThreshold()
+    {
+        return minimumCompactionThreshold;
+    }
+
+    /**
+     * Sets the minimum number of sstables in queue before compaction kicks off
+     */
+    public void setMinimumCompactionThreshold(int threshold)
+    {
+        minimumCompactionThreshold = threshold;
+    }
+
+    /**
+     * Gets the maximum number of sstables in queue before compaction kicks off
+     */
+    public int getMaximumCompactionThreshold()
+    {
+        return maximumCompactionThreshold;
+    }
+
+    /**
+     * Sets the maximum number of sstables in queue before compaction kicks off
+     */
+    public void setMaximumCompactionThreshold(int threshold)
+    {
+        maximumCompactionThreshold = threshold;
+    }
+
+    public void disableAutoCompaction()
+    {
+        minimumCompactionThreshold = 0;
+        maximumCompactionThreshold = 0;
+    }
+
+    /**
+     * For internal use and testing only.  The rest of the system should go through the submit* methods,
+     * which are properly serialized.
+     */
+    int doCompaction(ColumnFamilyStore cfs, Collection<SSTableReader> sstables, int gcBefore) throws IOException
+    {
+        // The collection of sstables passed may be empty (but not null); even if
+        // it is not empty, it may compact down to nothing if all rows are deleted.
+        Table table = cfs.getTable();
+        if (DatabaseDescriptor.isSnapshotBeforeCompaction())
+            table.snapshot("compact-" + cfs.columnFamily_);
+        logger.info("Compacting [" + StringUtils.join(sstables, ",") + "]");
+        String compactionFileLocation = table.getDataFileLocation(cfs.getExpectedCompactedFileSize(sstables));
+        // If the compaction file path is null that means we have no space left for this compaction.
+        // try again w/o the largest one.
+        List<SSTableReader> smallerSSTables = new ArrayList<SSTableReader>(sstables);
+        while (compactionFileLocation == null && smallerSSTables.size() > 1)
+        {
+            logger.warn("insufficient space to compact all requested files " + StringUtils.join(smallerSSTables, ", "));
+            smallerSSTables.remove(cfs.getMaxSizeFile(smallerSSTables));
+            compactionFileLocation = table.getDataFileLocation(cfs.getExpectedCompactedFileSize(smallerSSTables));
+        }
+        if (compactionFileLocation == null)
+        {
+            logger.error("insufficient space to compact even the two smallest files, aborting");
+            return 0;
+        }
+        sstables = smallerSSTables;
+
+        // new sstables from flush can be added during a compaction, but only the compaction can remove them,
+        // so in our single-threaded compaction world this is a valid way of determining if we're compacting
+        // all the sstables (that existed when we started)
+        boolean major = cfs.isCompleteSSTables(sstables);
+
+        long startTime = System.currentTimeMillis();
+        long totalkeysWritten = 0;
+
+        // TODO the int cast here is potentially buggy
+        int expectedBloomFilterSize = Math.max(SSTableReader.indexInterval(), (int)SSTableReader.getApproximateKeyCount(sstables));
+        if (logger.isDebugEnabled())
+          logger.debug("Expected bloom filter size : " + expectedBloomFilterSize);
+
+        SSTableWriter writer;
+        CompactionIterator ci = new CompactionIterator(sstables, gcBefore, major); // retain a handle so we can call close()
+        Iterator<CompactionIterator.CompactedRow> nni = new FilterIterator(ci, PredicateUtils.notNullPredicate());
+        executor.beginCompaction(cfs, ci);
+
+        try
+        {
+            if (!nni.hasNext())
+            {
+                // don't mark compacted in the finally block, since if there _is_ nondeleted data,
+                // we need to sync it (via closeAndOpen) first, so there is no period during which
+                // a crash could cause data loss.
+                cfs.markCompacted(sstables);
+                return 0;
+            }
+
+            String newFilename = new File(cfs.getTempSSTablePath(compactionFileLocation)).getAbsolutePath();
+            writer = new SSTableWriter(newFilename, expectedBloomFilterSize, StorageService.getPartitioner());
+
+            // validate the CF as we iterate over it
+            AntiEntropyService.IValidator validator = AntiEntropyService.instance.getValidator(table.name, cfs.getColumnFamilyName(), null, major);
+            validator.prepare();
+            while (nni.hasNext())
+            {
+                CompactionIterator.CompactedRow row = nni.next();
+                writer.append(row.key, row.buffer);
+                validator.add(row);
+                totalkeysWritten++;
+            }
+            validator.complete();
+        }
+        finally
+        {
+            ci.close();
+        }
+
+        SSTableReader ssTable = writer.closeAndOpenReader(DatabaseDescriptor.getKeysCachedFraction(table.name, cfs.getColumnFamilyName()));
+        cfs.replaceCompactedSSTables(sstables, Arrays.asList(ssTable));
+        submitMinorIfNeeded(cfs);
+
+        String format = "Compacted to %s.  %d/%d bytes for %d keys.  Time: %dms.";
+        long dTime = System.currentTimeMillis() - startTime;
+        logger.info(String.format(format, writer.getFilename(), SSTable.getTotalBytes(sstables), ssTable.length(), totalkeysWritten, dTime));
+        return sstables.size();
+    }
+
+    /**
+     * This function is used to do the anti compaction process , it spits out the file which has keys that belong to a given range
+     * If the target is not specified it spits out the file as a compacted file with the unecessary ranges wiped out.
+     *
+     * @param cfs
+     * @param sstables
+     * @param ranges
+     * @param target
+     * @return
+     * @throws java.io.IOException
+     */
+    private List<SSTableReader> doAntiCompaction(ColumnFamilyStore cfs, Collection<SSTableReader> sstables, Collection<Range> ranges, InetAddress target)
+            throws IOException
+    {
+        Table table = cfs.getTable();
+        logger.info("AntiCompacting [" + StringUtils.join(sstables, ",") + "]");
+        // Calculate the expected compacted filesize
+        long expectedRangeFileSize = cfs.getExpectedCompactedFileSize(sstables) / 2;
+        String compactionFileLocation = table.getDataFileLocation(expectedRangeFileSize);
+        if (compactionFileLocation == null)
+        {
+            throw new UnsupportedOperationException("disk full");
+        }
+
+        List<SSTableReader> results = new ArrayList<SSTableReader>();
+        long startTime = System.currentTimeMillis();
+        long totalkeysWritten = 0;
+
+        int expectedBloomFilterSize = Math.max(SSTableReader.indexInterval(), (int)(SSTableReader.getApproximateKeyCount(sstables) / 2));
+        if (logger.isDebugEnabled())
+          logger.debug("Expected bloom filter size : " + expectedBloomFilterSize);
+
+        SSTableWriter writer = null;
+        CompactionIterator ci = new AntiCompactionIterator(sstables, ranges, getDefaultGCBefore(), cfs.isCompleteSSTables(sstables));
+        Iterator<CompactionIterator.CompactedRow> nni = new FilterIterator(ci, PredicateUtils.notNullPredicate());
+        executor.beginCompaction(cfs, ci);
+
+        try
+        {
+            if (!nni.hasNext())
+            {
+                return results;
+            }
+
+            while (nni.hasNext())
+            {
+                CompactionIterator.CompactedRow row = nni.next();
+                if (writer == null)
+                {
+                    FileUtils.createDirectory(compactionFileLocation);
+                    String newFilename = new File(cfs.getTempSSTablePath(compactionFileLocation)).getAbsolutePath();
+                    writer = new SSTableWriter(newFilename, expectedBloomFilterSize, StorageService.getPartitioner());
+                }
+                writer.append(row.key, row.buffer);
+                totalkeysWritten++;
+            }
+        }
+        finally
+        {
+            ci.close();
+        }
+
+        if (writer != null)
+        {
+            results.add(writer.closeAndOpenReader(DatabaseDescriptor.getKeysCachedFraction(table.name, cfs.getColumnFamilyName()), target != null));
+            String format = "AntiCompacted to %s.  %d/%d bytes for %d keys.  Time: %dms.";
+            long dTime = System.currentTimeMillis() - startTime;
+            logger.info(String.format(format, writer.getFilename(), SSTable.getTotalBytes(sstables), results.get(0).length(), totalkeysWritten, dTime));
+        }
+
+        return results;
+    }
+
+    /**
+     * This function goes over each file and removes the keys that the node is not responsible for
+     * and only keeps keys that this node is responsible for.
+     *
+     * @throws IOException
+     */
+    private void doCleanupCompaction(ColumnFamilyStore cfs) throws IOException
+    {
+        Collection<SSTableReader> originalSSTables = cfs.getSSTables();
+        List<SSTableReader> sstables = doAntiCompaction(cfs, originalSSTables, StorageService.instance.getLocalRanges(cfs.getTable().name), null);
+        if (!sstables.isEmpty())
+        {
+            cfs.replaceCompactedSSTables(originalSSTables, sstables);
         }
     }
 
     /**
-     * Create the metadata tables. This table has information about
-     * the table name and the column families that make up the table.
-     * Each column family also has an associated ID which is an int.
-    */
-    // TODO duplicating data b/t tablemetadata and CFMetaData is confusing and error-prone
-    public static void storeMetadata() throws IOException
+     * Performs a readonly "compaction" of all sstables in order to validate complete rows,
+     * but without writing the merge result
+     */
+    private void doReadonlyCompaction(ColumnFamilyStore cfs, InetAddress initiator) throws IOException
     {
-        int cfId = 0;
-        Set<String> tables = tableToCFMetaDataMap_.keySet();
-
-        for (String table : tables)
+        Collection<SSTableReader> sstables = cfs.getSSTables();
+        CompactionIterator ci = new CompactionIterator(sstables, getDefaultGCBefore(), true);
+        executor.beginCompaction(cfs, ci);
+        try
         {
-            Table.TableMetadata tmetadata = Table.TableMetadata.instance(table);
-            if (tmetadata.isEmpty())
-            {
-                tmetadata = Table.TableMetadata.instance(table);
-                /* Column families associated with this table */
-                Map<String, CFMetaData> columnFamilies = tableToCFMetaDataMap_.get(table);
+            Iterator<CompactionIterator.CompactedRow> nni = new FilterIterator(ci, PredicateUtils.notNullPredicate());
 
-                for (String columnFamily : columnFamilies.keySet())
+            // validate the CF as we iterate over it
+            AntiEntropyService.IValidator validator = AntiEntropyService.instance.getValidator(cfs.getTable().name, cfs.getColumnFamilyName(), initiator, true);
+            validator.prepare();
+            while (nni.hasNext())
+            {
+                CompactionIterator.CompactedRow row = nni.next();
+                validator.add(row);
+            }
+            validator.complete();
+        }
+        finally
+        {
+            ci.close();
+        }
+    }
+
+    /*
+    * Group files of similar size into buckets.
+    */
+    static Set<List<SSTableReader>> getBuckets(Iterable<SSTableReader> files, long min)
+    {
+        Map<List<SSTableReader>, Long> buckets = new HashMap<List<SSTableReader>, Long>();
+        for (SSTableReader sstable : files)
+        {
+            long size = sstable.length();
+
+            boolean bFound = false;
+            // look for a bucket containing similar-sized files:
+            // group in the same bucket if it's w/in 50% of the average for this bucket,
+            // or this file and the bucket are all considered "small" (less than `min`)
+            for (Entry<List<SSTableReader>, Long> entry : buckets.entrySet())
+            {
+                List<SSTableReader> bucket = entry.getKey();
+                long averageSize = entry.getValue();
+                if ((size > averageSize / 2 && size < 3 * averageSize / 2)
+                    || (size < min && averageSize < min))
                 {
-                    tmetadata.add(columnFamily, cfId++, DatabaseDescriptor.getColumnType(table, columnFamily));
+                    // remove and re-add because adding changes the hash
+                    buckets.remove(bucket);
+                    long totalSize = bucket.size() * averageSize;
+                    averageSize = (totalSize + size) / (bucket.size() + 1);
+                    bucket.add(sstable);
+                    buckets.put(bucket, averageSize);
+                    bFound = true;
+                    break;
                 }
             }
+            // no similar bucket found; put it in a new one
+            if (!bFound)
+            {
+                ArrayList<SSTableReader> bucket = new ArrayList<SSTableReader>();
+                bucket.add(sstable);
+                buckets.put(bucket, size);
+            }
         }
+
+        return buckets.keySet();
     }
 
-    public static int getGcGraceInSeconds()
+    public static int getDefaultGCBefore()
     {
-        return gcGraceInSeconds_;
+        return (int)(System.currentTimeMillis() / 1000) - DatabaseDescriptor.getGcGraceInSeconds();
     }
 
-    public static String getPartitionerClass()
+    private static class AntiCompactionIterator extends CompactionIterator
     {
-        return partitionerClass_;
-    }
-    
-    public static String getCalloutLocation()
-    {
-        return calloutLocation_;
-    }
-    
-    public static String getJobTrackerAddress()
-    {
-        return jobTrackerHost_;
-    }
-    
-    public static int getColumnIndexSize()
-    {
-    	return columnIndexSizeInKB_ * 1024;
-    }
+        private Set<SSTableScanner> scanners;
 
-    public static int getMemtableLifetime()
-    {
-      return memtableLifetime_;
-    }
-
-    public static String getInitialToken()
-    {
-      return initialToken_;
-    }
-
-    public static int getMemtableSize()
-    {
-      return memtableSize_;
-    }
-
-    public static double getMemtableObjectCount()
-    {
-      return memtableObjectCount_;
-    }
-
-    public static boolean getConsistencyCheck()
-    {
-      return doConsistencyCheck_;
-    }
-
-    public static String getClusterName()
-    {
-        return clusterName_;
-    }
-
-    public static String getConfigFileName() {
-        return configFileName_;
-    }
-    
-    public static boolean isApplicationColumnFamily(String columnFamily)
-    {
-        return applicationColumnFamilies_.contains(columnFamily);
-    }
-
-    public static String getJobJarLocation()
-    {
-        return jobJarFileLocation_;
-    }
-    
-    public static Map<String, CFMetaData> getTableMetaData(String tableName)
-    {
-        assert tableName != null;
-        return tableToCFMetaDataMap_.get(tableName);
-    }
-
-    /*
-     * Given a table name & column family name, get the column family
-     * meta data. If the table name or column family name is not valid
-     * this function returns null.
-     */
-    public static CFMetaData getCFMetaData(String tableName, String cfName)
-    {
-        assert tableName != null;
-        Map<String, CFMetaData> cfInfo = tableToCFMetaDataMap_.get(tableName);
-        if (cfInfo == null)
-            return null;
-        
-        return cfInfo.get(cfName);
-    }
-    
-    public static String getColumnType(String tableName, String cfName)
-    {
-        assert tableName != null;
-        CFMetaData cfMetaData = getCFMetaData(tableName, cfName);
-        
-        if (cfMetaData == null)
-            return null;
-        return cfMetaData.columnType;
-    }
-
-    public static int getFlushPeriod(String tableName, String columnFamilyName)
-    {
-        assert tableName != null;
-        CFMetaData cfMetaData = getCFMetaData(tableName, columnFamilyName);
-        
-        if (cfMetaData == null)
-            return 0;
-        return cfMetaData.flushPeriodInMinutes;
-    }
-
-    public static List<String> getTables()
-    {
-        return tables_;
-    }
-
-    public static String getTable(String tableName)
-    {
-        assert tableName != null;
-        int index = getTables().indexOf(tableName);
-        return index >= 0 ? getTables().get(index) : null;
-    }
-
-    public static void  setTables(String table)
-    {
-        tables_.add(table);
-    }
-
-    public static int getStoragePort()
-    {
-        return storagePort_;
-    }
-
-    public static int getControlPort()
-    {
-        return controlPort_;
-    }
-
-    public static int getThriftPort()
-    {
-        return thriftPort_;
-    }
-
-    public static int getReplicationFactor()
-    {
-        return replicationFactor_;
-    }
-
-    public static int getQuorum()
-    {
-        return (replicationFactor_ / 2) + 1;
-    }
-
-    public static long getRpcTimeout()
-    {
-        return rpcTimeoutInMillis_;
-    }
-
-    public static int getThreadsPerPool()
-    {
-        return threadsPerPool_;
-    }
-
-    public static String getSnapshotDirectory()
-    {
-        return snapshotDirectory_;
-    }
-
-    public static void setSnapshotDirectory(String snapshotDirectory)
-    {
-    	snapshotDirectory_ = snapshotDirectory;
-    }
-
-    public static String[] getAllDataFileLocations()
-    {
-        return dataFileDirectories_;
-    }
-
-    public static String[] getAllDataFileLocationsForTable(String table)
-    {
-        String[] tableLocations = new String[dataFileDirectories_.length];
-
-        for (int i = 0; i < dataFileDirectories_.length; i++)
+        public AntiCompactionIterator(Collection<SSTableReader> sstables, Collection<Range> ranges, int gcBefore, boolean isMajor)
+                throws IOException
         {
-            tableLocations[i] = dataFileDirectories_[i] + File.separator + table;
+            super(getCollatedRangeIterator(sstables, ranges), gcBefore, isMajor);
         }
 
-        return tableLocations;
-    }
-
-    public static String getDataFileLocationForTable(String table)
-    {
-        String dataFileDirectory = dataFileDirectories_[currentIndex_] + File.separator + table;
-        currentIndex_ = (currentIndex_ + 1) % dataFileDirectories_.length;
-        return dataFileDirectory;
-    }
-
-    public static String getBootstrapFileLocation()
-    {
-        return bootstrapFileDirectory_;
-    }
-
-    public static void setBootstrapFileLocation(String bfLocation)
-    {
-        bootstrapFileDirectory_ = bfLocation;
-    }
-
-    public static String getLogFileLocation()
-    {
-        return logFileDirectory_;
-    }
-
-    public static void setLogFileLocation(String logLocation)
-    {
-        logFileDirectory_ = logLocation;
-    }
-
-    public static boolean isRackAware()
-    {
-        return rackAware_;
-    }
-
-    public static Set<String> getSeeds()
-    {
-        return seeds_;
-    }
-
-    public static String getColumnFamilyType(String tableName, String cfName)
-    {
-        assert tableName != null;
-        String cfType = getColumnType(tableName, cfName);
-        if ( cfType == null )
-            cfType = "Standard";
-    	return cfType;
-    }
-
-    /*
-     * Loop through all the disks to see which disk has the max free space
-     * return the disk with max free space for compactions. If the size of the expected
-     * compacted file is greater than the max disk space available return null, we cannot
-     * do compaction in this case.
-     */
-    public static String getDataFileLocationForTable(String table, long expectedCompactedFileSize)
-    {
-      long maxFreeDisk = 0;
-      int maxDiskIndex = 0;
-      String dataFileDirectory = null;
-      String[] dataDirectoryForTable = getAllDataFileLocationsForTable(table);
-
-      for ( int i = 0 ; i < dataDirectoryForTable.length ; i++ )
-      {
-        File f = new File(dataDirectoryForTable[i]);
-        if( maxFreeDisk < f.getUsableSpace())
+        private static Iterator getCollatedRangeIterator(Collection<SSTableReader> sstables, final Collection<Range> ranges)
+                throws IOException
         {
-          maxFreeDisk = f.getUsableSpace();
-          maxDiskIndex = i;
+            org.apache.commons.collections.Predicate rangesPredicate = new org.apache.commons.collections.Predicate()
+            {
+                public boolean evaluate(Object row)
+                {
+                    return Range.isTokenInRanges(((IteratingRow)row).getKey().token, ranges);
+                }
+            };
+            CollatingIterator iter = FBUtilities.<IteratingRow>getCollatingIterator();
+            for (SSTableReader sstable : sstables)
+            {
+                SSTableScanner scanner = sstable.getScanner(FILE_BUFFER_SIZE);
+                iter.addIterator(new FilterIterator(scanner, rangesPredicate));
+            }
+            return iter;
         }
-      }
-      // Load factor of 0.9 we do not want to use the entire disk that is too risky.
-      maxFreeDisk = (long)(0.9 * maxFreeDisk);
-      if( expectedCompactedFileSize < maxFreeDisk )
-      {
-        dataFileDirectory = dataDirectoryForTable[maxDiskIndex];
-        currentIndex_ = (maxDiskIndex + 1 )%dataDirectoryForTable.length ;
-      }
-      else
-      {
-        currentIndex_ = maxDiskIndex;
-      }
-        return dataFileDirectory;
-    }
-    
-    public static AbstractType getComparator(String tableName, String cfName)
-    {
-        assert tableName != null;
-        return getCFMetaData(tableName, cfName).comparator;
-    }
 
-    public static AbstractType getSubComparator(String tableName, String cfName)
-    {
-        assert tableName != null;
-        return getCFMetaData(tableName, cfName).comparator;
-    }
-
-    public static Map<String, Map<String, CFMetaData>> getTableToColumnFamilyMap()
-    {
-        return tableToCFMetaDataMap_;
-    }
-
-    public static double getKeysCachedFraction(String tableName)
-    {
-        return tableKeysCachedFractions_.get(tableName);
-    }
-
-    private static class ConfigurationException extends Exception
-    {
-        public ConfigurationException(String message)
+        public Iterable<SSTableScanner> getScanners()
         {
-            super(message);
+            if (scanners == null)
+            {
+                scanners = new HashSet<SSTableScanner>();
+                for (Object o : ((CollatingIterator)source).getIterators())
+                {
+                    scanners.add((SSTableScanner)((FilterIterator)o).getIterator());
+                }
+            }
+            return scanners;
         }
     }
 
-    public static String getListenAddress()
+    public void checkAllColumnFamilies() throws IOException
     {
-        return listenAddress_;
+        // perform estimates
+        for (final ColumnFamilyStore cfs : ColumnFamilyStore.all())
+        {
+            Runnable runnable = new Runnable()
+            {
+                public void run ()
+                {
+                    logger.debug("Estimating compactions for " + cfs.columnFamily_);
+                    final Set<List<SSTableReader>> buckets = getBuckets(cfs.getSSTables(), 50L * 1024L * 1024L);
+                    updateEstimateFor(cfs, buckets);
+                }
+            };
+            executor.submit(runnable);
+        }
+
+        // actually schedule compactions.  done in a second pass so all the estimates occur before we
+        // bog down the executor in actual compactions.
+        for (ColumnFamilyStore cfs : ColumnFamilyStore.all())
+        {
+            submitMinorIfNeeded(cfs);
+        }
     }
-    
-    public static String getThriftAddress()
+
+    private class CompactionExecutor extends DebuggableThreadPoolExecutor
     {
-        return thriftAddress_;
+        private volatile ColumnFamilyStore cfs;
+        private volatile CompactionIterator ci;
+
+        public CompactionExecutor()
+        {
+            super("COMPACTION-POOL");
+        }
+
+        @Override
+        public void afterExecute(Runnable r, Throwable t)
+        {
+            super.afterExecute(r, t);
+            cfs = null;
+            ci = null;
+        }
+
+        void beginCompaction(ColumnFamilyStore cfs, CompactionIterator ci)
+        {
+            this.cfs = cfs;
+            this.ci = ci;
+        }
+
+        public String getColumnFamilyName()
+        {
+            return cfs == null ? null : cfs.getColumnFamilyName();
+        }
+
+        public Long getBytesTotal()
+        {
+            return ci == null ? null : ci.getTotalBytes();
+        }
+
+        public Long getBytesCompleted()
+        {
+            return ci == null ? null : ci.getBytesRead();
+        }
+    }
+
+    public String getColumnFamilyInProgress()
+    {
+        return executor.getColumnFamilyName();
+    }
+
+    public Long getBytesTotalInProgress()
+    {
+        return executor.getBytesTotal();
+    }
+
+    public Long getBytesCompacted()
+    {
+        return executor.getBytesCompleted();
+    }
+
+    public int getPendingTasks()
+    {
+        int n = 0;
+        for (Integer i : estimatedCompactions.values())
+        {
+            n += i;
+        }
+        return n;
     }
 }

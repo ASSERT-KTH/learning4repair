@@ -16,67 +16,127 @@
  * limitations under the License.
  */
 
-package org.apache.cassandra.net;
+package org.apache.cassandra.loader;
 
-import java.io.*;
-import java.net.SocketException;
-import java.net.InetAddress;
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.InputStreamReader;
+import java.util.List;
 
-import org.apache.cassandra.net.sink.SinkManager;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.RowMutation;
+import org.apache.cassandra.db.Table;
+import org.apache.cassandra.io.SSTable;
+import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.LogUtil;
 import org.apache.log4j.Logger;
 
-class FileStreamTask implements Runnable
+/**
+ * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
+ */
+
+public class PreLoad
 {
-    private static Logger logger_ = Logger.getLogger( FileStreamTask.class );
-    
-    private String file_;
-    private long startPosition_;
-    private long total_;
-    private InetAddress from_;
-    private InetAddress to_;
-    
-    FileStreamTask(String file, long startPosition, long total, InetAddress from, InetAddress to)
+	
+	private static long siesta_ = 2*60*1000;
+	private static Logger logger_ = Logger.getLogger( Loader.class );
+    private StorageService storageService_;
+	
+	public PreLoad(StorageService storageService)
     {
-        file_ = file;
-        startPosition_ = startPosition;
-        total_ = total;
-        from_ = from;
-        to_ = to;
+        storageService_ = storageService;
+    }
+    /*
+     * This method loads all the keys into a special column family 
+     * called "RecycleBin". This column family is used for temporary
+     * processing of data and then can be recycled. The idea is that 
+     * after the load is complete we have all the keys in the system.
+     * Now we force a compaction and examine the single Index file 
+     * that is generated to determine how the nodes need to relocate
+     * to be perfectly load balanced.
+     * 
+     *  param @ rootDirectory - rootDirectory at which the parsing begins.
+     *  param @ table - table that will be populated.
+     *  param @ cfName - name of the column that will be populated. This is 
+     *  passed in so that we do not unncessary allocate temporary String objects.
+    */
+    private void preParse(String rootDirectory, String table, String cfName) throws Throwable
+    {        
+        BufferedReader bufReader = new BufferedReader(new InputStreamReader(
+                new FileInputStream(rootDirectory)), 16 * 1024 * 1024);
+        String line = null;
+        while ((line = bufReader.readLine()) != null)
+        {
+                String userId = line;
+                RowMutation rm = new RowMutation(table, userId);
+                rm.add(cfName, userId.getBytes(), 0);
+                rm.apply();
+        }
     }
     
-    public void run()
+    void run(String userFile) throws Throwable
     {
-        TcpConnection connection = null;
-        try
-        {                        
-            connection = new TcpConnection(from_, to_);
-            File file = new File(file_);             
-            connection.stream(file, startPosition_, total_);
-            MessagingService.setStreamingMode(false);
-            if (logger_.isDebugEnabled())
-              logger_.debug("Done streaming " + file);
-        }            
-        catch ( SocketException se )
-        {                        
-            logger_.info(LogUtil.throwableToString(se));
-        }
-        catch ( IOException e )
+        String table = DatabaseDescriptor.getTables().get(0);
+        String cfName = Table.recycleBin_ + ":" + "Keys";
+        /* populate just the keys. */
+        preParse(userFile, table, cfName);
+        /* dump the memtables */
+        Table.open(table).flush(false);
+        /* force a compaction of the files. */
+        Table.open(table).forceCompaction(null, null,null);
+        
+        /*
+         * This is a hack to let everyone finish. Just sleep for
+         * a couple of minutes. 
+        */
+        logger_.info("Taking a nap after forcing a compaction ...");
+        Thread.sleep(PreLoad.siesta_);
+        
+        /* Figure out the keys in the index file to relocate the node */
+        List<String> ssTables = Table.open(table).getAllSSTablesOnDisk();
+        /* Load the indexes into memory */
+        for ( String df : ssTables )
         {
-            logConnectAndIOException(e, connection);
+        	SSTable ssTable = new SSTable(df, StorageService.getPartitioner());
+        	ssTable.close();
         }
-        catch (Throwable th)
-        {
-            logger_.warn(LogUtil.throwableToString(th));
-        }        
+        /* We should have only one file since we just compacted. */        
+        List<String> indexedKeys = SSTable.getIndexedKeys();        
+        storageService_.relocate(indexedKeys.toArray( new String[0]) );
+        
+        /*
+         * This is a hack to let everyone relocate and learn about
+         * each other. Just sleep for a couple of minutes. 
+        */
+        logger_.info("Taking a nap after relocating ...");
+        Thread.sleep(PreLoad.siesta_);  
+        
+        /* 
+         * Do the cleanup necessary. Delete all commit logs and
+         * the SSTables and reset the load state in the StorageService. 
+        */
+        SSTable.delete(ssTables.get(0));
+        storageService_.resetLoadState();
+        logger_.info("Finished all the requisite clean up ...");
     }
+
     
-    private void logConnectAndIOException(IOException ex, TcpConnection connection)
-    {                    
-        if ( connection != null )
-        {
-            connection.errorClose();
-        }
-        logger_.info(LogUtil.throwableToString(ex));
-    }
+	/**
+	 * @param args
+	 */
+	public static void main(String[] args) throws Throwable
+	{
+		if(args.length != 1)
+		{
+			System.out.println("Usage: PreLoad <Fully qualified path of the file containing user names>");
+		}
+		// TODO Auto-generated method stub
+		LogUtil.init();
+        StorageService s = StorageService.instance();
+        s.start();
+        PreLoad preLoad = new PreLoad(s);
+        preLoad.run(args[0]);
+	}
+
 }

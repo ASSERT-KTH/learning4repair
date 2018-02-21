@@ -1,8 +1,8 @@
-final LineFileDocs docs = new LineFileDocs(random);
+Builder<Long> fstBuilder = new Builder<Long>(FST.INPUT_TYPE.BYTE2, 0, 0, true, true, Integer.MAX_VALUE, fstOutput, null, true, true);
 
-package org.apache.lucene.index;
+package org.apache.lucene.analysis.ja.util;
 
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -19,359 +19,212 @@ package org.apache.lucene.index;
  * limitations under the License.
  */
 
+import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.FilenameFilter;
 import java.io.IOException;
+import java.io.InputStreamReader;
+import java.nio.charset.Charset;
+import java.nio.charset.CharsetDecoder;
+import java.nio.charset.CodingErrorAction;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
-import java.util.Set;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.TimeUnit;
 
-import org.apache.lucene.analysis.MockAnalyzer;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.index.codecs.CodecProvider;
-import org.apache.lucene.search.IndexSearcher;
-import org.apache.lucene.search.PhraseQuery;
-import org.apache.lucene.search.Query;
-import org.apache.lucene.search.Sort;
-import org.apache.lucene.search.SortField;
-import org.apache.lucene.search.TermQuery;
-import org.apache.lucene.search.TopDocs;
-import org.apache.lucene.store.FSDirectory;
-import org.apache.lucene.store.MockDirectoryWrapper;
-import org.apache.lucene.util.NamedThreadFactory;
-import org.apache.lucene.util.Bits;
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.LineFileDocs;
-import org.apache.lucene.util.LuceneTestCase;
-import org.apache.lucene.util._TestUtil;
-import org.junit.Test;
+import org.apache.lucene.analysis.ja.util.DictionaryBuilder.DictionaryFormat;
+import org.apache.lucene.util.IntsRef;
+import org.apache.lucene.util.fst.Builder;
+import org.apache.lucene.util.fst.FST;
+import org.apache.lucene.util.fst.PositiveIntOutputs;
+import org.apache.lucene.util.packed.PackedInts;
 
-// TODO
-//   - mix in optimize, addIndexes
-//   - randomoly mix in non-congruent docs
+import com.ibm.icu.text.Normalizer2;
 
-public class TestNRTThreads extends LuceneTestCase {
-
-  @Test
-  public void testNRTThreads() throws Exception {
-
-    final long t0 = System.currentTimeMillis();
-
-    if (CodecProvider.getDefault().getDefaultFieldCodec().equals("SimpleText")) {
-      // no
-      CodecProvider.getDefault().setDefaultFieldCodec("Standard");
-    }
-
-    final LineFileDocs docs = new LineFileDocs(true);
-    final File tempDir = _TestUtil.getTempDir("nrtopenfiles");
-    final MockDirectoryWrapper dir = new MockDirectoryWrapper(random, FSDirectory.open(tempDir));
-    final IndexWriterConfig conf = newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer());
-    conf.setMergedSegmentWarmer(new IndexWriter.IndexReaderWarmer() {
+/**
+ */
+public class TokenInfoDictionaryBuilder {
+  
+  /** Internal word id - incrementally assigned as entries are read and added. This will be byte offset of dictionary file */
+  private int offset = 0;
+  
+  private String encoding = "euc-jp";
+  
+  private boolean normalizeEntries = false;
+  private Normalizer2 normalizer;
+  
+  private DictionaryFormat format = DictionaryFormat.IPADIC;
+  
+  public TokenInfoDictionaryBuilder(DictionaryFormat format, String encoding, boolean normalizeEntries) {
+    this.format = format;
+    this.encoding = encoding;
+    this.normalizeEntries = normalizeEntries;
+    this.normalizer = normalizeEntries ? Normalizer2.getInstance(null, "nfkc", Normalizer2.Mode.COMPOSE) : null;
+  }
+  
+  public TokenInfoDictionaryWriter build(String dirname) throws IOException {
+    FilenameFilter filter = new FilenameFilter() {
       @Override
-      public void warm(IndexReader reader) throws IOException {
-        if (VERBOSE) {
-          System.out.println("TEST: now warm merged reader=" + reader);
+      public boolean accept(File dir, String name) {
+        return name.endsWith(".csv");
+      }
+    };
+    ArrayList<File> csvFiles = new ArrayList<File>();
+    for (File file : new File(dirname).listFiles(filter)) {
+      csvFiles.add(file);
+    }
+    Collections.sort(csvFiles);
+    return buildDictionary(csvFiles);
+  }
+
+  public TokenInfoDictionaryWriter buildDictionary(List<File> csvFiles) throws IOException {
+    TokenInfoDictionaryWriter dictionary = new TokenInfoDictionaryWriter(10 * 1024 * 1024);
+    
+    // all lines in the file
+    System.out.println("  parse...");
+    List<String[]> lines = new ArrayList<String[]>(400000);
+    for (File file : csvFiles){
+      FileInputStream inputStream = new FileInputStream(file);
+      Charset cs = Charset.forName(encoding);
+      CharsetDecoder decoder = cs.newDecoder()
+          .onMalformedInput(CodingErrorAction.REPORT)
+          .onUnmappableCharacter(CodingErrorAction.REPORT);
+      InputStreamReader streamReader = new InputStreamReader(inputStream, decoder);
+      BufferedReader reader = new BufferedReader(streamReader);
+      
+      String line = null;
+      while ((line = reader.readLine()) != null) {
+        String[] entry = CSVUtil.parse(line);
+
+        if(entry.length < 13) {
+          System.out.println("Entry in CSV is not valid: " + line);
+          continue;
         }
-        final int maxDoc = reader.maxDoc();
-        final Bits delDocs = reader.getDeletedDocs();
-        int sum = 0;
-        final int inc = Math.max(1, maxDoc/50);
-        for(int docID=0;docID<maxDoc;docID += inc) {
-          if (delDocs == null || !delDocs.get(docID)) {
-            final Document doc = reader.document(docID);
-            sum += doc.getFields().size();
+        
+        String[] formatted = formatEntry(entry);
+        lines.add(formatted);
+        
+        // NFKC normalize dictionary entry
+        if (normalizeEntries) {
+          if (normalizer.isNormalized(entry[0])){
+            continue;
           }
-        }
-
-        sum += new IndexSearcher(reader).search(new TermQuery(new Term("body", "united")), 10).totalHits;
-
-        if (VERBOSE) {
-          System.out.println("TEST: warm visited " + sum + " fields");
-        }
-      }
-      });
-
-    final IndexWriter writer = new IndexWriter(dir, conf);
-    if (VERBOSE) {
-      writer.setInfoStream(System.out);
-    }
-    MergeScheduler ms = writer.getConfig().getMergeScheduler();
-    if (ms instanceof ConcurrentMergeScheduler) {
-      // try to keep max file open count down
-      ((ConcurrentMergeScheduler) ms).setMaxThreadCount(1);
-      ((ConcurrentMergeScheduler) ms).setMaxMergeCount(1);
-    }
-    LogMergePolicy lmp = (LogMergePolicy) writer.getConfig().getMergePolicy();
-    if (lmp.getMergeFactor() > 5) {
-      lmp.setMergeFactor(5);
-    }
-
-    final int NUM_INDEX_THREADS = 2;
-    final int NUM_SEARCH_THREADS = 3;
-    final int RUN_TIME_SEC = LuceneTestCase.TEST_NIGHTLY ? 300 : 5;
-
-    final AtomicBoolean failed = new AtomicBoolean();
-    final AtomicInteger addCount = new AtomicInteger();
-    final AtomicInteger delCount = new AtomicInteger();
-
-    final List<String> delIDs = Collections.synchronizedList(new ArrayList<String>());
-
-    final long stopTime = System.currentTimeMillis() + RUN_TIME_SEC*1000;
-    Thread[] threads = new Thread[NUM_INDEX_THREADS];
-    for(int thread=0;thread<NUM_INDEX_THREADS;thread++) {
-      threads[thread] = new Thread() {
-          @Override
-          public void run() {
-            final List<String> toDeleteIDs = new ArrayList<String>();
-            while(System.currentTimeMillis() < stopTime && !failed.get()) {
-              try {
-                Document doc = docs.nextDoc();
-                if (doc == null) {
-                  break;
-                }
-                if (random.nextBoolean()) {
-                  if (VERBOSE) {
-                    //System.out.println(Thread.currentThread().getName() + ": add doc id:" + doc.get("id"));
-                  }
-                  writer.addDocument(doc);
-                } else {
-                  // we use update but it never replaces a
-                  // prior doc
-                  if (VERBOSE) {
-                    //System.out.println(Thread.currentThread().getName() + ": update doc id:" + doc.get("id"));
-                  }
-                  writer.updateDocument(new Term("id", doc.get("id")), doc);
-                }
-                if (random.nextInt(5) == 3) {
-                  if (VERBOSE) {
-                    //System.out.println(Thread.currentThread().getName() + ": buffer del id:" + doc.get("id"));
-                  }
-                  toDeleteIDs.add(doc.get("id"));
-                }
-                if (random.nextInt(50) == 17) {
-                  if (VERBOSE) {
-                    System.out.println(Thread.currentThread().getName() + ": apply " + toDeleteIDs.size() + " deletes");
-                  }
-                  for(String id : toDeleteIDs) {
-                    writer.deleteDocuments(new Term("id", id));
-                  }
-                  final int count = delCount.addAndGet(toDeleteIDs.size());
-                  if (VERBOSE) {
-                    System.out.println(Thread.currentThread().getName() + ": tot " + count + " deletes");
-                  }
-                  delIDs.addAll(toDeleteIDs);
-                  toDeleteIDs.clear();
-                }
-                addCount.getAndIncrement();
-              } catch (Exception exc) {
-                System.out.println(Thread.currentThread().getName() + ": hit exc");
-                exc.printStackTrace();
-                failed.set(true);
-                throw new RuntimeException(exc);
-              }
-            }
-            if (VERBOSE) {
-              System.out.println(Thread.currentThread().getName() + ": indexing done");
-            }
+          String[] normalizedEntry = new String[entry.length];
+          for (int i = 0; i < entry.length; i++) {
+            normalizedEntry[i] = normalizer.normalize(entry[i]);
           }
-        };
-      threads[thread].setDaemon(true);
-      threads[thread].start();
-    }
-
-    if (VERBOSE) {
-      System.out.println("TEST: DONE start indexing threads [" + (System.currentTimeMillis()-t0) + " ms]");
-    }
-
-    // let index build up a bit
-    Thread.sleep(100);
-
-    IndexReader r = IndexReader.open(writer);
-    boolean any = false;
-
-    // silly starting guess:
-    final AtomicInteger totTermCount = new AtomicInteger(100);
-
-    final ExecutorService es = Executors.newCachedThreadPool(new NamedThreadFactory("NRT search threads"));
-
-    while(System.currentTimeMillis() < stopTime && !failed.get()) {
-      if (random.nextBoolean()) {
-        if (VERBOSE) {
-          System.out.println("TEST: now reopen r=" + r);
+          
+          formatted = formatEntry(normalizedEntry);
+          lines.add(formatted);
         }
-        final IndexReader r2 = r.reopen();
-        if (r != r2) {
-          r.close();
-          r = r2;
-        }
-      } else {
-        if (VERBOSE) {
-          System.out.println("TEST: now close reader=" + r);
-        }
-        r.close();
-        writer.commit();
-        final Set<String> openDeletedFiles = dir.getOpenDeletedFiles();
-        if (openDeletedFiles.size() > 0) {
-          System.out.println("OBD files: " + openDeletedFiles);
-        }
-        any |= openDeletedFiles.size() > 0;
-        //assertEquals("open but deleted: " + openDeletedFiles, 0, openDeletedFiles.size());
-        if (VERBOSE) {
-          System.out.println("TEST: now open");
-        }
-        r = IndexReader.open(writer);
       }
-      if (VERBOSE) {
-        System.out.println("TEST: got new reader=" + r);
-      }
-      //System.out.println("numDocs=" + r.numDocs() + "
-      //openDelFileCount=" + dir.openDeleteFileCount());
-
-      smokeTestReader(r);
-
-      if (r.numDocs() > 0) {
-
-        final IndexSearcher s = new IndexSearcher(r, es);
-
-        // run search threads
-        final long searchStopTime = System.currentTimeMillis() + 500;
-        final Thread[] searchThreads = new Thread[NUM_SEARCH_THREADS];
-        final AtomicInteger totHits = new AtomicInteger();
-        for(int thread=0;thread<NUM_SEARCH_THREADS;thread++) {
-          searchThreads[thread] = new Thread() {
-              @Override
-                public void run() {
-                try {
-                  TermsEnum termsEnum = MultiFields.getTerms(s.getIndexReader(), "body").iterator();
-                  int seenTermCount = 0;
-                  int shift;
-                  int trigger;
-                  if (totTermCount.get() == 0) {
-                    shift = 0;
-                    trigger = 1;
-                  } else {
-                    shift = random.nextInt(totTermCount.get()/10);
-                    trigger = totTermCount.get()/10;
-                  }
-                  while(System.currentTimeMillis() < searchStopTime) {
-                    BytesRef term = termsEnum.next();
-                    if (term == null) {
-                      if (seenTermCount == 0) {
-                        break;
-                      }
-                      totTermCount.set(seenTermCount);
-                      seenTermCount = 0;
-                      trigger = totTermCount.get()/10;
-                      //System.out.println("trigger " + trigger);
-                      shift = random.nextInt(totTermCount.get()/10);
-                      termsEnum.seek(new BytesRef(""));
-                      continue;
-                    }
-                    seenTermCount++;
-                    // search 10 terms
-                    if (trigger == 0) {
-                      trigger = 1;
-                    }
-                    if ((seenTermCount + shift) % trigger == 0) {
-                      //if (VERBOSE) {
-                      //System.out.println(Thread.currentThread().getName() + " now search body:" + term.utf8ToString());
-                      //}
-                      totHits.addAndGet(runQuery(s, new TermQuery(new Term("body", term))));
-                    }
-                  }
-                  if (VERBOSE) {
-                    System.out.println(Thread.currentThread().getName() + ": search done");
-                  }
-                } catch (Throwable t) {
-                  failed.set(true);
-                  t.printStackTrace(System.out);
-                  throw new RuntimeException(t);
-                }
-              }
-            };
-          searchThreads[thread].setDaemon(true);
-          searchThreads[thread].start();
-        }
-
-        for(int thread=0;thread<NUM_SEARCH_THREADS;thread++) {
-          searchThreads[thread].join();
-        }
-
-        if (VERBOSE) {
-          System.out.println("TEST: DONE search: totHits=" + totHits);
-        }
-      } else {
-        Thread.sleep(100);
-      }
-    }
-
-    es.shutdown();
-    es.awaitTermination(1, TimeUnit.SECONDS);
-
-    if (VERBOSE) {
-      System.out.println("TEST: all searching done [" + (System.currentTimeMillis()-t0) + " ms]");
-    }
-
-    //System.out.println("numDocs=" + r.numDocs() + " openDelFileCount=" + dir.openDeleteFileCount());
-    r.close();
-    final Set<String> openDeletedFiles = dir.getOpenDeletedFiles();
-    if (openDeletedFiles.size() > 0) {
-      System.out.println("OBD files: " + openDeletedFiles);
-    }
-    any |= openDeletedFiles.size() > 0;
-
-    assertFalse("saw non-zero open-but-deleted count", any);
-    if (VERBOSE) {
-      System.out.println("TEST: now join");
-    }
-    for(int thread=0;thread<NUM_INDEX_THREADS;thread++) {
-      threads[thread].join();
-    }
-    if (VERBOSE) {
-      System.out.println("TEST: done join [" + (System.currentTimeMillis()-t0) + " ms]; addCount=" + addCount + " delCount=" + delCount);
     }
     
-    final IndexReader r2 = writer.getReader();
-    final IndexSearcher s = new IndexSearcher(r2);
-    for(String id : delIDs) {
-      final TopDocs hits = s.search(new TermQuery(new Term("id", id)), 1);
-      if (hits.totalHits != 0) {
-        fail("doc id=" + id + " is supposed to be deleted, but got docID=" + hits.scoreDocs[0].doc);
+    System.out.println("  sort...");
+
+    // sort by term: we sorted the files already and use a stable sort.
+    Collections.sort(lines, new Comparator<String[]>() {
+      public int compare(String[] left, String[] right) {
+        return left[0].compareTo(right[0]);
       }
-    }
-    assertEquals("index=" + writer.segString() + " addCount=" + addCount + " delCount=" + delCount, addCount.get() - delCount.get(), r2.numDocs());
-    r2.close();
+    });
+    
+    System.out.println("  encode...");
 
-    writer.commit();
-    assertEquals("index=" + writer.segString() + " addCount=" + addCount + " delCount=" + delCount, addCount.get() - delCount.get(), writer.numDocs());
+    PositiveIntOutputs fstOutput = PositiveIntOutputs.getSingleton(true);
+    Builder<Long> fstBuilder = new Builder<Long>(FST.INPUT_TYPE.BYTE2, 0, 0, true, true, Integer.MAX_VALUE, fstOutput, null, true);
+    IntsRef scratch = new IntsRef();
+    long ord = -1; // first ord will be 0
+    String lastValue = null;
+
+    // build tokeninfo dictionary
+    for (String[] entry : lines) {
+      int next = dictionary.put(entry);
+        
+      if(next == offset){
+        System.out.println("Failed to process line: " + Arrays.toString(entry));
+        continue;
+      }
       
-    writer.close(false);
-    dir.close();
-    _TestUtil.rmDir(tempDir);
-    docs.close();
-    if (VERBOSE) {
-      System.out.println("TEST: done [" + (System.currentTimeMillis()-t0) + " ms]");
+      String token = entry[0];
+      if (!token.equals(lastValue)) {
+        // new word to add to fst
+        ord++;
+        lastValue = token;
+        scratch.grow(token.length());
+        scratch.length = token.length();
+        for (int i = 0; i < token.length(); i++) {
+          scratch.ints[i] = (int) token.charAt(i);
+        }
+        fstBuilder.add(scratch, ord);
+      }
+      dictionary.addMapping((int)ord, offset);
+      offset = next;
     }
+    
+    final FST<Long> fst = fstBuilder.finish();
+    
+    System.out.print("  " + fst.getNodeCount() + " nodes, " + fst.getArcCount() + " arcs, " + fst.sizeInBytes() + " bytes...  ");
+    dictionary.setFST(fst);
+    System.out.println(" done");
+    
+    return dictionary;
   }
-
-  private int runQuery(IndexSearcher s, Query q) throws Exception {
-    s.search(q, 10);
-    return s.search(q, null, 10, new Sort(new SortField("title", SortField.STRING))).totalHits;
-  }
-
-  private void smokeTestReader(IndexReader r) throws Exception {
-    IndexSearcher s = new IndexSearcher(r);
-    runQuery(s, new TermQuery(new Term("body", "united")));
-    runQuery(s, new TermQuery(new Term("titleTokenized", "states")));
-    PhraseQuery pq = new PhraseQuery();
-    pq.add(new Term("body", "united"));
-    pq.add(new Term("body", "states"));
-    runQuery(s, pq);
-    s.close();
+  
+  /*
+   * IPADIC features
+   * 
+   * 0   - surface
+   * 1   - left cost
+   * 2   - right cost
+   * 3   - word cost
+   * 4-9 - pos
+   * 10  - base form
+   * 11  - reading
+   * 12  - pronounciation
+   *
+   * UniDic features
+   * 
+   * 0   - surface
+   * 1   - left cost
+   * 2   - right cost
+   * 3   - word cost
+   * 4-9 - pos
+   * 10  - base form reading
+   * 11  - base form
+   * 12  - surface form
+   * 13  - surface reading
+   */
+  
+  public String[] formatEntry(String[] features) {
+    if (this.format == DictionaryFormat.IPADIC) {
+      return features;
+    } else {
+      String[] features2 = new String[13];
+      features2[0] = features[0];
+      features2[1] = features[1];
+      features2[2] = features[2];
+      features2[3] = features[3];
+      features2[4] = features[4];
+      features2[5] = features[5];
+      features2[6] = features[6];
+      features2[7] = features[7];
+      features2[8] = features[8];
+      features2[9] = features[9];
+      features2[10] = features[11];
+      
+      // If the surface reading is non-existent, use surface form for reading and pronunciation.
+      // This happens with punctuation in UniDic and there are possibly other cases as well
+      if (features[13].length() == 0) {
+        features2[11] = features[0];
+        features2[12] = features[0];
+      } else {
+        features2[11] = features[13];
+        features2[12] = features[13];
+      }
+      return features2;
+    }
   }
 }

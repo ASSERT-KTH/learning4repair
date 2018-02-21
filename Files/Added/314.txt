@@ -1,347 +1,351 @@
-import org.apache.lucene.document.Field;          // for javadoc
+assert collectionStats.sumTotalTermFreq() >= -1;
 
-package org.apache.lucene.index;
+package org.apache.lucene.search.similarities;
 
-/* ====================================================================
- * The Apache Software License, Version 1.1
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
- * Copyright (c) 2001 The Apache Software Foundation.  All rights
- * reserved.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- *
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- *
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in
- *    the documentation and/or other materials provided with the
- *    distribution.
- *
- * 3. The end-user documentation included with the redistribution,
- *    if any, must include the following acknowledgment:
- *       "This product includes software developed by the
- *        Apache Software Foundation (http://www.apache.org/)."
- *    Alternately, this acknowledgment may appear in the software itself,
- *    if and wherever such third-party acknowledgments normally appear.
- *
- * 4. The names "Apache" and "Apache Software Foundation" and
- *    "Apache Lucene" must not be used to endorse or promote products
- *    derived from this software without prior written permission. For
- *    written permission, please contact apache@apache.org.
- *
- * 5. Products derived from this software may not be called "Apache",
- *    "Apache Lucene", nor may "Apache" appear in their name, without
- *    prior written permission of the Apache Software Foundation.
- *
- * THIS SOFTWARE IS PROVIDED ``AS IS'' AND ANY EXPRESSED OR IMPLIED
- * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
- * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED.  IN NO EVENT SHALL THE APACHE SOFTWARE FOUNDATION OR
- * ITS CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
- * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
- * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF
- * USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
- * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
- * SUCH DAMAGE.
- * ====================================================================
- *
- * This software consists of voluntary contributions made by many
- * individuals on behalf of the Apache Software Foundation.  For more
- * information on the Apache Software Foundation, please see
- * <http://www.apache.org/>.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 import java.io.IOException;
-import java.io.File;
-import java.util.Collection;
 
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.FSDirectory;
-import org.apache.lucene.store.Lock;
-import org.apache.lucene.document.Document;
+import org.apache.lucene.index.DocValues;
+import org.apache.lucene.index.FieldInvertState;
+import org.apache.lucene.index.IndexReader.AtomicReaderContext;
+import org.apache.lucene.index.Norm;
+import org.apache.lucene.search.CollectionStatistics;
+import org.apache.lucene.search.Explanation;
+import org.apache.lucene.search.TermStatistics;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.SmallFloat;
 
-/** IndexReader is an abstract class, providing an interface for accessing an
-  index.  Search of an index is done entirely through this abstract interface,
-  so that any subclass which implements it is searchable.
+/**
+ * BM25 Similarity. Introduced in Stephen E. Robertson, Steve Walker,
+ * Susan Jones, Micheline Hancock-Beaulieu, and Mike Gatford. Okapi at TREC-3.
+ * In Proceedings of the Third Text REtrieval Conference (TREC 1994).
+ * Gaithersburg, USA, November 1994.
+ * @lucene.experimental
+ */
+public class BM25Similarity extends Similarity {
+  private final float k1;
+  private final float b;
+  // TODO: should we add a delta like sifaka.cs.uiuc.edu/~ylv2/pub/sigir11-bm25l.pdf ?
 
-  <p> Concrete subclasses of IndexReader are usually constructed with a call to
-  the static method {@link #open}.
-
-  <p> For efficiency, in this API documents are often referred to via
-  <i>document numbers</i>, non-negative integers which each name a unique
-  document in the index.  These document numbers are ephemeral--they may change
-  as documents are added to and deleted from an index.  Clients should thus not
-  rely on a given document having the same number between sessions. */
-
-public abstract class IndexReader {
-  protected IndexReader(Directory directory) {
-    this.directory = directory;
+  public BM25Similarity(float k1, float b) {
+    this.k1 = k1;
+    this.b  = b;
+  }
+  
+  /** BM25 with these default values:
+   * <ul>
+   *   <li>{@code k1 = 1.2},
+   *   <li>{@code b = 0.75}.</li>
+   * </ul>
+   */
+  public BM25Similarity() {
+    this.k1 = 1.2f;
+    this.b  = 0.75f;
+  }
+  
+  /** Implemented as <code>log(1 + (numDocs - docFreq + 0.5)/(docFreq + 0.5))</code>. */
+  protected float idf(int docFreq, int numDocs) {
+    return (float) Math.log(1 + (numDocs - docFreq + 0.5D)/(docFreq + 0.5D));
+  }
+  
+  /** Implemented as <code>1 / (distance + 1)</code>. */
+  protected float sloppyFreq(int distance) {
+    return 1.0f / (distance + 1);
+  }
+  
+  /** The default implementation returns <code>1</code> */
+  protected float scorePayload(int doc, int start, int end, BytesRef payload) {
+    return 1;
+  }
+  
+  /** The default implementation computes the average as <code>sumTotalTermFreq / maxDoc</code>,
+   * or returns <code>1</code> if the index does not store sumTotalTermFreq (Lucene 3.x indexes
+   * or any field that omits frequency information). */
+  protected float avgFieldLength(CollectionStatistics collectionStats) {
+    final long sumTotalTermFreq = collectionStats.sumTotalTermFreq();
+    if (sumTotalTermFreq <= 0) {
+      return 1f;       // field does not exist, or stat is unsupported
+    } else {
+      return (float) (sumTotalTermFreq / (double) collectionStats.maxDoc());
+    }
+  }
+  
+  /** The default implementation encodes <code>boost / sqrt(length)</code>
+   * with {@link SmallFloat#floatToByte315(float)}.  This is compatible with 
+   * Lucene's default implementation.  If you change this, then you should 
+   * change {@link #decodeNormValue(byte)} to match. */
+  protected byte encodeNormValue(float boost, int fieldLength) {
+    return SmallFloat.floatToByte315(boost / (float) Math.sqrt(fieldLength));
   }
 
-  Directory directory;
-  private Lock writeLock;
+  /** The default implementation returns <code>1 / f<sup>2</sup></code>
+   * where <code>f</code> is {@link SmallFloat#byte315ToFloat(byte)}. */
+  protected float decodeNormValue(byte b) {
+    return NORM_TABLE[b & 0xFF];
+  }
+  
+  // Default true
+  protected boolean discountOverlaps = true;
 
-  /** Returns an IndexReader reading the index in an FSDirectory in the named
-  path. */
-  public static IndexReader open(String path) throws IOException {
-    return open(FSDirectory.getDirectory(path, false));
+  /** Determines whether overlap tokens (Tokens with 0 position increment) are 
+   *  ignored when computing norm.  By default this is true, meaning overlap
+   *  tokens do not count when computing norms. */
+  public void setDiscountOverlaps(boolean v) {
+    discountOverlaps = v;
   }
 
-  /** Returns an IndexReader reading the index in an FSDirectory in the named
-  path. */
-  public static IndexReader open(File path) throws IOException {
-    return open(FSDirectory.getDirectory(path, false));
+  /** @see #setDiscountOverlaps */
+  public boolean getDiscountOverlaps() {
+    return discountOverlaps;
   }
+  
+  /** Cache of decoded bytes. */
+  private static final float[] NORM_TABLE = new float[256];
 
-  /** Returns an IndexReader reading the index in the given Directory. */
-  public static IndexReader open(final Directory directory) throws IOException{
-    synchronized (directory) {			  // in- & inter-process sync
-      return (IndexReader)new Lock.With(directory.makeLock("commit.lock")) {
-	  public Object doBody() throws IOException {
-	    SegmentInfos infos = new SegmentInfos();
-	    infos.read(directory);
-	    if (infos.size() == 1)		  // index is optimized
-	      return new SegmentReader(infos.info(0), true);
-
-	    SegmentReader[] readers = new SegmentReader[infos.size()];
-	    for (int i = 0; i < infos.size(); i++)
-	      readers[i] = new SegmentReader(infos.info(i), i==infos.size()-1);
-	    return new SegmentsReader(directory, readers);
-	  }
-	}.run();
+  static {
+    for (int i = 0; i < 256; i++) {
+      float f = SmallFloat.byte315ToFloat((byte)i);
+      NORM_TABLE[i] = 1.0f / (f*f);
     }
   }
 
-  /** Returns the time the index in the named directory was last modified. */
-  public static long lastModified(String directory) throws IOException {
-    return lastModified(new File(directory));
+
+  @Override
+  public final void computeNorm(FieldInvertState state, Norm norm) {
+    final int numTerms = discountOverlaps ? state.getLength() - state.getNumOverlap() : state.getLength();
+    norm.setByte(encodeNormValue(state.getBoost(), numTerms));
   }
 
-  /** Returns the time the index in the named directory was last modified. */
-  public static long lastModified(File directory) throws IOException {
-    return FSDirectory.fileModified(directory, "segments");
+  public Explanation idfExplain(CollectionStatistics collectionStats, TermStatistics termStats) {
+    final int df = termStats.docFreq();
+    final int max = collectionStats.maxDoc();
+    final float idf = idf(df, max);
+    return new Explanation(idf, "idf(docFreq=" + df + ", maxDocs=" + max + ")");
   }
 
-  /** Returns the time the index in this directory was last modified. */
-  public static long lastModified(Directory directory) throws IOException {
-    return directory.fileModified("segments");
-  }
-
-  /**
-   * Returns <code>true</code> if an index exists at the specified directory.
-   * If the directory does not exist or if there is no index in it.
-   * <code>false</code> is returned.
-   * @param  directory the directory to check for an index
-   * @return <code>true</code> if an index exists; <code>false</code> otherwise
-   */
-  public static boolean indexExists(String directory) {
-    return (new File(directory, "segments")).exists();
-  }
-
-  /**
-   * Returns <code>true</code> if an index exists at the specified directory.
-   * If the directory does not exist or if there is no index in it.
-   * @param  directory the directory to check for an index
-   * @return <code>true</code> if an index exists; <code>false</code> otherwise
-   */
-  public static boolean indexExists(File directory) {
-    return (new File(directory, "segments")).exists();
-  }
-
-  /**
-   * Returns <code>true</code> if an index exists at the specified directory.
-   * If the directory does not exist or if there is no index in it.
-   * @param  directory the directory to check for an index
-   * @return <code>true</code> if an index exists; <code>false</code> otherwise
-   * @throws IOException if there is a problem with accessing the index
-   */
-  public static boolean indexExists(Directory directory) throws IOException {
-    return directory.fileExists("segments");
-  }
-
-  /** Returns the number of documents in this index. */
-  public abstract int numDocs();
-
-  /** Returns one greater than the largest possible document number.
-    This may be used to, e.g., determine how big to allocate an array which
-    will have an element for every document number in an index.
-   */
-  public abstract int maxDoc();
-
-  /** Returns the stored fields of the <code>n</code><sup>th</sup>
-      <code>Document</code> in this index. */
-  public abstract Document document(int n) throws IOException;
-
-  /** Returns true if document <i>n</i> has been deleted */
-  public abstract boolean isDeleted(int n);
-
-  /** Returns the byte-encoded normalization factor for the named field of
-   * every document.  This is used by the search code to score documents.
-   *
-   * @see Field#setBoost(float)
-   */
-  public abstract byte[] norms(String field) throws IOException;
-
-  /** Returns an enumeration of all the terms in the index.
-    The enumeration is ordered by Term.compareTo().  Each term
-    is greater than all that precede it in the enumeration.
-   */
-  public abstract TermEnum terms() throws IOException;
-
-  /** Returns an enumeration of all terms after a given term.
-    The enumeration is ordered by Term.compareTo().  Each term
-    is greater than all that precede it in the enumeration.
-   */
-  public abstract TermEnum terms(Term t) throws IOException;
-
-  /** Returns the number of documents containing the term <code>t</code>. */
-  public abstract int docFreq(Term t) throws IOException;
-
-  /** Returns an enumeration of all the documents which contain
-    <code>term</code>. For each document, the document number, the frequency of
-    the term in that document is also provided, for use in search scoring.
-    Thus, this method implements the mapping:
-    <p><ul>
-    Term &nbsp;&nbsp; =&gt; &nbsp;&nbsp; &lt;docNum, freq&gt;<sup>*</sup>
-    </ul>
-    <p>The enumeration is ordered by document number.  Each document number
-    is greater than all that precede it in the enumeration. */
-  public TermDocs termDocs(Term term) throws IOException {
-    TermDocs termDocs = termDocs();
-    termDocs.seek(term);
-    return termDocs;
-  }
-
-  /** Returns an unpositioned {@link TermDocs} enumerator. */
-  public abstract TermDocs termDocs() throws IOException;
-
-  /** Returns an enumeration of all the documents which contain
-    <code>term</code>.  For each document, in addition to the document number
-    and frequency of the term in that document, a list of all of the ordinal
-    positions of the term in the document is available.  Thus, this method
-    implements the mapping:
-
-    <p><ul>
-    Term &nbsp;&nbsp; =&gt; &nbsp;&nbsp; &lt;docNum, freq,
-          &lt;pos<sub>1</sub>, pos<sub>2</sub>, ...
-	  pos<sub>freq-1</sub>&gt;
-	&gt;<sup>*</sup>
-    </ul>
-    <p> This positional information faciliates phrase and proximity searching.
-    <p>The enumeration is ordered by document number.  Each document number is
-    greater than all that precede it in the enumeration. */
-  public TermPositions termPositions(Term term) throws IOException {
-    TermPositions termPositions = termPositions();
-    termPositions.seek(term);
-    return termPositions;
-  }
-
-  /** Returns an unpositioned {@link TermPositions} enumerator. */
-  public abstract TermPositions termPositions() throws IOException;
-
-  /** Deletes the document numbered <code>docNum</code>.  Once a document is
-    deleted it will not appear in TermDocs or TermPostitions enumerations.
-    Attempts to read its field with the {@link #document}
-    method will result in an error.  The presence of this document may still be
-    reflected in the {@link #docFreq} statistic, though
-    this will be corrected eventually as the index is further modified.  */
-  public final synchronized void delete(int docNum) throws IOException {
-    if (writeLock == null) {
-      Lock writeLock = directory.makeLock("write.lock");
-      if (!writeLock.obtain())			  // obtain write lock
-        throw new IOException("Index locked for write: " + writeLock);
-      this.writeLock = writeLock;
+  public Explanation idfExplain(CollectionStatistics collectionStats, TermStatistics termStats[]) {
+    final int max = collectionStats.maxDoc();
+    float idf = 0.0f;
+    final Explanation exp = new Explanation();
+    exp.setDescription("idf(), sum of:");
+    for (final TermStatistics stat : termStats ) {
+      final int df = stat.docFreq();
+      final float termIdf = idf(df, max);
+      exp.addDetail(new Explanation(termIdf, "idf(docFreq=" + df + ", maxDocs=" + max + ")"));
+      idf += termIdf;
     }
-    doDelete(docNum);
+    exp.setValue(idf);
+    return exp;
   }
-  abstract void doDelete(int docNum) throws IOException;
 
-  /** Deletes all documents containing <code>term</code>.
-    This is useful if one uses a document field to hold a unique ID string for
-    the document.  Then to delete such a document, one merely constructs a
-    term with the appropriate field and the unique ID string as its text and
-    passes it to this method.  Returns the number of documents deleted. */
-  public final int delete(Term term) throws IOException {
-    TermDocs docs = termDocs(term);
-    if ( docs == null ) return 0;
-    int n = 0;
-    try {
-      while (docs.next()) {
-	delete(docs.doc());
-	n++;
-      }
-    } finally {
-      docs.close();
+  @Override
+  public final Stats computeStats(CollectionStatistics collectionStats, float queryBoost, TermStatistics... termStats) {
+    Explanation idf = termStats.length == 1 ? idfExplain(collectionStats, termStats[0]) : idfExplain(collectionStats, termStats);
+
+    float avgdl = avgFieldLength(collectionStats);
+
+    // compute freq-independent part of bm25 equation across all norm values
+    float cache[] = new float[256];
+    for (int i = 0; i < cache.length; i++) {
+      cache[i] = k1 * ((1 - b) + b * decodeNormValue((byte)i) / avgdl);
     }
-    return n;
+    return new BM25Stats(idf, queryBoost, avgdl, cache);
   }
 
-  /**
-   * Closes files associated with this index.
-   * Also saves any new deletions to disk.
-   * No other methods should be called after this has been called.
-   */
-  public final synchronized void close() throws IOException {
-    doClose();
-    if (writeLock != null) {
-      writeLock.release();  // release write lock
-      writeLock = null;
+  @Override
+  public final ExactDocScorer exactDocScorer(Stats stats, String fieldName, AtomicReaderContext context) throws IOException {
+    final DocValues norms = context.reader.normValues(fieldName);
+    return norms == null 
+      ? new ExactBM25DocScorerNoNorms((BM25Stats)stats)
+      : new ExactBM25DocScorer((BM25Stats)stats, norms);
+  }
+
+  @Override
+  public final SloppyDocScorer sloppyDocScorer(Stats stats, String fieldName, AtomicReaderContext context) throws IOException {
+    return new SloppyBM25DocScorer((BM25Stats) stats, context.reader.normValues(fieldName));
+  }
+  
+  private class ExactBM25DocScorer extends ExactDocScorer {
+    private final BM25Stats stats;
+    private final float weightValue;
+    private final byte[] norms;
+    private final float[] cache;
+    
+    ExactBM25DocScorer(BM25Stats stats, DocValues norms) throws IOException {
+      assert norms != null;
+      this.stats = stats;
+      this.weightValue = stats.weight * (k1 + 1); // boost * idf * (k1 + 1)
+      this.cache = stats.cache;
+      this.norms = (byte[])norms.getSource().getArray();
+    }
+    
+    @Override
+    public float score(int doc, int freq) {
+      return weightValue * freq / (freq + cache[norms[doc] & 0xFF]);
+    }
+    
+    @Override
+    public Explanation explain(int doc, Explanation freq) {
+      return explainScore(doc, freq, stats, norms);
     }
   }
+  
+  /** there are no norms, we act as if b=0 */
+  private class ExactBM25DocScorerNoNorms extends ExactDocScorer {
+    private final BM25Stats stats;
+    private final float weightValue;
+    private static final int SCORE_CACHE_SIZE = 32;
+    private float[] scoreCache = new float[SCORE_CACHE_SIZE];
 
-  /** Implements close. */
-  abstract void doClose() throws IOException;
-
-  /** Release the write lock, if needed. */
-  protected final void finalize() throws IOException {
-    if (writeLock != null) {
-      writeLock.release();                        // release write lock
-      writeLock = null;
+    ExactBM25DocScorerNoNorms(BM25Stats stats) {
+      this.stats = stats;
+      this.weightValue = stats.weight * (k1 + 1); // boost * idf * (k1 + 1)
+      for (int i = 0; i < SCORE_CACHE_SIZE; i++)
+        scoreCache[i] = weightValue * i / (i + k1);
+    }
+    
+    @Override
+    public float score(int doc, int freq) {
+      // TODO: maybe score cache is more trouble than its worth?
+      return freq < SCORE_CACHE_SIZE        // check cache
+        ? scoreCache[freq]                  // cache hit
+        : weightValue * freq / (freq + k1); // cache miss
+    }
+    
+    @Override
+    public Explanation explain(int doc, Explanation freq) {
+      return explainScore(doc, freq, stats, null);
     }
   }
-
-    /**
-     * Return a list of all unique field names which exist in the index pointed to by
-     * this IndexReader.
-     * @return Collection of Strings indicating the names of the fields
-     * @throws IOException if there is a problem with accessing the index
-     */
-    public abstract Collection getFieldNames() throws IOException;
-
-  /**
-   * Returns <code>true</code> iff the index in the named directory is
-   * currently locked.
-   * @param directory the directory to check for a lock
-   * @throws IOException if there is a problem with accessing the index
-   */
-    public static boolean isLocked(Directory directory) throws IOException {
-	return directory.fileExists("write.lock");
+  
+  private class SloppyBM25DocScorer extends SloppyDocScorer {
+    private final BM25Stats stats;
+    private final float weightValue; // boost * idf * (k1 + 1)
+    private final byte[] norms;
+    private final float[] cache;
+    
+    SloppyBM25DocScorer(BM25Stats stats, DocValues norms) throws IOException {
+      this.stats = stats;
+      this.weightValue = stats.weight * (k1 + 1);
+      this.cache = stats.cache;
+      this.norms = norms == null ? null : (byte[])norms.getSource().getArray();
+    }
+    
+    @Override
+    public float score(int doc, float freq) {
+      // if there are no norms, we act as if b=0
+      float norm = norms == null ? k1 : cache[norms[doc] & 0xFF];
+      return weightValue * freq / (freq + norm);
+    }
+    
+    @Override
+    public Explanation explain(int doc, Explanation freq) {
+      return explainScore(doc, freq, stats, norms);
     }
 
-  /**
-   * Returns <code>true</code> iff the index in the named directory is
-   * currently locked.
-   * @param directory the directory to check for a lock
-   * @throws IOException if there is a problem with accessing the index
-   */
-    public static boolean isLocked(String directory) throws IOException {
-	return (new File(directory, "write.lock")).exists();
+    @Override
+    public float computeSlopFactor(int distance) {
+      return sloppyFreq(distance);
     }
 
-   /**
-    * Forcibly unlocks the index in the named directory.
-    * <P>
-    * Caution: this should only be used by failure recovery code,
-    * when it is known that no other process nor thread is in fact
-    * currently accessing this index.
-    */
-    public static void unlock(Directory directory) throws IOException {
-	directory.deleteFile("write.lock");
-	directory.deleteFile("commit.lock");
+    @Override
+    public float computePayloadFactor(int doc, int start, int end, BytesRef payload) {
+      return scorePayload(doc, start, end, payload);
     }
+  }
+  
+  /** Collection statistics for the BM25 model. */
+  private static class BM25Stats extends Stats {
+    /** BM25's idf */
+    private final Explanation idf;
+    /** The average document length. */
+    private final float avgdl;
+    /** query's inner boost */
+    private final float queryBoost;
+    /** query's outer boost (only for explain) */
+    private float topLevelBoost;
+    /** weight (idf * boost) */
+    private float weight;
+    /** precomputed norm[256] with k1 * ((1 - b) + b * dl / avgdl) */
+    private final float cache[];
+
+    BM25Stats(Explanation idf, float queryBoost, float avgdl, float cache[]) {
+      this.idf = idf;
+      this.queryBoost = queryBoost;
+      this.avgdl = avgdl;
+      this.cache = cache;
+    }
+
+    @Override
+    public float getValueForNormalization() {
+      // we return a TF-IDF like normalization to be nice, but we don't actually normalize ourselves.
+      final float queryWeight = idf.getValue() * queryBoost;
+      return queryWeight * queryWeight;
+    }
+
+    @Override
+    public void normalize(float queryNorm, float topLevelBoost) {
+      // we don't normalize with queryNorm at all, we just capture the top-level boost
+      this.topLevelBoost = topLevelBoost;
+      this.weight = idf.getValue() * queryBoost * topLevelBoost;
+    } 
+  }
+  
+  private Explanation explainScore(int doc, Explanation freq, BM25Stats stats, byte[] norms) {
+    Explanation result = new Explanation();
+    result.setDescription("score(doc="+doc+",freq="+freq+"), product of:");
+    
+    Explanation boostExpl = new Explanation(stats.queryBoost * stats.topLevelBoost, "boost");
+    if (boostExpl.getValue() != 1.0f)
+      result.addDetail(boostExpl);
+    
+    result.addDetail(stats.idf);
+
+    Explanation tfNormExpl = new Explanation();
+    tfNormExpl.setDescription("tfNorm, computed from:");
+    tfNormExpl.addDetail(freq);
+    tfNormExpl.addDetail(new Explanation(k1, "parameter k1"));
+    if (norms == null) {
+      tfNormExpl.addDetail(new Explanation(0, "parameter b (norms omitted for field)"));
+      tfNormExpl.setValue((freq.getValue() * (k1 + 1)) / (freq.getValue() + k1));
+    } else {
+      float doclen = decodeNormValue(norms[doc]);
+      tfNormExpl.addDetail(new Explanation(b, "parameter b"));
+      tfNormExpl.addDetail(new Explanation(stats.avgdl, "avgFieldLength"));
+      tfNormExpl.addDetail(new Explanation(doclen, "fieldLength"));
+      tfNormExpl.setValue((freq.getValue() * (k1 + 1)) / (freq.getValue() + k1 * (1 - b + b * doclen/stats.avgdl)));
+    }
+    result.addDetail(tfNormExpl);
+    result.setValue(boostExpl.getValue() * stats.idf.getValue() * tfNormExpl.getValue());
+    return result;
+  }
+
+  @Override
+  public String toString() {
+    return "BM25(k1=" + k1 + ",b=" + b + ")";
+  }
+  
+  public float getK1() {
+    return k1;
+  }
+  
+  public float getB() {
+    return b;
+  }
 }

@@ -1,4 +1,4 @@
-void clearUnsafe()
+public void forceCleanup()
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one
@@ -20,379 +20,994 @@ void clearUnsafe()
 
 package org.apache.cassandra.db;
 
-import java.io.IOException;
 import java.util.*;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.io.File;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.atomic.AtomicInteger;
 
-import org.apache.commons.collections.comparators.ReverseComparator;
-import org.apache.commons.lang.ArrayUtils;
+import org.apache.commons.collections.IteratorUtils;
+import org.apache.commons.collections.Predicate;
 
+import org.apache.cassandra.analytics.DBAnalyticsSource;
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.BootstrapInitiateMessage;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.io.DataInputBuffer;
 import org.apache.cassandra.io.DataOutputBuffer;
+import org.apache.cassandra.io.ICompactSerializer;
+import org.apache.cassandra.io.IFileReader;
+import org.apache.cassandra.io.IFileWriter;
 import org.apache.cassandra.io.SSTable;
+import org.apache.cassandra.io.SequenceFile;
+import org.apache.cassandra.net.EndPoint;
+import org.apache.cassandra.net.IVerbHandler;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.net.io.IStreamComplete;
+import org.apache.cassandra.net.io.StreamContextManager;
 import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.utils.BloomFilter;
-import org.apache.cassandra.utils.DestructivePQIterator;
+import org.apache.cassandra.utils.*;
 import org.apache.log4j.Logger;
 
 /**
  * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
- */
+*/
 
-public class Memtable implements Comparable<Memtable>
+public class Table
 {
-	private static Logger logger_ = Logger.getLogger( Memtable.class );
-
-    private boolean isFrozen_;
-    private volatile boolean isDirty_;
-    private volatile boolean isFlushed_; // for tests, in particular forceBlockingFlush asserts this
-
-    private int threshold_ = DatabaseDescriptor.getMemtableSize()*1024*1024;
-    private int thresholdCount_ = (int)(DatabaseDescriptor.getMemtableObjectCount()*1024*1024);
-    private AtomicInteger currentSize_ = new AtomicInteger(0);
-    private AtomicInteger currentObjectCount_ = new AtomicInteger(0);
-
-    /* Table and ColumnFamily name are used to determine the ColumnFamilyStore */
-    private String table_;
-    private String cfName_;
-    /* Creation time of this Memtable */
-    private long creationTime_;
-    private Map<String, ColumnFamily> columnFamilies_ = new HashMap<String, ColumnFamily>();
-    /* Lock and Condition for notifying new clients about Memtable switches */
-
-    Memtable(String table, String cfName)
+    /*
+     * This class represents the metadata of this Table. The metadata
+     * is basically the column family name and the ID associated with
+     * this column family. We use this ID in the Commit Log header to
+     * determine when a log file that has been rolled can be deleted.
+    */
+    public static class TableMetadata
     {
-        table_ = table;
-        cfName_ = cfName;
-        creationTime_ = System.currentTimeMillis();
-    }
-
-    public boolean isFlushed()
-    {
-        return isFlushed_;
-    }
-
-    /**
-     * Compares two Memtable based on creation time.
-     * @param rhs Memtable to compare to.
-     * @return a negative integer, zero, or a positive integer as this object
-     * is less than, equal to, or greater than the specified object.
-     */
-    public int compareTo(Memtable rhs)
-    {
-    	long diff = creationTime_ - rhs.creationTime_;
-    	if ( diff > 0 )
-    		return 1;
-    	else if ( diff < 0 )
-    		return -1;
-    	else
-    		return 0;
-    }
-
-    public int getCurrentSize()
-    {
-        return currentSize_.get();
-    }
-    
-    public int getCurrentObjectCount()
-    {
-        return currentObjectCount_.get();
-    }
-
-    void resolveSize(int oldSize, int newSize)
-    {
-        currentSize_.addAndGet(newSize - oldSize);
-    }
-
-    void resolveCount(int oldCount, int newCount)
-    {
-        currentObjectCount_.addAndGet(newCount - oldCount);
-    }
-
-    boolean isThresholdViolated()
-    {
-        return currentSize_.get() >= threshold_ ||  currentObjectCount_.get() >= thresholdCount_;
-    }
-
-    String getColumnFamily()
-    {
-    	return cfName_;
-    }
-
-    synchronized void enqueueFlush(CommitLog.CommitLogContext cLogCtx)
-    {
-        if (!isFrozen_)
+        /* Name of the column family */
+        public final static String cfName_ = "TableMetadata";
+        private static ICompactSerializer<TableMetadata> serializer_;
+        static
         {
-            isFrozen_ = true;
-            ColumnFamilyStore.submitFlush(this, cLogCtx);
+            serializer_ = new TableMetadataSerializer();
+        }
+        
+        private static TableMetadata tableMetadata_;
+        /* Use the following writer/reader to write/read to Metadata table */
+        private static IFileWriter writer_;
+        private static IFileReader reader_;
+        
+        public static Table.TableMetadata instance() throws IOException
+        {
+            if ( tableMetadata_ == null )
+            {
+                String file = getFileName();
+                writer_ = SequenceFile.writer(file);        
+                reader_ = SequenceFile.reader(file);
+                Table.TableMetadata.load();
+                if ( tableMetadata_ == null )
+                    tableMetadata_ = new Table.TableMetadata();
+            }
+            return tableMetadata_;
+        }
+
+        static ICompactSerializer<TableMetadata> serializer()
+        {
+            return serializer_;
+        }
+        
+        private static void load() throws IOException
+        {            
+            String file = Table.TableMetadata.getFileName();
+            File f = new File(file);
+            if ( f.exists() )
+            {
+                DataOutputBuffer bufOut = new DataOutputBuffer();
+                DataInputBuffer bufIn = new DataInputBuffer();
+                
+                if ( reader_ == null )
+                {
+                    reader_ = SequenceFile.reader(file);
+                }
+                
+                while ( !reader_.isEOF() )
+                {
+                    /* Read the metadata info. */
+                    reader_.next(bufOut);
+                    bufIn.reset(bufOut.getData(), bufOut.getLength());
+
+                    /* The key is the table name */
+                    bufIn.readUTF();
+                    /* read the size of the data we ignore this value */
+                    bufIn.readInt();
+                    tableMetadata_ = Table.TableMetadata.serializer().deserialize(bufIn);
+                    break;
+                }        
+            }            
+        }
+        
+        /* The mapping between column family and the column type. */
+        private Map<String, String> cfTypeMap_ = new HashMap<String, String>();
+        private Map<String, Integer> cfIdMap_ = new HashMap<String, Integer>();
+        private Map<Integer, String> idCfMap_ = new HashMap<Integer, String>();        
+        
+        private static String getFileName()
+        {
+            String table = DatabaseDescriptor.getTables().get(0);
+            return DatabaseDescriptor.getMetadataDirectory() + System.getProperty("file.separator") + table + "-Metadata.db";
+        }
+
+        public void add(String cf, int id)
+        {
+            add(cf, id, "Standard");
+        }
+        
+        public void add(String cf, int id, String type)
+        {
+            cfIdMap_.put(cf, id);
+            idCfMap_.put(id, cf);
+            cfTypeMap_.put(cf, type);
+        }
+        
+        public boolean isEmpty()
+        {
+            return cfIdMap_.isEmpty();
+        }
+
+        int getColumnFamilyId(String columnFamily)
+        {
+            return cfIdMap_.get(columnFamily);
+        }
+
+        String getColumnFamilyName(int id)
+        {
+            return idCfMap_.get(id);
+        }
+        
+        String getColumnFamilyType(String cfName)
+        {
+            return cfTypeMap_.get(cfName);
+        }
+
+        Set<String> getColumnFamilies()
+        {
+            return cfIdMap_.keySet();
+        }
+        
+        int size()
+        {
+            return cfIdMap_.size();
+        }
+        
+        boolean isValidColumnFamily(String cfName)
+        {
+            return cfIdMap_.containsKey(cfName);
+        }
+        
+        public void apply() throws IOException
+        {
+            String table = DatabaseDescriptor.getTables().get(0);
+            DataOutputBuffer bufOut = new DataOutputBuffer();
+            Table.TableMetadata.serializer_.serialize(this, bufOut);
+            try
+            {
+                writer_.append(table, bufOut);
+            }
+            catch ( IOException ex )
+            {
+                writer_.seek(0L);
+                logger_.debug(LogUtil.throwableToString(ex));
+            }
+        }
+
+        public String toString()
+        {
+            StringBuilder sb = new StringBuilder("");
+            Set<String> cfNames = cfIdMap_.keySet();
+            
+            for ( String cfName : cfNames )
+            {
+                sb.append(cfName);
+                sb.append("---->");
+                sb.append(cfIdMap_.get(cfName));
+                sb.append(System.getProperty("line.separator"));
+            }
+            
+            return sb.toString();
+        }
+    }
+
+    static class TableMetadataSerializer implements ICompactSerializer<TableMetadata>
+    {
+        public void serialize(TableMetadata tmetadata, DataOutputStream dos) throws IOException
+        {
+            int size = tmetadata.cfIdMap_.size();
+            dos.writeInt(size);
+            Set<String> cfNames = tmetadata.cfIdMap_.keySet();
+
+            for ( String cfName : cfNames )
+            {
+                dos.writeUTF(cfName);
+                dos.writeInt( tmetadata.cfIdMap_.get(cfName).intValue() );
+                dos.writeUTF(tmetadata.getColumnFamilyType(cfName));
+            }            
+        }
+
+        public TableMetadata deserialize(DataInputStream dis) throws IOException
+        {
+            TableMetadata tmetadata = new TableMetadata();
+            int size = dis.readInt();
+            for( int i = 0; i < size; ++i )
+            {
+                String cfName = dis.readUTF();
+                int id = dis.readInt();
+                String type = dis.readUTF();
+                tmetadata.add(cfName, id, type);
+            }            
+            return tmetadata;
         }
     }
 
     /**
-     * Should only be called by ColumnFamilyStore.apply.  NOT a public API.
-     * (CFS handles locking to avoid submitting an op
-     *  to a flushing memtable.  Any other way is unsafe.)
+     * This is the callback handler that is invoked when we have
+     * completely been bootstrapped for a single file by a remote host.
     */
-    void put(String key, ColumnFamily columnFamily)
+    public static class BootstrapCompletionHandler implements IStreamComplete
+    {                
+        public void onStreamCompletion(String host, StreamContextManager.StreamContext streamContext, StreamContextManager.StreamStatus streamStatus) throws IOException
+        {                        
+            /* Parse the stream context and the file to the list of SSTables in the associated Column Family Store. */            
+            if (streamContext.getTargetFile().contains("-Data.db"))
+            {
+                File file = new File( streamContext.getTargetFile() );
+                String fileName = file.getName();
+                /*
+                 * If the file is a Data File we need to load the indicies associated
+                 * with this file. We also need to cache the file name in the SSTables
+                 * list of the associated Column Family. Also merge the CBF into the
+                 * sampler.
+                */                
+                SSTable ssTable = new SSTable(streamContext.getTargetFile(), StorageService.getPartitioner());
+                ssTable.close();
+                logger_.debug("Merging the counting bloom filter in the sampler ...");                
+                String[] peices = FBUtilities.strip(fileName, "-");
+                Table.open(peices[0]).getColumnFamilyStore(peices[1]).addToList(streamContext.getTargetFile());                
+            }
+            
+            EndPoint to = new EndPoint(host, DatabaseDescriptor.getStoragePort());
+            logger_.debug("Sending a bootstrap terminate message with " + streamStatus + " to " + to);
+            /* Send a StreamStatusMessage object which may require the source node to re-stream certain files. */
+            StreamContextManager.StreamStatusMessage streamStatusMessage = new StreamContextManager.StreamStatusMessage(streamStatus);
+            Message message = StreamContextManager.StreamStatusMessage.makeStreamStatusMessage(streamStatusMessage);
+            MessagingService.getMessagingInstance().sendOneWay(message, to);           
+        }
+    }
+
+    public static class BootStrapInitiateVerbHandler implements IVerbHandler
     {
-        assert !isFrozen_; // not 100% foolproof but hell, it's an assert
-        isDirty_ = true;
-        resolve(key, columnFamily);
+        /*
+         * Here we handle the BootstrapInitiateMessage. Here we get the
+         * array of StreamContexts. We get file names for the column
+         * families associated with the files and replace them with the
+         * file names as obtained from the column family store on the
+         * receiving end.
+        */
+        public void doVerb(Message message)
+        {
+            byte[] body = message.getMessageBody();
+            DataInputBuffer bufIn = new DataInputBuffer();
+            bufIn.reset(body, body.length); 
+            
+            try
+            {
+                BootstrapInitiateMessage biMsg = BootstrapInitiateMessage.serializer().deserialize(bufIn);
+                StreamContextManager.StreamContext[] streamContexts = biMsg.getStreamContext();                
+                
+                Map<String, String> fileNames = getNewNames(streamContexts);
+                /*
+                 * For each of stream context's in the incoming message
+                 * generate the new file names and store the new file names
+                 * in the StreamContextManager.
+                */
+                for (StreamContextManager.StreamContext streamContext : streamContexts )
+                {                    
+                    StreamContextManager.StreamStatus streamStatus = new StreamContextManager.StreamStatus(streamContext.getTargetFile(), streamContext.getExpectedBytes() );
+                    File sourceFile = new File( streamContext.getTargetFile() );
+                    String[] peices = FBUtilities.strip(sourceFile.getName(), "-");
+                    String newFileName = fileNames.get( peices[1] + "-" + peices[2] );
+                    
+                    String file = new String(DatabaseDescriptor.getDataFileLocation() + System.getProperty("file.separator") + newFileName + "-Data.db");
+                    logger_.debug("Received Data from  : " + message.getFrom() + " " + streamContext.getTargetFile() + " " + file);
+                    streamContext.setTargetFile(file);
+                    addStreamContext(message.getFrom().getHost(), streamContext, streamStatus);                                            
+                }    
+                                             
+                StreamContextManager.registerStreamCompletionHandler(message.getFrom().getHost(), new Table.BootstrapCompletionHandler());
+                /* Send a bootstrap initiation done message to execute on default stage. */
+                logger_.debug("Sending a bootstrap initiate done message ...");                
+                Message doneMessage = new Message( StorageService.getLocalStorageEndPoint(), "", StorageService.bootStrapInitiateDoneVerbHandler_, new byte[0] );
+                MessagingService.getMessagingInstance().sendOneWay(doneMessage, message.getFrom());
+            }
+            catch ( IOException ex )
+            {
+                logger_.info(LogUtil.throwableToString(ex));
+            }
+        }
+        
+        private Map<String, String> getNewNames(StreamContextManager.StreamContext[] streamContexts)
+        {
+            /* 
+             * Mapping for each file with unique CF-i ---> new file name. For eg.
+             * for a file with name <Table>-<CF>-<i>-Data.db there is a corresponding
+             * <Table>-<CF>-<i>-Index.db. We maintain a mapping from <CF>-<i> to a newly
+             * generated file name.
+            */
+            Map<String, String> fileNames = new HashMap<String, String>();
+            /* Get the distinct entries from StreamContexts i.e have one entry per Data/Index file combination */
+            Set<String> distinctEntries = new HashSet<String>();
+            for ( StreamContextManager.StreamContext streamContext : streamContexts )
+            {
+                String[] peices = FBUtilities.strip(streamContext.getTargetFile(), "-");
+                distinctEntries.add(peices[1] + "-" + peices[2]);
+            }
+            
+            /* Generate unique file names per entry */
+            Table table = Table.open( DatabaseDescriptor.getTables().get(0) );
+            Map<String, ColumnFamilyStore> columnFamilyStores = table.getColumnFamilyStores();
+            
+            for ( String distinctEntry : distinctEntries )
+            {
+                String[] peices = FBUtilities.strip(distinctEntry, "-");
+                ColumnFamilyStore cfStore = columnFamilyStores.get(peices[0]);
+                logger_.debug("Generating file name for " + distinctEntry + " ...");
+                fileNames.put(distinctEntry, cfStore.getNextFileName());
+            }
+            
+            return fileNames;
+        }
+
+        private void addStreamContext(String host, StreamContextManager.StreamContext streamContext, StreamContextManager.StreamStatus streamStatus)
+        {
+            logger_.debug("Adding stream context " + streamContext + " for " + host + " ...");
+            StreamContextManager.addStreamContext(host, streamContext, streamStatus);
+        }
+    }
+    
+    private static Logger logger_ = Logger.getLogger(Table.class);
+    public static final String recycleBin_ = "RecycleColumnFamily";
+    public static final String hints_ = "HintsColumnFamily";
+    
+    /* Used to lock the factory for creation of Table instance */
+    private static Lock createLock_ = new ReentrantLock();
+    private static Map<String, Table> instances_ = new HashMap<String, Table>();
+    /* Table name. */
+    private String table_;
+    /* Handle to the Table Metadata */
+    private Table.TableMetadata tableMetadata_;
+    /* ColumnFamilyStore per column family */
+    private Map<String, ColumnFamilyStore> columnFamilyStores_ = new HashMap<String, ColumnFamilyStore>();
+    /* The AnalyticsSource instance which keeps track of statistics reported to Ganglia. */
+    private DBAnalyticsSource dbAnalyticsSource_;
+    // cache application CFs since Range queries ask for them a _lot_
+    private SortedSet<String> applicationColumnFamilies_;
+
+    public static Table open(String table)
+    {
+        Table tableInstance = instances_.get(table);
+        /*
+         * Read the config and figure the column families for this table.
+         * Set the isConfigured flag so that we do not read config all the
+         * time.
+        */
+        if ( tableInstance == null )
+        {
+            Table.createLock_.lock();
+            try
+            {
+                if ( tableInstance == null )
+                {
+                    tableInstance = new Table(table);
+                    instances_.put(table, tableInstance);
+                }
+            }
+            finally
+            {
+                createLock_.unlock();
+            }
+        }
+        return tableInstance;
+    }
+        
+    public Set<String> getColumnFamilies()
+    {
+        return tableMetadata_.getColumnFamilies();
+    }
+
+    Map<String, ColumnFamilyStore> getColumnFamilyStores()
+    {
+        return columnFamilyStores_;
+    }
+
+    public ColumnFamilyStore getColumnFamilyStore(String cfName)
+    {
+        return columnFamilyStores_.get(cfName);
+    }
+    
+    String getColumnFamilyType(String cfName)
+    {
+        String cfType = null;
+        if ( tableMetadata_ != null )
+          cfType = tableMetadata_.getColumnFamilyType(cfName);
+        return cfType;
     }
 
     /*
-     * This version is used to switch memtable and force flush.
-     * Flushing is still done in a separate executor -- forceFlush only blocks
-     * until the flush runnable is queued.
+     * This method is called to obtain statistics about
+     * the table. It will return statistics about all
+     * the column families that make up this table. 
     */
-    public void forceflush()
+    public String tableStats(String newLineSeparator, java.text.DecimalFormat df)
     {
-        if (isClean())
-            return;
+        StringBuilder sb = new StringBuilder();
+        sb.append(table_ + " statistics :");
+        sb.append(newLineSeparator);
+        int oldLength = sb.toString().length();
+        
+        Set<String> cfNames = columnFamilyStores_.keySet();
+        for ( String cfName : cfNames )
+        {
+            ColumnFamilyStore cfStore = columnFamilyStores_.get(cfName);
+            sb.append(cfStore.cfStats(newLineSeparator));
+        }
+        int newLength = sb.toString().length();
+        
+        /* Don't show anything if there is nothing to show. */
+        if ( newLength == oldLength )
+            return "";
+        
+        return sb.toString();
+    }
+
+    void onStart() throws IOException
+    {
+        /* Cache the callouts if any */
+        CalloutManager.instance().onStart();
+        Set<String> columnFamilies = tableMetadata_.getColumnFamilies();
+        for ( String columnFamily : columnFamilies )
+        {
+            ColumnFamilyStore cfStore = columnFamilyStores_.get( columnFamily );
+            if ( cfStore != null )
+                cfStore.onStart();
+        }         
+    }
+    
+    /** 
+     * Do a cleanup of keys that do not belong locally.
+     */
+    public void doGC()
+    {
+        Set<String> columnFamilies = tableMetadata_.getColumnFamilies();
+        for ( String columnFamily : columnFamilies )
+        {
+            ColumnFamilyStore cfStore = columnFamilyStores_.get( columnFamily );
+            if ( cfStore != null )
+                cfStore.forceCleanup();
+        }   
+    }
+    
+    /*
+     * Clear the existing snapshots in the system
+     */
+    public void clearSnapshot()
+    {
+    	String snapshotDir = DatabaseDescriptor.getSnapshotDirectory();
+    	File snapshot = new File(snapshotDir);
+    	FileUtils.deleteDir(snapshot);
+    }
+    
+    /*
+     * This method is invoked only during a bootstrap process. We basically
+     * do a complete compaction since we can figure out based on the ranges
+     * whether the files need to be split.
+    */
+    public boolean forceCompaction(List<Range> ranges, EndPoint target, List<String> fileList)
+    {
+        boolean result = true;
+        Set<String> columnFamilies = tableMetadata_.getColumnFamilies();
+        for ( String columnFamily : columnFamilies )
+        {
+            if ( !isApplicationColumnFamily(columnFamily) )
+                continue;
+            
+            ColumnFamilyStore cfStore = columnFamilyStores_.get( columnFamily );
+            if ( cfStore != null )
+            {
+                /* Counting Bloom Filter for the Column Family */
+                cfStore.forceCompaction(ranges, target, 0, fileList);                
+            }
+        }
+        return result;
+    }
+    
+    /*
+     * This method is an ADMIN operation to force compaction
+     * of all SSTables on disk. 
+    */
+    public void forceCompaction()
+    {
+        Set<String> columnFamilies = tableMetadata_.getColumnFamilies();
+        for ( String columnFamily : columnFamilies )
+        {
+            ColumnFamilyStore cfStore = columnFamilyStores_.get( columnFamily );
+            if ( cfStore != null )
+                MinorCompactionManager.instance().submitMajor(cfStore, 0);
+        }
+    }
+
+    /*
+     * Get the list of all SSTables on disk.  Not safe unless you aquire the CFS readlocks!
+    */
+    public List<String> getAllSSTablesOnDisk()
+    {
+        List<String> list = new ArrayList<String>();
+        Set<String> columnFamilies = tableMetadata_.getColumnFamilies();
+        for ( String columnFamily : columnFamilies )
+        {
+            ColumnFamilyStore cfStore = columnFamilyStores_.get( columnFamily );
+            if ( cfStore != null )
+                list.addAll(cfStore.getSSTableFilenames());
+        }
+        return list;
+    }
+
+    private Table(String table)
+    {
+        table_ = table;
+        dbAnalyticsSource_ = new DBAnalyticsSource();
+        try
+        {
+            tableMetadata_ = Table.TableMetadata.instance();
+            Set<String> columnFamilies = tableMetadata_.getColumnFamilies();
+            for ( String columnFamily : columnFamilies )
+            {
+                columnFamilyStores_.put(columnFamily, ColumnFamilyStore.getColumnFamilyStore(table, columnFamily));
+            }
+        }
+        catch ( IOException ex )
+        {
+            logger_.info(LogUtil.throwableToString(ex));
+        }
+    }
+
+    String getTableName()
+    {
+        return table_;
+    }
+    
+    boolean isApplicationColumnFamily(String columnFamily)
+    {
+        return DatabaseDescriptor.isApplicationColumnFamily(columnFamily);
+    }
+
+    int getNumberOfColumnFamilies()
+    {
+        return tableMetadata_.size();
+    }
+
+    int getColumnFamilyId(String columnFamily)
+    {
+        return tableMetadata_.getColumnFamilyId(columnFamily);
+    }
+
+    String getColumnFamilyName(int id)
+    {
+        return tableMetadata_.getColumnFamilyName(id);
+    }
+
+    boolean isValidColumnFamily(String columnFamily)
+    {
+        return tableMetadata_.isValidColumnFamily(columnFamily);
+    }
+
+    /**
+     * Selects the row associated with the given key.
+    */
+    public Row get(String key) throws IOException
+    {        
+        Row row = new Row(key);
+        Set<String> columnFamilies = tableMetadata_.getColumnFamilies();
+        long start = System.currentTimeMillis();
+        for ( String columnFamily : columnFamilies )
+        {
+            ColumnFamilyStore cfStore = columnFamilyStores_.get(columnFamily);
+            if ( cfStore != null )
+            {                
+                ColumnFamily cf = cfStore.getColumnFamily(key, columnFamily, new IdentityFilter());                
+                if ( cf != null )
+                    row.addColumnFamily(cf);
+            }
+        }
+        
+        long timeTaken = System.currentTimeMillis() - start;
+        dbAnalyticsSource_.updateReadStatistics(timeTaken);
+        return row;
+    }
+
+
+    /**
+     * Selects the specified column family for the specified key.
+    */
+    public ColumnFamily get(String key, String cf) throws IOException
+    {
+        String[] values = RowMutation.getColumnAndColumnFamily(cf);
+        long start = System.currentTimeMillis();
+        ColumnFamilyStore cfStore = columnFamilyStores_.get(values[0]);
+        assert cfStore != null : "Column family " + cf + " has not been defined";
+        ColumnFamily columnFamily = cfStore.getColumnFamily(key, cf, new IdentityFilter());
+        long timeTaken = System.currentTimeMillis() - start;
+        dbAnalyticsSource_.updateReadStatistics(timeTaken);
+        return columnFamily;
+    }
+
+    /**
+     * Selects only the specified column family for the specified key.
+    */
+    public Row getRow(String key, String cf) throws IOException
+    {
+        Row row = new Row(key);
+        ColumnFamily columnFamily = get(key, cf);
+        if ( columnFamily != null )
+        	row.addColumnFamily(columnFamily);
+        return row;
+    }
+  
+    /**
+     * Selects only the specified column family for the specified key.
+    */
+    public Row getRow(String key, String cf, int start, int count) throws IOException
+    {
+        Row row = new Row(key);
+        String[] values = RowMutation.getColumnAndColumnFamily(cf);
+        ColumnFamilyStore cfStore = columnFamilyStores_.get(values[0]);
+        long start1 = System.currentTimeMillis();
+        assert cfStore != null : "Column family " + cf + " has not been defined";
+        ColumnFamily columnFamily = cfStore.getColumnFamily(key, cf, new IdentityFilter());
+        if ( columnFamily != null )
+        {
+
+            ColumnFamily filteredCf = null;
+            if ((count <=0 || count == Integer.MAX_VALUE) && start <= 0) //Don't need to filter
+            {
+                filteredCf = columnFamily;
+            }
+            else
+            {
+                filteredCf = new CountFilter(count, start).filter(cf, columnFamily);
+            }
+            row.addColumnFamily(filteredCf);
+        }
+        long timeTaken = System.currentTimeMillis() - start1;
+        dbAnalyticsSource_.updateReadStatistics(timeTaken);
+        return row;
+    }
+    
+    public Row getRow(String key, String cf, String startColumn, String endColumn, int count) throws IOException
+    {
+        Row row = new Row(key);
+        String[] values = RowMutation.getColumnAndColumnFamily(cf);
+        ColumnFamilyStore cfStore = columnFamilyStores_.get(values[0]);
+        long start1 = System.currentTimeMillis();
+        assert cfStore != null : "Column family " + cf + " has not been defined";
+        ColumnFamily columnFamily = cfStore.getColumnFamily(key, cf, new IdentityFilter());
+        if ( columnFamily != null )
+        {
+            ColumnFamily filteredCf =  new RangeFilter(startColumn, endColumn, count).filter(cf, columnFamily);
+            row.addColumnFamily(filteredCf);
+        }
+        long timeTaken = System.currentTimeMillis() - start1;
+        dbAnalyticsSource_.updateReadStatistics(timeTaken);
+        return row;
+    }
+
+    
+    public Row getRow(String key, String cf, long sinceTimeStamp) throws IOException
+    {
+        Row row = new Row(key);
+        String[] values = RowMutation.getColumnAndColumnFamily(cf);
+        ColumnFamilyStore cfStore = columnFamilyStores_.get(values[0]);
+        long start1 = System.currentTimeMillis();
+        assert cfStore != null : "Column family " + cf + " has not been defined";
+        ColumnFamily columnFamily = cfStore.getColumnFamily(key, cf, new TimeFilter(sinceTimeStamp));
+        if ( columnFamily != null )
+            row.addColumnFamily(columnFamily);
+        long timeTaken = System.currentTimeMillis() - start1;
+        dbAnalyticsSource_.updateReadStatistics(timeTaken);
+        return row;
+    }
+
+    /**
+     * This method returns the specified columns for the specified
+     * column family.
+     * 
+     *  param @ key - key for which data is requested.
+     *  param @ cf - column family we are interested in.
+     *  param @ columns - columns that are part of the above column family.
+    */
+    public Row getRow(String key, String cf, List<String> columns) throws IOException
+    {
+    	Row row = new Row(key);
+        String[] values = RowMutation.getColumnAndColumnFamily(cf);
+        ColumnFamilyStore cfStore = columnFamilyStores_.get(values[0]);
+
+        if ( cfStore != null )
+        {
+        	ColumnFamily columnFamily = cfStore.getColumnFamily(key, cf, new NamesFilter(new ArrayList<String>(columns)));
+        	if ( columnFamily != null )
+        		row.addColumnFamily(columnFamily);
+        }
+    	return row;
+    }
+
+    /**
+     * Selects a list of columns in a column family from a given column for the specified key.
+    */
+    public Row getSliceFrom(String key, String cf, boolean isAscending, int count) throws IOException
+    {
+        Row row = new Row(key);
+        String[] values = RowMutation.getColumnAndColumnFamily(cf);
+        ColumnFamilyStore cfStore = columnFamilyStores_.get(values[0]);
+        long start1 = System.currentTimeMillis();
+        try
+        {
+            ColumnFamily columnFamily = cfStore.getSliceFrom(key, values[0], values[1], isAscending, count);
+            if (columnFamily != null)
+                row.addColumnFamily(columnFamily);
+            long timeTaken = System.currentTimeMillis() - start1;
+            dbAnalyticsSource_.updateReadStatistics(timeTaken);
+            return row;
+        }
+        catch (InterruptedException e)
+        {
+            throw new RuntimeException(e);
+        }
+        catch (ExecutionException e)
+        {
+            throw new RuntimeException(e);
+        }
+    }
+
+    /**
+     * This method adds the row to the Commit Log associated with this table.
+     * Once this happens the data associated with the individual column families
+     * is also written to the column family store's memtable.
+    */
+    void apply(Row row) throws IOException
+    {
+        /* Add row to the commit log. */
+        long start = System.currentTimeMillis();
+        CommitLog.CommitLogContext cLogCtx = CommitLog.open(table_).add(row);
+
+        for (ColumnFamily columnFamily : row.getColumnFamilies())
+        {
+            ColumnFamilyStore cfStore = columnFamilyStores_.get(columnFamily.name());
+            cfStore.apply(row.key(), columnFamily, cLogCtx);
+        }
+
+        long timeTaken = System.currentTimeMillis() - start;
+        dbAnalyticsSource_.updateWriteStatistics(timeTaken);
+    }
+
+    void applyNow(Row row) throws IOException
+    {
+        String key = row.key();
+        for (ColumnFamily columnFamily : row.getColumnFamilies())
+        {
+            ColumnFamilyStore cfStore = columnFamilyStores_.get(columnFamily.name());
+            cfStore.applyNow( key, columnFamily );
+        }
+    }
+
+    public void flush(boolean fRecovery) throws IOException
+    {
+        Set<String> cfNames = columnFamilyStores_.keySet();
+        for ( String cfName : cfNames )
+        {
+            if (fRecovery) {
+                columnFamilyStores_.get(cfName).flushMemtableOnRecovery();
+            } else {
+                columnFamilyStores_.get(cfName).forceFlush();
+            }
+        }
+    }
+
+    void load(Row row) throws IOException
+    {
+        String key = row.key();
+        /* Add row to the commit log. */
+        long start = System.currentTimeMillis();
+                
+        for (ColumnFamily columnFamily : row.getColumnFamilies())
+        {
+        	if (columnFamily.name().equals(Table.recycleBin_))
+        	{
+	        	Collection<IColumn> columns = columnFamily.getAllColumns();
+        		for(IColumn column : columns)
+        		{
+    	            ColumnFamilyStore cfStore = columnFamilyStores_.get(column.name());
+    	            if(column.timestamp() == 1)
+    	            {
+    	            	cfStore.forceFlushBinary();
+    	            }
+    	            else if(column.timestamp() == 2)
+    	            {
+    	            	cfStore.forceCompaction(null, null, BasicUtilities.byteArrayToLong(column.value()), null);
+    	            }
+    	            else if(column.timestamp() == 3)
+    	            {
+    	            	cfStore.forceFlush();
+    	            }
+    	            else if(column.timestamp() == 4)
+    	            {
+    	            	cfStore.forceCleanup();
+    	            }    	            
+    	            else
+    	            {
+    	            	cfStore.applyBinary(key, column.value());
+    	            }
+        		}
+        	}
+        }
+        row.clear();
+        long timeTaken = System.currentTimeMillis() - start;
+        dbAnalyticsSource_.updateWriteStatistics(timeTaken);
+    }
+
+    public SortedSet<String> getApplicationColumnFamilies()
+    {
+        if (applicationColumnFamilies_ == null)
+        {
+            applicationColumnFamilies_ = new TreeSet<String>();
+            for (String cfName : getColumnFamilies())
+            {
+                if (DatabaseDescriptor.isApplicationColumnFamily(cfName))
+                {
+                    applicationColumnFamilies_.add(cfName);
+                }
+            }
+        }
+        return applicationColumnFamilies_;
+    }
+
+    /**
+     * @param startWith key to start with, inclusive.  empty string = start at beginning.
+     * @param stopAt key to stop at, inclusive.  empty string = stop only when keys are exhausted.
+     * @param maxResults
+     * @return list of keys between startWith and stopAt
+     */
+    public List<String> getKeyRange(Collection<String> columnFamilyNames, final String startWith, final String stopAt, int maxResults)
+    throws IOException, ExecutionException, InterruptedException
+    {
+        // TODO we need a better way to keep compactions from stomping on reads than One Big Lock per CF.
+        if (columnFamilyNames.isEmpty())
+        {
+            columnFamilyNames = getApplicationColumnFamilies();
+        }
+
+        for (String cfName : columnFamilyNames)
+        {
+            getColumnFamilyStore(cfName).getReadLock().lock();
+        }
+        try
+        {
+            return getKeyRangeUnsafe(columnFamilyNames, startWith, stopAt, maxResults);
+        }
+        finally
+        {
+            for (String cfName : columnFamilyNames)
+            {
+                getColumnFamilyStore(cfName).getReadLock().unlock();
+            }
+        }
+    }
+
+    private List<String> getKeyRangeUnsafe(final Collection<String> columnFamilyNames, final String startWith, final String stopAt, int maxResults) throws IOException, ExecutionException, InterruptedException
+    {
+        assert !columnFamilyNames.isEmpty(); // checked by the 'safe' method
+
+        // (OPP key decoration is a no-op so using the "decorated" comparator against raw keys is fine)
+        final Comparator<String> comparator = StorageService.getPartitioner().getDecoratedKeyComparator();
+
+        // create a CollatedIterator that will return unique keys from different sources
+        // (current memtable, historical memtables, and SSTables) in the correct order.
+        List<Iterator<String>> iterators = new ArrayList<Iterator<String>>();
+        for (String cfName : columnFamilyNames)
+        {
+            ColumnFamilyStore cfs = getColumnFamilyStore(cfName);
+
+            // we iterate through memtables with a priorityqueue to avoid more sorting than necessary.
+            // this predicate throws out the keys before the start of our range.
+            Predicate p = new Predicate()
+            {
+                public boolean evaluate(Object key)
+                {
+                    String st = (String)key;
+                    return comparator.compare(startWith, st) <= 0 && (stopAt.isEmpty() || comparator.compare(st, stopAt) <= 0);
+                }
+            };
+
+            // current memtable keys.  have to go through the CFS api for locking.
+            iterators.add(IteratorUtils.filteredIterator(cfs.memtableKeyIterator(), p));
+            // historical memtables
+            for (Memtable memtable : ColumnFamilyStore.getUnflushedMemtables(cfName))
+            {
+                iterators.add(IteratorUtils.filteredIterator(Memtable.getKeyIterator(memtable.getKeys()), p));
+            }
+
+            // sstables
+            for (String filename : cfs.getSSTableFilenames())
+            {
+                FileStruct fs = new FileStruct(SequenceFile.reader(filename), StorageService.getPartitioner());
+                fs.seekTo(startWith);
+                iterators.add(fs);
+            }
+        }
+        Iterator<String> collated = IteratorUtils.collatedIterator(comparator, iterators);
+        Iterable<String> reduced = new ReducingIterator<String>(collated) {
+            String current;
+
+            public void reduce(String current)
+            {
+                 this.current = current;
+            }
+
+            protected String getReduced()
+            {
+                return current;
+            }
+        };
 
         try
         {
-            Table.open(table_).getColumnFamilyStore(cfName_).switchMemtable();
-            enqueueFlush(CommitLog.open(table_).getContext());
-        }
-        catch (IOException ex)
-        {
-            throw new RuntimeException(ex);
-        }
-    }
-
-    /** flush synchronously (in the current thread, not on the executor).
-     *  only the recover code should call this. */
-    void flushOnRecovery() throws IOException {
-        if (!isClean())
-            flush(CommitLog.CommitLogContext.NULL);
-    }
-
-    private void resolve(String key, ColumnFamily columnFamily)
-    {
-    	ColumnFamily oldCf = columnFamilies_.get(key);
-        if ( oldCf != null )
-        {
-            int oldSize = oldCf.size();
-            int oldObjectCount = oldCf.getColumnCount();
-            oldCf.addColumns(columnFamily);
-            int newSize = oldCf.size();
-            int newObjectCount = oldCf.getColumnCount();
-            resolveSize(oldSize, newSize);
-            resolveCount(oldObjectCount, newObjectCount);
-            oldCf.delete(columnFamily);
-        }
-        else
-        {
-            columnFamilies_.put(key, columnFamily);
-            currentSize_.addAndGet(columnFamily.size() + key.length());
-            currentObjectCount_.addAndGet(columnFamily.getColumnCount());
-        }
-    }
-
-    // for debugging
-    public String contents()
-    {
-        StringBuilder builder = new StringBuilder();
-        builder.append("{");
-        for (Map.Entry<String, ColumnFamily> entry : columnFamilies_.entrySet())
-        {
-            builder.append(entry.getKey()).append(": ").append(entry.getValue()).append(", ");
-        }
-        builder.append("}");
-        return builder.toString();
-    }
-
-    ColumnFamily getLocalCopy(String key, String columnFamilyColumn, IFilter filter)
-    {
-    	String[] values = RowMutation.getColumnAndColumnFamily(columnFamilyColumn);
-    	ColumnFamily columnFamily = null;
-        if(values.length == 1 )
-        {
-        	columnFamily = columnFamilies_.get(key);
-        }
-        else
-        {
-        	ColumnFamily cFamily = columnFamilies_.get(key);
-        	if (cFamily == null) return null;
-
-        	if (values.length == 2) {
-                IColumn column = cFamily.getColumn(values[1]); // super or normal column
-                if (column != null )
-                {
-                    columnFamily = cFamily.cloneMeShallow();
-                    columnFamily.addColumn(column);
-                }
-        	}
-            else
+            // pull keys out of the CollatedIterator.  checking tombstone status is expensive,
+            // so we set an arbitrary limit on how many we'll do at once.
+            List<String> keys = new ArrayList<String>();
+            for (String current : reduced)
             {
-                assert values.length == 3;
-                SuperColumn superColumn = (SuperColumn)cFamily.getColumn(values[1]);
-                if (superColumn != null)
+                if (!stopAt.isEmpty() && comparator.compare(stopAt, current) < 0)
                 {
-                    IColumn subColumn = superColumn.getSubColumn(values[2]);
-                    if (subColumn != null)
+                    break;
+                }
+                // make sure there is actually non-tombstone content associated w/ this key
+                // TODO record the key source(s) somehow and only check that source (e.g., memtable or sstable)
+                for (String cfName : columnFamilyNames)
+                {
+                    ColumnFamilyStore cfs = getColumnFamilyStore(cfName);
+                    ColumnFamily cf = cfs.getColumnFamily(current, cfName, new IdentityFilter(), Integer.MAX_VALUE);
+                    if (cf != null && cf.getColumns().size() > 0)
                     {
-                        columnFamily = cFamily.cloneMeShallow();
-                        SuperColumn container = new SuperColumn(superColumn.name());
-                        container.markForDeleteAt(superColumn.getLocalDeletionTime(), superColumn.getMarkedForDeleteAt());
-                        container.addColumn(subColumn);
-                        columnFamily.addColumn(container);
+                        keys.add(current);
+                        break;
                     }
                 }
-        	}
-        }
-        /* Filter unnecessary data from the column based on the provided filter */
-        return filter.filter(columnFamilyColumn, columnFamily);
-    }
-
-    void flush(CommitLog.CommitLogContext cLogCtx) throws IOException
-    {
-        logger_.info("Flushing " + this);
-        ColumnFamilyStore cfStore = Table.open(table_).getColumnFamilyStore(cfName_);
-
-        String directory = DatabaseDescriptor.getDataFileLocation();
-        String filename = cfStore.getTempFileName();
-        SSTable ssTable = new SSTable(directory, filename, StorageService.getPartitioner());
-
-        // sort keys in the order they would be in when decorated
-        final IPartitioner partitioner = StorageService.getPartitioner();
-        final Comparator<String> dc = partitioner.getDecoratedKeyComparator();
-        ArrayList<String> orderedKeys = new ArrayList<String>(columnFamilies_.keySet());
-        Collections.sort(orderedKeys, new Comparator<String>()
-        {
-            public int compare(String o1, String o2)
-            {
-                return dc.compare(partitioner.decorateKey(o1), partitioner.decorateKey(o2));
+                if (keys.size() >= maxResults)
+                {
+                    break;
+                }
             }
-        });
-        DataOutputBuffer buffer = new DataOutputBuffer();
-        /* Use this BloomFilter to decide if a key exists in a SSTable */
-        BloomFilter bf = new BloomFilter(columnFamilies_.size(), 15);
-        for (String key : orderedKeys)
+            return keys;
+        }
+        finally
         {
-            buffer.reset();
-            ColumnFamily columnFamily = columnFamilies_.get(key);
-            if ( columnFamily != null )
+            for (Iterator iter : iterators)
             {
-                /* serialize the cf with column indexes */
-                ColumnFamily.serializerWithIndexes().serialize( columnFamily, buffer );
-                /* Now write the key and value to disk */
-                ssTable.append(partitioner.decorateKey(key), buffer);
-                bf.add(key);
+                if (iter instanceof FileStruct)
+                {
+                    ((FileStruct)iter).close();
+                }
             }
         }
-        ssTable.closeRename(bf);
-        cfStore.onMemtableFlush(cLogCtx);
-        cfStore.storeLocation( ssTable.getDataFileLocation(), bf );
-        buffer.close();
-        isFlushed_ = true;
-        logger_.info("Completed flushing " + this);
-    }
-
-    public String toString()
-    {
-        return "Memtable(" + cfName_ + ")@" + hashCode();
-    }
-
-    /**
-     * there does not appear to be any data structure that we can pass to PriorityQueue that will
-     * get it to heapify in-place instead of copying first, so we might as well return a Set.
-    */
-    Set<String> getKeys() throws ExecutionException, InterruptedException
-    {
-        return new HashSet<String>(columnFamilies_.keySet());
-    }
-
-    public static Iterator<String> getKeyIterator(Set<String> keys)
-    {
-        if (keys.size() == 0)
-        {
-            // cannot create a PQ of size zero (wtf?)
-            return Arrays.asList(new String[0]).iterator();
-        }
-        PriorityQueue<String> pq = new PriorityQueue<String>(keys.size(), StorageService.getPartitioner().getDecoratedKeyComparator());
-        pq.addAll(keys);
-        return new DestructivePQIterator<String>(pq);
-    }
-
-    public boolean isClean()
-    {
-        // executor taskcount is inadequate for our needs here -- it can return zero under certain
-        // race conditions even though a task has been processed.
-        return !isDirty_;
-    }
-
-    /**
-     * obtain an iterator of columns in this memtable in the specified order starting from a given column.
-     */
-    ColumnIterator getColumnIterator(final String key, final String cfName, final boolean isAscending, String startColumn)
-    {
-        ColumnFamily cf = columnFamilies_.get(key);
-        final ColumnFamily columnFamily;
-        if (cf != null)
-            columnFamily = cf.cloneMeShallow();
-        else
-            columnFamily = new ColumnFamily(cfName, DatabaseDescriptor.getColumnFamilyType(cfName));
-
-        final IColumn columns[] = (cf == null ? columnFamily : cf).getAllColumns().toArray(new IColumn[columnFamily.getAllColumns().size()]);
-        // TODO if we are dealing with supercolumns, we need to clone them while we have the read lock since they can be modified later
-        if (!isAscending)
-            ArrayUtils.reverse(columns);
-        IColumn startIColumn;
-        if (DatabaseDescriptor.getColumnFamilyType(cfName).equals("Standard"))
-            startIColumn = new Column(startColumn);
-        else
-            startIColumn = new SuperColumn(startColumn);
-
-        // can't use a ColumnComparatorFactory comparator since those compare on both name and time (and thus will fail to match
-        // our dummy column, since the time there is arbitrary).
-        Comparator<IColumn> comparator = new Comparator<IColumn>()
-        {
-            public int compare(IColumn column1, IColumn column2)
-            {
-                return column1.name().compareTo(column2.name());
-            }
-        };
-        if (!isAscending)
-        {
-            comparator = new ReverseComparator(comparator);
-        }
-        int index = Arrays.binarySearch(columns, startIColumn, comparator);
-        final int startIndex = index < 0 ? -(index + 1) : index;
-
-        return new ColumnIterator()
-        {
-            private int curIndex_ = startIndex;
-
-            public ColumnFamily getColumnFamily()
-            {
-                return columnFamily;
-            }
-
-            public boolean hasNext()
-            {
-                return curIndex_ < columns.length;
-            }
-
-            public IColumn next()
-            {
-                return columns[curIndex_++];
-            }
-
-            public void close() throws IOException {}
-
-            public void remove()
-            {
-                throw new UnsupportedOperationException();
-            }
-        };
-    }
-
-    public void clearUnsafe()
-    {
-        columnFamilies_.clear();
     }
 }

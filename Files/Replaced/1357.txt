@@ -1,304 +1,415 @@
-<p>
+if (((long) nrBuffers * maxBufSize) <= length) nrBuffers++;
 
-/*
-
-   Derby - Class org.apache.derby.impl.store.raw.data.RecordId
-
-   Licensed to the Apache Software Foundation (ASF) under one or more
-   contributor license agreements.  See the NOTICE file distributed with
-   this work for additional information regarding copyright ownership.
-   The ASF licenses this file to you under the Apache License, Version 2.0
-   (the "License"); you may not use this file except in compliance with
-   the License.  You may obtain a copy of the License at
-
-      http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
-
- */
-
-package org.apache.derby.impl.store.raw.data;
-
-import org.apache.derby.iapi.store.raw.ContainerKey;
-import org.apache.derby.iapi.store.raw.PageKey;
-import org.apache.derby.iapi.services.locks.Latch;
-
-import org.apache.derby.iapi.store.raw.RowLock;
-import org.apache.derby.iapi.store.raw.RecordHandle;
-
-import org.apache.derby.iapi.services.sanity.SanityManager;
-import org.apache.derby.iapi.services.locks.VirtualLockTable;
-
-import org.apache.derby.catalog.UUID;
-import java.util.Hashtable;
+package org.apache.lucene.store;
 
 /**
-	Implementation of RecordHandle.
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+ 
+import java.io.IOException;
+import java.io.File;
+import java.io.RandomAccessFile;
+import java.nio.ByteBuffer;
+import java.nio.BufferUnderflowException;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileChannel.MapMode;
 
-	<BR>
-	MT - Mutable - Immutable identity : Thread Aware -
-	<BR>The methods of RecordHandle only access the identity
-	    of the object and so the object appears immutable to them, as required.
-	<BR>The methods of Lockable  are single thread required.
+import java.security.AccessController;
+import java.security.PrivilegedExceptionAction;
+import java.security.PrivilegedActionException;
+import java.lang.reflect.Method;
 
-*/
-public final class RecordId implements RecordHandle {
+import org.apache.lucene.util.Constants;
 
-	/**
-		Page the record lives in.
-		MT - Immutable
-	*/
-	private final PageKey pageId;
+/** File-based {@link Directory} implementation that uses
+ *  mmap for reading, and {@link
+ *  FSDirectory.FSIndexOutput} for writing.
+ *
+ * <p><b>NOTE</b>: memory mapping uses up a portion of the
+ * virtual memory address space in your process equal to the
+ * size of the file being mapped.  Before using this class,
+ * be sure your have plenty of virtual address space, e.g. by
+ * using a 64 bit JRE, or a 32 bit JRE with indexes that are
+ * guaranteed to fit within the address space.
+ * On 32 bit platforms also consult {@link #setMaxChunkSize}
+ * if you have problems with mmap failing because of fragmented
+ * address space. If you get an OutOfMemoryException, it is recommended
+ * to reduce the chunk size, until it works.
+ *
+ * <p>Due to <a href="http://bugs.sun.com/bugdatabase/view_bug.do?bug_id=4724038">
+ * this bug</a> in Sun's JRE, MMapDirectory's {@link IndexInput#close}
+ * is unable to close the underlying OS file handle.  Only when GC
+ * finally collects the underlying objects, which could be quite
+ * some time later, will the file handle be closed.
+ *
+ * <p>This will consume additional transient disk usage: on Windows,
+ * attempts to delete or overwrite the files will result in an
+ * exception; on other platforms, which typically have a &quot;delete on
+ * last close&quot; semantics, while such operations will succeed, the bytes
+ * are still consuming space on disk.  For many applications this
+ * limitation is not a problem (e.g. if you have plenty of disk space,
+ * and you don't rely on overwriting files on Windows) but it's still
+ * an important limitation to be aware of.
+ *
+ * <p>This class supplies the workaround mentioned in the bug report
+ * (disabled by default, see {@link #setUseUnmap}), which may fail on
+ * non-Sun JVMs. It forcefully unmaps the buffer on close by using
+ * an undocumented internal cleanup functionality.
+ * {@link #UNMAP_SUPPORTED} is <code>true</code>, if the workaround
+ * can be enabled (with no guarantees).
+ */
+public class MMapDirectory extends FSDirectory {
+  private boolean useUnmapHack = false;
+  private int maxBBuf = Constants.JRE_IS_64BIT ? Integer.MAX_VALUE : (256 * 1024 * 1024);
 
-	/**
-		The actual record id.
-		MT - Immutable
-	*/
-	private final int recordId;
+  /** Create a new MMapDirectory for the named location.
+   *
+   * @param path the path of the directory
+   * @param lockFactory the lock factory to use, or null for the default
+   * ({@link NativeFSLockFactory});
+   * @throws IOException
+   */
+  public MMapDirectory(File path, LockFactory lockFactory) throws IOException {
+    super(path, lockFactory);
+  }
 
-    /**
-        Last slot number this record id was at.
-    */
-    transient private int slotNumberHint;
+  /** Create a new MMapDirectory for the named location and {@link NativeFSLockFactory}.
+   *
+   * @param path the path of the directory
+   * @throws IOException
+   */
+  public MMapDirectory(File path) throws IOException {
+    super(path, null);
+  }
 
-	public RecordId(ContainerKey container, long pageNumber, int recordId) {
-		this.pageId = new PageKey(container, pageNumber);
-		this.recordId = recordId;
+  /**
+   * <code>true</code>, if this platform supports unmapping mmapped files.
+   */
+  public static final boolean UNMAP_SUPPORTED;
+  static {
+    boolean v;
+    try {
+      Class.forName("sun.misc.Cleaner");
+      Class.forName("java.nio.DirectByteBuffer")
+        .getMethod("cleaner");
+      v = true;
+    } catch (Exception e) {
+      v = false;
+    }
+    UNMAP_SUPPORTED = v;
+  }
+  
+  /**
+   * This method enables the workaround for unmapping the buffers
+   * from address space after closing {@link IndexInput}, that is
+   * mentioned in the bug report. This hack may fail on non-Sun JVMs.
+   * It forcefully unmaps the buffer on close by using
+   * an undocumented internal cleanup functionality.
+   * <p><b>NOTE:</b> Enabling this is completely unsupported
+   * by Java and may lead to JVM crashes if <code>IndexInput</code>
+   * is closed while another thread is still accessing it (SIGSEGV).
+   * @throws IllegalArgumentException if {@link #UNMAP_SUPPORTED}
+   * is <code>false</code> and the workaround cannot be enabled.
+   */
+  public void setUseUnmap(final boolean useUnmapHack) {
+    if (useUnmapHack && !UNMAP_SUPPORTED)
+      throw new IllegalArgumentException("Unmap hack not supported on this platform!");
+    this.useUnmapHack=useUnmapHack;
+  }
+  
+  /**
+   * Returns <code>true</code>, if the unmap workaround is enabled.
+   * @see #setUseUnmap
+   */
+  public boolean getUseUnmap() {
+    return useUnmapHack;
+  }
+  
+  /**
+   * Try to unmap the buffer, this method silently fails if no support
+   * for that in the JVM. On Windows, this leads to the fact,
+   * that mmapped files cannot be modified or deleted.
+   */
+  final void cleanMapping(final ByteBuffer buffer) throws IOException {
+    if (useUnmapHack) {
+      try {
+        AccessController.doPrivileged(new PrivilegedExceptionAction<Object>() {
+          public Object run() throws Exception {
+            final Method getCleanerMethod = buffer.getClass()
+              .getMethod("cleaner");
+            getCleanerMethod.setAccessible(true);
+            final Object cleaner = getCleanerMethod.invoke(buffer);
+            if (cleaner != null) {
+              cleaner.getClass().getMethod("clean")
+                .invoke(cleaner);
+            }
+            return null;
+          }
+        });
+      } catch (PrivilegedActionException e) {
+        final IOException ioe = new IOException("unable to unmap the mapped buffer");
+        ioe.initCause(e.getCause());
+        throw ioe;
+      }
+    }
+  }
+  
+  /**
+   * Sets the maximum chunk size (default is {@link Integer#MAX_VALUE} for
+   * 64 bit JVMs and 256 MiBytes for 32 bit JVMs) used for memory mapping.
+   * Especially on 32 bit platform, the address space can be very fragmented,
+   * so large index files cannot be mapped.
+   * Using a lower chunk size makes the directory implementation a little
+   * bit slower (as the correct chunk must be resolved on each seek)
+   * but the chance is higher that mmap does not fail. On 64 bit
+   * Java platforms, this parameter should always be {@link Integer#MAX_VALUE},
+   * as the address space is big enough.
+   */
+  public void setMaxChunkSize(final int maxBBuf) {
+    if (maxBBuf<=0)
+      throw new IllegalArgumentException("Maximum chunk size for mmap must be >0");
+    this.maxBBuf=maxBBuf;
+  }
+  
+  /**
+   * Returns the current mmap chunk size.
+   * @see #setMaxChunkSize
+   */
+  public int getMaxChunkSize() {
+    return maxBBuf;
+  }
 
-		// FIRST_SLOT_NUMBER guaranteed to be zero
-        // this.slotNumberHint = Page.FIRST_SLOT_NUMBER;
-	}
+  /** Creates an IndexInput for the file with the given name. */
+  @Override
+  public IndexInput openInput(String name, int bufferSize) throws IOException {
+    ensureOpen();
+    File f = new File(getDirectory(), name);
+    RandomAccessFile raf = new RandomAccessFile(f, "r");
+    try {
+      return (raf.length() <= maxBBuf)
+             ? (IndexInput) new MMapIndexInput(raf)
+             : (IndexInput) new MultiMMapIndexInput(raf, maxBBuf);
+    } finally {
+      raf.close();
+    }
+  }
 
-	public RecordId(PageKey pageId, int recordId) {
-		this.pageId = pageId;
-		this.recordId = recordId;
+  private class MMapIndexInput extends IndexInput {
 
-		// FIRST_SLOT_NUMBER guaranteed to be zero
-        // this.slotNumberHint = Page.FIRST_SLOT_NUMBER;
-	}
+    private ByteBuffer buffer;
+    private final long length;
+    private boolean isClone = false;
 
-	public RecordId(PageKey pageId, int recordId, int current_slot) {
-		this.pageId = pageId;
-		this.recordId = recordId;
-        this.slotNumberHint = current_slot;
-	}
-
-	/*
-	**	Methods of RecordHandle
-	*/
-
-	/**
-		Get my record id.
-
-		<BR>
-		MT - thread safe
-
-		@see RecordHandle#getId
-	*/
-	public int	getId() {
-		return recordId;
-	}
-
-	/**
-		Get my page number.
-
-		<BR>
-		MT - thread safe
-
-		@see RecordHandle#getPageNumber
-	*/
-
-	public long getPageNumber() {
-		return pageId.getPageNumber();
-	}
-
-	public Object getPageId() {
-		return pageId;
-	}
-
-	public ContainerKey getContainerId() {
-		return pageId.getContainerId();
-	}
-
-
-    /**
-     * What slot number might the record be at?
-     * <p>
-     * The raw store guarantees that the record handle of a record will not
-     * change, but its slot number may.  When a RecordId is constructed the
-     * caller could have provided a slot number, if so return that slot number
-     * hint here.  If a hint was not provided then the default 
-     * Page.FIRST_SLOT_NUMBER will be returned.
-     *
-	 * @return The slot number the record handle may be at.
-     **/
-    public int getSlotNumberHint()
-    {
-        return(slotNumberHint);
+    private MMapIndexInput(RandomAccessFile raf) throws IOException {
+        this.length = raf.length();
+        this.buffer = raf.getChannel().map(MapMode.READ_ONLY, 0, length);
     }
 
-	/*
-	** Methods of Lockable (from RecordHandle)
-	*/
-
-	/**
-		Lock me.
-
-		<BR>
-		MT - Single thread required (methods of Lockable)
-
-		@see org.apache.derby.iapi.services.locks.Lockable#lockEvent
-	*/
-	public void lockEvent(Latch lockInfo) {
-	}
-
-
-	/**
-		Determine if this request can be granted.
-        <p)
-        Implements the grant/wait lock logic for row locks.  See the
-        table in RowLock for more information.
-
-		<BR>
-		MT - Single thread required (methods of Lockable)
-
-		@see org.apache.derby.iapi.services.locks.Lockable#requestCompatible
-	*/	 
-	public boolean requestCompatible(
-    Object requestedQualifier, 
-    Object grantedQualifier)
-    {
-
-		if (SanityManager.DEBUG) {
-            SanityManager.ASSERT((requestedQualifier == RowLock.RS2) ||
-                                 (requestedQualifier == RowLock.RS3) ||
-                                 (requestedQualifier == RowLock.RU2) ||
-                                 (requestedQualifier == RowLock.RU3) ||
-                                 (requestedQualifier == RowLock.RIP) ||
-                                 (requestedQualifier == RowLock.RI)  ||
-                                 (requestedQualifier == RowLock.RX2) ||
-                                 (requestedQualifier == RowLock.RX3));
-            SanityManager.ASSERT((grantedQualifier == RowLock.RS2) ||
-                                 (grantedQualifier == RowLock.RS3) ||
-                                 (grantedQualifier == RowLock.RU2) ||
-                                 (grantedQualifier == RowLock.RU3) ||
-                                 (grantedQualifier == RowLock.RIP) ||
-                                 (grantedQualifier == RowLock.RI)  ||
-                                 (grantedQualifier == RowLock.RX2) ||
-                                 (grantedQualifier == RowLock.RX3));
-		}
-
-		RowLock rlRequested = (RowLock) requestedQualifier;
-		RowLock rlGranted  = (RowLock) grantedQualifier;
-
-		return(rlRequested.isCompatible(rlGranted));
-	}
-
-	/**
-		Is a caller that holds a lock compatible with themselves?
-        <p>
-        Row locks held in the same transaction are always compatible with
-        themselves.
-
-		<BR>
-		MT - Single thread required (methods of Lockable)
-
-		@see org.apache.derby.iapi.services.locks.Lockable#lockerAlwaysCompatible
-	*/	 
-	public boolean lockerAlwaysCompatible() {
-		return true;
-	}
-
-	/**
-		Unlock me.
-
-		<BR>
-		MT - Single thread required (methods of Lockable)
-
-		@see org.apache.derby.iapi.services.locks.Lockable#unlockEvent
-	*/	 
-	public void unlockEvent(Latch lockInfo) {
-	}
-
-	/*
-	**		Methods of Object
-	*/
-
-	/**
-		Implement value equality.
-		<BR>
-		MT - Thread safe
-	*/
-	public boolean equals(Object ref) {
-
-		if (!(ref instanceof RecordId))
-			return false;
-
-		RecordId other = (RecordId) ref;
-
-		return ((recordId == other.recordId)
-			&& pageId.equals(other.pageId));
-	}
-
-	/**
-		Return a hashcode based on value.
-		<BR>
-		MT - thread safe
-	*/
-	public int hashCode() {
-
-		return (int) recordId ^ pageId.hashCode();
-	}
-
-    public String toString()
-    {
-        if (SanityManager.DEBUG)
-        {
-            return "Record id=" + recordId + " " + pageId.toString(); 
-        }
-        else
-        {
-            return(null);
-        }
-
+    @Override
+    public byte readByte() throws IOException {
+      try {
+        return buffer.get();
+      } catch (BufferUnderflowException e) {
+        throw new IOException("read past EOF");
+      }
     }
 
-	/**
-		This lockable wants to participate in the Virtual Lock table.
-	 */
-	public boolean lockAttributes(int flag, Hashtable attributes)
-	{
+    @Override
+    public void readBytes(byte[] b, int offset, int len) throws IOException {
+      try {
+        buffer.get(b, offset, len);
+      } catch (BufferUnderflowException e) {
+        throw new IOException("read past EOF");
+      }
+    }
 
-		if (SanityManager.DEBUG)
-		{
-			SanityManager.ASSERT(attributes != null, 
-				"cannot call lockProperties with null attribute list");
-			SanityManager.ASSERT(pageId != null,
-				"RecordId PageId is null");
-		}
+    @Override
+    public long getFilePointer() {
+      return buffer.position();
+    }
 
-		if ((flag & VirtualLockTable.TABLE_AND_ROWLOCK) == 0)
-			return false;
+    @Override
+    public void seek(long pos) throws IOException {
+      buffer.position((int)pos);
+    }
 
-		attributes.put(VirtualLockTable.CONTAINERID, 
-					   new Long(pageId.getContainerId().getContainerId()));
+    @Override
+    public long length() {
+      return length;
+    }
 
-		attributes.put(VirtualLockTable.LOCKNAME,
-					   "(" + pageId.getPageNumber() + "," + recordId + ")");
+    @Override
+    public Object clone() {
+      MMapIndexInput clone = (MMapIndexInput)super.clone();
+      clone.isClone = true;
+      clone.buffer = buffer.duplicate();
+      return clone;
+    }
 
-		attributes.put(VirtualLockTable.LOCKTYPE, "ROW");
+    @Override
+    public void close() throws IOException {
+      if (isClone || buffer == null) return;
+      // unmap the buffer (if enabled) and at least unset it for GC
+      try {
+        cleanMapping(buffer);
+      } finally {
+        buffer = null;
+      }
+    }
+  }
 
-		// don't new unnecessary things for now
-		// attributes.put(VirtualLockTable.SEGMENTID, new Long(pageId.getContainerId().getSegmentId()));
-		// attributes.put(VirtualLockTable.PAGENUM, new Long(pageId.getPageNumber()));
-		// attributes.put(VirtualLockTable.PAGENUM, new Long(pageId.getPageNumber()));
-		// attributes.put(VirtualLockTable.RECID, new Integer(getId()));
-
-		return true;
-	}
-
+  // Because Java's ByteBuffer uses an int to address the
+  // values, it's necessary to access a file >
+  // Integer.MAX_VALUE in size using multiple byte buffers.
+  private class MultiMMapIndexInput extends IndexInput {
+  
+    private ByteBuffer[] buffers;
+    private int[] bufSizes; // keep here, ByteBuffer.size() method is optional
+  
+    private final long length;
+  
+    private int curBufIndex;
+    private final int maxBufSize;
+  
+    private ByteBuffer curBuf; // redundant for speed: buffers[curBufIndex]
+    private int curAvail; // redundant for speed: (bufSizes[curBufIndex] - curBuf.position())
+  
+    private boolean isClone = false;
+    
+    public MultiMMapIndexInput(RandomAccessFile raf, int maxBufSize)
+      throws IOException {
+      this.length = raf.length();
+      this.maxBufSize = maxBufSize;
+      
+      if (maxBufSize <= 0)
+        throw new IllegalArgumentException("Non positive maxBufSize: "
+                                           + maxBufSize);
+      
+      if ((length / maxBufSize) > Integer.MAX_VALUE)
+        throw new IllegalArgumentException
+          ("RandomAccessFile too big for maximum buffer size: "
+           + raf.toString());
+      
+      int nrBuffers = (int) (length / maxBufSize);
+      if (((long) nrBuffers * maxBufSize) < length) nrBuffers++;
+      
+      this.buffers = new ByteBuffer[nrBuffers];
+      this.bufSizes = new int[nrBuffers];
+      
+      long bufferStart = 0;
+      FileChannel rafc = raf.getChannel();
+      for (int bufNr = 0; bufNr < nrBuffers; bufNr++) { 
+        int bufSize = (length > (bufferStart + maxBufSize))
+          ? maxBufSize
+          : (int) (length - bufferStart);
+        this.buffers[bufNr] = rafc.map(MapMode.READ_ONLY,bufferStart,bufSize);
+        this.bufSizes[bufNr] = bufSize;
+        bufferStart += bufSize;
+      }
+      seek(0L);
+    }
+  
+    @Override
+    public byte readByte() throws IOException {
+      // Performance might be improved by reading ahead into an array of
+      // e.g. 128 bytes and readByte() from there.
+      if (curAvail == 0) {
+        curBufIndex++;
+        if (curBufIndex >= buffers.length)
+          throw new IOException("read past EOF");
+        curBuf = buffers[curBufIndex];
+        curBuf.position(0);
+        curAvail = bufSizes[curBufIndex];
+      }
+      curAvail--;
+      return curBuf.get();
+    }
+  
+    @Override
+    public void readBytes(byte[] b, int offset, int len) throws IOException {
+      while (len > curAvail) {
+        curBuf.get(b, offset, curAvail);
+        len -= curAvail;
+        offset += curAvail;
+        curBufIndex++;
+        if (curBufIndex >= buffers.length)
+          throw new IOException("read past EOF");
+        curBuf = buffers[curBufIndex];
+        curBuf.position(0);
+        curAvail = bufSizes[curBufIndex];
+      }
+      curBuf.get(b, offset, len);
+      curAvail -= len;
+    }
+  
+    @Override
+    public long getFilePointer() {
+      return ((long) curBufIndex * maxBufSize) + curBuf.position();
+    }
+  
+    @Override
+    public void seek(long pos) throws IOException {
+      curBufIndex = (int) (pos / maxBufSize);
+      curBuf = buffers[curBufIndex];
+      int bufOffset = (int) (pos - ((long) curBufIndex * maxBufSize));
+      curBuf.position(bufOffset);
+      curAvail = bufSizes[curBufIndex] - bufOffset;
+    }
+  
+    @Override
+    public long length() {
+      return length;
+    }
+  
+    @Override
+    public Object clone() {
+      MultiMMapIndexInput clone = (MultiMMapIndexInput)super.clone();
+      clone.isClone = true;
+      clone.buffers = new ByteBuffer[buffers.length];
+      // No need to clone bufSizes.
+      // Since most clones will use only one buffer, duplicate() could also be
+      // done lazy in clones, e.g. when adapting curBuf.
+      for (int bufNr = 0; bufNr < buffers.length; bufNr++) {
+        clone.buffers[bufNr] = buffers[bufNr].duplicate();
+      }
+      try {
+        clone.seek(getFilePointer());
+      } catch(IOException ioe) {
+        RuntimeException newException = new RuntimeException(ioe);
+        newException.initCause(ioe);
+        throw newException;
+      }
+      return clone;
+    }
+  
+    @Override
+    public void close() throws IOException {
+      if (isClone || buffers == null) return;
+      try {
+        for (int bufNr = 0; bufNr < buffers.length; bufNr++) {
+          // unmap the buffer (if enabled) and at least unset it for GC
+          try {
+            cleanMapping(buffers[bufNr]);
+          } finally {
+            buffers[bufNr] = null;
+          }
+        }
+      } finally {
+        buffers = null;
+      }
+    }
+  }
 }

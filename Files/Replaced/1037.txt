@@ -1,309 +1,422 @@
-bq.setBoost(getBoost());
-
-package org.apache.lucene.search;
-
-import java.io.IOException;
-import java.io.StringReader;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Iterator;
-
-import org.apache.lucene.analysis.Analyzer;
-import org.apache.lucene.analysis.Token;
-import org.apache.lucene.analysis.TokenStream;
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.Term;
-import org.apache.lucene.index.TermEnum;
-import org.apache.lucene.util.PriorityQueue;
+EstimatedHistogram.serializer.serialize(columnnCounts, out);
 
 /**
- * Fuzzifies ALL terms provided as strings and then picks the best n differentiating terms.
- * In effect this mixes the behaviour of FuzzyQuery and MoreLikeThis but with special consideration
- * of fuzzy scoring factors.
- * This generally produces good results for queries where users may provide details in a number of 
- * fields and have no knowledge of boolean query syntax and also want a degree of fuzzy matching and
- * a fast query.
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  * 
- * For each source term the fuzzy variants are held in a BooleanQuery with no coord factor (because
- * we are not looking for matches on multiple variants in any one doc). Additionally, a specialized
- * TermQuery is used for variants and does not use that variant term's IDF because this would favour rarer 
- * terms eg misspellings. Instead, all variants use the same IDF ranking (the one for the source query 
- * term) and this is factored into the variant's boost. If the source query term does not exist in the
- * index the average IDF of the variants is used. 
- * @author maharwood
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
  */
-public class FuzzyLikeThisQuery extends Query
+
+package org.apache.cassandra.io.sstable;
+
+import java.io.*;
+import java.nio.ByteBuffer;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
+
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.ColumnFamily;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.Table;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.io.AbstractCompactedRow;
+import org.apache.cassandra.io.ICompactionInfo;
+import org.apache.cassandra.io.util.BufferedRandomAccessFile;
+import org.apache.cassandra.io.util.FileMark;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.io.util.SegmentedFile;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.BloomFilter;
+import org.apache.cassandra.utils.EstimatedHistogram;
+import org.apache.cassandra.utils.FBUtilities;
+
+public class SSTableWriter extends SSTable
 {
-    static Similarity sim=new DefaultSimilarity();
-    Query rewrittenQuery=null;
-    ArrayList fieldVals=new ArrayList();
-    Analyzer analyzer;
-    
-    ScoreTermQueue q;
-    int MAX_VARIANTS_PER_TERM=50;
-    boolean ignoreTF=false;
+    private static Logger logger = LoggerFactory.getLogger(SSTableWriter.class);
 
-    
-    /**
-     * 
-     * @param maxNumTerms The total number of terms clauses that will appear once rewritten as a BooleanQuery
-     * @param analyzer
-     */
-    public FuzzyLikeThisQuery(int maxNumTerms, Analyzer analyzer)
+    private IndexWriter iwriter;
+    private SegmentedFile.Builder dbuilder;
+    private final BufferedRandomAccessFile dataFile;
+    private DecoratedKey lastWrittenKey;
+    private FileMark dataMark;
+
+    public SSTableWriter(String filename, long keyCount) throws IOException
     {
-        q=new ScoreTermQueue(maxNumTerms);
-        this.analyzer=analyzer;
+        this(filename, keyCount, DatabaseDescriptor.getCFMetaData(Descriptor.fromFilename(filename)), StorageService.getPartitioner());
     }
 
-    class FieldVals
+    public SSTableWriter(String filename, long keyCount, CFMetaData metadata, IPartitioner partitioner) throws IOException
     {
-    	String queryString;
-    	String fieldName;
-    	float minSimilarity;
-    	int prefixLength;
-		public FieldVals(String name, float similarity, int length, String queryString)
-		{
-			fieldName = name;
-			minSimilarity = similarity;
-			prefixLength = length;
-			this.queryString = queryString;
-		}
-    	
+        super(Descriptor.fromFilename(filename),
+              new HashSet<Component>(Arrays.asList(Component.DATA, Component.FILTER, Component.PRIMARY_INDEX, Component.STATS)),
+              metadata,
+              partitioner,
+              SSTable.defaultRowHistogram(),
+              SSTable.defaultColumnHistogram());
+        iwriter = new IndexWriter(descriptor, partitioner, keyCount);
+        dbuilder = SegmentedFile.getBuilder(DatabaseDescriptor.getDiskAccessMode());
+        dataFile = new BufferedRandomAccessFile(new File(getFilename()), "rw", DatabaseDescriptor.getInMemoryCompactionLimit(), true);
     }
     
+    public void mark()
+    {
+        dataMark = dataFile.mark();
+        iwriter.mark();
+    }
+
+    public void reset()
+    {
+        try
+        {
+            dataFile.reset(dataMark);
+            iwriter.reset();
+        }
+        catch (IOException e)
+        {
+            throw new IOError(e);
+        }
+    }
+
+    private long beforeAppend(DecoratedKey decoratedKey) throws IOException
+    {
+        if (decoratedKey == null)
+        {
+            throw new IOException("Keys must not be null.");
+        }
+        if (lastWrittenKey != null && lastWrittenKey.compareTo(decoratedKey) > 0)
+        {
+            logger.info("Last written key : " + lastWrittenKey);
+            logger.info("Current key : " + decoratedKey);
+            logger.info("Writing into file " + getFilename());
+            throw new IOException("Keys must be written in ascending order.");
+        }
+        return (lastWrittenKey == null) ? 0 : dataFile.getFilePointer();
+    }
+
+    private void afterAppend(DecoratedKey decoratedKey, long dataPosition) throws IOException
+    {
+        lastWrittenKey = decoratedKey;
+
+        if (logger.isTraceEnabled())
+            logger.trace("wrote " + decoratedKey + " at " + dataPosition);
+        iwriter.afterAppend(decoratedKey, dataPosition);
+        dbuilder.addPotentialBoundary(dataPosition);
+    }
+
+    public long append(AbstractCompactedRow row) throws IOException
+    {
+        long currentPosition = beforeAppend(row.key);
+        ByteBufferUtil.writeWithShortLength(row.key.key, dataFile);
+        row.write(dataFile);
+        estimatedRowSize.add(dataFile.getFilePointer() - currentPosition);
+        estimatedColumnCount.add(row.columnCount());
+        afterAppend(row.key, currentPosition);
+        return currentPosition;
+    }
+
+    public void append(DecoratedKey decoratedKey, ColumnFamily cf) throws IOException
+    {
+        long startPosition = beforeAppend(decoratedKey);
+        ByteBufferUtil.writeWithShortLength(decoratedKey.key, dataFile);
+        // write placeholder for the row size, since we don't know it yet
+        long sizePosition = dataFile.getFilePointer();
+        dataFile.writeLong(-1);
+        // write out row data
+        int columnCount = ColumnFamily.serializer().serializeWithIndexes(cf, dataFile);
+        // seek back and write the row size (not including the size Long itself)
+        long endPosition = dataFile.getFilePointer();
+        dataFile.seek(sizePosition);
+        dataFile.writeLong(endPosition - (sizePosition + 8));
+        // finally, reset for next row
+        dataFile.seek(endPosition);
+        afterAppend(decoratedKey, startPosition);
+        estimatedRowSize.add(endPosition - startPosition);
+        estimatedColumnCount.add(columnCount);
+    }
+
+    public void append(DecoratedKey decoratedKey, ByteBuffer value) throws IOException
+    {
+        long currentPosition = beforeAppend(decoratedKey);
+        ByteBufferUtil.writeWithShortLength(decoratedKey.key, dataFile);
+        assert value.remaining() > 0;
+        dataFile.writeLong(value.remaining());
+        ByteBufferUtil.write(value, dataFile);
+        afterAppend(decoratedKey, currentPosition);
+    }
+
+    public SSTableReader closeAndOpenReader() throws IOException
+    {
+        return closeAndOpenReader(System.currentTimeMillis());
+    }
+
+    public SSTableReader closeAndOpenReader(long maxDataAge) throws IOException
+    {
+        // index and filter
+        iwriter.close();
+
+        // main data
+        long position = dataFile.getFilePointer();
+        dataFile.close(); // calls force
+        FileUtils.truncate(dataFile.getPath(), position);
+
+        // write sstable statistics
+        writeStatistics(descriptor, estimatedRowSize, estimatedColumnCount);
+
+        // remove the 'tmp' marker from all components
+        final Descriptor newdesc = rename(descriptor, components);
+
+        // finalize in-memory state for the reader
+        SegmentedFile ifile = iwriter.builder.complete(newdesc.filenameFor(SSTable.COMPONENT_INDEX));
+        SegmentedFile dfile = dbuilder.complete(newdesc.filenameFor(SSTable.COMPONENT_DATA));
+        SSTableReader sstable = SSTableReader.internalOpen(newdesc, components, metadata, partitioner, ifile, dfile, iwriter.summary, iwriter.bf, maxDataAge, estimatedRowSize, estimatedColumnCount);
+        iwriter = null;
+        dbuilder = null;
+        return sstable;
+    }
+
+    private static void writeStatistics(Descriptor desc, EstimatedHistogram rowSizes, EstimatedHistogram columnnCounts) throws IOException
+    {
+        DataOutputStream out = new DataOutputStream(new FileOutputStream(desc.filenameFor(SSTable.COMPONENT_STATS)));
+        EstimatedHistogram.serializer.serialize(rowSizes, out);
+        EstimatedHistogram.serializer.serialize(rowSizes, out);
+        out.close();
+    }
+
+    static Descriptor rename(Descriptor tmpdesc, Set<Component> components)
+    {
+        Descriptor newdesc = tmpdesc.asTemporary(false);
+        try
+        {
+            for (Component component : components)
+                FBUtilities.renameWithConfirm(tmpdesc.filenameFor(component), newdesc.filenameFor(component));
+        }
+        catch (IOException e)
+        {
+            throw new IOError(e);
+        }
+        return newdesc;
+    }
+
+    public long getFilePointer()
+    {
+        return dataFile.getFilePointer();
+    }
+    
+    public static Builder createBuilder(Descriptor desc)
+    {
+        if (!desc.isLatestVersion)
+            // TODO: streaming between different versions will fail: need support for
+            // recovering other versions to provide a stable streaming api
+            throw new RuntimeException(String.format("Cannot recover SSTable with version %s (current version %s).",
+                                                     desc.version, Descriptor.CURRENT_VERSION));
+
+        return new Builder(desc);
+    }
+
     /**
-     * Adds user input for "fuzzification" 
-     * @param queryString The string which will be parsed by the analyzer and for which fuzzy variants will be parsed
-     * @param fieldName
-     * @param minSimilarity The minimum similarity of the term variants (see FuzzyTermEnum)
-     * @param prefixLength Length of required common prefix on variant terms (see FuzzyTermEnum)
+     * Removes the given SSTable from temporary status and opens it, rebuilding the
+     * bloom filter and row index from the data file.
      */
-    public void addTerms(String queryString, String fieldName,float minSimilarity, int prefixLength) 
+    public static class Builder implements ICompactionInfo
     {
-    	fieldVals.add(new FieldVals(fieldName,minSimilarity,prefixLength,queryString));
-    }
-    
-    
-    private void addTerms(IndexReader reader,FieldVals f) throws IOException
-    {
-        if(f.queryString==null) return;
-        TokenStream ts=analyzer.tokenStream(f.fieldName,new StringReader(f.queryString));
-        Token token=ts.next();
-        int corpusNumDocs=reader.numDocs();
-        Term internSavingTemplateTerm =new Term(f.fieldName,""); //optimization to avoid constructing new Term() objects
-        HashSet processedTerms=new HashSet();
-        while(token!=null)
-        {            
-        	if(!processedTerms.contains(token.termText()))
-        	{
-        		processedTerms.add(token.termText());
-                ScoreTermQueue variantsQ=new ScoreTermQueue(MAX_VARIANTS_PER_TERM); //maxNum variants considered for any one term
-                float minScore=0;
-                Term startTerm=internSavingTemplateTerm.createTerm(token.termText());
-                FuzzyTermEnum fe=new FuzzyTermEnum(reader,startTerm,f.minSimilarity,f.prefixLength);
-                TermEnum origEnum = reader.terms(startTerm);
-                int df=0;
-                if(startTerm.equals(origEnum.term()))
-                {
-                    df=origEnum.docFreq(); //store the df so all variants use same idf
-                }
-                int numVariants=0;
-                int totalVariantDocFreqs=0;
-                do
-                {
-                    Term possibleMatch=fe.term();
-                    if(possibleMatch!=null)
-                    {
-    	                numVariants++;
-    	                totalVariantDocFreqs+=fe.docFreq();
-    	                float score=fe.difference();
-    	                if(variantsQ.size() < MAX_VARIANTS_PER_TERM || score > minScore){
-    	                    ScoreTerm st=new ScoreTerm(possibleMatch,score,startTerm);                    
-    	                    variantsQ.insert(st);
-    	                    minScore = ((ScoreTerm)variantsQ.top()).score; // maintain minScore
-    	                }
-                    }
-                }
-                while(fe.next());
-                if(numVariants==0)
-                {
-                    //no variants to rank here
-                    break;
-                }
-                int avgDf=totalVariantDocFreqs/numVariants;
-                if(df==0)//no direct match we can use as df for all variants 
-                {
-                    df=avgDf; //use avg df of all variants
-                }
-                
-                // take the top variants (scored by edit distance) and reset the score
-                // to include an IDF factor then add to the global queue for ranking overall top query terms
-                int size = variantsQ.size();
-                for(int i = 0; i < size; i++)
-                {
-                  ScoreTerm st = (ScoreTerm) variantsQ.pop();
-                  st.score=(st.score*st.score)*sim.idf(df,corpusNumDocs);
-                  q.insert(st);
-                }                            
-        	}
-            token=ts.next();
-        }        
-    }
-            
-    public Query rewrite(IndexReader reader) throws IOException
-    {
-        if(rewrittenQuery!=null)
+        private final Descriptor desc;
+        public final ColumnFamilyStore cfs;
+        private BufferedRandomAccessFile dfile;
+
+        public Builder(Descriptor desc)
         {
-            return rewrittenQuery;
-        }
-        //load up the list of possible terms
-        for (Iterator iter = fieldVals.iterator(); iter.hasNext();)
-		{
-			FieldVals f = (FieldVals) iter.next();
-			addTerms(reader,f);			
-		}
-        //clear the list of fields
-        fieldVals.clear();
-        
-        BooleanQuery bq=new BooleanQuery();
-        
-        
-        //create BooleanQueries to hold the variants for each token/field pair and ensure it
-        // has no coord factor
-        //Step 1: sort the termqueries by term/field
-        HashMap variantQueries=new HashMap();
-        int size = q.size();
-        for(int i = 0; i < size; i++)
-        {
-          ScoreTerm st = (ScoreTerm) q.pop();
-          ArrayList l=(ArrayList) variantQueries.get(st.fuzziedSourceTerm);
-          if(l==null)
-          {
-              l=new ArrayList();
-              variantQueries.put(st.fuzziedSourceTerm,l);
-          }
-          l.add(st);
-        }
-        //Step 2: Organize the sorted termqueries into zero-coord scoring boolean queries
-        for (Iterator iter = variantQueries.values().iterator(); iter.hasNext();)
-        {
-            ArrayList variants = (ArrayList) iter.next();
-            if(variants.size()==1)
+
+            this.desc = desc;
+            cfs = Table.open(desc.ksname).getColumnFamilyStore(desc.cfname);
+            try
             {
-                //optimize where only one selected variant
-                ScoreTerm st=(ScoreTerm) variants.get(0);
-                TermQuery tq = new FuzzyTermQuery(st.term,ignoreTF);
-                tq.setBoost(st.score); // set the boost to a mix of IDF and score
-                bq.add(tq, BooleanClause.Occur.SHOULD); 
+                dfile = new BufferedRandomAccessFile(new File(desc.filenameFor(SSTable.COMPONENT_DATA)), "r", 8 * 1024 * 1024, true);
             }
-            else
+            catch (IOException e)
             {
-                BooleanQuery termVariants=new BooleanQuery(true); //disable coord and IDF for these term variants
-                for (Iterator iterator2 = variants.iterator(); iterator2
-                        .hasNext();)
-                {
-                    ScoreTerm st = (ScoreTerm) iterator2.next();
-                    TermQuery tq = new FuzzyTermQuery(st.term,ignoreTF);      // found a match
-                    tq.setBoost(st.score); // set the boost using the ScoreTerm's score
-                    termVariants.add(tq, BooleanClause.Occur.SHOULD);          // add to query                    
-                }
-                bq.add(termVariants, BooleanClause.Occur.SHOULD);          // add to query
+                throw new IOError(e);
             }
         }
-        //TODO possible alternative step 3 - organize above booleans into a new layer of field-based
-        // booleans with a minimum-should-match of NumFields-1?
-        
-        this.rewrittenQuery=bq;
-        return bq;
+
+        public SSTableReader build() throws IOException
+        {
+            if (cfs.isInvalid())
+                return null;
+            File ifile = new File(desc.filenameFor(SSTable.COMPONENT_INDEX));
+            File ffile = new File(desc.filenameFor(SSTable.COMPONENT_FILTER));
+            assert !ifile.exists();
+            assert !ffile.exists();
+
+            EstimatedHistogram rowSizes = SSTable.defaultRowHistogram();
+            EstimatedHistogram columnCounts = SSTable.defaultColumnHistogram();
+
+            IndexWriter iwriter;
+            long estimatedRows;
+            try
+            {
+                estimatedRows = SSTable.estimateRowsFromData(desc, dfile);
+                iwriter = new IndexWriter(desc, StorageService.getPartitioner(), estimatedRows);
+            }
+            catch(IOException e)
+            {
+                dfile.close();
+                throw e;
+            }
+
+            // build the index and filter
+            long rows = 0;
+            try
+            {
+                DecoratedKey key;
+                long rowPosition = 0;
+                while (rowPosition < dfile.length())
+                {
+                    key = SSTableReader.decodeKey(StorageService.getPartitioner(), desc, FBUtilities.readShortByteArray(dfile));
+                    iwriter.afterAppend(key, rowPosition);
+
+                    long dataSize = SSTableReader.readRowSize(dfile, desc);
+                    rowPosition = dfile.getFilePointer() + dataSize; // next row
+
+                    IndexHelper.skipBloomFilter(dfile);
+                    IndexHelper.skipIndex(dfile);
+                    ColumnFamily.serializer().deserializeFromSSTableNoColumns(ColumnFamily.create(cfs.metadata), dfile);
+                    rowSizes.add(dataSize);
+                    columnCounts.add(dfile.readInt());
+
+                    dfile.seek(rowPosition);
+                    rows++;
+                }
+
+                writeStatistics(desc, rowSizes, columnCounts);
+            }
+            finally
+            {
+                try
+                {
+                    dfile.close();
+                    iwriter.close();
+                }
+                catch (IOException e)
+                {
+                    throw new IOError(e);
+                }
+            }
+
+            logger.debug("estimated row count was %s of real count", ((double)estimatedRows) / rows);
+            return SSTableReader.open(rename(desc, SSTable.componentsFor(desc)));
+        }
+
+        public long getTotalBytes()
+        {
+            try
+            {
+                return dfile.length();
+            }
+            catch (IOException e)
+            {
+                throw new IOError(e);
+            }
+        }
+
+        public long getBytesRead()
+        {
+            return dfile.getFilePointer();
+        }
+
+        public String getTaskType()
+        {
+            return "SSTable rebuild";
+        }
     }
-    
-    //Holds info for a fuzzy term variant - initially score is set to edit distance (for ranking best
-    // term variants) then is reset with IDF for use in ranking against all other
-    // terms/fields
-    private static class ScoreTerm{
-        public Term term;
-        public float score;
-        Term fuzziedSourceTerm;
-        
-        public ScoreTerm(Term term, float score, Term fuzziedSourceTerm){
-          this.term = term;
-          this.score = score;
-          this.fuzziedSourceTerm=fuzziedSourceTerm;
+
+    /**
+     * Encapsulates writing the index and filter for an SSTable. The state of this object is not valid until it has been closed.
+     */
+    static class IndexWriter
+    {
+        private final BufferedRandomAccessFile indexFile;
+        public final Descriptor desc;
+        public final IPartitioner partitioner;
+        public final SegmentedFile.Builder builder;
+        public final IndexSummary summary;
+        public final BloomFilter bf;
+        private FileMark mark;
+
+        IndexWriter(Descriptor desc, IPartitioner part, long keyCount) throws IOException
+        {
+            this.desc = desc;
+            this.partitioner = part;
+            indexFile = new BufferedRandomAccessFile(new File(desc.filenameFor(SSTable.COMPONENT_INDEX)), "rw", 8 * 1024 * 1024, true);
+            builder = SegmentedFile.getBuilder(DatabaseDescriptor.getIndexAccessMode());
+            summary = new IndexSummary(keyCount);
+            bf = BloomFilter.getFilter(keyCount, 15);
         }
-      }
-      
-      private static class ScoreTermQueue extends PriorityQueue {        
-        public ScoreTermQueue(int size){
-          initialize(size);
+
+        public void afterAppend(DecoratedKey key, long dataPosition) throws IOException
+        {
+            bf.add(key.key);
+            long indexPosition = indexFile.getFilePointer();
+            ByteBufferUtil.writeWithShortLength(key.key, indexFile);
+            indexFile.writeLong(dataPosition);
+            if (logger.isTraceEnabled())
+                logger.trace("wrote index of " + key + " at " + indexPosition);
+
+            summary.maybeAddEntry(key, indexPosition);
+            builder.addPotentialBoundary(indexPosition);
         }
-        
-        /* (non-Javadoc)
-         * @see org.apache.lucene.util.PriorityQueue#lessThan(java.lang.Object, java.lang.Object)
+
+        /**
+         * Closes the index and bloomfilter, making the public state of this writer valid for consumption.
          */
-        protected boolean lessThan(Object a, Object b) {
-          ScoreTerm termA = (ScoreTerm)a;
-          ScoreTerm termB = (ScoreTerm)b;
-          if (termA.score== termB.score)
-            return termA.term.compareTo(termB.term) > 0;
-          else
-            return termA.score < termB.score;
+        public void close() throws IOException
+        {
+            // bloom filter
+            FileOutputStream fos = new FileOutputStream(desc.filenameFor(SSTable.COMPONENT_FILTER));
+            DataOutputStream stream = new DataOutputStream(fos);
+            BloomFilter.serializer().serialize(bf, stream);
+            stream.flush();
+            fos.getFD().sync();
+            stream.close();
+
+            // index
+            long position = indexFile.getFilePointer();
+            indexFile.close(); // calls force
+            FileUtils.truncate(indexFile.getPath(), position);
+
+            // finalize in-memory index state
+            summary.complete();
         }
-        
-      }
-      
-      //overrides basic TermQuery to negate effects of IDF (idf is factored into boost of containing BooleanQuery)
-      private static class FuzzyTermQuery extends TermQuery
-      {
-    	  boolean ignoreTF;
-          public FuzzyTermQuery(Term t, boolean ignoreTF)
-          {
-        	  super(t);
-        	  this.ignoreTF=ignoreTF;
-          }
-          public Similarity getSimilarity(Searcher searcher)
-          {            
-              Similarity result = super.getSimilarity(searcher);
-              result = new SimilarityDelegator(result) {
-                  
-                  public float tf(float freq)
-                  {
-                	  if(ignoreTF)
-                	  {
-                          return 1; //ignore tf
-                	  }
-            		  return super.tf(freq);
-                  }
-                  public float idf(int docFreq, int numDocs)
-                  {
-                      //IDF is already factored into individual term boosts
-                      return 1;
-                  }               
-              };
-              return result;
-          }        
-      }
-      
-      
 
-    /* (non-Javadoc)
-     * @see org.apache.lucene.search.Query#toString(java.lang.String)
-     */
-    public String toString(String field)
-    {
-        return null;
+        public void mark()
+        {
+            mark = indexFile.mark();
+        }
+
+        public void reset() throws IOException
+        {
+            // we can't un-set the bloom filter addition, but extra keys in there are harmless.
+            // we can't reset dbuilder either, but that is the last thing called in afterappend so
+            // we assume that if that worked then we won't be trying to reset.
+            indexFile.reset(mark);
+        }
     }
-
-
-	public boolean isIgnoreTF()
-	{
-		return ignoreTF;
-	}
-
-
-	public void setIgnoreTF(boolean ignoreTF)
-	{
-		this.ignoreTF = ignoreTF;
-	}   
-    
 }

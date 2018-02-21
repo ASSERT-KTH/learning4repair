@@ -1,11 +1,12 @@
+package org.apache.lucene;
+
 /**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -15,61 +16,95 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+import java.io.IOException;
 
-package org.apache.cassandra.db;
+import org.apache.lucene.util.LuceneTestCase;
+import org.apache.lucene.store.MockDirectoryWrapper;
+import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.index.IndexWriterConfig;
+import org.apache.lucene.index.LogMergePolicy;
+import org.apache.lucene.index.MergePolicy;
+import org.apache.lucene.index.ConcurrentMergeScheduler;
+import org.apache.lucene.analysis.MockAnalyzer;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.Field;
 
-import java.io.*;
 
-import org.apache.cassandra.io.DataInputBuffer;
-import java.net.InetAddress;
-import org.apache.cassandra.net.IVerbHandler;
-import org.apache.cassandra.net.Message;
+/**
+ * Holds tests cases to verify external APIs are accessible
+ * while not being in org.apache.lucene.index package.
+ */
+public class TestMergeSchedulerExternal extends LuceneTestCase {
 
-import org.apache.log4j.Logger;
+  volatile boolean mergeCalled;
+  volatile boolean mergeThreadCreated;
+  volatile boolean excCalled;
 
-import org.apache.cassandra.net.*;
+  private class MyMergeScheduler extends ConcurrentMergeScheduler {
 
-public class RowMutationVerbHandler implements IVerbHandler
-{
-    private static Logger logger_ = Logger.getLogger(RowMutationVerbHandler.class);
-
-    public void doVerb(Message message)
-    {
-        byte[] bytes = message.getMessageBody();
-        DataInputBuffer buffer = new DataInputBuffer();
-        buffer.reset(bytes, bytes.length);
-
-        try
-        {
-            RowMutation rm = RowMutation.serializer().deserialize(buffer);
-            if (logger_.isDebugEnabled())
-              logger_.debug("Applying " + rm);
-
-            /* Check if there were any hints in this message */
-            byte[] hintedBytes = message.getHeader(RowMutation.HINT);
-            if ( hintedBytes != null && hintedBytes.length > 0 )
-            {
-            	InetAddress hint = InetAddress.getByAddress(hintedBytes);
-                if (logger_.isDebugEnabled())
-                  logger_.debug("Adding hint for " + hint);
-                /* add necessary hints to this mutation */
-                RowMutation hintedMutation = new RowMutation(Table.SYSTEM_TABLE, rm.getTable());
-                hintedMutation.addHints(rm.key(), hintedBytes);
-                hintedMutation.apply();
-            }
-
-            Table.open(rm.getTable()).apply(rm, bytes, true);
-            rm.apply();
-
-            WriteResponse response = new WriteResponse(rm.getTable(), rm.key(), true);
-            Message responseMessage = WriteResponse.makeWriteResponseMessage(message, response);
-            if (logger_.isDebugEnabled())
-              logger_.debug(rm + " applied.  Sending response to " + message.getMessageId() + "@" + message.getFrom());
-            MessagingService.instance().sendOneWay(responseMessage, message.getFrom());
-        }
-        catch (IOException e)
-        {
-            logger_.error("Error in row mutation", e);
-        }
+    private class MyMergeThread extends ConcurrentMergeScheduler.MergeThread {
+      public MyMergeThread(IndexWriter writer, MergePolicy.OneMerge merge) throws IOException {
+        super(writer, merge);
+        mergeThreadCreated = true;
+      }
     }
+
+    @Override
+    protected MergeThread getMergeThread(IndexWriter writer, MergePolicy.OneMerge merge) throws IOException {
+      MergeThread thread = new MyMergeThread(writer, merge);
+      thread.setThreadPriority(getMergeThreadPriority());
+      thread.setDaemon(true);
+      thread.setName("MyMergeThread");
+      return thread;
+    }
+
+    @Override
+    protected void handleMergeException(Throwable t) {
+      excCalled = true;
+    }
+
+    @Override
+    protected void doMerge(MergePolicy.OneMerge merge) throws IOException {
+      mergeCalled = true;
+      super.doMerge(merge);
+    }
+  }
+
+  private static class FailOnlyOnMerge extends MockDirectoryWrapper.Failure {
+    @Override
+    public void eval(MockDirectoryWrapper dir)  throws IOException {
+      StackTraceElement[] trace = new Exception().getStackTrace();
+      for (int i = 0; i < trace.length; i++) {
+        if ("doMerge".equals(trace[i].getMethodName()))
+          throw new IOException("now failing during merge");
+      }
+    }
+  }
+
+  public void testSubclassConcurrentMergeScheduler() throws IOException {
+    MockDirectoryWrapper dir = newDirectory();
+    dir.failOn(new FailOnlyOnMerge());
+
+    Document doc = new Document();
+    Field idField = newField("id", "", Field.Store.YES, Field.Index.NOT_ANALYZED);
+    doc.add(idField);
+    
+    IndexWriter writer = new IndexWriter(dir, newIndexWriterConfig(
+        TEST_VERSION_CURRENT, new MockAnalyzer()).setMergeScheduler(new MyMergeScheduler())
+        .setMaxBufferedDocs(2).setRAMBufferSizeMB(
+            IndexWriterConfig.DISABLE_AUTO_FLUSH));
+    LogMergePolicy logMP = (LogMergePolicy) writer.getConfig().getMergePolicy();
+    logMP.setMergeFactor(10);
+    for(int i=0;i<20;i++)
+      writer.addDocument(doc);
+
+    ((MyMergeScheduler) writer.getConfig().getMergeScheduler()).sync();
+    writer.close();
+    
+    assertTrue(mergeThreadCreated);
+    assertTrue(mergeCalled);
+    assertTrue(excCalled);
+    dir.close();
+    assertTrue(ConcurrentMergeScheduler.anyUnhandledExceptions());
+  }
 }

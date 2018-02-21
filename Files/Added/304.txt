@@ -1,1245 +1,1206 @@
-ords[bottomSlot] = bottomOrd;
+maxRows = activation.getMaxRows();
 
-package org.apache.lucene.search;
+/*
 
-/**
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+   Derby - Class org.apache.derby.impl.sql.execute.ScrollInsensitiveResultSet
+
+   Licensed to the Apache Software Foundation (ASF) under one or more
+   contributor license agreements.  See the NOTICE file distributed with
+   this work for additional information regarding copyright ownership.
+   The ASF licenses this file to you under the Apache License, Version 2.0
+   (the "License"); you may not use this file except in compliance with
+   the License.  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+
  */
 
-import java.io.IOException;
-import java.text.Collator;
-import java.util.Locale;
+package org.apache.derby.impl.sql.execute;
 
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.search.FieldCache.DocTermsIndex;
-import org.apache.lucene.search.FieldCache.DocTerms;
-import org.apache.lucene.search.cache.ByteValuesCreator;
-import org.apache.lucene.search.cache.CachedArray;
-import org.apache.lucene.search.cache.CachedArrayCreator;
-import org.apache.lucene.search.cache.DoubleValuesCreator;
-import org.apache.lucene.search.cache.FloatValuesCreator;
-import org.apache.lucene.search.cache.IntValuesCreator;
-import org.apache.lucene.search.cache.LongValuesCreator;
-import org.apache.lucene.search.cache.ShortValuesCreator;
-import org.apache.lucene.search.cache.CachedArray.ByteValues;
-import org.apache.lucene.search.cache.CachedArray.DoubleValues;
-import org.apache.lucene.search.cache.CachedArray.FloatValues;
-import org.apache.lucene.search.cache.CachedArray.IntValues;
-import org.apache.lucene.search.cache.CachedArray.LongValues;
-import org.apache.lucene.search.cache.CachedArray.ShortValues;
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.packed.Direct8;
-import org.apache.lucene.util.packed.Direct16;
-import org.apache.lucene.util.packed.Direct32;
-import org.apache.lucene.util.packed.PackedInts;
+import org.apache.derby.iapi.services.sanity.SanityManager;
+
+import org.apache.derby.iapi.sql.execute.CursorResultSet;
+import org.apache.derby.iapi.sql.execute.ExecRow;
+import org.apache.derby.iapi.sql.execute.NoPutResultSet;
+
+import org.apache.derby.iapi.sql.Activation;
+
+import org.apache.derby.iapi.types.RowLocation;
+import org.apache.derby.iapi.types.DataValueDescriptor;
+
+import org.apache.derby.iapi.error.StandardException;
+import org.apache.derby.iapi.reference.SQLState;
+
+import org.apache.derby.iapi.store.access.BackingStoreHashtable;
+
+import org.apache.derby.iapi.types.SQLBoolean;
+import org.apache.derby.iapi.types.SQLInteger;
 
 /**
- * Expert: a FieldComparator compares hits so as to determine their
- * sort order when collecting the top results with {@link
- * TopFieldCollector}.  The concrete public FieldComparator
- * classes here correspond to the SortField types.
  *
- * <p>This API is designed to achieve high performance
- * sorting, by exposing a tight interaction with {@link
- * FieldValueHitQueue} as it visits hits.  Whenever a hit is
- * competitive, it's enrolled into a virtual slot, which is
- * an int ranging from 0 to numHits-1.  The {@link
- * FieldComparator} is made aware of segment transitions
- * during searching in case any internal state it's tracking
- * needs to be recomputed during these transitions.</p>
+ * Provide insensitive scrolling functionality for the underlying
+ * result set.  We build a disk backed hash table of rows as the 
+ * user scrolls forward, with the position as the key.
  *
- * <p>A comparator must define these functions:</p>
+ * For read-only result sets the hash table will containg the
+ * following columns:
+ *<pre>
+ *  +-------------------------------+
+ *  | KEY                           |
+ *  +-------------------------------+
+ *  | Row                           |
+ *  +-------------------------------+
+ *</pre>
+ * where key is the position of the row in the result set and row is the data.
  *
- * <ul>
+ * And for updatable result sets it will contain:
+ * <pre>
+ *  +-------------------------------+
+ *  | KEY                           | [0]
+ *  +-------------------------------+
+ *  | RowLocation                   | [POS_ROWLOCATION]
+ *  +-------------------------------+
+ *  | Deleted                       | [POS_ROWDELETED]
+ *  +-------------------------------+
+ *  | Updated                       | [POS_ROWUPDATED]
+ *  +-------------------------------+
+ *  | Row                           | [extraColumns ... n]
+ *  +-------------------------------+
+ *</pre>
+ * where key is the position of the row in the result set, rowLocation is
+ * the row location of that row in the Heap, Deleted indicates whether the
+ * row has been deleted, Updated indicates whether the row has been updated,
+ * and row is the data.
  *
- *  <li> {@link #compare} Compare a hit at 'slot a'
- *       with hit 'slot b'.
- *
- *  <li> {@link #setBottom} This method is called by
- *       {@link FieldValueHitQueue} to notify the
- *       FieldComparator of the current weakest ("bottom")
- *       slot.  Note that this slot may not hold the weakest
- *       value according to your comparator, in cases where
- *       your comparator is not the primary one (ie, is only
- *       used to break ties from the comparators before it).
- *
- *  <li> {@link #compareBottom} Compare a new hit (docID)
- *       against the "weakest" (bottom) entry in the queue.
- *
- *  <li> {@link #copy} Installs a new hit into the
- *       priority queue.  The {@link FieldValueHitQueue}
- *       calls this method when a new hit is competitive.
- *
- *  <li> {@link #setNextReader} Invoked
- *       when the search is switching to the next segment.
- *       You may need to update internal state of the
- *       comparator, for example retrieving new values from
- *       the {@link FieldCache}.
- *
- *  <li> {@link #value} Return the sort value stored in
- *       the specified slot.  This is only called at the end
- *       of the search, in order to populate {@link
- *       FieldDoc#fields} when returning the top results.
- * </ul>
- *
- * @lucene.experimental
  */
-public abstract class FieldComparator {
-
-  /**
-   * Compare hit at slot1 with hit at slot2.
-   * 
-   * @param slot1 first slot to compare
-   * @param slot2 second slot to compare
-   * @return any N < 0 if slot2's value is sorted after
-   * slot1, any N > 0 if the slot2's value is sorted before
-   * slot1 and 0 if they are equal
-   */
-  public abstract int compare(int slot1, int slot2);
-
-  /**
-   * Set the bottom slot, ie the "weakest" (sorted last)
-   * entry in the queue.  When {@link #compareBottom} is
-   * called, you should compare against this slot.  This
-   * will always be called before {@link #compareBottom}.
-   * 
-   * @param slot the currently weakest (sorted last) slot in the queue
-   */
-  public abstract void setBottom(final int slot);
-
-  /**
-   * Compare the bottom of the queue with doc.  This will
-   * only invoked after setBottom has been called.  This
-   * should return the same result as {@link
-   * #compare(int,int)}} as if bottom were slot1 and the new
-   * document were slot 2.
-   *    
-   * <p>For a search that hits many results, this method
-   * will be the hotspot (invoked by far the most
-   * frequently).</p>
-   * 
-   * @param doc that was hit
-   * @return any N < 0 if the doc's value is sorted after
-   * the bottom entry (not competitive), any N > 0 if the
-   * doc's value is sorted before the bottom entry and 0 if
-   * they are equal.
-   */
-  public abstract int compareBottom(int doc) throws IOException;
-
-  /**
-   * This method is called when a new hit is competitive.
-   * You should copy any state associated with this document
-   * that will be required for future comparisons, into the
-   * specified slot.
-   * 
-   * @param slot which slot to copy the hit to
-   * @param doc docID relative to current reader
-   */
-  public abstract void copy(int slot, int doc) throws IOException;
-
-  /**
-   * Set a new Reader. All subsequent docIDs are relative to
-   * the current reader (you must add docBase if you need to
-   * map it to a top-level docID).
-   * 
-   * @param reader current reader
-   * @param docBase docBase of this reader 
-   * @return the comparator to use for this segment; most
-   *   comparators can just return "this" to reuse the same
-   *   comparator across segments
-   * @throws IOException
-   * @throws IOException
-   */
-  public abstract FieldComparator setNextReader(IndexReader reader, int docBase) throws IOException;
-
-  /** Sets the Scorer to use in case a document's score is
-   *  needed.
-   * 
-   * @param scorer Scorer instance that you should use to
-   * obtain the current hit's score, if necessary. */
-  public void setScorer(Scorer scorer) {
-    // Empty implementation since most comparators don't need the score. This
-    // can be overridden by those that need it.
-  }
-  
-  /**
-   * Return the actual value in the slot.
-   *
-   * @param slot the value
-   * @return value in this slot upgraded to Comparable
-   */
-  public abstract Comparable<?> value(int slot);
-
-    
-
-  public static abstract class NumericComparator<T extends CachedArray> extends FieldComparator {
-    protected final CachedArrayCreator<T> creator;
-    protected T cached;
-    protected final boolean checkMissing;
-    
-    public NumericComparator( CachedArrayCreator<T> c, boolean checkMissing ) {
-      this.creator = c;
-      this.checkMissing = checkMissing;
-    }
-  }
-
-  /** Parses field's values as byte (using {@link
-   *  FieldCache#getBytes} and sorts by ascending value */
-  public static final class ByteComparator extends NumericComparator<ByteValues> {
-    private final byte[] values;
-    private final byte missingValue;
-    private byte bottom;
-
-    ByteComparator(int numHits, ByteValuesCreator creator, Byte missingValue ) {
-      super( creator, missingValue!=null );
-      values = new byte[numHits];
-      this.missingValue = checkMissing
-         ? missingValue.byteValue() : 0;
-    }
-
-    @Override
-    public int compare(int slot1, int slot2) {
-      return values[slot1] - values[slot2];
-    }
-
-    @Override
-    public int compareBottom(int doc) {
-      final byte v2 = (checkMissing && !cached.valid.get(doc)) 
-        ? missingValue : cached.values[doc];
-      return bottom - v2;
-    }
-
-    @Override
-    public void copy(int slot, int doc) {
-      values[slot] = ( checkMissing && cached.valid != null && !cached.valid.get(doc) )
-        ? missingValue : cached.values[doc];
-    }
-
-    @Override
-    public FieldComparator setNextReader(IndexReader reader, int docBase) throws IOException {
-      cached = FieldCache.DEFAULT.getBytes(reader, creator.field, creator );
-      return this;
-    }
-    
-    @Override
-    public void setBottom(final int bottom) {
-      this.bottom = values[bottom];
-    }
-
-    @Override
-    public Comparable<?> value(int slot) {
-      return Byte.valueOf(values[slot]);
-    }
-  }
-
-  
-  /** Parses field's values as double (using {@link
-   *  FieldCache#getDoubles} and sorts by ascending value */
-  public static final class DoubleComparator extends NumericComparator<DoubleValues> {
-    private final double[] values;
-    private final double missingValue;
-    private double bottom;
-
-
-    DoubleComparator(int numHits, DoubleValuesCreator creator, Double missingValue ) {
-      super( creator, missingValue != null );
-      values = new double[numHits];
-      this.missingValue = checkMissing
-        ? missingValue.doubleValue() : 0;
-    }
-
-    @Override
-    public int compare(int slot1, int slot2) {
-      final double v1 = values[slot1];
-      final double v2 = values[slot2];
-      if (v1 > v2) {
-        return 1;
-      } else if (v1 < v2) {
-        return -1;
-      } else {
-        return 0;
-      }
-    }
-
-    @Override
-    public int compareBottom(int doc) {
-      final double v2 = (checkMissing && !cached.valid.get(doc)) 
-        ? missingValue : cached.values[doc];
-      
-      if (bottom > v2) {
-        return 1;
-      } else if (bottom < v2) {
-        return -1;
-      } else {
-        return 0;
-      }
-    }
-
-    @Override
-    public void copy(int slot, int doc) {
-      values[slot] = ( checkMissing && cached.valid != null && !cached.valid.get(doc) )
-        ? missingValue : cached.values[doc];
-    }
-
-    @Override
-    public FieldComparator setNextReader(IndexReader reader, int docBase) throws IOException {
-      cached = FieldCache.DEFAULT.getDoubles(reader, creator.field, creator );
-      return this;
-    }
-    
-    @Override
-    public void setBottom(final int bottom) {
-      this.bottom = values[bottom];
-    }
-
-    @Override
-    public Comparable<?> value(int slot) {
-      return Double.valueOf(values[slot]);
-    }
-  }
-
-  /** Parses field's values as float (using {@link
-   *  FieldCache#getFloats} and sorts by ascending value */
-  public static final class FloatComparator extends NumericComparator<FloatValues> {
-    private final float[] values;
-    private final float missingValue;
-    private float bottom;
-
-    FloatComparator(int numHits, FloatValuesCreator creator, Float missingValue ) {
-      super( creator, missingValue != null );
-      values = new float[numHits];
-      this.missingValue = checkMissing
-        ? missingValue.floatValue() : 0;
-    }
-    
-    @Override
-    public int compare(int slot1, int slot2) {
-      // TODO: are there sneaky non-branch ways to compute
-      // sign of float?
-      final float v1 = values[slot1];
-      final float v2 = values[slot2];
-      if (v1 > v2) {
-        return 1;
-      } else if (v1 < v2) {
-        return -1;
-      } else {
-        return 0;
-      }
-    }
-
-    @Override
-    public int compareBottom(int doc) {
-      // TODO: are there sneaky non-branch ways to compute sign of float?
-      final float v2 = (checkMissing && !cached.valid.get(doc)) 
-        ? missingValue : cached.values[doc];
-      
-      if (bottom > v2) {
-        return 1;
-      } else if (bottom < v2) {
-        return -1;
-      } else {
-        return 0;
-      }
-    }
-
-    @Override
-    public void copy(int slot, int doc) {
-      values[slot] = ( checkMissing && cached.valid != null && !cached.valid.get(doc) )
-        ? missingValue : cached.values[doc];
-    }
-
-    @Override
-    public FieldComparator setNextReader(IndexReader reader, int docBase) throws IOException {
-      cached = FieldCache.DEFAULT.getFloats(reader, creator.field, creator );
-      return this;
-    }
-    
-    @Override
-    public void setBottom(final int bottom) {
-      this.bottom = values[bottom];
-    }
-
-    @Override
-    public Comparable<?> value(int slot) {
-      return Float.valueOf(values[slot]);
-    }
-  }
-
-  /** Parses field's values as int (using {@link
-   *  FieldCache#getInts} and sorts by ascending value */
-  public static final class IntComparator extends NumericComparator<IntValues> {
-    private final int[] values;
-    private int bottom;                           // Value of bottom of queue
-    final int missingValue;
-    
-    IntComparator(int numHits, IntValuesCreator creator, Integer missingValue ) {
-      super( creator, missingValue != null );
-      values = new int[numHits];
-      this.missingValue = checkMissing
-        ? missingValue.intValue() : 0;
-    }
-        
-    @Override
-    public int compare(int slot1, int slot2) {
-      // TODO: there are sneaky non-branch ways to compute
-      // -1/+1/0 sign
-      // Cannot return values[slot1] - values[slot2] because that
-      // may overflow
-      final int v1 = values[slot1];
-      final int v2 = values[slot2];
-      if (v1 > v2) {
-        return 1;
-      } else if (v1 < v2) {
-        return -1;
-      } else {
-        return 0;
-      }
-    }
-
-    @Override
-    public int compareBottom(int doc) {
-      // TODO: there are sneaky non-branch ways to compute
-      // -1/+1/0 sign
-      // Cannot return bottom - values[slot2] because that
-      // may overflow
-      final int v2 = (checkMissing && !cached.valid.get(doc)) 
-        ? missingValue : cached.values[doc];
-      
-      if (bottom > v2) {
-        return 1;
-      } else if (bottom < v2) {
-        return -1;
-      } else {
-        return 0;
-      }
-    }
-
-    @Override
-    public void copy(int slot, int doc) {
-      values[slot] = ( checkMissing && cached.valid != null && !cached.valid.get(doc) )
-        ? missingValue : cached.values[doc];
-    }
-
-    @Override
-    public FieldComparator setNextReader(IndexReader reader, int docBase) throws IOException {
-      cached = FieldCache.DEFAULT.getInts(reader, creator.field, creator);  
-      return this;
-    }
-    
-    @Override
-    public void setBottom(final int bottom) {
-      this.bottom = values[bottom];
-    }
-
-    @Override
-    public Comparable<?> value(int slot) {
-      return Integer.valueOf(values[slot]);
-    }
-  }
-
-  /** Parses field's values as long (using {@link
-   *  FieldCache#getLongs} and sorts by ascending value */
-  public static final class LongComparator extends NumericComparator<LongValues> {
-    private final long[] values;
-    private long bottom;
-    private final long missingValue;
-
-    LongComparator(int numHits, LongValuesCreator creator, Long missingValue ) {
-      super( creator, missingValue != null );
-      values = new long[numHits];
-      this.missingValue = checkMissing
-        ? missingValue.longValue() : 0;
-    }
-    
-    @Override
-    public int compare(int slot1, int slot2) {
-      // TODO: there are sneaky non-branch ways to compute
-      // -1/+1/0 sign
-      final long v1 = values[slot1];
-      final long v2 = values[slot2];
-      if (v1 > v2) {
-        return 1;
-      } else if (v1 < v2) {
-        return -1;
-      } else {
-        return 0;
-      }
-    }
-
-    @Override
-    public int compareBottom(int doc) {
-      // TODO: there are sneaky non-branch ways to compute
-      // -1/+1/0 sign
-      final long v2 = (checkMissing && !cached.valid.get(doc)) 
-        ? missingValue : cached.values[doc];
-      
-      if (bottom > v2) {
-        return 1;
-      } else if (bottom < v2) {
-        return -1;
-      } else {
-        return 0;
-      }
-    }
-
-    @Override
-    public void copy(int slot, int doc) {
-      values[slot] = ( checkMissing && cached.valid != null && !cached.valid.get(doc) )
-        ? missingValue : cached.values[doc];
-    }
-
-    @Override
-    public FieldComparator setNextReader(IndexReader reader, int docBase) throws IOException {
-      cached = FieldCache.DEFAULT.getLongs(reader, creator.field, creator);
-      return this;
-    }
-    
-    @Override
-    public void setBottom(final int bottom) {
-      this.bottom = values[bottom];
-    }
-
-    @Override
-    public Comparable<?> value(int slot) {
-      return Long.valueOf(values[slot]);
-    }
-  }
-
-  /** Sorts by descending relevance.  NOTE: if you are
-   *  sorting only by descending relevance and then
-   *  secondarily by ascending docID, performance is faster
-   *  using {@link TopScoreDocCollector} directly (which {@link
-   *  IndexSearcher#search} uses when no {@link Sort} is
-   *  specified). */
-  public static final class RelevanceComparator extends FieldComparator {
-    private final float[] scores;
-    private float bottom;
-    private Scorer scorer;
-    
-    RelevanceComparator(int numHits) {
-      scores = new float[numHits];
-    }
-
-    @Override
-    public int compare(int slot1, int slot2) {
-      final float score1 = scores[slot1];
-      final float score2 = scores[slot2];
-      return score1 > score2 ? -1 : (score1 < score2 ? 1 : 0);
-    }
-
-    @Override
-    public int compareBottom(int doc) throws IOException {
-      float score = scorer.score();
-      return bottom > score ? -1 : (bottom < score ? 1 : 0);
-    }
-
-    @Override
-    public void copy(int slot, int doc) throws IOException {
-      scores[slot] = scorer.score();
-    }
-
-    @Override
-    public FieldComparator setNextReader(IndexReader reader, int docBase) {
-      return this;
-    }
-    
-    @Override
-    public void setBottom(final int bottom) {
-      this.bottom = scores[bottom];
-    }
-
-    @Override
-    public void setScorer(Scorer scorer) {
-      // wrap with a ScoreCachingWrappingScorer so that successive calls to
-      // score() will not incur score computation over and over again.
-      this.scorer = new ScoreCachingWrappingScorer(scorer);
-    }
-    
-    @Override
-    public Comparable<?> value(int slot) {
-      return Float.valueOf(scores[slot]);
-    }
-  }
-
-  /** Parses field's values as short (using {@link
-   *  FieldCache#getShorts} and sorts by ascending value */
-  public static final class ShortComparator extends NumericComparator<ShortValues> {
-    private final short[] values;
-    private short bottom;
-    private final short missingValue;
-    
-    ShortComparator(int numHits, ShortValuesCreator creator, Short missingValue ) {
-      super( creator, missingValue != null );
-      values = new short[numHits];
-      this.missingValue = checkMissing
-        ? missingValue.shortValue() : 0;
-    }
-
-    @Override
-    public int compare(int slot1, int slot2) {
-      return values[slot1] - values[slot2];
-    }
-
-    @Override
-    public int compareBottom(int doc) {
-      final short v2 = (checkMissing && !cached.valid.get(doc)) 
-        ? missingValue : cached.values[doc];
-      
-      return bottom - v2;
-    }
-
-    @Override
-    public void copy(int slot, int doc) {
-      values[slot] = ( checkMissing && cached.valid != null && !cached.valid.get(doc) )
-        ? missingValue : cached.values[doc];
-    }
-
-    @Override
-    public FieldComparator setNextReader(IndexReader reader, int docBase) throws IOException {
-      cached = FieldCache.DEFAULT.getShorts(reader, creator.field, creator );
-      return this;
-    }
-    
-    @Override
-    public void setBottom(final int bottom) {
-      this.bottom = values[bottom];
-    }
-
-    @Override
-    public Comparable<?> value(int slot) {
-      return Short.valueOf(values[slot]);
-    }
-  }
-
-
-  /** Sorts by ascending docID */
-  public static final class DocComparator extends FieldComparator {
-    private final int[] docIDs;
-    private int docBase;
-    private int bottom;
-
-    DocComparator(int numHits) {
-      docIDs = new int[numHits];
-    }
-
-    @Override
-    public int compare(int slot1, int slot2) {
-      // No overflow risk because docIDs are non-negative
-      return docIDs[slot1] - docIDs[slot2];
-    }
-
-    @Override
-    public int compareBottom(int doc) {
-      // No overflow risk because docIDs are non-negative
-      return bottom - (docBase + doc);
-    }
-
-    @Override
-    public void copy(int slot, int doc) {
-      docIDs[slot] = docBase + doc;
-    }
-
-    @Override
-    public FieldComparator setNextReader(IndexReader reader, int docBase) {
-      // TODO: can we "map" our docIDs to the current
-      // reader? saves having to then subtract on every
-      // compare call
-      this.docBase = docBase;
-      return this;
-    }
-    
-    @Override
-    public void setBottom(final int bottom) {
-      this.bottom = docIDs[bottom];
-    }
-
-    @Override
-    public Comparable<?> value(int slot) {
-      return Integer.valueOf(docIDs[slot]);
-    }
-  }
-  
-  
-  /** Sorts by a field's value using the Collator for a
-   *  given Locale.
-   *
-   * <p><b>WARNING</b>: this is likely very slow; you'll
-   * get much better performance using the
-   * CollationKeyAnalyzer or ICUCollationKeyAnalyzer. */
-  public static final class StringComparatorLocale extends FieldComparator {
-
-    private final String[] values;
-    private DocTerms currentDocTerms;
-    private final String field;
-    final Collator collator;
-    private String bottom;
-    private final BytesRef tempBR = new BytesRef();
-
-    StringComparatorLocale(int numHits, String field, Locale locale) {
-      values = new String[numHits];
-      this.field = field;
-      collator = Collator.getInstance(locale);
-    }
-
-    @Override
-    public int compare(int slot1, int slot2) {
-      final String val1 = values[slot1];
-      final String val2 = values[slot2];
-      if (val1 == null) {
-        if (val2 == null) {
-          return 0;
-        }
-        return -1;
-      } else if (val2 == null) {
-        return 1;
-      }
-      return collator.compare(val1, val2);
-    }
-
-    @Override
-    public int compareBottom(int doc) {
-      final String val2 = currentDocTerms.getTerm(doc, tempBR).utf8ToString();
-      if (bottom == null) {
-        if (val2 == null) {
-          return 0;
-        }
-        return -1;
-      } else if (val2 == null) {
-        return 1;
-      }
-      return collator.compare(bottom, val2);
-    }
-
-    @Override
-    public void copy(int slot, int doc) {
-      final BytesRef br = currentDocTerms.getTerm(doc, tempBR);
-      if (br == null) {
-        values[slot] = null;
-      } else {
-        values[slot] = br.utf8ToString();
-      }
-    }
-
-    @Override
-    public FieldComparator setNextReader(IndexReader reader, int docBase) throws IOException {
-      currentDocTerms = FieldCache.DEFAULT.getTerms(reader, field);
-      return this;
-    }
-    
-    @Override
-    public void setBottom(final int bottom) {
-      this.bottom = values[bottom];
-    }
-
-    @Override
-    public Comparable<?> value(int slot) {
-      final String s = values[slot];
-      return s == null ? null : new BytesRef(values[slot]);
-    }
-  }
-
-  /** Sorts by field's natural Term sort order, using
-   *  ordinals.  This is functionally equivalent to {@link
-   *  TermValComparator}, but it first resolves the string
-   *  to their relative ordinal positions (using the index
-   *  returned by {@link FieldCache#getTermsIndex}), and
-   *  does most comparisons using the ordinals.  For medium
-   *  to large results, this comparator will be much faster
-   *  than {@link TermValComparator}.  For very small
-   *  result sets it may be slower. */
-  public static final class TermOrdValComparator extends FieldComparator {
-
-    private final int[] ords;
-    private final BytesRef[] values;
-    private final int[] readerGen;
-
-    private int currentReaderGen = -1;
-    private DocTermsIndex termsIndex;
-    private final String field;
-
-    private int bottomSlot = -1;
-    private int bottomOrd;
-    private boolean bottomSameReader;
-    private BytesRef bottomValue;
-    private final BytesRef tempBR = new BytesRef();
-
-    public TermOrdValComparator(int numHits, String field, int sortPos, boolean reversed) {
-      ords = new int[numHits];
-      values = new BytesRef[numHits];
-      readerGen = new int[numHits];
-      this.field = field;
-    }
-
-    @Override
-    public int compare(int slot1, int slot2) {
-      if (readerGen[slot1] == readerGen[slot2]) {
-        return ords[slot1] - ords[slot2];
-      }
-
-      final BytesRef val1 = values[slot1];
-      final BytesRef val2 = values[slot2];
-      if (val1 == null) {
-        if (val2 == null) {
-          return 0;
-        }
-        return -1;
-      } else if (val2 == null) {
-        return 1;
-      }
-      return val1.compareTo(val2);
-    }
-
-    @Override
-    public int compareBottom(int doc) {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public void copy(int slot, int doc) {
-      throw new UnsupportedOperationException();
-    }
-
-    // Base class for specialized (per bit width of the
-    // ords) per-segment comparator.  NOTE: this is messy;
-    // we do this only because hotspot can't reliably inline
-    // the underlying array access when looking up doc->ord
-    private abstract class PerSegmentComparator extends FieldComparator {
-      
-      @Override
-      public FieldComparator setNextReader(IndexReader reader, int docBase) throws IOException {
-        return TermOrdValComparator.this.setNextReader(reader, docBase);
-      }
-
-      @Override
-      public int compare(int slot1, int slot2) {
-        return TermOrdValComparator.this.compare(slot1, slot2);
-      }
-
-      @Override
-      public void setBottom(final int bottom) {
-        TermOrdValComparator.this.setBottom(bottom);
-      }
-
-      @Override
-      public Comparable<?> value(int slot) {
-        return TermOrdValComparator.this.value(slot);
-      }
-    }
-
-    // Used per-segment when bit width of doc->ord is 8:
-    private final class ByteOrdComparator extends PerSegmentComparator {
-      private final byte[] readerOrds;
-      private final DocTermsIndex termsIndex;
-      private final int docBase;
-
-      public ByteOrdComparator(byte[] readerOrds, DocTermsIndex termsIndex, int docBase) {
-        this.readerOrds = readerOrds;
-        this.termsIndex = termsIndex;
-        this.docBase = docBase;
-      }
-
-      @Override
-      public int compareBottom(int doc) {
-        assert bottomSlot != -1;
-        if (bottomSameReader) {
-          // ord is precisely comparable, even in the equal case
-          return bottomOrd - (readerOrds[doc]&0xFF);
-        } else {
-          // ord is only approx comparable: if they are not
-          // equal, we can use that; if they are equal, we
-          // must fallback to compare by value
-          final int order = readerOrds[doc]&0xFF;
-          final int cmp = bottomOrd - order;
-          if (cmp != 0) {
-            return cmp;
-          }
-
-          if (bottomValue == null) {
-            if (order == 0) {
-              // unset
-              return 0;
-            }
-            // bottom wins
-            return -1;
-          } else if (order == 0) {
-            // doc wins
-            return 1;
-          }
-          termsIndex.lookup(order, tempBR);
-          return bottomValue.compareTo(tempBR);
-        }
-      }
-
-      @Override
-      public void copy(int slot, int doc) {
-        final int ord = readerOrds[doc]&0xFF;
-        ords[slot] = ord;
-        if (ord == 0) {
-          values[slot] = null;
-        } else {
-          assert ord > 0;
-          if (values[slot] == null) {
-            values[slot] = new BytesRef();
-          }
-          termsIndex.lookup(ord, values[slot]);
-        }
-        readerGen[slot] = currentReaderGen;
-      }
-    }
-
-    // Used per-segment when bit width of doc->ord is 16:
-    private final class ShortOrdComparator extends PerSegmentComparator {
-      private final short[] readerOrds;
-      private final DocTermsIndex termsIndex;
-      private final int docBase;
-
-      public ShortOrdComparator(short[] readerOrds, DocTermsIndex termsIndex, int docBase) {
-        this.readerOrds = readerOrds;
-        this.termsIndex = termsIndex;
-        this.docBase = docBase;
-      }
-
-      @Override
-      public int compareBottom(int doc) {
-        assert bottomSlot != -1;
-        if (bottomSameReader) {
-          // ord is precisely comparable, even in the equal case
-          return bottomOrd - (readerOrds[doc]&0xFFFF);
-        } else {
-          // ord is only approx comparable: if they are not
-          // equal, we can use that; if they are equal, we
-          // must fallback to compare by value
-          final int order = readerOrds[doc]&0xFFFF;
-          final int cmp = bottomOrd - order;
-          if (cmp != 0) {
-            return cmp;
-          }
-
-          if (bottomValue == null) {
-            if (order == 0) {
-              // unset
-              return 0;
-            }
-            // bottom wins
-            return -1;
-          } else if (order == 0) {
-            // doc wins
-            return 1;
-          }
-          termsIndex.lookup(order, tempBR);
-          return bottomValue.compareTo(tempBR);
-        }
-      }
-
-      @Override
-      public void copy(int slot, int doc) {
-        final int ord = readerOrds[doc]&0xFFFF;
-        ords[slot] = ord;
-        if (ord == 0) {
-          values[slot] = null;
-        } else {
-          assert ord > 0;
-          if (values[slot] == null) {
-            values[slot] = new BytesRef();
-          }
-          termsIndex.lookup(ord, values[slot]);
-        }
-        readerGen[slot] = currentReaderGen;
-      }
-    }
-
-    // Used per-segment when bit width of doc->ord is 32:
-    private final class IntOrdComparator extends PerSegmentComparator {
-      private final int[] readerOrds;
-      private final DocTermsIndex termsIndex;
-      private final int docBase;
-
-      public IntOrdComparator(int[] readerOrds, DocTermsIndex termsIndex, int docBase) {
-        this.readerOrds = readerOrds;
-        this.termsIndex = termsIndex;
-        this.docBase = docBase;
-      }
-
-      @Override
-      public int compareBottom(int doc) {
-        assert bottomSlot != -1;
-        if (bottomSameReader) {
-          // ord is precisely comparable, even in the equal case
-          return bottomOrd - readerOrds[doc];
-        } else {
-          // ord is only approx comparable: if they are not
-          // equal, we can use that; if they are equal, we
-          // must fallback to compare by value
-          final int order = readerOrds[doc];
-          final int cmp = bottomOrd - order;
-          if (cmp != 0) {
-            return cmp;
-          }
-
-          if (bottomValue == null) {
-            if (order == 0) {
-              // unset
-              return 0;
-            }
-            // bottom wins
-            return -1;
-          } else if (order == 0) {
-            // doc wins
-            return 1;
-          }
-          termsIndex.lookup(order, tempBR);
-          return bottomValue.compareTo(tempBR);
-        }
-      }
-
-      @Override
-      public void copy(int slot, int doc) {
-        final int ord = readerOrds[doc];
-        ords[slot] = ord;
-        if (ord == 0) {
-          values[slot] = null;
-        } else {
-          assert ord > 0;
-          if (values[slot] == null) {
-            values[slot] = new BytesRef();
-          }
-          termsIndex.lookup(ord, values[slot]);
-        }
-        readerGen[slot] = currentReaderGen;
-      }
-    }
-
-    // Used per-segment when bit width is not a native array
-    // size (8, 16, 32):
-    private final class AnyOrdComparator extends PerSegmentComparator {
-      private final PackedInts.Reader readerOrds;
-      private final DocTermsIndex termsIndex;
-      private final int docBase;
-
-      public AnyOrdComparator(PackedInts.Reader readerOrds, DocTermsIndex termsIndex, int docBase) {
-        this.readerOrds = readerOrds;
-        this.termsIndex = termsIndex;
-        this.docBase = docBase;
-      }
-
-      @Override
-      public int compareBottom(int doc) {
-        assert bottomSlot != -1;
-        if (bottomSameReader) {
-          // ord is precisely comparable, even in the equal case
-          return bottomOrd - (int) readerOrds.get(doc);
-        } else {
-          // ord is only approx comparable: if they are not
-          // equal, we can use that; if they are equal, we
-          // must fallback to compare by value
-          final int order = (int) readerOrds.get(doc);
-          final int cmp = bottomOrd - order;
-          if (cmp != 0) {
-            return cmp;
-          }
-
-          if (bottomValue == null) {
-            if (order == 0) {
-              // unset
-              return 0;
-            }
-            // bottom wins
-            return -1;
-          } else if (order == 0) {
-            // doc wins
-            return 1;
-          }
-          termsIndex.lookup(order, tempBR);
-          return bottomValue.compareTo(tempBR);
-        }
-      }
-
-      @Override
-      public void copy(int slot, int doc) {
-        final int ord = (int) readerOrds.get(doc);
-        ords[slot] = ord;
-        if (ord == 0) {
-          values[slot] = null;
-        } else {
-          assert ord > 0;
-          if (values[slot] == null) {
-            values[slot] = new BytesRef();
-          }
-          termsIndex.lookup(ord, values[slot]);
-        }
-        readerGen[slot] = currentReaderGen;
-      }
-    }
-
-    @Override
-    public FieldComparator setNextReader(IndexReader reader, int docBase) throws IOException {
-      termsIndex = FieldCache.DEFAULT.getTermsIndex(reader, field);
-      final PackedInts.Reader docToOrd = termsIndex.getDocToOrd();
-      FieldComparator perSegComp;
-      if (docToOrd instanceof Direct8) {
-        perSegComp = new ByteOrdComparator(((Direct8) docToOrd).getArray(), termsIndex, docBase);
-      } else if (docToOrd instanceof Direct16) {
-        perSegComp = new ShortOrdComparator(((Direct16) docToOrd).getArray(), termsIndex, docBase);
-      } else if (docToOrd instanceof Direct32) {
-        perSegComp = new IntOrdComparator(((Direct32) docToOrd).getArray(), termsIndex, docBase);
-      } else {
-        perSegComp = new AnyOrdComparator(docToOrd, termsIndex, docBase);
-      }
-
-      currentReaderGen++;
-      if (bottomSlot != -1) {
-        perSegComp.setBottom(bottomSlot);
-      }
-
-      return perSegComp;
-    }
-    
-    @Override
-    public void setBottom(final int bottom) {
-      bottomSlot = bottom;
-
-      bottomValue = values[bottomSlot];
-      if (currentReaderGen == readerGen[bottomSlot]) {
-        bottomOrd = ords[bottomSlot];
-        bottomSameReader = true;
-      } else {
-        if (bottomValue == null) {
-          // 0 ord is null for all segments
-          assert ords[bottomSlot] == 0;
-          bottomOrd = 0;
-          bottomSameReader = true;
-          readerGen[bottomSlot] = currentReaderGen;
-        } else {
-          final int index = binarySearch(tempBR, termsIndex, bottomValue);
-          if (index < 0) {
-            bottomOrd = -index - 2;
-            bottomSameReader = false;
-          } else {
-            bottomOrd = index;
-            // exact value match
-            bottomSameReader = true;
-          }
-        }
-      }
-      if (bottomSameReader) {
-        readerGen[bottomSlot] = currentReaderGen;
-      }
-    }
-
-    @Override
-    public Comparable<?> value(int slot) {
-      return values[slot];
-    }
-  }
-
-  /** Sorts by field's natural Term sort order.  All
-   *  comparisons are done using BytesRef.compareTo, which is
-   *  slow for medium to large result sets but possibly
-   *  very fast for very small results sets. */
-  public static final class TermValComparator extends FieldComparator {
-
-    private BytesRef[] values;
-    private DocTerms docTerms;
-    private final String field;
-    private BytesRef bottom;
-    private final BytesRef tempBR = new BytesRef();
-
-    TermValComparator(int numHits, String field) {
-      values = new BytesRef[numHits];
-      this.field = field;
-    }
-
-    @Override
-    public int compare(int slot1, int slot2) {
-      final BytesRef val1 = values[slot1];
-      final BytesRef val2 = values[slot2];
-      if (val1 == null) {
-        if (val2 == null) {
-          return 0;
-        }
-        return -1;
-      } else if (val2 == null) {
-        return 1;
-      }
-
-      return val1.compareTo(val2);
-    }
-
-    @Override
-    public int compareBottom(int doc) {
-      BytesRef val2 = docTerms.getTerm(doc, tempBR);
-      if (bottom == null) {
-        if (val2 == null) {
-          return 0;
-        }
-        return -1;
-      } else if (val2 == null) {
-        return 1;
-      }
-      return bottom.compareTo(val2);
-    }
-
-    @Override
-    public void copy(int slot, int doc) {
-      if (values[slot] == null) {
-        values[slot] = new BytesRef();
-      }
-      docTerms.getTerm(doc, values[slot]);
-    }
-
-    @Override
-    public FieldComparator setNextReader(IndexReader reader, int docBase) throws IOException {
-      docTerms = FieldCache.DEFAULT.getTerms(reader, field);
-      return this;
-    }
-    
-    @Override
-    public void setBottom(final int bottom) {
-      this.bottom = values[bottom];
-    }
-
-    @Override
-    public Comparable<?> value(int slot) {
-      return values[slot];
-    }
-  }
-
-  final protected static int binarySearch(BytesRef br, DocTermsIndex a, BytesRef key) {
-    return binarySearch(br, a, key, 1, a.numOrd()-1);
-  }
-
-  final protected static int binarySearch(BytesRef br, DocTermsIndex a, BytesRef key, int low, int high) {
-
-    while (low <= high) {
-      int mid = (low + high) >>> 1;
-      BytesRef midVal = a.lookup(mid, br);
-      int cmp;
-      if (midVal != null) {
-        cmp = midVal.compareTo(key);
-      } else {
-        cmp = -1;
-      }
-
-      if (cmp < 0)
-        low = mid + 1;
-      else if (cmp > 0)
-        high = mid - 1;
-      else
-        return mid;
-    }
-    return -(low + 1);
-  }
+
+public class ScrollInsensitiveResultSet extends NoPutResultSetImpl
+	implements CursorResultSet
+{
+	/*
+    ** Set in constructor and not altered during life of object.
+	*/
+
+    public NoPutResultSet	source;
+
+
+
+	private int							sourceRowWidth;
+
+	private	  BackingStoreHashtable		ht;
+	private	  ExecRow					resultRow;
+
+	// Scroll tracking
+	private int positionInSource;
+	private int currentPosition;
+	private int lastPosition;
+	private	boolean seenFirst;
+	private	boolean seenLast;
+	private	boolean beforeFirst = true;
+	private	boolean afterLast;
+
+	public int numFromHashTable;
+	public int numToHashTable;
+
+	private int maxRows;
+
+    private boolean keepAfterCommit;
+
+	/* The hash table will contain a different number of extra columns depending
+	 * on whether the result set is updatable or not.
+	 * extraColumns will contain the number of extra columns on the hash table,
+	 * 1 for read-only result sets and LAST_EXTRA_COLUMN + 1 for updatable 
+	 * result sets.
+	 */
+	private int extraColumns;
+	
+	/* positionInHashTable is used for getting a row from the hash table. Prior
+	 * to getting the row, positionInHashTable will be set to the desired KEY.
+	 */
+	private SQLInteger positionInHashTable;
+
+	/* Reference to the target result set. Target is used for updatable result
+	 * sets in order to keep the target result set on the same row as the
+	 * ScrollInsensitiveResultSet.  
+	 */
+	private CursorResultSet target;
+
+	/* If the last row was fetched from the HashTable, updatable result sets
+	 * need to be positioned in the last fetched row before resuming the 
+	 * fetch from core.
+	 */
+	private boolean needsRepositioning;
+
+	/* Position of the different fields in the hash table row for updatable
+	 * result sets 
+	 */
+	private static final int POS_ROWLOCATION = 1;
+	private static final int POS_ROWDELETED = 2;
+	private static final int POS_ROWUPDATED = 3;
+	private static final int LAST_EXTRA_COLUMN = 3;
+
+	/**
+	 * Constructor for a ScrollInsensitiveResultSet
+	 *
+	 * @param source					The NoPutResultSet from which to get rows
+	 *									to scroll through
+	 * @param activation				The activation for this execution
+	 * @param resultSetNumber			The resultSetNumber
+	 * @param sourceRowWidth			# of columns in the source row
+	 *
+	 * @exception StandardException	on error
+	 */
+
+	public ScrollInsensitiveResultSet(NoPutResultSet source,
+							  Activation activation, int resultSetNumber,
+							  int sourceRowWidth,
+							  double optimizerEstimatedRowCount,
+							  double optimizerEstimatedCost) throws StandardException
+	{
+		super(activation, resultSetNumber, 
+			  optimizerEstimatedRowCount, optimizerEstimatedCost);
+		this.source = source;
+		this.sourceRowWidth = sourceRowWidth;
+        keepAfterCommit = activation.getResultSetHoldability();
+		maxRows = activation.getMaxRows();
+		if (SanityManager.DEBUG)
+		{
+			SanityManager.ASSERT(maxRows != -1,
+				"maxRows not expected to be -1");
+		}
+
+		constructorTime += getElapsedMillis(beginTime);
+
+		positionInHashTable = new SQLInteger();
+		needsRepositioning = false;
+		if (isForUpdate()) {
+			target = ((CursorActivation)activation).getTargetResultSet();
+			extraColumns = LAST_EXTRA_COLUMN + 1;
+		} else {
+			target = null;
+			extraColumns = 1;
+		}
+	}
+
+
+	//
+	// ResultSet interface (leftover from NoPutResultSet)
+	//
+
+	/**
+     * open a scan on the source. scan parameters are evaluated
+     * at each open, so there is probably some way of altering
+     * their values...
+	 *
+ 	 * @exception StandardException thrown on failure 
+     */
+	public void	openCore() throws StandardException
+	{
+		beginTime = getCurrentTimeMillis();
+		if (SanityManager.DEBUG)
+	    	SanityManager.ASSERT( ! isOpen, "ScrollInsensitiveResultSet already open");
+
+        source.openCore();
+	    isOpen = true;
+		numOpens++;
+
+		/* Create the hash table.  We pass
+		 * null in as the row source as we will
+		 * build the hash table on demand as
+		 * the user scrolls.
+		 * The 1st column, the position in the
+		 * scan, will be the key column.
+		 */
+		final int[] keyCols = new int[] { 0 };
+		
+		/* We don't use the optimizer row count for this because it could be
+		 * wildly pessimistic.  We only use Hash tables when the optimizer row count
+		 * is within certain bounds.  We have no alternative for scrolling insensitive 
+		 * cursors so we'll just trust that it will fit.
+		 * We need BackingStoreHashtable to actually go to disk when it doesn't fit.
+		 * This is a known limitation.
+		 */
+		ht = new BackingStoreHashtable(getTransactionController(),
+									   null,
+									   keyCols,
+									   false,
+										-1, // don't trust optimizer row count
+									   HashScanResultSet.DEFAULT_MAX_CAPACITY,
+									   HashScanResultSet.DEFAULT_INITIAL_CAPACITY,
+									   HashScanResultSet.DEFAULT_MAX_CAPACITY,
+									   false,
+                                       keepAfterCommit);
+
+		// When re-using language result sets (DERBY-827) we need to
+		// reset some member variables to the value they would have
+		// had in a newly constructed object.
+		lastPosition = 0;
+		needsRepositioning = false;
+		numFromHashTable = 0;
+		numToHashTable = 0;
+		positionInSource = 0;
+		seenFirst = false;
+		seenLast = false;
+
+		openTime += getElapsedMillis(beginTime);
+		setBeforeFirstRow();
+	}
+
+	/**
+     * reopen a scan on the table. scan parameters are evaluated
+     * at each open, so there is probably some way of altering
+     * their values...
+	 *
+	 * @exception StandardException thrown if cursor finished.
+     */
+	public void	reopenCore() throws StandardException 
+	{
+		boolean constantEval = true;
+
+		beginTime = getCurrentTimeMillis();
+
+		if (SanityManager.DEBUG)
+		{
+		    SanityManager.ASSERT(isOpen, "ScrollInsensitiveResultSet already open");
+			SanityManager.THROWASSERT(
+				"reopenCore() not expected to be called");
+		}
+		setBeforeFirstRow();
+	}
+
+	/**
+	 * Returns the row at the absolute position from the query, 
+	 * and returns NULL when there is no such position.
+	 * (Negative position means from the end of the result set.)
+	 * Moving the cursor to an invalid position leaves the cursor
+	 * positioned either before the first row (negative position)
+	 * or after the last row (positive position).
+	 * NOTE: An exception will be thrown on 0.
+	 *
+	 * @param row	The position.
+	 * @return	The row at the absolute position, or NULL if no such position.
+	 *
+	 * @exception StandardException		Thrown on failure
+	 * @see org.apache.derby.iapi.sql.Row
+	 */
+	public ExecRow	getAbsoluteRow(int row) throws StandardException
+	{
+	    if ( ! isOpen ) 
+		{
+			throw StandardException.newException(SQLState.LANG_RESULT_SET_NOT_OPEN, "absolute");
+		}
+
+		attachStatementContext();
+
+		if (SanityManager.DEBUG)
+		{
+			if (!isTopResultSet)
+			{
+				SanityManager.THROWASSERT(
+					this + "expected to be the top ResultSet");
+			}
+		}
+
+                // Absolute 0 is defined to be before first!
+		if (row == 0)
+		{
+                    setBeforeFirstRow();
+                    return null;
+		}
+
+		if (seenLast && row > lastPosition) {
+		   return setAfterLastRow();
+		}		
+
+		if (row > 0)
+		{
+			// position is from the start of the result set
+			if (row <= positionInSource)
+			{
+				// We've already seen the row before
+				return getRowFromHashTable(row);
+			}
+			
+			/* We haven't seen the row yet, scan until we find
+			 * it or we get to the end.
+			 */
+			int diff = row - positionInSource;
+			ExecRow result = null;
+			while (diff > 0)
+			{
+				if ((result = getNextRowFromSource()) != null)
+				{
+					diff--;
+				}
+				else
+				{
+					break;
+				}
+			}
+			if (result != null) {
+				result = getRowFromHashTable(row);
+			}
+			currentRow = result;
+			return result;
+		}
+		else if (row < 0)
+		{
+			// position is from the end of the result set
+
+			// Get the last row, if we haven't already
+			if (!seenLast)
+			{
+				getLastRow();
+			}
+
+			// Note, for negative values position is from beyond the end
+			// of the result set, e.g. absolute(-1) points to the last row
+			int beyondResult = lastPosition + 1;
+			if (beyondResult + row > 0)
+			{
+				// valid row
+				return getRowFromHashTable(beyondResult + row);
+			}
+			else
+			{
+				// position before the beginning of the result set
+				return setBeforeFirstRow();
+			}
+		}
+ 
+		currentRow = null;
+		return null;
+	}
+
+	/**
+	 * Returns the row at the relative position from the current
+	 * cursor position, and returns NULL when there is no such position.
+	 * (Negative position means toward the beginning of the result set.)
+	 * Moving the cursor to an invalid position leaves the cursor
+	 * positioned either before the first row (negative position)
+	 * or after the last row (positive position).
+	 * NOTE: 0 is valid.
+	 * NOTE: An exception is thrown if the cursor is not currently
+	 * positioned on a row.
+	 *
+	 * @param row	The position.
+	 * @return	The row at the relative position, or NULL if no such position.
+	 *
+	 * @exception StandardException		Thrown on failure
+	 * @see org.apache.derby.iapi.sql.Row
+	 */
+	public ExecRow	getRelativeRow(int row) throws StandardException
+	{
+	    if ( ! isOpen ) 
+		{
+			throw StandardException.newException(SQLState.LANG_RESULT_SET_NOT_OPEN, "relative");
+		}
+
+		attachStatementContext();
+
+		if (SanityManager.DEBUG)
+		{
+			if (!isTopResultSet)
+			{
+				SanityManager.THROWASSERT(
+					this + "expected to be the top ResultSet");
+			}
+		}
+
+		// Return the current row for 0
+		if (row == 0)
+		{
+                    if (beforeFirst || afterLast || currentPosition==0) {
+                        return null;
+                    } else {
+			return getRowFromHashTable(currentPosition);
+                    }
+		}
+		else if (row > 0)
+		{
+			return getAbsoluteRow(currentPosition + row);
+		}
+		else
+		{
+			// row < 0
+			if (currentPosition + row < 0)
+			{
+				return setBeforeFirstRow();
+			}
+			return getAbsoluteRow(currentPosition + row);
+		}
+	}
+
+	/**
+	 * Sets the current position to before the first row and returns NULL
+	 * because there is no current row.
+	 *
+	 * @return	NULL.
+	 *
+	 * @see org.apache.derby.iapi.sql.Row
+	 */
+	public ExecRow	setBeforeFirstRow() 
+	{
+		currentPosition = 0;
+		beforeFirst = true;
+		afterLast = false;
+		currentRow = null;
+		return null;
+	}
+
+	/**
+	 * Returns the first row from the query, and returns NULL when there
+	 * are no rows.
+	 *
+	 * @return	The first row, or NULL if no rows.
+	 *
+	 * @exception StandardException		Thrown on failure
+	 * @see org.apache.derby.iapi.sql.Row
+	 */
+	public ExecRow	getFirstRow() 
+		throws StandardException
+	{
+	    if ( ! isOpen ) 
+		{
+			throw StandardException.newException(SQLState.LANG_RESULT_SET_NOT_OPEN, "first");
+		}
+
+		/* Get the row from the hash table if
+		 * we have already seen it before.
+		 */
+		if (seenFirst)
+		{
+			return getRowFromHashTable(1);
+		}
+
+		attachStatementContext();
+
+		if (SanityManager.DEBUG)
+		{
+			if (!isTopResultSet)
+			{
+				SanityManager.THROWASSERT(
+					this + "expected to be the top ResultSet");
+			}
+		}
+
+		return getNextRowCore();
+	}
+
+	/**
+	 *
+ 	 * @exception StandardException thrown on failure 
+	 */
+	public ExecRow	getNextRowCore() throws StandardException
+	{
+		ExecRow result = null;
+
+		beginTime = getCurrentTimeMillis();
+		if (!isOpen)
+			throw StandardException.newException(SQLState.LANG_RESULT_SET_NOT_OPEN, "next");
+
+		if (seenLast && currentPosition == lastPosition) {
+		   return setAfterLastRow();
+		}
+
+		/* Should we get the next row from the source or the hash table? */
+		if (currentPosition == positionInSource)
+		{
+			/* Current position is same as position in source.
+			 * Get row from the source.
+			 */
+			result = getNextRowFromSource();
+			if (result !=null) {
+				result = getRowFromHashTable(currentPosition);
+			}
+		}
+		else if (currentPosition < positionInSource)
+		{
+			/* Current position is before position in source.
+			 * Get row from the hash table.
+			 */
+			result = getRowFromHashTable(currentPosition + 1);
+		}
+		else
+		{
+			result = null;
+		}
+
+		if (result != null)
+		{
+			rowsSeen++;
+			afterLast = false;
+		}
+
+		currentRow = result;
+		setCurrentRow(currentRow);
+		beforeFirst = false;
+
+		nextTime += getElapsedMillis(beginTime);
+
+		return result;
+	}
+
+	/**
+	 * Returns the previous row from the query, and returns NULL when there
+	 * are no more previous rows.
+	 *
+	 * @return	The previous row, or NULL if no more previous rows.
+	 *
+	 * @exception StandardException		Thrown on failure
+	 * @see org.apache.derby.iapi.sql.Row
+	 */
+	public ExecRow	getPreviousRow() 
+		throws StandardException
+	{
+	    if ( ! isOpen ) 
+		{
+			throw StandardException.newException(SQLState.LANG_RESULT_SET_NOT_OPEN, "next");
+		}
+
+		if (SanityManager.DEBUG)
+		{
+			if (!isTopResultSet)
+			{
+				SanityManager.THROWASSERT(
+					this + "expected to be the top ResultSet");
+			}
+		}
+
+		/* No row if we are positioned before the first row
+		 * or the result set is empty.
+		 */
+		if (beforeFirst || currentPosition == 0)
+		{
+			currentRow = null;
+			return null;
+		}
+
+		// Get the last row, if we are after it
+		if (afterLast)
+		{
+			// Special case for empty tables
+			if (lastPosition == 0)
+			{
+				afterLast = false;
+				beforeFirst = false;
+				currentRow = null;
+				return null;
+			}
+			else
+			{
+				return getRowFromHashTable(lastPosition);
+			}
+		}
+
+		// Move back 1
+		currentPosition--;
+		if (currentPosition == 0)
+		{
+			setBeforeFirstRow();
+			return null;
+		}
+		return getRowFromHashTable(currentPosition);
+	}
+
+	/**
+	 * Returns the last row from the query, and returns NULL when there
+	 * are no rows.
+	 *
+	 * @return	The last row, or NULL if no rows.
+	 *
+	 * @exception StandardException		Thrown on failure
+	 * @see org.apache.derby.iapi.sql.Row
+	 */
+	public ExecRow	getLastRow()
+		throws StandardException
+	{		
+	    if ( ! isOpen ) 
+		{
+			throw StandardException.newException(SQLState.LANG_RESULT_SET_NOT_OPEN, "next");
+		}
+		
+		if (!seenLast) 
+		{
+			attachStatementContext();
+
+			if (SanityManager.DEBUG)
+			{
+				if (!isTopResultSet)
+				{
+					SanityManager.THROWASSERT(
+											  this + "expected to be the top ResultSet");
+				}
+			}
+			
+			/* Scroll to the end, filling the hash table as
+			 * we scroll, and return the last row that we find.
+			 */
+			ExecRow result = null;
+			while ((result = getNextRowFromSource()) != null);
+		}
+		
+		if (SanityManager.DEBUG && !seenLast)
+		{
+			SanityManager.THROWASSERT(this + "expected to have seen last");
+		}
+		
+		beforeFirst = false;
+		afterLast = false;
+
+		// Special case if table is empty
+		if (lastPosition == 0)
+		{
+			currentRow = null;
+			return null;
+		}
+		else
+		{
+			return getRowFromHashTable(lastPosition);
+		}
+	}
+
+	/**
+	 * Sets the current position to after the last row and returns NULL
+	 * because there is no current row.
+	 *
+	 * @return	NULL.
+	 *
+	 * @exception StandardException		Thrown on failure
+	 * @see org.apache.derby.iapi.sql.Row
+	 */
+	public ExecRow	setAfterLastRow() 
+		throws StandardException
+	{
+		if (! seenLast)
+		{
+			getLastRow();
+		}
+		if (lastPosition == 0) {
+		   // empty rs special case
+		   currentPosition = 0;
+		   afterLast = false;
+		} else {
+		   currentPosition = lastPosition + 1;
+		   afterLast = true;
+		}
+
+		beforeFirst = false;
+		currentRow = null;
+		return null;
+	}
+
+    /**
+     * Determine if the cursor is before the first row in the result 
+     * set.   
+     *
+     * @return true if before the first row, false otherwise. Returns
+     * false when the result set contains no rows.
+	 * @exception StandardException Thrown on error.
+     */
+   public boolean checkRowPosition(int isType) throws StandardException
+	{
+		switch (isType) {
+		case ISBEFOREFIRST:
+
+			if (! beforeFirst)
+			{
+				return false;
+			}
+
+			//  Spec says to return false if result set is empty
+			if (seenFirst)
+			{
+				return true;
+			}
+			else
+			{
+				ExecRow firstRow = getFirstRow();
+				if (firstRow == null)
+				{
+					// ResultSet is empty
+					return false;
+				}
+				else
+				{
+					// ResultSet is not empty - reset position
+					getPreviousRow();
+					return true;
+				}
+			}
+		case ISFIRST:
+			return (currentPosition == 1);
+		case ISLAST:
+			if (beforeFirst || afterLast || currentPosition==0 ||
+				currentPosition<positionInSource)
+			{
+				return false;
+			}			
+			
+			/* If we have seen the last row, we can tell if we are 
+			 * on it by comparing currentPosition with lastPosition.
+			 * Otherwise, we check if there is a next row.
+			 */
+			if (seenLast)
+			{
+				return (currentPosition == lastPosition);
+			}
+			else
+			{
+				final int savePosition = currentPosition;
+				final boolean retval = (getNextRowFromSource() == null);
+				getRowFromHashTable(savePosition);
+				return retval;
+			}
+		case ISAFTERLAST:
+			return afterLast;
+		default:
+			return false;
+		}
+	}
+
+	/**
+	 * Returns the row number of the current row.  Row
+	 * numbers start from 1 and go to 'n'.  Corresponds
+	 * to row numbering used to position current row
+	 * in the result set (as per JDBC).
+	 *
+	 * @return	the row number, or 0 if not on a row
+	 *
+	 */
+	public int getRowNumber()
+	{
+		return currentRow == null ? 0 : currentPosition;
+	}
+
+	/* Get the next row from the source ResultSet tree and insert into the hash table */
+	private ExecRow getNextRowFromSource() throws StandardException
+	{
+		ExecRow		sourceRow = null;
+		ExecRow		result = null;
+
+		/* Don't give back more rows than requested */
+		if (maxRows > 0 && maxRows == positionInSource)
+		{
+			seenLast = true;
+			lastPosition = positionInSource;
+			afterLast = true;
+			return null;
+		}
+
+
+		if (needsRepositioning) {
+			positionInLastFetchedRow();
+			needsRepositioning = false;
+		}
+		sourceRow = source.getNextRowCore();
+
+		if (sourceRow != null)
+		{
+			seenFirst = true;
+			beforeFirst = false;
+
+			long beginTCTime = getCurrentTimeMillis();
+			/* If this is the first row from the source then we create a new row
+			 * for use when fetching from the hash table.
+			 */
+			if (resultRow == null)
+			{
+				resultRow = activation.getExecutionFactory().getValueRow(sourceRowWidth);
+			}
+
+			positionInSource++;
+			currentPosition = positionInSource;
+
+			RowLocation rowLoc = null;
+			if (source.isForUpdate()) {
+				rowLoc = ((CursorResultSet)source).getRowLocation();
+			}
+
+			addRowToHashTable(sourceRow, currentPosition, rowLoc, false);
+
+		}
+		// Remember whether or not we're past the end of the table
+		else
+		{
+			if (! seenLast)
+			{
+				lastPosition = positionInSource;
+			}
+			seenLast = true;
+			// Special case for empty table (afterLast is never true)
+			if (positionInSource == 0)
+			{
+				afterLast = false;
+			}
+			else
+			{
+				afterLast = true;
+				currentPosition = positionInSource + 1;
+			}
+		}
+
+		return sourceRow;
+	}
+
+	/**
+	 * If the result set has been opened,
+	 * close the open scan.
+	 *
+	 * @exception StandardException thrown on error
+	 */
+	public void	close() throws StandardException
+	{
+		beginTime = getCurrentTimeMillis();
+	    if ( isOpen )
+	    {
+			currentRow = null;
+	        source.close();
+
+			if (ht != null)
+			{
+				ht.close();
+				ht = null;
+			}
+
+			super.close();
+	    }
+		else
+			if (SanityManager.DEBUG)
+				SanityManager.DEBUG("CloseRepeatInfo","Close of ScrollInsensitiveResultSet repeated");
+		setBeforeFirstRow();
+
+		closeTime += getElapsedMillis(beginTime);
+	}
+
+	public void	finish() throws StandardException
+	{
+		source.finish();
+		finishAndRTS();
+	}
+
+	/**
+	 * Return the total amount of time spent in this ResultSet
+	 *
+	 * @param type	CURRENT_RESULTSET_ONLY - time spent only in this ResultSet
+	 *				ENTIRE_RESULTSET_TREE  - time spent in this ResultSet and below.
+	 *
+	 * @return long		The total amount of time spent (in milliseconds).
+	 */
+	public long getTimeSpent(int type)
+	{
+		long totTime = constructorTime + openTime + nextTime + closeTime;
+
+		if (type == NoPutResultSet.CURRENT_RESULTSET_ONLY)
+		{
+			return	totTime - source.getTimeSpent(ENTIRE_RESULTSET_TREE);
+		}
+		else
+		{
+			return totTime;
+		}
+	}
+
+	//
+	// CursorResultSet interface
+	//
+
+	/**
+	 * Gets information from its source. We might want
+	 * to have this take a CursorResultSet in its constructor some day,
+	 * instead of doing a cast here?
+	 *
+	 * @see CursorResultSet
+	 *
+	 * @return the row location of the current cursor row.
+	 *
+ 	 * @exception StandardException thrown on failure 
+	 */
+	public RowLocation getRowLocation() throws StandardException 
+	{
+		if (SanityManager.DEBUG)
+			SanityManager.ASSERT(source instanceof CursorResultSet, "source not CursorResultSet");
+		return ( (CursorResultSet)source ).getRowLocation();
+	}
+
+	/**
+	 * Gets information from last getNextRow call.
+	 *
+	 * @see CursorResultSet
+	 *
+	 * @return the last row returned.
+	 */
+	/* RESOLVE - this should return activation.getCurrentRow(resultSetNumber),
+	 * once there is such a method.  (currentRow is redundant)
+	 */
+	public ExecRow getCurrentRow() throws StandardException
+	{
+		if (isForUpdate() && isDeleted()) {
+			return null;
+		} else {
+			return currentRow;
+		}
+	}
+
+	//
+	// class implementation
+	//
+
+	/**
+	 * Add a row to the backing hash table, keyed on position.
+	 * When a row gets updated when using scrollable insensitive updatable
+	 * result sets, the old entry for the row will be deleted from the hash 
+	 * table and this method will be called to add the new values for the row
+	 * to the hash table, with the parameter rowUpdated = true so as to mark 
+	 * the row as updated. The latter is done in order to implement 
+	 * detectability of own changes for result sets of this type.
+	 *
+	 * @param sourceRow	The row to add.
+	 * @param position The key
+	 * @param rowLoc The rowLocation of the row to add.
+	 * @param rowUpdated Indicates whether the row has been updated.
+	 *
+	 */
+	private void addRowToHashTable(ExecRow sourceRow, int position,
+			RowLocation rowLoc, boolean rowUpdated)
+		throws StandardException
+	{
+		DataValueDescriptor[] hashRowArray = new 
+				DataValueDescriptor[sourceRowWidth + extraColumns];
+		// 1st element is the key
+		hashRowArray[0] = new SQLInteger(position);
+		if (isForUpdate()) {
+			hashRowArray[POS_ROWLOCATION] = rowLoc.getClone();
+			hashRowArray[POS_ROWDELETED] = new SQLBoolean(false);
+			hashRowArray[POS_ROWUPDATED] = new SQLBoolean(rowUpdated);
+		}
+
+		/* Copy rest of elements from sourceRow.
+		 * NOTE: We need to clone the source row
+		 * and we do our own cloning since the 1st column
+		 * is not a wrapper.
+		 */
+		DataValueDescriptor[] sourceRowArray = sourceRow.getRowArray();
+
+		System.arraycopy(sourceRowArray, 0, hashRowArray, extraColumns, 
+				sourceRowArray.length);
+
+		ht.putRow(true, hashRowArray);
+
+		numToHashTable++;
+	}
+
+	/**
+	 * Get the row at the specified position
+	 * from the hash table.
+	 *
+	 * @param position	The specified position.
+	 *
+	 * @return	The row at that position.
+	 *
+ 	 * @exception StandardException thrown on failure 
+	 */
+	private ExecRow getRowFromHashTable(int position)
+		throws StandardException
+	{
+
+		// Get the row from the hash table
+		positionInHashTable.setValue(position);
+		DataValueDescriptor[] hashRowArray = (DataValueDescriptor[]) 
+				ht.get(positionInHashTable);
+
+
+		if (SanityManager.DEBUG)
+		{
+			SanityManager.ASSERT(hashRowArray != null,
+				"hashRowArray expected to be non-null");
+		}
+		// Copy out the Object[] without the position.
+		DataValueDescriptor[] resultRowArray = new 
+				DataValueDescriptor[hashRowArray.length - extraColumns];
+		System.arraycopy(hashRowArray, extraColumns, resultRowArray, 0, 
+				resultRowArray.length);
+
+		resultRow.setRowArray(resultRowArray);
+
+		// Reset the current position to the user position
+		currentPosition = position;
+
+		numFromHashTable++;
+
+		if (resultRow != null)
+		{
+			beforeFirst = false;
+			afterLast = false;
+		}
+
+		if (isForUpdate()) {
+			RowLocation rowLoc = (RowLocation) hashRowArray[POS_ROWLOCATION];
+			// Keep source and target with the same currentRow
+			((NoPutResultSet)target).setCurrentRow(resultRow);
+			((NoPutResultSet)target).positionScanAtRowLocation(rowLoc);
+			needsRepositioning = true;
+		}
+		
+		setCurrentRow(resultRow);
+
+		return resultRow;
+	}
+	
+	/**
+	 * Get the row data at the specified position 
+	 * from the hash table.
+	 *
+	 * @param position	The specified position.
+	 *
+	 * @return	The row data at that position.
+	 *
+ 	 * @exception StandardException thrown on failure 
+	 */
+	private DataValueDescriptor[] getRowArrayFromHashTable(int position)
+		throws StandardException
+	{
+		positionInHashTable.setValue(position);
+		final DataValueDescriptor[] hashRowArray = (DataValueDescriptor[]) 
+			ht.get(positionInHashTable);
+		
+		// Copy out the Object[] without the position.
+		final DataValueDescriptor[] resultRowArray = new 
+			DataValueDescriptor[hashRowArray.length - extraColumns];
+		System.arraycopy(hashRowArray, extraColumns, resultRowArray, 0, 
+						 resultRowArray.length);
+		return resultRowArray;
+	}
+
+	/**
+	 * Positions the cursor in the last fetched row. This is done before
+	 * navigating to a row that has not previously been fetched, so that
+	 * getNextRowCore() will re-start from where it stopped.
+	 */
+	private void positionInLastFetchedRow() throws StandardException {
+		if (positionInSource > 0) {
+			positionInHashTable.setValue(positionInSource);
+			DataValueDescriptor[] hashRowArray = (DataValueDescriptor[]) 
+					ht.get(positionInHashTable);
+			RowLocation rowLoc = (RowLocation) hashRowArray[POS_ROWLOCATION];
+			((NoPutResultSet)target).positionScanAtRowLocation(rowLoc);
+			currentPosition = positionInSource;
+		}
+	}
+
+	/**
+	 * @see NoPutResultSet#updateRow
+	 *
+	 * Sets the updated column of the hash table to true and updates the row
+	 * in the hash table with the new values for the row.
+	 */
+	public void updateRow(ExecRow row) throws StandardException {
+		ExecRow newRow = row;
+		boolean undoProjection = false;
+		
+		if (source instanceof ProjectRestrictResultSet) {
+			newRow = ((ProjectRestrictResultSet)source).
+				doBaseRowProjection(row);
+			undoProjection = true;
+		}
+		positionInHashTable.setValue(currentPosition);
+		DataValueDescriptor[] hashRowArray = (DataValueDescriptor[]) 
+				ht.get(positionInHashTable);
+		RowLocation rowLoc = (RowLocation) hashRowArray[POS_ROWLOCATION];
+		ht.remove(new SQLInteger(currentPosition));
+		addRowToHashTable(newRow, currentPosition, rowLoc, true);
+		
+		// Modify row to refer to data in the BackingStoreHashtable.
+		// This allows reading of data which goes over multiple pages
+		// when doing the actual update (LOBs). Putting columns of
+		// type SQLBinary to disk, has destructive effect on the columns,
+		// and they need to be re-read. That is the reason this is needed.
+		if (undoProjection) {
+			
+			final DataValueDescriptor[] newRowData = newRow.getRowArray();
+			
+			// Array of original position in row
+			final int[] origPos =((ProjectRestrictResultSet)source).
+				getBaseProjectMapping(); 
+			
+			// We want the row to contain data backed in BackingStoreHashtable
+			final DataValueDescriptor[] backedData = 
+				getRowArrayFromHashTable(currentPosition);
+			
+			for (int i=0; i<origPos.length; i++) {
+				if (origPos[i]>=0) {
+					row.setColumn(origPos[i], backedData[i]);
+				}
+			}
+		} else {
+			row.setRowArray(getRowArrayFromHashTable(currentPosition));
+		}
+	}
+
+	/**
+	 * @see NoPutResultSet#markRowAsDeleted
+	 *
+	 * Sets the deleted column of the hash table to true in the current row.
+	 */
+	public void markRowAsDeleted() throws StandardException  {
+		positionInHashTable.setValue(currentPosition);
+		DataValueDescriptor[] hashRowArray = (DataValueDescriptor[]) 
+				ht.get(positionInHashTable);
+		RowLocation rowLoc = (RowLocation) hashRowArray[POS_ROWLOCATION];
+		ht.remove(new SQLInteger(currentPosition));
+		((SQLBoolean)hashRowArray[POS_ROWDELETED]).setValue(true);
+		// Set all columns to NULL, the row is now a placeholder
+		for (int i=extraColumns; i<hashRowArray.length; i++) {
+			hashRowArray[i].setToNull();
+		}
+
+		ht.putRow(true, hashRowArray);
+	}
+
+	/**
+	 * Returns TRUE if the row was been deleted within the transaction,
+	 * otherwise returns FALSE
+	 *
+	 * @return True if the row has been deleted, otherwise false
+	 *
+	 * @exception StandardException on error
+	 */
+	public boolean isDeleted() throws StandardException  {
+		if (currentPosition <= positionInSource && currentPosition > 0) {
+			positionInHashTable.setValue(currentPosition);
+			DataValueDescriptor[] hashRowArray = (DataValueDescriptor[]) 
+					ht.get(positionInHashTable);
+			return hashRowArray[POS_ROWDELETED].getBoolean();
+		}
+		return false;
+	}
+
+	/**
+	 * Returns TRUE if the row was been updated within the transaction,
+	 * otherwise returns FALSE
+	 *
+	 * @return True if the row has been deleted, otherwise false
+	 *
+	 * @exception StandardException on error
+	 */
+	public boolean isUpdated() throws StandardException {
+		if (currentPosition <= positionInSource && currentPosition > 0) {
+			positionInHashTable.setValue(currentPosition);
+			DataValueDescriptor[] hashRowArray = (DataValueDescriptor[]) 
+					ht.get(positionInHashTable);
+			return hashRowArray[POS_ROWUPDATED].getBoolean();
+		}
+		return false;
+	}
+
+	public boolean isForUpdate() {
+		return source.isForUpdate();
+	}
+
 }

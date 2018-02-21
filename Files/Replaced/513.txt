@@ -1,279 +1,544 @@
-println("-- " + iter++);
-
-/*
-
-Derby - Class org.apache.derbyTesting.functionTests.tests.memory.MemoryLeakFixesTest
-
-Licensed to the Apache Software Foundation (ASF) under one or more
-contributor license agreements.  See the NOTICE file distributed with
-this work for additional information regarding copyright ownership.
-The ASF licenses this file to You under the Apache License, Version 2.0
-(the "License"); you may not use this file except in compliance with
-the License.  You may obtain a copy of the License at
-
-   http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
-*/
-
-package org.apache.derbyTesting.functionTests.tests.memory;
-
-import java.io.File;
-import java.sql.Connection;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.sql.Statement;
-
-import javax.sql.DataSource;
-import junit.framework.Test;
-
-import org.apache.derbyTesting.functionTests.util.PrivilegedFileOpsForTests;
-import org.apache.derbyTesting.junit.BaseJDBCTestCase;
-import org.apache.derbyTesting.junit.JDBCDataSource;
-import org.apache.derbyTesting.junit.TestConfiguration;
+if (reader != null) comparators[i] = comparators[i].setNextReader(reader, docBase);
 
 /**
- * MemoryLeakFixesTest should be run with -Xmx16M or run 
- * as part of the ant junit-lowmem target. The test is
- * generally successful if it does not run out of memory.
- * Results are not typically checked.
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
-public class MemoryLeakFixesTest extends BaseJDBCTestCase {
+package org.apache.solr.search;
 
-    public MemoryLeakFixesTest(String name) {
-        super(name);
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.search.*;
+import org.apache.solr.search.function.DocValues;
+import org.apache.solr.search.function.ValueSource;
+
+import java.io.IOException;
+import java.util.*;
+
+public class MultiCollector extends Collector {
+  final Collector[] collectors;
+  final boolean acceptsDocsOutOfOrder;
+
+  public static Collector wrap(List<? extends Collector> collectors) {
+    return collectors.size() == 1 ? collectors.get(0) : new MultiCollector(collectors);  
+  }
+
+  public static Collector[] subCollectors(Collector collector) {
+    if (collector instanceof MultiCollector)
+      return ((MultiCollector)collector).collectors;
+    return new Collector[]{collector};
+  }
+
+  public MultiCollector(List<? extends Collector> collectors) {
+    this(collectors.toArray(new Collector[collectors.size()]));
+  }
+
+  public MultiCollector(Collector[] collectors) {
+    this.collectors = collectors;
+
+    boolean acceptsDocsOutOfOrder = true;
+    for (Collector collector : collectors) {
+      if (collector.acceptsDocsOutOfOrder() == false) {
+        acceptsDocsOutOfOrder = false;
+        break;
+      }
     }
-    private static long HALFMB = 500*1024;
-    
-    private static int numRows = 100;
-    private static int numPreparedStmts = 2000;
+    this.acceptsDocsOutOfOrder = acceptsDocsOutOfOrder;
+  }
+
+  @Override
+  public void setScorer(Scorer scorer) throws IOException {
+    for (Collector collector : collectors)
+      collector.setScorer(scorer);
+  }
+
+  @Override
+  public void collect(int doc) throws IOException {
+    for (Collector collector : collectors)
+      collector.collect(doc);
+  }
+
+  @Override
+  public void setNextReader(IndexReader reader, int docBase) throws IOException {
+    for (Collector collector : collectors)
+      collector.setNextReader(reader, docBase);
+  }
+
+  @Override
+  public boolean acceptsDocsOutOfOrder() {
+    return acceptsDocsOutOfOrder;
+  }
+}
 
 
-    // Tests prepared statements are not leaked if not explicitly closed by
-    // user (DERBY-210)
-    public void testPrepStmtD210() throws Exception
-    {
-        Connection conn = getConnection();
-        PreparedStatement ps = null;
-        ResultSet rs = null;
-        conn.setAutoCommit(false);
 
-        Statement stmt = createStatement();
 
-        stmt.execute("create table t1 (lvc  LONG VARCHAR)");
-        stmt.close();
 
-        String insertTabSql = "insert into t1 values(?)";
-        ps = conn.prepareStatement(insertTabSql);
-        for (int i = 0; i < numRows; i++)
-        {
-            ps.setString(1,"Hello" + i);
-            ps.executeUpdate();
+
+class SearchGroup {
+  public MutableValue groupValue;
+  int matches;
+  int topDoc;
+  // float topDocScore;  // currently unused
+  int comparatorSlot;
+
+  // currently only used when sort != sort.group
+  FieldComparator[] sortGroupComparators;
+  int[] sortGroupReversed;
+
+  /***
+  @Override
+  public int hashCode() {
+    return super.hashCode();
+  }
+
+  @Override
+  public boolean equals(Object obj) {
+    return groupValue.equalsSameType(((SearchGroup)obj).groupValue);
+  }
+  ***/
+}
+
+
+
+/** Finds the top set of groups, grouped by groupByVS when sort == group.sort */
+class TopGroupCollector extends Collector {
+  final int nGroups;
+  final HashMap<MutableValue, SearchGroup> groupMap;
+  TreeSet<SearchGroup> orderedGroups;
+  final ValueSource vs;
+  final Map context;
+  final FieldComparator[] comparators;
+  final int[] reversed;
+
+  DocValues docValues;
+  DocValues.ValueFiller filler;
+  MutableValue mval;
+  Scorer scorer;
+  int docBase;
+  int spareSlot;
+
+  int matches;
+
+  public TopGroupCollector(ValueSource groupByVS, Map vsContext, Sort sort, int nGroups) throws IOException {
+    this.vs = groupByVS;
+    this.context = vsContext;
+    this.nGroups = nGroups;
+
+    SortField[] sortFields = sort.getSort();
+    this.comparators = new FieldComparator[sortFields.length];
+    this.reversed = new int[sortFields.length];
+    for (int i = 0; i < sortFields.length; i++) {
+      SortField sortField = sortFields[i];
+      reversed[i] = sortField.getReverse() ? -1 : 1;
+      // use nGroups + 1 so we have a spare slot to use for comparing (tracked by this.spareSlot)
+      comparators[i] = sortField.getComparator(nGroups + 1, i);
+    }
+    this.spareSlot = nGroups;
+
+    this.groupMap = new HashMap<MutableValue, SearchGroup>(nGroups);
+  }
+
+  @Override
+  public void setScorer(Scorer scorer) throws IOException {
+    this.scorer = scorer;
+    for (FieldComparator fc : comparators)
+      fc.setScorer(scorer);
+  }
+
+  @Override
+  public void collect(int doc) throws IOException {
+    matches++;
+    filler.fillValue(doc);
+    SearchGroup group = groupMap.get(mval);
+    if (group == null) {
+      int num = groupMap.size();
+      if (groupMap.size() < nGroups) {
+        SearchGroup sg = new SearchGroup();
+        sg.groupValue = mval.duplicate();
+        sg.comparatorSlot = num++;
+        sg.matches = 1;
+        sg.topDoc = docBase + doc;
+        // sg.topDocScore = scorer.score();
+        for (FieldComparator fc : comparators)
+          fc.copy(sg.comparatorSlot, doc);
+        groupMap.put(sg.groupValue, sg);
+        return;
+      }
+
+      if (orderedGroups == null) {
+        buildSet();
+      }
+
+
+      for (int i = 0;; i++) {
+        final int c = reversed[i] * comparators[i].compareBottom(doc);
+        if (c < 0) {
+          // Definitely not competitive.
+          return;
+        } else if (c > 0) {
+          // Definitely competitive.
+          break;
+        } else if (i == comparators.length - 1) {
+          // Here c=0. If we're at the last comparator, this doc is not
+          // competitive, since docs are visited in doc Id order, which means
+          // this doc cannot compete with any other document in the queue.
+          return;
         }
-        ps.close();
+      }
 
+      // remove current smallest group
+      SearchGroup smallest = orderedGroups.pollLast();
+      groupMap.remove(smallest.groupValue);
 
+      // reuse the removed SearchGroup
+      smallest.groupValue.copy(mval);
+      smallest.matches = 1;
+      smallest.topDoc = docBase + doc;
+      // smallest.topDocScore = scorer.score();
+      for (FieldComparator fc : comparators)
+        fc.copy(smallest.comparatorSlot, doc);
 
-        String selTabSql = "select * from t1";
+      groupMap.put(smallest.groupValue, smallest);
+      orderedGroups.add(smallest);
 
-        for (int i = 0 ; i  < numPreparedStmts; i++)
-        {
-            ps = conn.prepareStatement(selTabSql);
-            rs = ps.executeQuery();
+      for (FieldComparator fc : comparators)
+        fc.setBottom(orderedGroups.last().comparatorSlot);
 
-            while (rs.next())
-            {
-                rs.getString(1);
-            }
+      return;
+    }
 
-            rs.close();
+    //
+    // update existing group
+    //
 
-            // Do not close the prepared statement
-            // because we want to check that it is
-            // garbage collected
-            //ps.close();
-            if ((i % 100) == 0)
-                runFinalizerIfNeeded();
+    group.matches++; // TODO: these aren't valid if the group is every discarded then re-added.  keep track if there have been discards?
+
+    for (int i = 0;; i++) {
+      FieldComparator fc = comparators[i];
+      fc.copy(spareSlot, doc);
+
+      final int c = reversed[i] * fc.compare(group.comparatorSlot, spareSlot);
+      if (c < 0) {
+        // Definitely not competitive.
+        return;
+      } else if (c > 0) {
+        // Definitely competitive.
+        // Set remaining comparators
+        for (int j=i+1; j<comparators.length; j++)
+          comparators[j].copy(spareSlot, doc);
+        break;
+      } else if (i == comparators.length - 1) {
+        // Here c=0. If we're at the last comparator, this doc is not
+        // competitive, since docs are visited in doc Id order, which means
+        // this doc cannot compete with any other document in the queue.
+        return;
+      }
+    }
+
+    // remove before updating the group since lookup is done via comparators
+    // TODO: optimize this
+    if (orderedGroups != null)
+      orderedGroups.remove(group);
+
+    group.topDoc = docBase + doc;
+    // group.topDocScore = scorer.score();
+    int tmp = spareSlot; spareSlot = group.comparatorSlot; group.comparatorSlot=tmp;  // swap slots
+
+    // re-add the changed group
+    if (orderedGroups != null)
+      orderedGroups.add(group);
+  }
+
+  void buildSet() {
+    Comparator<SearchGroup> comparator = new Comparator<SearchGroup>() {
+      public int compare(SearchGroup o1, SearchGroup o2) {
+        for (int i = 0;; i++) {
+          FieldComparator fc = comparators[i];
+          int c = reversed[i] * fc.compare(o1.comparatorSlot, o2.comparatorSlot);
+          if (c != 0) {
+            return c;
+          } else if (i == comparators.length - 1) {
+            return o1.topDoc - o2.topDoc;
+          }
         }
-        conn.commit();
-    }
+      }
+    };
 
-    // Tests re-execution of a statement without closing the result
-    // set (DERBY-557).
-    public void testReExecuteD557() throws Exception {
-        println("DERBY-557: reExecuteStatementTest() ");
-        Connection conn = getConnection();
-        Statement stmt = conn.createStatement();
-        for (int i = 0; i < 50000; i++) {
-            if ((i % 1000) == 0)
-                runFinalizerIfNeeded();
-            ResultSet rs = stmt.executeQuery("values(1)");
-            // How silly! I forgot to close the result set.
+    orderedGroups = new TreeSet<SearchGroup>(comparator);
+    orderedGroups.addAll(groupMap.values());
+    if (orderedGroups.size() == 0) return;
+    for (FieldComparator fc : comparators)
+      fc.setBottom(orderedGroups.last().comparatorSlot);
+  }
+
+  @Override
+  public void setNextReader(IndexReader reader, int docBase) throws IOException {
+    this.docBase = docBase;
+    docValues = vs.getValues(context, reader);
+    filler = docValues.getValueFiller();
+    mval = filler.getValue();
+    for (FieldComparator fc : comparators)
+      fc.setNextReader(reader, docBase);
+  }
+
+  @Override
+  public boolean acceptsDocsOutOfOrder() {
+    return false;
+  }
+
+  public int getMatches() {
+    return matches;
+  }
+}
+
+
+/**
+ * This class allows a different sort within a group than what is used between groups.
+ * Sorting between groups is done by the sort value of the first (highest ranking)
+ * document in that group.
+ */
+class TopGroupSortCollector extends TopGroupCollector {
+
+  IndexReader reader;
+  Sort groupSort;
+
+  public TopGroupSortCollector(ValueSource groupByVS, Map vsContext, Sort sort, Sort groupSort, int nGroups) throws IOException {
+    super(groupByVS, vsContext, sort, nGroups);
+    this.groupSort = groupSort;
+  }
+
+  void constructComparators(FieldComparator[] comparators, int[] reversed, SortField[] sortFields, int size) throws IOException {
+    for (int i = 0; i < sortFields.length; i++) {
+      SortField sortField = sortFields[i];
+      reversed[i] = sortField.getReverse() ? -1 : 1;
+      comparators[i] = sortField.getComparator(size, i);
+      if (scorer != null) comparators[i].setScorer(scorer);
+      if (reader != null) comparators[i].setNextReader(reader, docBase);
+    }
+  }
+
+  @Override
+  public void setScorer(Scorer scorer) throws IOException {
+    super.setScorer(scorer);
+    for (SearchGroup searchGroup : groupMap.values()) {
+      for (FieldComparator fc : searchGroup.sortGroupComparators) {
+        fc.setScorer(scorer);
+      }
+    }
+  }
+
+  @Override
+  public void collect(int doc) throws IOException {
+    matches++;
+    filler.fillValue(doc);
+    SearchGroup group = groupMap.get(mval);
+    if (group == null) {
+      int num = groupMap.size();
+      if (groupMap.size() < nGroups) {
+        SearchGroup sg = new SearchGroup();
+        SortField[] sortGroupFields = groupSort.getSort();
+        sg.sortGroupComparators = new FieldComparator[sortGroupFields.length];
+        sg.sortGroupReversed = new int[sortGroupFields.length];
+        constructComparators(sg.sortGroupComparators, sg.sortGroupReversed, sortGroupFields, 1);
+
+        sg.groupValue = mval.duplicate();
+        sg.comparatorSlot = num++;
+        sg.matches = 1;
+        sg.topDoc = docBase + doc;
+        // sg.topDocScore = scorer.score();
+        for (FieldComparator fc : comparators)
+          fc.copy(sg.comparatorSlot, doc);
+        for (FieldComparator fc : sg.sortGroupComparators) {
+          fc.copy(0, doc);
+          fc.setBottom(0);
         }
-        conn.commit();
-        stmt.close();
-        conn.close();
-    }
+        groupMap.put(sg.groupValue, sg);
+        return;
+      }
 
-    /**
-     * Test fix for leak if ResultSets are not closed.
-     * @throws Exception
-     */
-    public void testResultSetgcD3316() throws Exception {
-          println("DERBY-3316: Multiple statement executions ");
-                
-          Connection conn = getConnection();
-          Statement s = createStatement();
-          s.executeUpdate("CREATE TABLE TAB (col1 varchar(32672))");
-          PreparedStatement ps = conn.prepareStatement("INSERT INTO TAB VALUES(?)");
-          ps.setString(1,"hello");
-          ps.executeUpdate();
-          ps.setString(1,"hello");
-          ps.executeUpdate();
-          ps.close();
-          for (int i = 0; i < 2000; i++)
-          {
-                  s = conn.createStatement();
-                  ResultSet rs = s.executeQuery("SELECT * from tab");
-                  // drain the resultset
-                  while (rs.next());
-                  // With DERBY-3316, If I don't explicitly close the resultset or 
-                  // statement, we get a leak.
-                  //rs.close();
-                  //s.close();
-                  if ((i % 100) == 0) 
-                       runFinalizerIfNeeded();
-                  
-          }    
-          // close the connection to free up all the result sets that our sloppy 
-          // user didn't close.
-          conn.close();
-          conn = getConnection();
-          s = conn.createStatement();
-          s.executeUpdate("DROP TABLE TAB");
-          s.close();
-          conn.close();
-       }
+      if (orderedGroups == null) {
+        buildSet();
+      }
 
-    /**
-     * Tests that the memory usage dosen't increase for each database that is
-     * created.
-     * <p>
-     * The tests is primarily written to ensure that the automatic index
-     * statistics daemon doesn't cause memory leakage. One one database is
-     * active/booted at a time.
-     * <p>
-     * See DERBY-5336.
-     *
-     * @throws SQLException if something goes wrong
-     */
-    public void testRepeatedDatabaseCreationWithAutoStats()
-            throws SQLException {
-        final String DB_NAME = "derby-memory-test";
-        final File DB_DIR = new File("system", DB_NAME);
-        DataSource ds = JDBCDataSource.getDataSource(DB_NAME);
-    
-        // using -Xmx32M typically causes the out of memory error to appear
-        // within 20 iterations;  this program was run on Windows 7 64-bit using
-        // jdk1.6.0_26
-        int iter = 0;
-        while (iter < 50) {
-            
-            traceit("-- " + iter++);
-            
-            // remove database directory so we can start fresh each time;
-            // the memory leak also manifests when a different directory is
-            // used each time through, i.e. it is not required that the
-            // database be created in the same location over and over
-            if (PrivilegedFileOpsForTests.exists(DB_DIR)) {
-                assertDirectoryDeleted(DB_DIR);
-            }
-            
-            // create the database
-            JDBCDataSource.setBeanProperty(ds, "createDatabase", "create");
-            Connection conn = ds.getConnection();
-            JDBCDataSource.clearStringBeanProperty(ds, "createDatabase");
-            
-            // we'll use this one statement the whole time this db is open
-            Statement s = conn.createStatement();
-            
-            // create a simple schema; the presence of the index is important
-            // somehow as the memory leak does not appear without it
-            s.executeUpdate("CREATE TABLE TEST (CINT INT)");
-            s.executeUpdate("CREATE INDEX NDX ON TEST (CINT)");
-            
-            // perform some updates and queries; it seems that the number of
-            // iterations here is important and that there is a threshold that
-            // must be crossed; e.g. in my tests the memory leak would not
-            // manifest with 105 iterations but it would with 106 iterations
-            for (int i = 0; i < 500; i++) {
-                
-                // both update and query are important; removing either one
-                // causes the memory leak not to appear;  the order in which
-                // they are executed, however, does not seem to be important
-                s.executeUpdate("INSERT INTO TEST VALUES(" + i + ")");
-                s.executeQuery("SELECT * FROM TEST WHERE CINT=" + i).close();
-                
-            }
-            
-            // done with statement and connection
-            s.close();
-            conn.close();
-            
-            // shutdown this database, but not entire derby engine
-            JDBCDataSource.setBeanProperty(ds, "shutdownDatabase", "shutdown");
-            try {
-                ds.getConnection();
-                fail("Expected shutdown exception");
-            } catch (SQLException e) {
-                assertSQLState("08006", e);
-            } finally {
-                JDBCDataSource.clearStringBeanProperty(ds, "shutdownDatabase");
-            }
-
-            if (isPhoneME()) {
-                // DERBY-5412: phoneME fails after some iterations because the
-                // number of class names exceeds a VM limit. If we invoke
-                // garbage collection manually, it seems to be able to reclaim
-                // the classes that are no longer in use, and complete the test.
-                Runtime.getRuntime().gc();
-            }
+      SearchGroup leastSignificantGroup = orderedGroups.last();
+      for (int i = 0;; i++) {
+        final int c = leastSignificantGroup.sortGroupReversed[i] * leastSignificantGroup.sortGroupComparators[i].compareBottom(doc);
+        if (c < 0) {
+          // Definitely not competitive.
+          return;
+        } else if (c > 0) {
+          // Definitely competitive.
+          break;
+        } else if (i == leastSignificantGroup.sortGroupComparators.length - 1) {
+          // Here c=0. If we're at the last comparator, this doc is not
+          // competitive, since docs are visited in doc Id order, which means
+          // this doc cannot compete with any other document in the queue.
+          return;
         }
+      }
 
-        // extra sanity check making sure that the database was created in the
-        // location we assumed
-        assertTrue(PrivilegedFileOpsForTests.exists(DB_DIR));
+      // remove current smallest group
+      SearchGroup smallest = orderedGroups.pollLast();
+      groupMap.remove(smallest.groupValue);
+
+      // reuse the removed SearchGroup
+      smallest.groupValue.copy(mval);
+      smallest.matches = 1;
+      smallest.topDoc = docBase + doc;
+      // smallest.topDocScore = scorer.score();
+      for (FieldComparator fc : comparators)
+        fc.copy(smallest.comparatorSlot, doc);
+      for (FieldComparator fc : smallest.sortGroupComparators) {
+        fc.copy(0, doc);
+        fc.setBottom(0);
+      }
+
+      groupMap.put(smallest.groupValue, smallest);
+      orderedGroups.add(smallest);
+
+      for (FieldComparator fc : comparators)
+        fc.setBottom(orderedGroups.last().comparatorSlot);
+      for (FieldComparator fc : smallest.sortGroupComparators)
+        fc.setBottom(0);
+
+      return;
     }
 
-    /**
-     * runFinalizerIfNeeded is called periodically for DERBY-4200. With the IBM
-     * JVM in some modes, like soft real time or in a single threaded
-     * environment on vmware. The finalizer may lag behind the program so much
-     * we get an OOM. If we get low on memory, force the finalizer to catch up.
-     * 
-     */
-    private static void runFinalizerIfNeeded() {
-        
-        Runtime rt = Runtime.getRuntime();
-        if (rt.freeMemory() < HALFMB){
-            println("Waiting for finalizer ");
-            rt.runFinalization();
-            
+    //
+    // update existing group
+    //
 
+    group.matches++; // TODO: these aren't valid if the group is every discarded then re-added.  keep track if there have been discards?
+
+    for (int i = 0;; i++) {
+      FieldComparator fc = group.sortGroupComparators[i];
+
+      final int c = group.sortGroupReversed[i] * fc.compareBottom(doc);
+      if (c < 0) {
+        // Definitely not competitive.
+        return;
+      } else if (c > 0) {
+        // Definitely competitive.
+        // Set remaining comparators
+        for (int j = 0; j < group.sortGroupComparators.length; j++) {
+          group.sortGroupComparators[j].copy(0, doc);
+          group.sortGroupComparators[j].setBottom(0);
         }
+        for (FieldComparator comparator : comparators) comparator.copy(spareSlot, doc);
+        break;
+      } else if (i == group.sortGroupComparators.length - 1) {
+        // Here c=0. If we're at the last comparator, this doc is not
+        // competitive, since docs are visited in doc Id order, which means
+        // this doc cannot compete with any other document in the queue.
+        return;
+      }
+    }
 
+    // remove before updating the group since lookup is done via comparators
+    // TODO: optimize this
+    if (orderedGroups != null)
+      orderedGroups.remove(group);
+
+    group.topDoc = docBase + doc;
+    // group.topDocScore = scorer.score();
+    int tmp = spareSlot; spareSlot = group.comparatorSlot; group.comparatorSlot=tmp;  // swap slots
+
+    // re-add the changed group
+    if (orderedGroups != null)
+      orderedGroups.add(group);
+  }
+
+  @Override
+  public void setNextReader(IndexReader reader, int docBase) throws IOException {
+    super.setNextReader(reader, docBase);
+    this.reader = reader;
+    for (SearchGroup searchGroup : groupMap.values()) {
+      for (FieldComparator fc : searchGroup.sortGroupComparators) {
+        fc.setNextReader(reader, docBase);
+      }
     }
-    
-    public static Test suite() {
-        Test suite = TestConfiguration.defaultSuite(MemoryLeakFixesTest.class);
-        return suite;
+  }
+
+}
+
+
+class Phase2GroupCollector extends Collector {
+  final HashMap<MutableValue, SearchGroupDocs> groupMap;
+  final ValueSource vs;
+  final Map context;
+
+  DocValues docValues;
+  DocValues.ValueFiller filler;
+  MutableValue mval;
+  Scorer scorer;
+  int docBase;
+
+  // TODO: may want to decouple from the phase1 collector
+  public Phase2GroupCollector(TopGroupCollector topGroups, ValueSource groupByVS, Map vsContext, Sort sort, int docsPerGroup, boolean getScores) throws IOException {
+    boolean getSortFields = false;
+
+    groupMap = new HashMap<MutableValue, SearchGroupDocs>(topGroups.groupMap.size());
+    for (SearchGroup group : topGroups.groupMap.values()) {
+      SearchGroupDocs groupDocs = new SearchGroupDocs();
+      groupDocs.groupValue = group.groupValue;
+      groupDocs.collector = TopFieldCollector.create(sort, docsPerGroup, getSortFields, getScores, getScores, true);
+      groupMap.put(groupDocs.groupValue, groupDocs);
     }
+
+    this.vs = groupByVS;
+    this.context = vsContext;
+  }
+
+  @Override
+  public void setScorer(Scorer scorer) throws IOException {
+    this.scorer = scorer;
+    for (SearchGroupDocs group : groupMap.values())
+      group.collector.setScorer(scorer);
+  }
+
+  @Override
+  public void collect(int doc) throws IOException {
+    filler.fillValue(doc);
+    SearchGroupDocs group = groupMap.get(mval);
+    if (group == null) return;
+    group.matches++;
+    group.collector.collect(doc);
+  }
+
+  @Override
+  public void setNextReader(IndexReader reader, int docBase) throws IOException {
+    this.docBase = docBase;
+    docValues = vs.getValues(context, reader);
+    filler = docValues.getValueFiller();
+    mval = filler.getValue();
+    for (SearchGroupDocs group : groupMap.values())
+      group.collector.setNextReader(reader, docBase);
+  }
+
+  @Override
+  public boolean acceptsDocsOutOfOrder() {
+    return false;
+  }
+}
+
+// TODO: merge with SearchGroup or not?
+// ad: don't need to build a new hashmap
+// disad: blows up the size of SearchGroup if we need many of them, and couples implementations
+class SearchGroupDocs {
+  public MutableValue groupValue;
+  int matches;
+  TopFieldCollector collector;
 }

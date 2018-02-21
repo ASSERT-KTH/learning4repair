@@ -1,6 +1,6 @@
-termsWriter.hasVectors = true;
+new Throwable().printStackTrace(System.out);
 
-package org.apache.lucene.index;
+package org.apache.lucene.store;
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -21,270 +21,140 @@ package org.apache.lucene.index;
 
 import java.io.IOException;
 
-import org.apache.lucene.analysis.tokenattributes.OffsetAttribute;
-import org.apache.lucene.document.Fieldable;
-import org.apache.lucene.store.IndexOutput;
-import org.apache.lucene.util.ByteBlockPool;
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.RamUsageEstimator;
+import org.apache.lucene.util.LuceneTestCase;
 
-final class TermVectorsTermsWriterPerField extends TermsHashConsumerPerField {
+/**
+ * Used by MockRAMDirectory to create an output stream that
+ * will throw an IOException on fake disk full, track max
+ * disk space actually used, and maybe throw random
+ * IOExceptions.
+ */
 
-  final TermsHashPerField termsHashPerField;
-  final TermVectorsTermsWriter termsWriter;
-  final FieldInfo fieldInfo;
-  final DocumentsWriterPerThread.DocState docState;
-  final FieldInvertState fieldState;
+public class MockIndexOutputWrapper extends IndexOutput {
+  private MockDirectoryWrapper dir;
+  private final IndexOutput delegate;
+  private boolean first=true;
+  final String name;
+  
+  byte[] singleByte = new byte[1];
 
-  boolean doVectors;
-  boolean doVectorPositions;
-  boolean doVectorOffsets;
-
-  int maxNumPostings;
-  OffsetAttribute offsetAttribute = null;
-
-  public TermVectorsTermsWriterPerField(TermsHashPerField termsHashPerField, TermVectorsTermsWriter termsWriter, FieldInfo fieldInfo) {
-    this.termsHashPerField = termsHashPerField;
-    this.termsWriter = termsWriter;
-    this.fieldInfo = fieldInfo;
-    docState = termsHashPerField.docState;
-    fieldState = termsHashPerField.fieldState;
+  /** Construct an empty output buffer. */
+  public MockIndexOutputWrapper(MockDirectoryWrapper dir, IndexOutput delegate, String name) {
+    this.dir = dir;
+    this.name = name;
+    this.delegate = delegate;
   }
 
   @Override
-  int getStreamCount() {
-    return 2;
+  public void close() throws IOException {
+    dir.maybeThrowDeterministicException();
+    delegate.close();
+    if (dir.trackDiskUsage) {
+      // Now compute actual disk usage & track the maxUsedSize
+      // in the MockDirectoryWrapper:
+      long size = dir.getRecomputedActualSizeInBytes();
+      if (size > dir.maxUsedSize) {
+        dir.maxUsedSize = size;
+      }
+    }
+    synchronized(dir) {
+      dir.openFileHandles.remove(this);
+      dir.openFilesForWrite.remove(name);
+    }
   }
 
   @Override
-  boolean start(Fieldable[] fields, int count) {
-    doVectors = false;
-    doVectorPositions = false;
-    doVectorOffsets = false;
-
-    for(int i=0;i<count;i++) {
-      Fieldable field = fields[i];
-      if (field.isIndexed() && field.isTermVectorStored()) {
-        doVectors = true;
-        doVectorPositions |= field.isStorePositionWithTermVector();
-        doVectorOffsets |= field.isStoreOffsetWithTermVector();
-      }
-    }
-
-    if (doVectors) {
-      if (termsWriter.tvx != null) {
-        if (termsHashPerField.bytesHash.size() != 0) {
-          // Only necessary if previous doc hit a
-          // non-aborting exception while writing vectors in
-          // this field:
-          termsHashPerField.reset();
-        }
-      }
-    }
-
-    // TODO: only if needed for performance
-    //perThread.postingsCount = 0;
-
-    return doVectors;
-  }
-
-  public void abort() {}
-
-  /** Called once per field per document if term vectors
-   *  are enabled, to write the vectors to
-   *  RAMOutputStream, which is then quickly flushed to
-   *  the real term vectors files in the Directory. */  @Override
-  void finish() throws IOException {
-    if (!doVectors || termsHashPerField.bytesHash.size() == 0)
-      return;
-
-    termsWriter.addFieldToFlush(this);
-  }
-
-  void finishDocument() throws IOException {
-    assert docState.testPoint("TermVectorsTermsWriterPerField.finish start");
-
-    final int numPostings = termsHashPerField.bytesHash.size();
-
-    final BytesRef flushTerm = termsWriter.flushTerm;
-
-    assert numPostings >= 0;
-
-    if (numPostings > maxNumPostings)
-      maxNumPostings = numPostings;
-
-    // This is called once, after inverting all occurrences
-    // of a given field in the doc.  At this point we flush
-    // our hash into the DocWriter.
-
-    assert fieldInfo.storeTermVector;
-    assert termsWriter.vectorFieldsInOrder(fieldInfo);
-
-    TermVectorsPostingsArray postings = (TermVectorsPostingsArray) termsHashPerField.postingsArray;
-    final IndexOutput tvf = termsWriter.tvf;
-
-    // TODO: we may want to make this sort in same order
-    // as Codec's terms dict?
-    final int[] termIDs = termsHashPerField.sortPostings(BytesRef.getUTF8SortedAsUnicodeComparator());
-
-    tvf.writeVInt(numPostings);
-    byte bits = 0x0;
-    if (doVectorPositions)
-      bits |= TermVectorsReader.STORE_POSITIONS_WITH_TERMVECTOR;
-    if (doVectorOffsets)
-      bits |= TermVectorsReader.STORE_OFFSET_WITH_TERMVECTOR;
-    tvf.writeByte(bits);
-
-    int lastLen = 0;
-    byte[] lastBytes = null;
-    int lastStart = 0;
-
-    final ByteSliceReader reader = termsWriter.vectorSliceReader;
-    final ByteBlockPool termBytePool = termsHashPerField.termBytePool;
-
-    for(int j=0;j<numPostings;j++) {
-      final int termID = termIDs[j];
-      final int freq = postings.freqs[termID];
-
-      // Get BytesRef
-      termBytePool.setBytesRef(flushTerm, postings.textStarts[termID]);
-
-      // Compute common byte prefix between last term and
-      // this term
-      int prefix = 0;
-      if (j > 0) {
-        while(prefix < lastLen && prefix < flushTerm.length) {
-          if (lastBytes[lastStart+prefix] != flushTerm.bytes[flushTerm.offset+prefix]) {
-            break;
-          }
-          prefix++;
-        }
-      }
-
-      lastLen = flushTerm.length;
-      lastBytes = flushTerm.bytes;
-      lastStart = flushTerm.offset;
-
-      final int suffix = flushTerm.length - prefix;
-      tvf.writeVInt(prefix);
-      tvf.writeVInt(suffix);
-      tvf.writeBytes(flushTerm.bytes, lastStart+prefix, suffix);
-      tvf.writeVInt(freq);
-
-      if (doVectorPositions) {
-        termsHashPerField.initReader(reader, termID, 0);
-        reader.writeTo(tvf);
-      }
-
-      if (doVectorOffsets) {
-        termsHashPerField.initReader(reader, termID, 1);
-        reader.writeTo(tvf);
-      }
-    }
-
-    termsHashPerField.reset();
-  }
-
-  void shrinkHash() {
-    termsHashPerField.shrinkHash(maxNumPostings);
-    maxNumPostings = 0;
+  public void flush() throws IOException {
+    dir.maybeThrowDeterministicException();
+    delegate.flush();
   }
 
   @Override
-  void start(Fieldable f) {
-    if (doVectorOffsets) {
-      offsetAttribute = fieldState.attributeSource.addAttribute(OffsetAttribute.class);
+  public void writeByte(byte b) throws IOException {
+    singleByte[0] = b;
+    writeBytes(singleByte, 0, 1);
+  }
+  
+  @Override
+  public void writeBytes(byte[] b, int offset, int len) throws IOException {
+    long freeSpace = dir.maxSize == 0 ? 0 : dir.maxSize - dir.sizeInBytes();
+    long realUsage = 0;
+
+    // If MockRAMDir crashed since we were opened, then
+    // don't write anything:
+    if (dir.crashed)
+      throw new IOException("MockRAMDirectory was crashed; cannot write to " + name);
+
+    // Enforce disk full:
+    if (dir.maxSize != 0 && freeSpace <= len) {
+      // Compute the real disk free.  This will greatly slow
+      // down our test but makes it more accurate:
+      realUsage = dir.getRecomputedActualSizeInBytes();
+      freeSpace = dir.maxSize - realUsage;
+    }
+
+    if (dir.maxSize != 0 && freeSpace <= len) {
+      if (freeSpace > 0) {
+        realUsage += freeSpace;
+        delegate.writeBytes(b, offset, (int) freeSpace);
+      }
+      if (realUsage > dir.maxUsedSize) {
+        dir.maxUsedSize = realUsage;
+      }
+      String message = "fake disk full at " + dir.getRecomputedActualSizeInBytes() + " bytes when writing " + name + " (file length=" + delegate.length();
+      if (freeSpace > 0) {
+        message += "; wrote " + freeSpace + " of " + len + " bytes";
+      }
+      message += ")";
+      if (LuceneTestCase.VERBOSE) {
+        System.out.println(Thread.currentThread().getName() + ": MDW: now throw fake disk full");
+      }
+      throw new IOException(message);
     } else {
-      offsetAttribute = null;
+      if (dir.randomState.nextBoolean()) {
+        final int half = len/2;
+        delegate.writeBytes(b, offset, half);
+        Thread.yield();
+        delegate.writeBytes(b, offset+half, len-half);
+      } else {
+        delegate.writeBytes(b, offset, len);
+      }
+    }
+
+    dir.maybeThrowDeterministicException();
+
+    if (first) {
+      // Maybe throw random exception; only do this on first
+      // write to a new file:
+      first = false;
+      dir.maybeThrowIOException();
     }
   }
 
   @Override
-  void newTerm(final int termID) {
-    assert docState.testPoint("TermVectorsTermsWriterPerField.newTerm start");
-    TermVectorsPostingsArray postings = (TermVectorsPostingsArray) termsHashPerField.postingsArray;
-
-    postings.freqs[termID] = 1;
-
-    if (doVectorOffsets) {
-      int startOffset = fieldState.offset + offsetAttribute.startOffset();
-      int endOffset = fieldState.offset + offsetAttribute.endOffset();
-
-      termsHashPerField.writeVInt(1, startOffset);
-      termsHashPerField.writeVInt(1, endOffset - startOffset);
-      postings.lastOffsets[termID] = endOffset;
-    }
-
-    if (doVectorPositions) {
-      termsHashPerField.writeVInt(0, fieldState.position);
-      postings.lastPositions[termID] = fieldState.position;
-    }
+  public long getFilePointer() {
+    return delegate.getFilePointer();
   }
 
   @Override
-  void addTerm(final int termID) {
-
-    assert docState.testPoint("TermVectorsTermsWriterPerField.addTerm start");
-
-    TermVectorsPostingsArray postings = (TermVectorsPostingsArray) termsHashPerField.postingsArray;
-
-    postings.freqs[termID]++;
-
-    if (doVectorOffsets) {
-      int startOffset = fieldState.offset + offsetAttribute.startOffset();
-      int endOffset = fieldState.offset + offsetAttribute.endOffset();
-
-      termsHashPerField.writeVInt(1, startOffset - postings.lastOffsets[termID]);
-      termsHashPerField.writeVInt(1, endOffset - startOffset);
-      postings.lastOffsets[termID] = endOffset;
-    }
-
-    if (doVectorPositions) {
-      termsHashPerField.writeVInt(0, fieldState.position - postings.lastPositions[termID]);
-      postings.lastPositions[termID] = fieldState.position;
-    }
+  public void seek(long pos) throws IOException {
+    delegate.seek(pos);
   }
 
   @Override
-  void skippingLongTerm() {}
-
-  @Override
-  ParallelPostingsArray createPostingsArray(int size) {
-    return new TermVectorsPostingsArray(size);
+  public long length() throws IOException {
+    return delegate.length();
   }
 
-  static final class TermVectorsPostingsArray extends ParallelPostingsArray {
-    public TermVectorsPostingsArray(int size) {
-      super(size);
-      freqs = new int[size];
-      lastOffsets = new int[size];
-      lastPositions = new int[size];
-    }
+  @Override
+  public void setLength(long length) throws IOException {
+    delegate.setLength(length);
+  }
 
-    int[] freqs;                                       // How many times this term occurred in the current doc
-    int[] lastOffsets;                                 // Last offset we saw
-    int[] lastPositions;                               // Last position where this term occurred
-
-    @Override
-    ParallelPostingsArray newInstance(int size) {
-      return new TermVectorsPostingsArray(size);
-    }
-
-    @Override
-    void copyTo(ParallelPostingsArray toArray, int numToCopy) {
-      assert toArray instanceof TermVectorsPostingsArray;
-      TermVectorsPostingsArray to = (TermVectorsPostingsArray) toArray;
-
-      super.copyTo(toArray, numToCopy);
-
-      System.arraycopy(freqs, 0, to.freqs, 0, size);
-      System.arraycopy(lastOffsets, 0, to.lastOffsets, 0, size);
-      System.arraycopy(lastPositions, 0, to.lastPositions, 0, size);
-    }
-
-    @Override
-    int bytesPerPosting() {
-      return super.bytesPerPosting() + 3 * RamUsageEstimator.NUM_BYTES_INT;
-    }
+  @Override
+  public void copyBytes(DataInput input, long numBytes) throws IOException {
+    delegate.copyBytes(input, numBytes);
+    // TODO: we may need to check disk full here as well
+    dir.maybeThrowDeterministicException();
   }
 }

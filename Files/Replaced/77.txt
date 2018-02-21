@@ -1,13 +1,14 @@
-return getSlice(new SliceFromReadCommand(keyspace, key, column_parent, range.start, range.finish, range.reversed, range.count), consistency_level);
+return docIt < 0 ? -1 : docIt >= upto ? NO_MORE_DOCS : docs[docIt];
 
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+package org.apache.lucene.index.sorter;
+
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,477 +19,719 @@ return getSlice(new SliceFromReadCommand(keyspace, key, column_parent, range.sta
  * limitations under the License.
  */
 
-package org.apache.cassandra.service;
-
-import java.io.BufferedInputStream;
-import java.io.FileInputStream;
 import java.io.IOException;
-import java.util.*;
-import java.util.concurrent.TimeoutException;
+import java.util.Arrays;
 
-import org.apache.log4j.Logger;
-
-import org.apache.commons.lang.ArrayUtils;
-
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.marshal.MarshalException;
-import org.apache.cassandra.db.filter.QueryPath;
-import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.utils.LogUtil;
-import org.apache.cassandra.dht.OrderPreservingPartitioner;
-import org.apache.thrift.TException;
+import org.apache.lucene.index.AtomicReader;
+import org.apache.lucene.index.BinaryDocValues;
+import org.apache.lucene.index.DocsAndPositionsEnum;
+import org.apache.lucene.index.DocsEnum;
+import org.apache.lucene.index.FieldInfo.IndexOptions;
+import org.apache.lucene.index.FieldInfos;
+import org.apache.lucene.index.Fields;
+import org.apache.lucene.index.FilterAtomicReader;
+import org.apache.lucene.index.NumericDocValues;
+import org.apache.lucene.index.SortedDocValues;
+import org.apache.lucene.index.SortedSetDocValues;
+import org.apache.lucene.index.StoredFieldVisitor;
+import org.apache.lucene.index.Terms;
+import org.apache.lucene.index.TermsEnum;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.store.RAMFile;
+import org.apache.lucene.store.RAMInputStream;
+import org.apache.lucene.store.RAMOutputStream;
+import org.apache.lucene.util.ArrayUtil;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.SorterTemplate;
+import org.apache.lucene.util.automaton.CompiledAutomaton;
 
 /**
- * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
+ * An {@link AtomicReader} which supports sorting documents by a given
+ * {@link Sorter}. You can use this class to sort an index as follows:
+ * 
+ * <pre class="prettyprint">
+ * IndexWriter writer; // writer to which the sorted index will be added
+ * DirectoryReader reader; // reader on the input index
+ * Sorter sorter; // determines how the documents are sorted
+ * AtomicReader sortingReader = new SortingAtomicReader(reader, sorter);
+ * writer.addIndexes(reader);
+ * writer.close();
+ * reader.close();
+ * </pre>
+ * 
+ * @lucene.experimental
  */
+public class SortingAtomicReader extends FilterAtomicReader {
 
-public class CassandraServer implements Cassandra.Iface
-{
-	private static Logger logger = Logger.getLogger(CassandraServer.class);
+  private static class SortingFields extends FilterFields {
 
-    private final static List<ColumnOrSuperColumn> EMPTY_COLUMNS = Collections.emptyList();
-    private final static List<Column> EMPTY_SUBCOLUMNS = Collections.emptyList();
+    private final Sorter.DocMap docMap;
+    private final FieldInfos infos;
 
-    /*
-      * Handle to the storage service to interact with the other machines in the
-      * cluster.
-      */
-	protected StorageService storageService;
-
-    public CassandraServer()
-	{
-		storageService = StorageService.instance();
-	}
-
-	/*
-	 * The start function initializes the server and start's listening on the
-	 * specified port.
-	 */
-	public void start() throws IOException
-    {
-		LogUtil.init();
-		//LogUtil.setLogLevel("com.facebook", "DEBUG");
-		// Start the storage service
-		storageService.start();
-	}
-
-    protected ColumnFamily readColumnFamily(ReadCommand command, int consistency_level) throws InvalidRequestException
-    {
-        String cfName = command.getColumnFamilyName();
-        ThriftValidation.validateKey(command.key);
-
-        if (consistency_level == ConsistencyLevel.ZERO)
-        {
-            throw new InvalidRequestException("Consistency level zero may not be applied to read operations");
-        }
-        if (consistency_level == ConsistencyLevel.ALL)
-        {
-            throw new InvalidRequestException("Consistency level all is not yet supported on read operations");
-        }
-
-        Row row;
-        try
-        {
-            row = StorageProxy.readProtocol(command, consistency_level);
-        }
-        catch (IOException e)
-        {
-            throw new RuntimeException(e);
-        }
-        catch (TimeoutException e)
-        {
-            throw new RuntimeException(e);
-        }
-
-        if (row == null)
-        {
-            return null;
-        }
-        return row.getColumnFamily(cfName);
-	}
-
-    public List<Column> thriftifySubColumns(Collection<IColumn> columns)
-    {
-        if (columns == null || columns.isEmpty())
-        {
-            return EMPTY_SUBCOLUMNS;
-        }
-
-        ArrayList<Column> thriftColumns = new ArrayList<Column>(columns.size());
-        for (IColumn column : columns)
-        {
-            if (column.isMarkedForDelete())
-            {
-                continue;
-            }
-            Column thrift_column = new Column(column.name(), column.value(), column.timestamp());
-            thriftColumns.add(thrift_column);
-        }
-
-        return thriftColumns;
+    public SortingFields(final Fields in, FieldInfos infos, Sorter.DocMap docMap) {
+      super(in);
+      this.docMap = docMap;
+      this.infos = infos;
     }
 
-    public List<ColumnOrSuperColumn> thriftifyColumns(Collection<IColumn> columns, boolean reverseOrder)
-    {
-        ArrayList<ColumnOrSuperColumn> thriftColumns = new ArrayList<ColumnOrSuperColumn>(columns.size());
-        for (IColumn column : columns)
-        {
-            if (column.isMarkedForDelete())
-            {
-                continue;
-            }
-            Column thrift_column = new Column(column.name(), column.value(), column.timestamp());
-            thriftColumns.add(new ColumnOrSuperColumn(thrift_column, null));
-        }
-
-        // we have to do the reversing here, since internally we pass results around in ColumnFamily
-        // objects, which always sort their columns in the "natural" order
-        if (reverseOrder)
-            Collections.reverse(thriftColumns);
-        return thriftColumns;
+    @Override
+    public Terms terms(final String field) throws IOException {
+      Terms terms = in.terms(field);
+      if (terms == null) {
+        return null;
+      } else {
+        return new SortingTerms(terms, infos.fieldInfo(field).getIndexOptions(), docMap);
+      }
     }
 
-    private List<ColumnOrSuperColumn> thriftifySuperColumns(Collection<IColumn> columns, boolean reverseOrder)
-    {
-        ArrayList<ColumnOrSuperColumn> thriftSuperColumns = new ArrayList<ColumnOrSuperColumn>(columns.size());
-        for (IColumn column : columns)
-        {
-            List<Column> subcolumns = thriftifySubColumns(column.getSubColumns());
-            if (subcolumns.isEmpty())
-            {
-                continue;
-            }
-            SuperColumn superColumn = new SuperColumn(column.name(), subcolumns);
-            thriftSuperColumns.add(new ColumnOrSuperColumn(null, superColumn));
-        }
+  }
 
-        if (reverseOrder)
-            Collections.reverse(thriftSuperColumns);
+  private static class SortingTerms extends FilterTerms {
 
-        return thriftSuperColumns;
+    private final Sorter.DocMap docMap;
+    private final IndexOptions indexOptions;
+    
+    public SortingTerms(final Terms in, IndexOptions indexOptions, final Sorter.DocMap docMap) {
+      super(in);
+      this.docMap = docMap;
+      this.indexOptions = indexOptions;
     }
 
-    private List<ColumnOrSuperColumn> getSlice(ReadCommand command, int consistency_level) throws InvalidRequestException
-    {
-        ColumnFamily cfamily = readColumnFamily(command, consistency_level);
-        boolean reverseOrder = command instanceof SliceFromReadCommand && ((SliceFromReadCommand)command).reversed;
-
-        if (cfamily == null || cfamily.getColumnsMap().size() == 0)
-        {
-            return EMPTY_COLUMNS;
-        }
-        if (command.queryPath.superColumnName != null)
-        {
-            IColumn column = cfamily.getColumnsMap().values().iterator().next();
-            Collection<IColumn> subcolumns = column.getSubColumns();
-            if (subcolumns == null || subcolumns.isEmpty())
-            {
-                return EMPTY_COLUMNS;
-            }
-            return thriftifyColumns(subcolumns, reverseOrder);
-        }
-        if (cfamily.isSuper())
-        {
-            return thriftifySuperColumns(cfamily.getSortedColumns(), reverseOrder);
-        }
-        return thriftifyColumns(cfamily.getSortedColumns(), reverseOrder);
+    @Override
+    public TermsEnum iterator(final TermsEnum reuse) throws IOException {
+      return new SortingTermsEnum(in.iterator(reuse), docMap, indexOptions);
     }
 
-    public List<ColumnOrSuperColumn> get_slice(String keyspace, String key, ColumnParent column_parent, SlicePredicate predicate, int consistency_level)
-    throws InvalidRequestException, NotFoundException
-    {
-        if (logger.isDebugEnabled())
-            logger.debug("get_slice_from");
-        ThriftValidation.validateColumnParent(keyspace, column_parent);
-
-        if (predicate.column_names != null)
-        {
-            return getSlice(new SliceByNamesReadCommand(keyspace, key, column_parent, predicate.column_names), consistency_level);
-        }
-        else
-        {
-            SliceRange range = predicate.slice_range;
-            if (range.count < 0)
-                throw new InvalidRequestException("get_slice requires non-negative count");
-            return getSlice(new SliceFromReadCommand(keyspace, key, column_parent, range.start, range.finish, range.is_ascending, range.count), consistency_level);
-        }
+    @Override
+    public TermsEnum intersect(CompiledAutomaton compiled, BytesRef startTerm)
+        throws IOException {
+      return new SortingTermsEnum(in.intersect(compiled, startTerm), docMap, indexOptions);
     }
 
-    public ColumnOrSuperColumn get(String table, String key, ColumnPath column_path, int consistency_level)
-    throws InvalidRequestException, NotFoundException
-    {
-        if (logger.isDebugEnabled())
-            logger.debug("get");
-        ThriftValidation.validateColumnPath(table, column_path);
+  }
 
-        QueryPath path = new QueryPath(column_path.column_family, column_path.super_column);
-        List<byte[]> nameAsList = Arrays.asList(column_path.column == null ? column_path.super_column : column_path.column);
-        ColumnFamily cfamily = readColumnFamily(new SliceByNamesReadCommand(table, key, path, nameAsList), consistency_level);
-        if (cfamily == null)
-        {
-            throw new NotFoundException();
-        }
-        Collection<IColumn> columns = null;
-        if (column_path.super_column != null && column_path.column != null)
-        {
-            IColumn column = cfamily.getColumn(column_path.super_column);
-            if (column != null)
-            {
-                columns = column.getSubColumns();
-            }
-        }
-        else
-        {
-            columns = cfamily.getSortedColumns();
-        }
-        if (columns == null || columns.size() == 0)
-        {
-            throw new NotFoundException();
-        }
+  private static class SortingTermsEnum extends FilterTermsEnum {
 
-        assert columns.size() == 1;
-        IColumn column = columns.iterator().next();
-        if (column.isMarkedForDelete())
-        {
-            throw new NotFoundException();
-        }
-
-        return column instanceof org.apache.cassandra.db.Column
-               ? new ColumnOrSuperColumn(new Column(column.name(), column.value(), column.timestamp()), null)
-               : new ColumnOrSuperColumn(null, new SuperColumn(column.name(), thriftifySubColumns(column.getSubColumns())));
+    final Sorter.DocMap docMap; // pkg-protected to avoid synthetic accessor methods
+    private final IndexOptions indexOptions;
+    
+    public SortingTermsEnum(final TermsEnum in, Sorter.DocMap docMap, IndexOptions indexOptions) {
+      super(in);
+      this.docMap = docMap;
+      this.indexOptions = indexOptions;
     }
 
-    public int get_count(String table, String key, ColumnParent column_parent, int consistency_level)
-    throws InvalidRequestException
-    {
-        if (logger.isDebugEnabled())
-            logger.debug("get_column_count");
-        // validateColumnParent assumes we require simple columns; g_c_c is the only
-        // one of the columnParent-taking apis that can also work at the SC level.
-        // so we roll a one-off validator here.
-        String cfType = ThriftValidation.validateColumnFamily(table, column_parent.column_family);
-        if (cfType.equals("Standard") && column_parent.super_column != null)
-        {
-            throw new InvalidRequestException("columnfamily alone is required for standard CF " + column_parent.column_family);
+    Bits newToOld(final Bits liveDocs) {
+      if (liveDocs == null) {
+        return null;
+      }
+      return new Bits() {
+
+        @Override
+        public boolean get(int index) {
+          return liveDocs.get(docMap.oldToNew(index));
         }
 
-        ColumnFamily cfamily;
-        cfamily = readColumnFamily(new SliceFromReadCommand(table, key, column_parent, ArrayUtils.EMPTY_BYTE_ARRAY, ArrayUtils.EMPTY_BYTE_ARRAY, true, Integer.MAX_VALUE), consistency_level);
-        if (cfamily == null)
-        {
-            return 0;
+        @Override
+        public int length() {
+          return liveDocs.length();
         }
-        Collection<IColumn> columns = null;
-        if (column_parent.super_column != null)
-        {
-            IColumn column = cfamily.getColumn(column_parent.super_column);
-            if (column != null)
-            {
-                columns = column.getSubColumns();
-            }
-        }
-        else
-        {
-            columns = cfamily.getSortedColumns();
-        }
-        if (columns == null || columns.size() == 0)
-        {
-            return 0;
-        }
-        return columns.size();
-	}
 
-    public void insert(String table, String key, ColumnPath column_path, byte[] value, long timestamp, int consistency_level)
-    throws InvalidRequestException, UnavailableException
-    {
-        if (logger.isDebugEnabled())
-            logger.debug("insert");
-        ThriftValidation.validateKey(key);
-        ThriftValidation.validateColumnPath(table, column_path);
-
-        RowMutation rm = new RowMutation(table, key.trim());
-        try
-        {
-            rm.add(new QueryPath(column_path), value, timestamp);
-        }
-        catch (MarshalException e)
-        {
-            throw new InvalidRequestException(e.getMessage());
-        }
-        doInsert(consistency_level, rm);
+      };
     }
 
-    public void batch_insert(String table, BatchMutation batch_mutation, int consistency_level)
-    throws InvalidRequestException, UnavailableException
-    {
-        if (logger.isDebugEnabled())
-            logger.debug("batch_insert");
-        RowMutation rm = RowMutation.getRowMutation(table, batch_mutation);
-        Set<String> cfNames = rm.columnFamilyNames();
-        ThriftValidation.validateKeyCommand(rm.key(), rm.table(), cfNames.toArray(new String[cfNames.size()]));
+    @Override
+    public DocsEnum docs(Bits liveDocs, DocsEnum reuse, final int flags) throws IOException {
+      final DocsEnum inReuse;
+      final SortingDocsEnum wrapReuse;
+      if (reuse != null && reuse instanceof SortingDocsEnum) {
+        // if we're asked to reuse the given DocsEnum and it is Sorting, return
+        // the wrapped one, since some Codecs expect it.
+        wrapReuse = (SortingDocsEnum) reuse;
+        inReuse = wrapReuse.getWrapped();
+      } else {
+        wrapReuse = null;
+        inReuse = reuse;
+      }
 
-        doInsert(consistency_level, rm);
+      final DocsEnum inDocs = in.docs(newToOld(liveDocs), inReuse, flags);
+      final boolean withFreqs = indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS) >=0 && (flags & DocsEnum.FLAG_FREQS) != 0;
+      return new SortingDocsEnum(wrapReuse, inDocs, withFreqs, docMap);
     }
 
-    public void remove(String table, String key, ColumnPath column_path, long timestamp, int consistency_level)
-    throws InvalidRequestException, UnavailableException
-    {
-        if (logger.isDebugEnabled())
-            logger.debug("remove");
-        ThriftValidation.validateColumnPathOrParent(table, column_path);
+    @Override
+    public DocsAndPositionsEnum docsAndPositions(Bits liveDocs, DocsAndPositionsEnum reuse, final int flags) throws IOException {
+      final DocsAndPositionsEnum inReuse;
+      final SortingDocsAndPositionsEnum wrapReuse;
+      if (reuse != null && reuse instanceof SortingDocsAndPositionsEnum) {
+        // if we're asked to reuse the given DocsEnum and it is Sorting, return
+        // the wrapped one, since some Codecs expect it.
+        wrapReuse = (SortingDocsAndPositionsEnum) reuse;
+        inReuse = wrapReuse.getWrapped();
+      } else {
+        wrapReuse = null;
+        inReuse = reuse;
+      }
+
+      final DocsAndPositionsEnum inDocsAndPositions = in.docsAndPositions(newToOld(liveDocs), inReuse, flags);
+      if (inDocsAndPositions == null) {
+        return null;
+      }
+
+      // we ignore the fact that offsets may be stored but not asked for,
+      // since this code is expected to be used during addIndexes which will
+      // ask for everything. if that assumption changes in the future, we can
+      // factor in whether 'flags' says offsets are not required.
+      final boolean storeOffsets = indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) >= 0;
+      return new SortingDocsAndPositionsEnum(wrapReuse, inDocsAndPositions, docMap, storeOffsets);
+    }
+
+  }
+
+  private static class SortingBinaryDocValues extends BinaryDocValues {
+    
+    private final BinaryDocValues in;
+    private final Sorter.DocMap docMap;
+    
+    SortingBinaryDocValues(BinaryDocValues in, Sorter.DocMap docMap) {
+      this.in = in;
+      this.docMap = docMap;
+    }
+
+    @Override
+    public void get(int docID, BytesRef result) {
+      in.get(docMap.newToOld(docID), result);
+    }
+  }
+  
+  private static class SortingNumericDocValues extends NumericDocValues {
+
+    private final NumericDocValues in;
+    private final Sorter.DocMap docMap;
+
+    public SortingNumericDocValues(final NumericDocValues in, Sorter.DocMap docMap) {
+      this.in = in;
+      this.docMap = docMap;
+    }
+
+    @Override
+    public long get(int docID) {
+      return in.get(docMap.newToOld(docID));
+    }
+  }
+  
+  private static class SortingSortedDocValues extends SortedDocValues {
+    
+    private final SortedDocValues in;
+    private final Sorter.DocMap docMap;
+    
+    SortingSortedDocValues(SortedDocValues in, Sorter.DocMap docMap) {
+      this.in = in;
+      this.docMap = docMap;
+    }
+
+    @Override
+    public int getOrd(int docID) {
+      return in.getOrd(docMap.newToOld(docID));
+    }
+
+    @Override
+    public void lookupOrd(int ord, BytesRef result) {
+      in.lookupOrd(ord, result);
+    }
+
+    @Override
+    public int getValueCount() {
+      return in.getValueCount();
+    }
+
+    @Override
+    public void get(int docID, BytesRef result) {
+      in.get(docMap.newToOld(docID), result);
+    }
+
+    @Override
+    public int lookupTerm(BytesRef key) {
+      return in.lookupTerm(key);
+    }
+  }
+  
+  private static class SortingSortedSetDocValues extends SortedSetDocValues {
+    
+    private final SortedSetDocValues in;
+    private final Sorter.DocMap docMap;
+    
+    SortingSortedSetDocValues(SortedSetDocValues in, Sorter.DocMap docMap) {
+      this.in = in;
+      this.docMap = docMap;
+    }
+
+    @Override
+    public long nextOrd() {
+      return in.nextOrd();
+    }
+
+    @Override
+    public void setDocument(int docID) {
+      in.setDocument(docMap.newToOld(docID));
+    }
+
+    @Override
+    public void lookupOrd(long ord, BytesRef result) {
+      in.lookupOrd(ord, result);
+    }
+
+    @Override
+    public long getValueCount() {
+      return in.getValueCount();
+    }
+
+    @Override
+    public long lookupTerm(BytesRef key) {
+      return in.lookupTerm(key);
+    }
+  }
+
+  static class SortingDocsEnum extends FilterDocsEnum {
+    
+    private static final class DocFreqSorterTemplate extends SorterTemplate {
+      
+      private final int[] docs;
+      private final int[] freqs;
+      
+      private int pivot;
+      
+      public DocFreqSorterTemplate(int[] docs, int[] freqs) {
+        this.docs = docs;
+        this.freqs = freqs;
+      }
+      
+      @Override
+      protected int compare(int i, int j) {
+        return docs[i] - docs[j];
+      }
+      
+      @Override
+      protected int comparePivot(int j) {
+        return pivot - docs[j];
+      }
+      
+      @Override
+      protected void setPivot(int i) {
+        pivot = docs[i];
+      }
+      
+      @Override
+      protected void swap(int i, int j) {
+        int tmpDoc = docs[i];
+        docs[i] = docs[j];
+        docs[j] = tmpDoc;
         
-        RowMutation rm = new RowMutation(table, key.trim());
-        rm.delete(new QueryPath(column_path), timestamp);
-
-        doInsert(consistency_level, rm);
-	}
-
-    private void doInsert(int consistency_level, RowMutation rm) throws UnavailableException
-    {
-        if (consistency_level != ConsistencyLevel.ZERO)
-        {
-            StorageProxy.insertBlocking(rm, consistency_level);
+        if (freqs != null) {
+          int tmpFreq = freqs[i];
+          freqs[i] = freqs[j];
+          freqs[j] = tmpFreq;
         }
-        else
-        {
-            StorageProxy.insert(rm);
+      }
+    }
+    
+    private int[] docs;
+    private int[] freqs;
+    private int docIt = -1;
+    private final int upto;
+    private final boolean withFreqs;
+
+    SortingDocsEnum(SortingDocsEnum reuse, final DocsEnum in, boolean withFreqs, final Sorter.DocMap docMap) throws IOException {
+      super(in);
+      this.withFreqs = withFreqs;
+      if (reuse != null) {
+        docs = reuse.docs;
+        freqs = reuse.freqs; // maybe null
+      } else {
+        docs = new int[64];
+      }
+      docIt = -1;
+      int i = 0;
+      int doc;
+      if (withFreqs) {
+        if (freqs == null || freqs.length < docs.length) {
+          freqs = new int[docs.length];
         }
+        while ((doc = in.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS){
+          if (i >= docs.length) {
+            docs = ArrayUtil.grow(docs, docs.length + 1);
+            freqs = ArrayUtil.grow(freqs, freqs.length + 1);
+          }
+          docs[i] = docMap.oldToNew(doc);
+          freqs[i] = in.freq();
+          ++i;
+        }
+      } else {
+        freqs = null;
+        while ((doc = in.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS){
+          if (i >= docs.length) {
+            docs = ArrayUtil.grow(docs, docs.length + 1);
+          }
+          docs[i++] = docMap.oldToNew(doc);
+        }
+      }
+      // TimSort can save much time compared to other sorts in case of
+      // reverse sorting, or when sorting a concatenation of sorted readers
+      new DocFreqSorterTemplate(docs, freqs).timSort(0, i - 1);
+      upto = i;
     }
 
-    public void batch_insert_super_column(String table, BatchMutationSuper batch_mutation_super, int consistency_level)
-    throws InvalidRequestException, UnavailableException
-    {
-        if (logger.isDebugEnabled())
-            logger.debug("batch_insert_SuperColumn");
-        RowMutation rm = RowMutation.getRowMutation(table, batch_mutation_super);
-        Set<String> cfNames = rm.columnFamilyNames();
-        ThriftValidation.validateKeyCommand(rm.key(), rm.table(), cfNames.toArray(new String[cfNames.size()]));
-
-        doInsert(consistency_level, rm);
+    // for testing
+    boolean reused(DocsEnum other) {
+      if (other == null || !(other instanceof SortingDocsEnum)) {
+        return false;
+      }
+      return docs == ((SortingDocsEnum) other).docs;
     }
 
-    public String get_string_property(String propertyName)
-    {
-        if (propertyName.equals("cluster name"))
-        {
-            return DatabaseDescriptor.getClusterName();
+    @Override
+    public int advance(final int target) throws IOException {
+      // need to support it for checkIndex, but in practice it won't be called, so
+      // don't bother to implement efficiently for now.
+      return slowAdvance(target);
+    }
+    
+    @Override
+    public int docID() {
+      return docIt < 0 ? -1 : docIt >= upto ? NO_MORE_DOCS : docs[docIt];
+    }
+    
+    @Override
+    public int freq() throws IOException {
+      return withFreqs && docIt < upto ? freqs[docIt] : 1;
+    }
+    
+    @Override
+    public int nextDoc() throws IOException {
+      if (++docIt >= upto) return NO_MORE_DOCS;
+      return docs[docIt];
+    }
+    
+    /** Returns the wrapped {@link DocsEnum}. */
+    DocsEnum getWrapped() {
+      return in;
+    }
+  }
+  
+  static class SortingDocsAndPositionsEnum extends FilterDocsAndPositionsEnum {
+    
+    /**
+     * A {@link SorterTemplate} which sorts two parallel arrays of doc IDs and
+     * offsets in one go. Everytime a doc ID is 'swapped', its correponding offset
+     * is swapped too.
+     */
+    private static final class DocOffsetSorterTemplate extends SorterTemplate {
+      
+      private final int[] docs;
+      private final long[] offsets;
+      
+      private int pivot;
+      
+      public DocOffsetSorterTemplate(int[] docs, long[] offsets) {
+        this.docs = docs;
+        this.offsets = offsets;
+      }
+      
+      @Override
+      protected int compare(int i, int j) {
+        return docs[i] - docs[j];
+      }
+      
+      @Override
+      protected int comparePivot(int j) {
+        return pivot - docs[j];
+      }
+      
+      @Override
+      protected void setPivot(int i) {
+        pivot = docs[i];
+      }
+      
+      @Override
+      protected void swap(int i, int j) {
+        int tmpDoc = docs[i];
+        docs[i] = docs[j];
+        docs[j] = tmpDoc;
+        
+        long tmpOffset = offsets[i];
+        offsets[i] = offsets[j];
+        offsets[j] = tmpOffset;
+      }
+    }
+    
+    private int[] docs;
+    private long[] offsets;
+    private final int upto;
+    
+    private final IndexInput postingInput;
+    private final boolean storeOffsets;
+    
+    private int docIt = -1;
+    private int pos;
+    private int startOffset = -1;
+    private int endOffset = -1;
+    private final BytesRef payload;
+    private int currFreq;
+
+    private final RAMFile file;
+
+    SortingDocsAndPositionsEnum(SortingDocsAndPositionsEnum reuse, final DocsAndPositionsEnum in, Sorter.DocMap docMap, boolean storeOffsets) throws IOException {
+      super(in);
+      this.storeOffsets = storeOffsets;
+      if (reuse != null) {
+        docs = reuse.docs;
+        offsets = reuse.offsets;
+        payload = reuse.payload;
+        file = reuse.file;
+      } else {
+        docs = new int[32];
+        offsets = new long[32];
+        payload = new BytesRef(32);
+        file = new RAMFile();
+      }
+      final IndexOutput out = new RAMOutputStream(file);
+      int doc;
+      int i = 0;
+      while ((doc = in.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+        if (i == docs.length) {
+          final int newLength = ArrayUtil.oversize(i + 1, 4);
+          docs = Arrays.copyOf(docs, newLength);
+          offsets = Arrays.copyOf(offsets, newLength);
         }
-        else if (propertyName.equals("config file"))
-        {
-            String filename = DatabaseDescriptor.getConfigFileName();
-            try
-            {
-                StringBuilder fileData = new StringBuilder(8192);
-                BufferedInputStream stream = new BufferedInputStream(new FileInputStream(filename));
-                byte[] buf = new byte[1024];
-                int numRead;
-                while( (numRead = stream.read(buf)) != -1)
-                {
-                    String str = new String(buf, 0, numRead);
-                    fileData.append(str);
-                }
-                stream.close();
-                return fileData.toString();
-            }
-            catch (IOException e)
-            {
-                return "file not found!";
-            }
-        }
-        else if (propertyName.equals("version"))
-        {
-            return "0.3.0";
-        }
-        else
-        {
-            return "?";
-        }
+        docs[i] = docMap.oldToNew(doc);
+        offsets[i] = out.getFilePointer();
+        addPositions(in, out);
+        i++;
+      }
+      upto = i;
+      new DocOffsetSorterTemplate(docs, offsets).timSort(0, upto - 1);
+      out.close();
+      this.postingInput = new RAMInputStream("", file);
     }
 
-    public List<String> get_string_list_property(String propertyName)
-    {
-        if (propertyName.equals("keyspaces"))
-        {
-            return DatabaseDescriptor.getTables();        
-        }
-        else
-        {
-            return new ArrayList<String>();
-        }
+    // for testing
+    boolean reused(DocsAndPositionsEnum other) {
+      if (other == null || !(other instanceof SortingDocsAndPositionsEnum)) {
+        return false;
+      }
+      return docs == ((SortingDocsAndPositionsEnum) other).docs;
     }
 
-    public Map<String, Map<String, String>> describe_keyspace(String table) throws NotFoundException
-    {
-        Map<String, Map<String, String>> columnFamiliesMap = new HashMap<String, Map<String, String>>();
-
-        Map<String, CFMetaData> tableMetaData = DatabaseDescriptor.getTableMetaData(table);
-        // table doesn't exist
-        if (tableMetaData == null)
-        {
-            throw new NotFoundException();
+    private void addPositions(final DocsAndPositionsEnum in, final IndexOutput out) throws IOException {
+      int freq = in.freq();
+      out.writeVInt(freq);
+      int previousPosition = 0;
+      int previousEndOffset = 0;
+      for (int i = 0; i < freq; i++) {
+        final int pos = in.nextPosition();
+        final BytesRef payload = in.getPayload();
+        // The low-order bit of token is set only if there is a payload, the
+        // previous bits are the delta-encoded position. 
+        final int token = (pos - previousPosition) << 1 | (payload == null ? 0 : 1);
+        out.writeVInt(token);
+        previousPosition = pos;
+        if (storeOffsets) { // don't encode offsets if they are not stored
+          final int startOffset = in.startOffset();
+          final int endOffset = in.endOffset();
+          out.writeVInt(startOffset - previousEndOffset);
+          out.writeVInt(endOffset - startOffset);
+          previousEndOffset = endOffset;
         }
-
-        Iterator iter = tableMetaData.entrySet().iterator();
-        while (iter.hasNext())
-        {
-            Map.Entry<String, CFMetaData> pairs = (Map.Entry<String, CFMetaData>) iter.next();
-            CFMetaData columnFamilyMetaData = pairs.getValue();
-
-            String desc = "";
-
-
-            Map<String, String> columnMap = new HashMap<String, String>();
-            desc = columnFamilyMetaData.n_columnMap + "(" + columnFamilyMetaData.n_columnKey + ", " + columnFamilyMetaData.n_columnValue + ", " + columnFamilyMetaData.n_columnTimestamp + ")";
-            if (columnFamilyMetaData.columnType.equals("Super"))
-            {
-                columnMap.put("Type", "Super");
-                desc = columnFamilyMetaData.n_superColumnMap + "(" + columnFamilyMetaData.n_superColumnKey + ", " + desc + ")";
-            }
-            else
-            {
-                columnMap.put("Type", "Standard");
-            }
-
-            desc = columnFamilyMetaData.tableName + "." + columnFamilyMetaData.cfName + "(" +
-                   columnFamilyMetaData.n_rowKey + ", " + desc + ")";
-
-            columnMap.put("Desc", desc);
-            columnMap.put("CompareWith", columnFamilyMetaData.comparator.getClass().getName());
-            if (columnFamilyMetaData.columnType.equals("Super"))
-            {
-                columnMap.put("CompareSubcolumnsWith", columnFamilyMetaData.subcolumnComparator.getClass().getName());
-            }
-            columnMap.put("FlushPeriodInMinutes", columnFamilyMetaData.flushPeriodInMinutes + "");
-            columnFamiliesMap.put(columnFamilyMetaData.cfName, columnMap);
+        if (payload != null) {
+          out.writeVInt(payload.length);
+          out.writeBytes(payload.bytes, payload.offset, payload.length);
         }
-        return columnFamiliesMap;
+      }
+    }
+    
+    @Override
+    public int advance(final int target) throws IOException {
+      // need to support it for checkIndex, but in practice it won't be called, so
+      // don't bother to implement efficiently for now.
+      return slowAdvance(target);
+    }
+    
+    @Override
+    public int docID() {
+      return docIt >= upto ? NO_MORE_DOCS : docs[docIt];
+    }
+    
+    @Override
+    public int endOffset() throws IOException {
+      return endOffset;
+    }
+    
+    @Override
+    public int freq() throws IOException {
+      return currFreq;
+    }
+    
+    @Override
+    public BytesRef getPayload() throws IOException {
+      return payload.length == 0 ? null : payload;
+    }
+    
+    @Override
+    public int nextDoc() throws IOException {
+      if (++docIt >= upto) return DocIdSetIterator.NO_MORE_DOCS;
+      postingInput.seek(offsets[docIt]);
+      currFreq = postingInput.readVInt();
+      // reset variables used in nextPosition
+      pos = 0;
+      endOffset = 0;
+      return docs[docIt];
+    }
+    
+    @Override
+    public int nextPosition() throws IOException {
+      final int token = postingInput.readVInt();
+      pos += token >>> 1;
+      if (storeOffsets) {
+        startOffset = endOffset + postingInput.readVInt();
+        endOffset = startOffset + postingInput.readVInt();
+      }
+      if ((token & 1) != 0) {
+        payload.offset = 0;
+        payload.length = postingInput.readVInt();
+        if (payload.length > payload.bytes.length) {
+          payload.bytes = new byte[ArrayUtil.oversize(payload.length, 1)];
+        }
+        postingInput.readBytes(payload.bytes, 0, payload.length);
+      } else {
+        payload.length = 0;
+      }
+      return pos;
+    }
+    
+    @Override
+    public int startOffset() throws IOException {
+      return startOffset;
     }
 
-    public List<String> get_key_range(String tablename, String columnFamily, String startWith, String stopAt, int maxResults) throws InvalidRequestException, TException
-    {
-        if (logger.isDebugEnabled())
-            logger.debug("get_key_range");
-        ThriftValidation.validateCommand(tablename, columnFamily);
-        if (!(StorageService.getPartitioner() instanceof OrderPreservingPartitioner))
-        {
-            throw new InvalidRequestException("range queries may only be performed against an order-preserving partitioner");
-        }
-        if (maxResults <= 0)
-        {
-            throw new InvalidRequestException("maxResults must be positive");
-        }
-
-        try
-        {
-            return StorageProxy.getKeyRange(new RangeCommand(tablename, columnFamily, startWith, stopAt, maxResults));
-        }
-        catch (IOException e)
-        {
-            throw new RuntimeException(e);
-        }
+    /** Returns the wrapped {@link DocsAndPositionsEnum}. */
+    DocsAndPositionsEnum getWrapped() {
+      return in;
     }
+  }
 
-    // main method moved to CassandraDaemon
+  /** Return a sorted view of <code>reader</code> according to the order
+   *  defined by <code>sorter</code>. If the reader is already sorted, this
+   *  method might return the reader as-is. */
+  public static AtomicReader wrap(AtomicReader reader, Sorter sorter) throws IOException {
+    return wrap(reader, sorter.sort(reader));
+  }
+
+  /** Expert: same as {@link #wrap(AtomicReader, Sorter)} but operates directly on a {@link Sorter.DocMap}. */
+  public static AtomicReader wrap(AtomicReader reader, Sorter.DocMap docMap) {
+    if (docMap == null) {
+      // the reader is already sorter
+      return reader;
+    }
+    assert Sorter.isConsistent(docMap, reader.maxDoc());
+    return new SortingAtomicReader(reader, docMap);
+  }
+
+  final Sorter.DocMap docMap; // pkg-protected to avoid synthetic accessor methods
+
+  private SortingAtomicReader(final AtomicReader in, final Sorter.DocMap docMap) {
+    super(in);
+    this.docMap = docMap;
+  }
+
+  @Override
+  public void document(final int docID, final StoredFieldVisitor visitor) throws IOException {
+    in.document(docMap.newToOld(docID), visitor);
+  }
+  
+  @Override
+  public Fields fields() throws IOException {
+    Fields fields = in.fields();
+    if (fields == null) {
+      return null;
+    } else {
+      return new SortingFields(fields, in.getFieldInfos(), docMap);
+    }
+  }
+  
+  @Override
+  public BinaryDocValues getBinaryDocValues(String field) throws IOException {
+    BinaryDocValues oldDocValues = in.getBinaryDocValues(field);
+    if (oldDocValues == null) {
+      return null;
+    } else {
+      return new SortingBinaryDocValues(oldDocValues, docMap);
+    }
+  }
+  
+  @Override
+  public Bits getLiveDocs() {
+    final Bits inLiveDocs = in.getLiveDocs();
+    if (inLiveDocs == null) {
+      return null;
+    }
+    return new Bits() {
+
+      @Override
+      public boolean get(int index) {
+        return inLiveDocs.get(docMap.newToOld(index));
+      }
+
+      @Override
+      public int length() {
+        return inLiveDocs.length();
+      }
+
+    };
+  }
+  
+  @Override
+  public NumericDocValues getNormValues(String field) throws IOException {
+    final NumericDocValues norm = in.getNormValues(field);
+    if (norm == null) {
+      return null;
+    } else {
+      return new SortingNumericDocValues(norm, docMap);
+    }
+  }
+
+  @Override
+  public NumericDocValues getNumericDocValues(String field) throws IOException {
+    final NumericDocValues oldDocValues = in.getNumericDocValues(field);
+    if (oldDocValues == null) return null;
+    return new SortingNumericDocValues(oldDocValues, docMap);
+  }
+
+  @Override
+  public SortedDocValues getSortedDocValues(String field) throws IOException {
+    SortedDocValues sortedDV = in.getSortedDocValues(field);
+    if (sortedDV == null) {
+      return null;
+    } else {
+      return new SortingSortedDocValues(sortedDV, docMap);
+    }
+  }
+  
+  @Override
+  public SortedSetDocValues getSortedSetDocValues(String field) throws IOException {
+    SortedSetDocValues sortedSetDV = in.getSortedSetDocValues(field);
+    if (sortedSetDV == null) {
+      return null;
+    } else {
+      return new SortingSortedSetDocValues(sortedSetDV, docMap);
+    }  
+  }
+
+  @Override
+  public Fields getTermVectors(final int docID) throws IOException {
+    return in.getTermVectors(docMap.newToOld(docID));
+  }
+  
 }

@@ -1,8 +1,6 @@
-Collections.shuffle(splits, new Random(System.nanoTime()));
+logger.error("Attempting to mutate non-existant column family " + columnFamily.id());
 
-package org.apache.cassandra.hadoop;
-/*
- * 
+/**
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -10,218 +8,452 @@ package org.apache.cassandra.hadoop;
  * to you under the Apache License, Version 2.0 (the
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
- * 
- *   http://www.apache.org/licenses/LICENSE-2.0
- * 
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- * 
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
+package org.apache.cassandra.db;
 
-import java.io.IOException;
-import java.net.InetAddress;
+import java.io.IOError;
 import java.util.*;
-import java.util.concurrent.Callable;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.io.IOException;
+import java.io.File;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.concurrent.Future;
+
+import com.google.common.base.Function;
+import com.google.common.collect.Iterables;
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.Config;
+import org.apache.cassandra.db.commitlog.CommitLog;
+import org.apache.cassandra.db.commitlog.CommitLogSegment;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.io.sstable.SSTableDeletingReference;
+import org.apache.cassandra.io.sstable.SSTableReader;
+import org.apache.cassandra.io.util.FileUtils;
+
+import java.net.InetAddress;
+
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.db.filter.*;
+import org.cliffc.high_scale_lib.NonBlockingHashMap;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.db.IColumn;
-import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.thrift.*;
-import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.mapreduce.*;
-import org.apache.thrift.TException;
-import org.apache.thrift.protocol.TBinaryProtocol;
-import org.apache.thrift.transport.TSocket;
-import org.apache.thrift.transport.TTransportException;
-
-/**
- * Hadoop InputFormat allowing map/reduce against Cassandra rows within one ColumnFamily.
- *
- * At minimum, you need to set the CF and predicate (description of columns to extract from each row)
- * in your Hadoop job Configuration.  The ConfigHelper class is provided to make this
- * simple:
- *   ConfigHelper.setColumnFamily
- *   ConfigHelper.setSlicePredicate
- *
- * You can also configure the number of rows per InputSplit with
- *   ConfigHelper.setInputSplitSize
- * This should be "as big as possible, but no bigger."  Each InputSplit is read from Cassandra
- * with multiple get_slice_range queries, and the per-call overhead of get_slice_range is high,
- * so larger split sizes are better -- but if it is too large, you will run out of memory.
- *
- * The default split size is 64k rows.
- */
-public class ColumnFamilyInputFormat extends InputFormat<byte[], SortedMap<byte[], IColumn>>
+public class Table 
 {
+    public static final String SYSTEM_TABLE = "system";
 
-    private static final Logger logger = LoggerFactory.getLogger(StorageService.class);
+    private static final Logger logger = LoggerFactory.getLogger(Table.class);
+    private static final String SNAPSHOT_SUBDIR_NAME = "snapshots";
+    /* accesses to CFS.memtable should acquire this for thread safety.  only switchMemtable should aquire the writeLock. */
+    static final ReentrantReadWriteLock flusherLock = new ReentrantReadWriteLock(true);
 
-    private void validateConfiguration(Configuration conf)
+    private static Timer flushTimer = new Timer("FLUSH-TIMER");
+    private final boolean waitForCommitLog;
+
+    // This is a result of pushing down the point in time when storage directories get created.  It used to happen in
+    // CassandraDaemon, but it is possible to call Table.open without a running daemon, so it made sense to ensure
+    // proper directories here.
+    static
     {
-        if (ConfigHelper.getKeyspace(conf) == null || ConfigHelper.getColumnFamily(conf) == null)
+        try
         {
-            throw new UnsupportedOperationException("you must set the keyspace and columnfamily with setColumnFamily()");
+            DatabaseDescriptor.createAllDirectories();
         }
-        if (ConfigHelper.getSlicePredicate(conf) == null)
+        catch (IOException ex)
         {
-            throw new UnsupportedOperationException("you must set the predicate with setPredicate");
+            throw new RuntimeException(ex);
         }
     }
 
-    public List<InputSplit> getSplits(JobContext context) throws IOException
-    {
-        Configuration conf = context.getConfiguration();
+    /** Table objects, one per keyspace.  only one instance should ever exist for any given keyspace. */
+    private static final Map<String, Table> instances = new NonBlockingHashMap<String, Table>();
 
-        validateConfiguration(conf);
-
-        // cannonical ranges and nodes holding replicas
-        List<TokenRange> masterRangeNodes = getRangeMap(ConfigHelper.getKeyspace(conf));
-
-        int splitsize = ConfigHelper.getInputSplitSize(context.getConfiguration());
-        
-        // cannonical ranges, split into pieces, fetching the splits in parallel 
-        ExecutorService executor = Executors.newCachedThreadPool();
-        List<InputSplit> splits = new ArrayList<InputSplit>();
-
-        try
-        {
-            List<Future<List<InputSplit>>> splitfutures = new ArrayList<Future<List<InputSplit>>>();
-            for (TokenRange range : masterRangeNodes)
-            {
-                // for each range, pick a live owner and ask it to compute bite-sized splits
-                splitfutures.add(executor.submit(new SplitCallable(range, splitsize)));
-            }
+    /* Table name. */
+    public final String name;
+    /* ColumnFamilyStore per column family */
+    private final Map<Integer, ColumnFamilyStore> columnFamilyStores = new HashMap<Integer, ColumnFamilyStore>();
+    // cache application CFs since Range queries ask for them a _lot_
+    private SortedSet<String> applicationColumnFamilies;
+    private final TimerTask flushTask;
     
-            // wait until we have all the results back
-            for (Future<List<InputSplit>> futureInputSplits : splitfutures)
-            {
-                try
-                {
-                    splits.addAll(futureInputSplits.get());
-                } 
-                catch (Exception e)
-                {
-                    throw new IOException("Could not get input splits", e);
-                } 
-            }
-        } 
-        finally
+    public static Table open(String table)
+    {
+        Table tableInstance = instances.get(table);
+        if (tableInstance == null)
         {
-            executor.shutdownNow();
+            // instantiate the Table.  we could use putIfAbsent but it's important to making sure it is only done once
+            // per keyspace, so we synchronize and re-check before doing it.
+            synchronized (Table.class)
+            {
+                tableInstance = instances.get(table);
+                if (tableInstance == null)
+                {
+                    tableInstance = new Table(table);
+                    instances.put(table, tableInstance);
+                }
+            }
         }
+        return tableInstance;
+    }
+    
+    public static Table clear(String table) throws IOException
+    {
+        synchronized (Table.class)
+        {
+            Table t = instances.remove(table);
+            if (t != null)
+                t.flushTask.cancel();
+            return t;
+        }
+    }
+    
+    public Collection<ColumnFamilyStore> getColumnFamilyStores()
+    {
+        return Collections.unmodifiableCollection(columnFamilyStores.values());
+    }
 
-        assert splits.size() > 0;
-        
-        return splits;
+    public ColumnFamilyStore getColumnFamilyStore(int cfId)
+    {
+        return columnFamilyStores.get(cfId);
     }
 
     /**
-     * Gets a token range and splits it up according to the suggested
-     * size into input splits that Hadoop can use. 
+     * @Deprecated Use getColumnFamilyStore(id) instead.
      */
-    class SplitCallable implements Callable<List<InputSplit>>
+    @Deprecated
+    public ColumnFamilyStore getColumnFamilyStore(String cfName)
     {
+        Integer id = CFMetaData.getId(name, cfName);
+        if (id == null)
+            throw new IllegalArgumentException(String.format("Unknown table/cf pair (%s.%s)", name, cfName));
+        return columnFamilyStores.get(id);
+    }
 
-        private TokenRange range;
-        private int splitsize;
+    /**
+     * Do a cleanup of keys that do not belong locally.
+     */
+    public void forceCleanup()
+    {
+        if (name.equals(SYSTEM_TABLE))
+            throw new RuntimeException("Cleanup of the system table is neither necessary nor wise");
+
+        for (ColumnFamilyStore cfStore : columnFamilyStores.values())
+            cfStore.forceCleanup();
+    }
+    
+    
+    /**
+     * Take a snapshot of the entire set of column families with a given timestamp.
+     * 
+     * @param clientSuppliedName the tag associated with the name of the snapshot.  This
+     *                           value can be null.
+     */
+    public void snapshot(String clientSuppliedName)
+    {
+        String snapshotName = getTimestampedSnapshotName(clientSuppliedName);
+
+        for (ColumnFamilyStore cfStore : columnFamilyStores.values())
+        {
+            cfStore.snapshot(snapshotName);
+        }
+    }
+
+    /**
+     * @param clientSuppliedName; may be null.
+     * @return
+     */
+    public static String getTimestampedSnapshotName(String clientSuppliedName)
+    {
+        String snapshotName = Long.toString(System.currentTimeMillis());
+        if (clientSuppliedName != null && !clientSuppliedName.equals(""))
+        {
+            snapshotName = snapshotName + "-" + clientSuppliedName;
+        }
+        return snapshotName;
+    }
+
+
+    /**
+     * Clear all the snapshots for a given table.
+     */
+    public void clearSnapshot() throws IOException
+    {
+        for (String dataDirPath : DatabaseDescriptor.getAllDataFileLocations())
+        {
+            String snapshotPath = dataDirPath + File.separator + name + File.separator + SNAPSHOT_SUBDIR_NAME;
+            File snapshotDir = new File(snapshotPath);
+            if (snapshotDir.exists())
+            {
+                if (logger.isDebugEnabled())
+                    logger.debug("Removing snapshot directory " + snapshotPath);
+                FileUtils.deleteRecursive(snapshotDir);
+            }
+        }
+    }
+
+    /*
+     * This method is invoked only during a bootstrap process. We basically
+     * do a complete compaction since we can figure out based on the ranges
+     * whether the files need to be split.
+    */
+    public List<SSTableReader> forceAntiCompaction(Collection<Range> ranges, InetAddress target)
+    {
+        List<SSTableReader> allResults = new ArrayList<SSTableReader>();
+        for (ColumnFamilyStore cfStore : columnFamilyStores.values())
+        {
+            try
+            {
+                allResults.addAll(CompactionManager.instance.submitAnticompaction(cfStore, ranges, target).get());
+            }
+            catch (Exception e)
+            {
+                throw new RuntimeException(e);
+            }
+        }
+        return allResults;
+    }
+    
+    /*
+     * This method is an ADMIN operation to force compaction
+     * of all SSTables on disk. 
+    */
+    public void forceCompaction()
+    {
+        for (ColumnFamilyStore cfStore : columnFamilyStores.values())
+            CompactionManager.instance.submitMajor(cfStore);
+    }
+
+    List<SSTableReader> getAllSSTablesOnDisk()
+    {
+        List<SSTableReader> list = new ArrayList<SSTableReader>();
+        for (ColumnFamilyStore cfStore : columnFamilyStores.values())
+            list.addAll(cfStore.getSSTables());
+        return list;
+    }
+
+    private Table(String table)
+    {
+        name = table;
+        waitForCommitLog = DatabaseDescriptor.getCommitLogSync() == Config.CommitLogSync.batch;
+        // create data directories.
+        for (String dataDir : DatabaseDescriptor.getAllDataFileLocations())
+        {
+            try
+            {
+                String keyspaceDir = dataDir + File.separator + table;
+                FileUtils.createDirectory(keyspaceDir);
+    
+                // remove the deprecated streaming directory.
+                File streamingDir = new File(keyspaceDir, "stream");
+                if (streamingDir.exists())
+                    FileUtils.deleteRecursive(streamingDir);
+            }
+            catch (IOException ex)
+            {
+                throw new IOError(ex);
+            }
+        }
+      
+        for (CFMetaData cfm : DatabaseDescriptor.getTableDefinition(table).cfMetaData().values())
+        {
+            columnFamilyStores.put(cfm.cfId, ColumnFamilyStore.createColumnFamilyStore(table, cfm.cfName));
+         }
+
+        // check 10x as often as the lifetime, so we can exceed lifetime by 10% at most
+        int checkMs = DatabaseDescriptor.getMemtableLifetimeMS() / 10;
+        flushTask = new TimerTask()
+        {
+            public void run()
+            {
+                for (ColumnFamilyStore cfs : columnFamilyStores.values())
+                {
+                    cfs.forceFlushIfExpired();
+                }
+            }
+        };
+        flushTimer.schedule(flushTask, checkMs, checkMs);
+    }
+    
+    /** removes a cf from internal structures (doesn't change disk files). */
+    public void dropCf(int cfId) throws IOException
+    {
+        assert columnFamilyStores.containsKey(cfId);
+        ColumnFamilyStore cfs = columnFamilyStores.remove(cfId);
+        if (cfs != null)
+        {
+            try
+            {
+                cfs.forceBlockingFlush();
+            }
+            catch (ExecutionException e)
+            {
+                throw new IOException(e);
+            }
+            catch (InterruptedException e)
+            {
+                throw new IOException(e);
+            }
+        }
+    }
+    
+    /** adds a cf to internal structures, ends up creating disk files). */
+    public void initCf(int cfId, String cfName)
+    {
+        assert !columnFamilyStores.containsKey(cfId) : cfId;
+        columnFamilyStores.put(cfId, ColumnFamilyStore.createColumnFamilyStore(name, cfName));
+    }
+    
+    /** basically a combined drop and add */
+    public void renameCf(int cfId, String newName) throws IOException
+    {
+        dropCf(cfId);
+        initCf(cfId, newName);
+    }
+
+    public Row getRow(QueryFilter filter) throws IOException
+    {
+        ColumnFamilyStore cfStore = getColumnFamilyStore(filter.getColumnFamilyName());
+        ColumnFamily columnFamily = cfStore.getColumnFamily(filter);
+        return new Row(filter.key, columnFamily);
+    }
+
+    /**
+     * This method adds the row to the Commit Log associated with this table.
+     * Once this happens the data associated with the individual column families
+     * is also written to the column family store's memtable.
+    */
+    public void apply(RowMutation mutation, Object serializedMutation, boolean writeCommitLog) throws IOException
+    {
+        HashMap<ColumnFamilyStore,Memtable> memtablesToFlush = new HashMap<ColumnFamilyStore, Memtable>(2);
+
+        // write the mutation to the commitlog and memtables
+        flusherLock.readLock().lock();
+        try
+        {
+            if (writeCommitLog)
+            {
+                CommitLog.instance().add(mutation, serializedMutation);
+            }
         
-        public SplitCallable(TokenRange tr, int splitsize)
-        {
-            this.range = tr;
-            this.splitsize = splitsize;
-        }
-
-        @Override
-        public List<InputSplit> call() throws Exception
-        {
-            ArrayList<InputSplit> splits = new ArrayList<InputSplit>();
-            List<String> tokens = getSubSplits(range, splitsize);
-
-            // turn the sub-ranges into InputSplits
-            String[] endpoints = range.endpoints.toArray(new String[range.endpoints.size()]);
-            // hadoop needs hostname, not ip
-            for (int i = 0; i < endpoints.length; i++)
+            DecoratedKey key = StorageService.getPartitioner().decorateKey(mutation.key());
+            for (ColumnFamily columnFamily : mutation.getColumnFamilies())
             {
-                endpoints[i] = InetAddress.getByName(endpoints[i]).getHostName();
+                Memtable memtableToFlush;
+                ColumnFamilyStore cfs = columnFamilyStores.get(columnFamily.id());
+                if (cfs == null)
+                {
+                    logger.error("Attempting to mutate non-existant column family " + columnFamily.name());
+                }
+                else
+                {
+                    if ((memtableToFlush=cfs.apply(key, columnFamily)) != null)
+                        memtablesToFlush.put(cfs, memtableToFlush);
+    
+                    ColumnFamily cachedRow = cfs.getRawCachedRow(key);
+                    if (cachedRow != null)
+                        cachedRow.addAll(columnFamily);
+                }
             }
-            
-            for (int i = 1; i < tokens.size(); i++)
+        }
+        finally
+        {
+            flusherLock.readLock().unlock();
+        }
+
+        // flush memtables that got filled up.  usually mTF will be empty and this will be a no-op
+        for (Map.Entry<ColumnFamilyStore, Memtable> entry : memtablesToFlush.entrySet())
+            entry.getKey().maybeSwitchMemtable(entry.getValue(), writeCommitLog);
+    }
+
+    public List<Future<?>> flush() throws IOException
+    {
+        List<Future<?>> futures = new ArrayList<Future<?>>();
+        for (Integer cfId : columnFamilyStores.keySet())
+        {
+            Future<?> future = columnFamilyStores.get(cfId).forceFlush();
+            if (future != null)
+                futures.add(future);
+        }
+        return futures;
+    }
+
+    // for binary load path.  skips commitlog.
+    void load(RowMutation rowMutation) throws IOException
+    {
+        DecoratedKey key = StorageService.getPartitioner().decorateKey(rowMutation.key());
+        for (ColumnFamily columnFamily : rowMutation.getColumnFamilies())
+        {
+            Collection<IColumn> columns = columnFamily.getSortedColumns();
+            for (IColumn column : columns)
             {
-                ColumnFamilySplit split = new ColumnFamilySplit(tokens.get(i - 1), tokens.get(i), endpoints);
-                logger.debug("adding " + split);
-                splits.add(split);
+                ColumnFamilyStore cfStore = getColumnFamilyStore(new String(column.name(), "UTF-8"));
+                cfStore.applyBinary(key, column.value());
             }
-            return splits;
         }
     }
 
-    private List<String> getSubSplits(TokenRange range, int splitsize) throws IOException
+    public String getDataFileLocation(long expectedCompactedFileSize)
     {
-        // TODO handle failure of range replicas & retry
-        TSocket socket = new TSocket(range.endpoints.get(0),
-                                     DatabaseDescriptor.getRpcPort());
-        TBinaryProtocol binaryProtocol = new TBinaryProtocol(socket, false, false);
-        Cassandra.Client client = new Cassandra.Client(binaryProtocol);
-        try
+        String path = DatabaseDescriptor.getDataFileLocationForTable(name, expectedCompactedFileSize);
+        if (path == null)
         {
-            socket.open();
+            // retry after GCing to force unmap of compacted SSTables so they can be deleted
+            StorageService.instance.requestGC();
+            try
+            {
+                Thread.sleep(SSTableDeletingReference.RETRY_DELAY * 2);
+            }
+            catch (InterruptedException e)
+            {
+                throw new AssertionError(e);
+            }
+            path = DatabaseDescriptor.getDataFileLocationForTable(name, expectedCompactedFileSize);
         }
-        catch (TTransportException e)
-        {
-            throw new IOException(e);
-        }
-        List<String> splits;
-        try
-        {
-            splits = client.describe_splits(range.start_token, range.end_token, splitsize);
-        }
-        catch (TException e)
-        {
-            throw new RuntimeException(e);
-        }
-        return splits;
+        return path;
     }
 
-    private List<TokenRange> getRangeMap(String keyspace) throws IOException
+    public static String getSnapshotPath(String dataDirPath, String tableName, String snapshotName)
     {
-        TSocket socket = new TSocket(DatabaseDescriptor.getSeeds().iterator().next().getHostAddress(),
-                                     DatabaseDescriptor.getRpcPort());
-        TBinaryProtocol binaryProtocol = new TBinaryProtocol(socket, false, false);
-        Cassandra.Client client = new Cassandra.Client(binaryProtocol);
-        try
-        {
-            socket.open();
-        }
-        catch (TTransportException e)
-        {
-            throw new IOException(e);
-        }
-        List<TokenRange> map;
-        try
-        {
-            map = client.describe_ring(keyspace);
-        }
-        catch (TException e)
-        {
-            throw new RuntimeException(e);
-        }
-        return map;
+        return dataDirPath + File.separator + tableName + File.separator + SNAPSHOT_SUBDIR_NAME + File.separator + snapshotName;
     }
 
-    @Override
-    public RecordReader<byte[], SortedMap<byte[], IColumn>> createRecordReader(InputSplit inputSplit, TaskAttemptContext taskAttemptContext) throws IOException, InterruptedException
+    public static Iterable<Table> all()
     {
-        return new ColumnFamilyRecordReader();
+        Function<String, Table> transformer = new Function<String, Table>()
+        {
+            public Table apply(String tableName)
+            {
+                return Table.open(tableName);
+            }
+        };
+        return Iterables.transform(DatabaseDescriptor.getTables(), transformer);
+    }
+
+    /**
+     * Performs a synchronous truncate operation, effectively deleting all data
+     * from the column family cfname
+     * @param cfname
+     * @throws IOException
+     * @throws ExecutionException
+     * @throws InterruptedException
+     */
+    public void truncate(String cfname) throws InterruptedException, ExecutionException, IOException
+    {
+        logger.debug("Truncating...");
+        ColumnFamilyStore cfs = getColumnFamilyStore(cfname);
+        // truncate, blocking
+        cfs.truncate().get();
+        logger.debug("Truncation done.");
     }
 }

@@ -1,6 +1,6 @@
-import org.apache.lucene.analysis.standard.StandardAnalyzer;  // for javadoc
+import org.apache.lucene.search.IndexSearcher; // javadocs
 
-package org.apache.lucene.analysis.br;
+package org.apache.lucene.search;
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,172 +19,184 @@ package org.apache.lucene.analysis.br;
  * limitations under the License.
  */
 
-import java.io.File;
+import java.io.Closeable;
 import java.io.IOException;
-import java.io.Reader;
-import java.util.HashSet;
-import java.util.Map;
-import java.util.Set;
-import java.util.Collections;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.atomic.AtomicBoolean;
 
-import org.apache.lucene.analysis.Analyzer;
-import org.apache.lucene.analysis.LowerCaseFilter;
-import org.apache.lucene.analysis.StopFilter;
-import org.apache.lucene.analysis.TokenStream;
-import org.apache.lucene.analysis.Tokenizer;
-import org.apache.lucene.analysis.WordlistLoader;
-import org.apache.lucene.analysis.standard.StandardFilter;
-import org.apache.lucene.analysis.standard.StandardTokenizer;
-import org.apache.lucene.util.Version;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.index.NRTManager; // javadocs
+import org.apache.lucene.store.AlreadyClosedException;
+import org.apache.lucene.store.Directory;
 
-/**
- * {@link Analyzer} for Brazilian Portuguese language. 
- * <p>
- * Supports an external list of stopwords (words that
- * will not be indexed at all) and an external list of exclusions (words that will
- * not be stemmed, but indexed).
- * </p>
+/** Utility class to safely share {@link IndexSearcher} instances
+ *  across multiple threads, while periodically reopening.
+ *  This class ensures each IndexSearcher instance is not
+ *  closed until it is no longer needed.
  *
- * <p><b>NOTE</b>: This class uses the same {@link Version}
- * dependent settings as {@link StandardAnalyzer}.</p>
+ *  <p>Use {@link #get} to obtain the current searcher, and
+ *  {@link #release} to release it, like this:
+ *
+ *  <pre>
+ *    IndexSearcher s = manager.get();
+ *    try {
+ *      // Do searching, doc retrieval, etc. with s
+ *    } finally {
+ *      manager.release(s);
+ *    }
+ *    // Do not use s after this!
+ *    s = null;
+ *  </pre>
+ *
+ *  <p>In addition you should periodically call {@link
+ *  #maybeReopen}.  While it's possible to call this just
+ *  before running each query, this is discouraged since it
+ *  penalizes the unlucky queries that do the reopen.  It's
+ *  better to  use a separate background thread, that
+ *  periodically calls maybeReopen.  Finally, be sure to
+ *  call {@link #close} once you are done.
+ *
+ *  <p><b>NOTE</b>: if you have an {@link IndexWriter}, it's
+ *  better to use {@link NRTManager} since that class pulls
+ *  near-real-time readers from the IndexWriter.
+ *
+ *  @lucene.experimental
  */
-public final class BrazilianAnalyzer extends Analyzer {
 
-	/**
-	 * List of typical Brazilian Portuguese stopwords.
-	 */
-	public final static String[] BRAZILIAN_STOP_WORDS = {
-      "a","ainda","alem","ambas","ambos","antes",
-      "ao","aonde","aos","apos","aquele","aqueles",
-      "as","assim","com","como","contra","contudo",
-      "cuja","cujas","cujo","cujos","da","das","de",
-      "dela","dele","deles","demais","depois","desde",
-      "desta","deste","dispoe","dispoem","diversa",
-      "diversas","diversos","do","dos","durante","e",
-      "ela","elas","ele","eles","em","entao","entre",
-      "essa","essas","esse","esses","esta","estas",
-      "este","estes","ha","isso","isto","logo","mais",
-      "mas","mediante","menos","mesma","mesmas","mesmo",
-      "mesmos","na","nas","nao","nas","nem","nesse","neste",
-      "nos","o","os","ou","outra","outras","outro","outros",
-      "pelas","pelas","pelo","pelos","perante","pois","por",
-      "porque","portanto","proprio","propios","quais","qual",
-      "qualquer","quando","quanto","que","quem","quer","se",
-      "seja","sem","sendo","seu","seus","sob","sobre","sua",
-      "suas","tal","tambem","teu","teus","toda","todas","todo",
-      "todos","tua","tuas","tudo","um","uma","umas","uns"};
+public class SearcherManager implements Closeable {
 
+  // Current searcher
+  private volatile IndexSearcher currentSearcher;
+  private final SearcherWarmer warmer;
+  private final AtomicBoolean reopening = new AtomicBoolean();
+  private final ExecutorService es;
 
-	/**
-	 * Contains the stopwords used with the {@link StopFilter}.
-	 */
-	private Set stoptable = Collections.emptySet();
-	
-	/**
-	 * Contains words that should be indexed but not stemmed.
-	 */
-	private Set excltable = Collections.emptySet();
-        private final Version matchVersion;
+  /** Opens an initial searcher from the Directory.
+   *
+   * @param dir Directory to open the searcher from
+   *
+   * @param warmer optional {@link SearcherWarmer}.  Pass
+   *        null if you don't require the searcher to warmed
+   *        before going live.
+   *
+   *  <p><b>NOTE</b>: the provided {@link SearcherWarmer} is
+   *  not invoked for the initial searcher; you should
+   *  warm it yourself if necessary.
+   */
+  public SearcherManager(Directory dir, SearcherWarmer warmer) throws IOException {
+    this(dir, warmer, null);
+  }
 
-	/**
-	 * Builds an analyzer with the default stop words ({@link #BRAZILIAN_STOP_WORDS}).
-	 */
-	public BrazilianAnalyzer(Version matchVersion) {
-          stoptable = StopFilter.makeStopSet( BRAZILIAN_STOP_WORDS );
-          this.matchVersion = matchVersion;
-	}
+  /** Opens an initial searcher from the Directory.
+   *
+   * @param dir Directory to open the searcher from
+   *
+   * @param warmer optional {@link SearcherWarmer}.  Pass
+   *        null if you don't require the searcher to warmed
+   *        before going live.
+   *
+   * @param es optional ExecutorService so different segments can
+   *        be searched concurrently (see {@link
+   *        IndexSearcher#IndexSearcher(IndexReader,ExecutorService)}.  Pass null
+   *        to search segments sequentially.
+   *
+   *  <p><b>NOTE</b>: the provided {@link SearcherWarmer} is
+   *  not invoked for the initial searcher; you should
+   *  warm it yourself if necessary.
+   */
+  public SearcherManager(Directory dir, SearcherWarmer warmer, ExecutorService es) throws IOException {
+    this.es = es;
+    currentSearcher = new IndexSearcher(IndexReader.open(dir), this.es);
+    this.warmer = warmer;
+  }
 
-	/**
-	 * Builds an analyzer with the given stop words.
-	 */
-        public BrazilianAnalyzer( Version matchVersion, String... stopwords ) {
-          stoptable = StopFilter.makeStopSet( stopwords );
-          this.matchVersion = matchVersion;
-	}
+  /** You must call this, periodically, to perform a
+   *  reopen.  This calls {@link IndexReader#reopen} on the
+   *  underlying reader, and if that returns a new reader,
+   *  it's warmed (if you provided a {@link SearcherWarmer}
+   *  and then swapped into production.
+   *
+   *  <p><b>Threads</b>: it's fine for more than one thread to
+   *  call this at once.  Only the first thread will attempt
+   *  the reopen; subsequent threads will see that another
+   *  thread is already handling reopen and will return
+   *  immediately.  Note that this means if another thread
+   *  is already reopening then subsequent threads will
+   *  return right away without waiting for the reader
+   *  reopen to complete.</p>
+   *
+   *  <p>This method returns true if a new reader was in
+   *  fact opened.</p>
+   */
+  public boolean maybeReopen()
+    throws  IOException {
 
-	/**
-	 * Builds an analyzer with the given stop words.
-	 */
-        public BrazilianAnalyzer( Version matchVersion, Map stopwords ) {
-          stoptable = new HashSet(stopwords.keySet());
-          this.matchVersion = matchVersion;
-	}
-
-	/**
-	 * Builds an analyzer with the given stop words.
-	 */
-        public BrazilianAnalyzer( Version matchVersion, File stopwords ) throws IOException {
-          stoptable = WordlistLoader.getWordSet( stopwords );
-          this.matchVersion = matchVersion;
-	}
-
-	/**
-	 * Builds an exclusionlist from an array of Strings.
-	 */
-	public void setStemExclusionTable( String... exclusionlist ) {
-		excltable = StopFilter.makeStopSet( exclusionlist );
-		setPreviousTokenStream(null); // force a new stemmer to be created
-	}
-	/**
-	 * Builds an exclusionlist from a {@link Map}.
-	 */
-	public void setStemExclusionTable( Map exclusionlist ) {
-		excltable = new HashSet(exclusionlist.keySet());
-		setPreviousTokenStream(null); // force a new stemmer to be created
-	}
-	/**
-	 * Builds an exclusionlist from the words contained in the given file.
-	 */
-	public void setStemExclusionTable( File exclusionlist ) throws IOException {
-		excltable = WordlistLoader.getWordSet( exclusionlist );
-		setPreviousTokenStream(null); // force a new stemmer to be created
-	}
-
-	/**
-	 * Creates a {@link TokenStream} which tokenizes all the text in the provided {@link Reader}.
-	 *
-	 * @return  A {@link TokenStream} built from a {@link StandardTokenizer} filtered with
-	 * 			{@link LowerCaseFilter}, {@link StandardFilter}, {@link StopFilter}, and 
-	 *          {@link BrazilianStemFilter}.
-	 */
-	public final TokenStream tokenStream(String fieldName, Reader reader) {
-                TokenStream result = new StandardTokenizer( matchVersion, reader );
-		result = new LowerCaseFilter( result );
-		result = new StandardFilter( result );
-		result = new StopFilter( StopFilter.getEnablePositionIncrementsVersionDefault(matchVersion),
-                                         result, stoptable );
-		result = new BrazilianStemFilter( result, excltable );
-		return result;
-	}
-	
-    private class SavedStreams {
-      Tokenizer source;
-      TokenStream result;
-    };
-    
-    /**
-     * Returns a (possibly reused) {@link TokenStream} which tokenizes all the text 
-     * in the provided {@link Reader}.
-     *
-     * @return  A {@link TokenStream} built from a {@link StandardTokenizer} filtered with
-     *          {@link LowerCaseFilter}, {@link StandardFilter}, {@link StopFilter}, and 
-     *          {@link BrazilianStemFilter}.
-     */
-    public TokenStream reusableTokenStream(String fieldName, Reader reader)
-      throws IOException {
-      SavedStreams streams = (SavedStreams) getPreviousTokenStream();
-      if (streams == null) {
-        streams = new SavedStreams();
-        streams.source = new StandardTokenizer(matchVersion, reader);
-        streams.result = new LowerCaseFilter(streams.source);
-        streams.result = new StandardFilter(streams.result);
-        streams.result = new StopFilter(StopFilter.getEnablePositionIncrementsVersionDefault(matchVersion),
-                                        streams.result, stoptable);
-        streams.result = new BrazilianStemFilter(streams.result, excltable);
-        setPreviousTokenStream(streams);
-      } else {
-        streams.source.reset(reader);
-      }
-      return streams.result;
+    if (currentSearcher == null) {
+      throw new AlreadyClosedException("this SearcherManager is closed");
     }
+
+    // Ensure only 1 thread does reopen at once; other
+    // threads just return immediately:
+    if (!reopening.getAndSet(true)) {
+      try {
+        IndexReader newReader = currentSearcher.getIndexReader().reopen();
+        if (newReader != currentSearcher.getIndexReader()) {
+          IndexSearcher newSearcher = new IndexSearcher(newReader, es);
+          if (warmer != null) {
+            warmer.warm(newSearcher);
+          }
+          swapSearcher(newSearcher);
+          return true;
+        } else {
+          return false;
+        }
+      } finally {
+        reopening.set(false);
+      }
+    } else {
+      return false;
+    }
+  }
+
+  /** Obtain the current IndexSearcher.  You must match
+   *  every call to get with one call to {@link #release};
+   *  it's best to do so in a finally clause. */
+  public synchronized IndexSearcher get() {
+    if (currentSearcher == null) {
+      throw new AlreadyClosedException("this SearcherManager is closed");
+    }
+    currentSearcher.getIndexReader().incRef();
+    return currentSearcher;
+  }    
+
+  /** Release the searcher previously obtained with {@link
+   *  #get}.
+   *
+   *  <p><b>NOTE</b>: it's safe to call this after {@link
+   *  #close}. */
+  public void release(IndexSearcher searcher)
+    throws IOException {
+    searcher.getIndexReader().decRef();
+  }
+
+  // Replaces old searcher with new one
+  private synchronized void swapSearcher(IndexSearcher newSearcher)
+    throws IOException {
+    IndexSearcher oldSearcher = currentSearcher;
+    if (oldSearcher == null) {
+      throw new AlreadyClosedException("this SearcherManager is closed");
+    }
+    currentSearcher = newSearcher;
+    release(oldSearcher);
+  }
+
+  /** Close this SearcherManager to future searching.  Any
+   *  searches still in process in other threads won't be
+   *  affected, and they should still call {@link #release}
+   *  after they are done. */
+  // Not in Java 5: @Override
+  public void close() throws IOException {
+    swapSearcher(null);
+  }
 }

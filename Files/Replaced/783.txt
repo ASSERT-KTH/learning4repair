@@ -1,8 +1,8 @@
-if (bytes.length > left || currentBlock==null) {
+MockDirectoryWrapper dir = newMockDirectory();
 
-package org.apache.lucene.util;
+package org.apache.lucene;
 
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -18,289 +18,133 @@ package org.apache.lucene.util;
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
-import org.apache.lucene.store.IndexInput;
-
-import java.util.List;
-import java.util.ArrayList;
-import java.io.Closeable;
 import java.io.IOException;
 
-/** Represents a logical byte[] as a series of pages.  You
- *  can write-once into the logical byte[] (append only),
- *  using copy, and then retrieve slices (BytesRef) into it
- *  using fill.
- *
- * <p>@lucene.internal</p>*/
-public final class PagedBytes {
-  private final List<byte[]> blocks = new ArrayList<byte[]>();
-  private final List<Integer> blockEnd = new ArrayList<Integer>();
-  private final int blockSize;
-  private final int blockBits;
-  private final int blockMask;
-  private int upto;
-  private byte[] currentBlock;
+import org.apache.lucene.util.LuceneTestCase;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.MockDirectoryWrapper;
+import org.apache.lucene.store.RAMDirectory;
+import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.index.IndexWriterConfig;
+import org.apache.lucene.index.LogMergePolicy;
+import org.apache.lucene.index.MergePolicy;
+import org.apache.lucene.index.ConcurrentMergeScheduler;
+import org.apache.lucene.index.MergeScheduler;
+import org.apache.lucene.index.MergePolicy.OneMerge;
+import org.apache.lucene.analysis.MockAnalyzer;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.Field;
 
-  private static final byte[] EMPTY_BYTES = new byte[0];
+/**
+ * Holds tests cases to verify external APIs are accessible
+ * while not being in org.apache.lucene.index package.
+ */
+public class TestMergeSchedulerExternal extends LuceneTestCase {
 
-  public final static class Reader implements Closeable {
-    private final byte[][] blocks;
-    private final int[] blockEnds;
-    private final int blockBits;
-    private final int blockMask;
-    private final int blockSize;
-    private final CloseableThreadLocal<byte[]> threadBuffers = new CloseableThreadLocal<byte[]>();
+  volatile boolean mergeCalled;
+  volatile boolean mergeThreadCreated;
+  volatile boolean excCalled;
 
-    public Reader(PagedBytes pagedBytes) {
-      blocks = new byte[pagedBytes.blocks.size()][];
-      for(int i=0;i<blocks.length;i++) {
-        blocks[i] = pagedBytes.blocks.get(i);
+  private class MyMergeScheduler extends ConcurrentMergeScheduler {
+
+    private class MyMergeThread extends ConcurrentMergeScheduler.MergeThread {
+      public MyMergeThread(IndexWriter writer, MergePolicy.OneMerge merge) {
+        super(writer, merge);
+        mergeThreadCreated = true;
       }
-      blockEnds = new int[blocks.length];
-      for(int i=0;i< blockEnds.length;i++) {
-        blockEnds[i] = pagedBytes.blockEnd.get(i);
-      }
-      blockBits = pagedBytes.blockBits;
-      blockMask = pagedBytes.blockMask;
-      blockSize = pagedBytes.blockSize;
     }
 
-    /** Get a slice out of the byte array. */
-    public BytesRef fill(BytesRef b, long start, int length) {
-      assert length >= 0: "length=" + length;
-      final int index = (int) (start >> blockBits);
-      final int offset = (int) (start & blockMask);
-      b.length = length;
-      if (blockSize - offset >= length) {
-        // Within block
-        b.bytes = blocks[index];
-        b.offset = offset;
-      } else {
-        // Split
-        byte[] buffer = threadBuffers.get();
-        if (buffer == null) {
-          buffer = new byte[length];
-          threadBuffers.set(buffer);
-        } else if (buffer.length < length) {
-          buffer = ArrayUtil.grow(buffer, length);
-          threadBuffers.set(buffer);
+    @Override
+    protected MergeThread getMergeThread(IndexWriter writer, MergePolicy.OneMerge merge) throws IOException {
+      MergeThread thread = new MyMergeThread(writer, merge);
+      thread.setThreadPriority(getMergeThreadPriority());
+      thread.setDaemon(true);
+      thread.setName("MyMergeThread");
+      return thread;
+    }
+
+    @Override
+    protected void handleMergeException(Throwable t) {
+      excCalled = true;
+    }
+
+    @Override
+    protected void doMerge(MergePolicy.OneMerge merge) throws IOException {
+      mergeCalled = true;
+      super.doMerge(merge);
+    }
+  }
+
+  private static class FailOnlyOnMerge extends MockDirectoryWrapper.Failure {
+    @Override
+    public void eval(MockDirectoryWrapper dir)  throws IOException {
+      StackTraceElement[] trace = new Exception().getStackTrace();
+      for (int i = 0; i < trace.length; i++) {
+        if ("doMerge".equals(trace[i].getMethodName()))
+          throw new IOException("now failing during merge");
+      }
+    }
+  }
+
+  public void testSubclassConcurrentMergeScheduler() throws IOException {
+    MockDirectoryWrapper dir = newDirectory();
+    dir.failOn(new FailOnlyOnMerge());
+
+    Document doc = new Document();
+    Field idField = newStringField("id", "", Field.Store.YES);
+    doc.add(idField);
+    
+    IndexWriter writer = new IndexWriter(dir, newIndexWriterConfig(
+        TEST_VERSION_CURRENT, new MockAnalyzer(random())).setMergeScheduler(new MyMergeScheduler())
+        .setMaxBufferedDocs(2).setRAMBufferSizeMB(IndexWriterConfig.DISABLE_AUTO_FLUSH)
+        .setMergePolicy(newLogMergePolicy()));
+    LogMergePolicy logMP = (LogMergePolicy) writer.getConfig().getMergePolicy();
+    logMP.setMergeFactor(10);
+    for(int i=0;i<20;i++)
+      writer.addDocument(doc);
+
+    ((MyMergeScheduler) writer.getConfig().getMergeScheduler()).sync();
+    writer.close();
+    
+    assertTrue(mergeThreadCreated);
+    assertTrue(mergeCalled);
+    assertTrue(excCalled);
+    dir.close();
+  }
+  
+  private static class ReportingMergeScheduler extends MergeScheduler {
+
+    @Override
+    public void merge(IndexWriter writer) throws IOException {
+      OneMerge merge = null;
+      while ((merge = writer.getNextMerge()) != null) {
+        if (VERBOSE) {
+          System.out.println("executing merge " + merge.segString(writer.getDirectory()));
         }
-        b.bytes = buffer;
-        b.offset = 0;
-        System.arraycopy(blocks[index], offset, buffer, 0, blockSize-offset);
-        System.arraycopy(blocks[1+index], 0, buffer, blockSize-offset, length-(blockSize-offset));
+        writer.merge(merge);
       }
-      return b;
     }
 
-    /** Reads length as 1 or 2 byte vInt prefix, starting @ start */
-    public BytesRef fillUsingLengthPrefix(BytesRef b, long start) {
-      final int index = (int) (start >> blockBits);
-      final int offset = (int) (start & blockMask);
-      final byte[] block = b.bytes = blocks[index];
-
-      if ((block[offset] & 128) == 0) {
-        b.length = block[offset];
-        b.offset = offset+1;
-      } else {
-        b.length = ((block[offset] & 0x7f) << 8) | (block[1+offset] & 0xff);
-        b.offset = offset+2;
-        assert b.length > 0;
-      }
-      return b;
-    }
-
-    /** @lucene.internal  Reads length as 1 or 2 byte vInt prefix, starting @ start.  Returns the block number of the term. */
-    public int fillUsingLengthPrefix2(BytesRef b, long start) {
-      final int index = (int) (start >> blockBits);
-      final int offset = (int) (start & blockMask);
-      final byte[] block = b.bytes = blocks[index];
-
-      if ((block[offset] & 128) == 0) {
-        b.length = block[offset];
-        b.offset = offset+1;
-      } else {
-        b.length = ((block[offset] & 0x7f) << 8) | (block[1+offset] & 0xff);
-        b.offset = offset+2;
-        assert b.length > 0;
-      }
-      return index;
-    }
-
-    /** @lucene.internal  Reads length as 1 or 2 byte vInt prefix, starting @ start. 
-     * Returns the start offset of the next part, suitable as start parameter on next call
-     * to sequentially read all BytesRefs. */
-    public long fillUsingLengthPrefix3(BytesRef b, long start) {
-      final int index = (int) (start >> blockBits);
-      final int offset = (int) (start & blockMask);
-      final byte[] block = b.bytes = blocks[index];
-
-      if ((block[offset] & 128) == 0) {
-        b.length = block[offset];
-        b.offset = offset+1;
-        start += 1L + b.length;
-      } else {
-        b.length = ((block[offset] & 0x7f) << 8) | (block[1+offset] & 0xff);
-        b.offset = offset+2;
-        start += 2L + b.length;
-        assert b.length > 0;
-      }
-      return start;
-    }
-
-    /** @lucene.internal */
-    public byte[][] getBlocks() {
-      return blocks;
-    }
-
-    /** @lucene.internal */
-    public int[] getBlockEnds() {
-      return blockEnds;
-    }
-
-    public void close() {
-      threadBuffers.close();
-    }
+    @Override
+    public void close() throws IOException {}
+    
   }
 
-  /** 1<<blockBits must be bigger than biggest single
-   *  BytesRef slice that will be pulled */
-  public PagedBytes(int blockBits) {
-    this.blockSize = 1 << blockBits;
-    this.blockBits = blockBits;
-    blockMask = blockSize-1;
-    upto = blockSize;
+  public void testCustomMergeScheduler() throws Exception {
+    // we don't really need to execute anything, just to make sure the custom MS
+    // compiles. But ensure that it can be used as well, e.g., no other hidden
+    // dependencies or something. Therefore, don't use any random API !
+    Directory dir = new RAMDirectory();
+    IndexWriterConfig conf = new IndexWriterConfig(TEST_VERSION_CURRENT, null);
+    conf.setMergeScheduler(new ReportingMergeScheduler());
+    IndexWriter writer = new IndexWriter(dir, conf);
+    writer.addDocument(new Document());
+    writer.commit(); // trigger flush
+    writer.addDocument(new Document());
+    writer.commit(); // trigger flush
+    writer.forceMerge(1);
+    writer.close();
+    dir.close();
   }
-
-  /** Read this many bytes from in */
-  public void copy(IndexInput in, long byteCount) throws IOException {
-    while (byteCount > 0) {
-      int left = blockSize - upto;
-      if (left == 0) {
-        if (currentBlock != null) {
-          blocks.add(currentBlock);
-          blockEnd.add(upto);
-        }
-        currentBlock = new byte[blockSize];
-        upto = 0;
-        left = blockSize;
-      }
-      if (left < byteCount) {
-        in.readBytes(currentBlock, upto, left, false);
-        upto = blockSize;
-        byteCount -= left;
-      } else {
-        in.readBytes(currentBlock, upto, (int) byteCount, false);
-        upto += byteCount;
-        break;
-      }
-    }
-  }
-
-  /** Copy BytesRef in */
-  public void copy(BytesRef bytes) throws IOException {
-    int byteCount = bytes.length;
-    int bytesUpto = bytes.offset;
-    while (byteCount > 0) {
-      int left = blockSize - upto;
-      if (left == 0) {
-        if (currentBlock != null) {
-          blocks.add(currentBlock);
-          blockEnd.add(upto);          
-        }
-        currentBlock = new byte[blockSize];
-        upto = 0;
-        left = blockSize;
-      }
-      if (left < byteCount) {
-        System.arraycopy(bytes.bytes, bytesUpto, currentBlock, upto, left);
-        upto = blockSize;
-        byteCount -= left;
-        bytesUpto += left;
-      } else {
-        System.arraycopy(bytes.bytes, bytesUpto, currentBlock, upto, byteCount);
-        upto += byteCount;
-        break;
-      }
-    }
-  }
-
-  /** Copy BytesRef in, setting BytesRef out to the result.
-   * Do not use this if you will use freeze(true).
-   * This only supports bytes.length <= blockSize */
-  public void copy(BytesRef bytes, BytesRef out) throws IOException {
-    int left = blockSize - upto;
-    if (bytes.length > left) {
-      if (currentBlock != null) {
-        blocks.add(currentBlock);
-        blockEnd.add(upto);
-      }
-      currentBlock = new byte[blockSize];
-      upto = 0;
-      left = blockSize;
-      assert bytes.length <= blockSize;
-      // TODO: we could also support variable block sizes
-    }
-
-    out.bytes = currentBlock;
-    out.offset = upto;
-    out.length = bytes.length;
-
-    System.arraycopy(bytes.bytes, bytes.offset, currentBlock, upto, bytes.length);
-    upto += bytes.length;
-  }
-
-  /** Commits final byte[], trimming it if necessary and if trim=true */
-  public Reader freeze(boolean trim) {
-    if (trim && upto < blockSize) {
-      final byte[] newBlock = new byte[upto];
-      System.arraycopy(currentBlock, 0, newBlock, 0, upto);
-      currentBlock = newBlock;
-    }
-    if (currentBlock == null) {
-      currentBlock = EMPTY_BYTES;
-    }
-    blocks.add(currentBlock);
-    blockEnd.add(upto); 
-    currentBlock = null;
-    return new Reader(this);
-  }
-
-  public long getPointer() {
-    if (currentBlock == null) {
-      return 0;
-    } else {
-      return (blocks.size() * ((long) blockSize)) + upto;
-    }
-  }
-
-  /** Copy bytes in, writing the length as a 1 or 2 byte
-   *  vInt prefix. */
-  public long copyUsingLengthPrefix(BytesRef bytes) throws IOException {
-
-    if (upto + bytes.length + 2 > blockSize) {
-      if (bytes.length + 2 > blockSize) {
-        throw new IllegalArgumentException("block size " + blockSize + " is too small to store length " + bytes.length + " bytes");
-      }
-      if (currentBlock != null) {
-        blocks.add(currentBlock);
-        blockEnd.add(upto);        
-      }
-      currentBlock = new byte[blockSize];
-      upto = 0;
-    }
-
-    final long pointer = getPointer();
-
-    if (bytes.length < 128) {
-      currentBlock[upto++] = (byte) bytes.length;
-    } else {
-      currentBlock[upto++] = (byte) (0x80 | (bytes.length >> 8));
-      currentBlock[upto++] = (byte) (bytes.length & 0xff);
-    }
-    System.arraycopy(bytes.bytes, bytes.offset, currentBlock, upto, bytes.length);
-    upto += bytes.length;
-
-    return pointer;
-  }
+  
 }

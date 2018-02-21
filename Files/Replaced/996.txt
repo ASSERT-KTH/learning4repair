@@ -1,14 +1,13 @@
-if (totTermCount.get() < 30) {
-
-package org.apache.lucene.index;
+public Message getMessage(Integer version) throws IOException
 
 /**
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -19,633 +18,879 @@ package org.apache.lucene.index;
  * limitations under the License.
  */
 
-import java.io.File;
+package org.apache.cassandra.gms;
+
+import java.io.ByteArrayOutputStream;
+import java.io.DataOutputStream;
+import java.io.IOError;
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.net.InetAddress;
+import java.util.*;
+import java.util.Map.Entry;
+import java.util.concurrent.*;
 
-import org.apache.lucene.analysis.MockAnalyzer;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.Field;
-import org.apache.lucene.document.StringField;
-import org.apache.lucene.document.TextField;
-import org.apache.lucene.search.IndexSearcher;
-import org.apache.lucene.search.PhraseQuery;
-import org.apache.lucene.search.Query;
-import org.apache.lucene.search.ScoreDoc;
-import org.apache.lucene.search.Sort;
-import org.apache.lucene.search.SortField;
-import org.apache.lucene.search.TermQuery;
-import org.apache.lucene.search.TopDocs;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.MockDirectoryWrapper;
-import org.apache.lucene.util.Bits;
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.FailOnNonBulkMergesInfoStream;
-import org.apache.lucene.util.LineFileDocs;
-import org.apache.lucene.util.LuceneTestCase;
-import org.apache.lucene.util.NamedThreadFactory;
-import org.apache.lucene.util._TestUtil;
+import org.apache.cassandra.net.MessageProducer;
+import org.cliffc.high_scale_lib.NonBlockingHashMap;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-// TODO
-//   - mix in forceMerge, addIndexes
-//   - randomly mix in non-congruent docs
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.service.StorageService;
 
-/** Utility class that spawns multiple indexing and
- *  searching threads. */
-public abstract class ThreadedIndexingAndSearchingTestCase extends LuceneTestCase {
+/**
+ * This module is responsible for Gossiping information for the local endpoint. This abstraction
+ * maintains the list of live and dead endpoints. Periodically i.e. every 1 second this module
+ * chooses a random node and initiates a round of Gossip with it. A round of Gossip involves 3
+ * rounds of messaging. For instance if node A wants to initiate a round of Gossip with node B
+ * it starts off by sending node B a GossipDigestSynMessage. Node B on receipt of this message
+ * sends node A a GossipDigestAckMessage. On receipt of this message node A sends node B a
+ * GossipDigestAck2Message which completes a round of Gossip. This module as and when it hears one
+ * of the three above mentioned messages updates the Failure Detector with the liveness information.
+ */
 
-  protected final AtomicBoolean failed = new AtomicBoolean();
-  protected final AtomicInteger addCount = new AtomicInteger();
-  protected final AtomicInteger delCount = new AtomicInteger();
-  protected final AtomicInteger packCount = new AtomicInteger();
+public class Gossiper implements IFailureDetectionEventListener
+{
+    static final ApplicationState[] STATES = ApplicationState.values();
+    private ScheduledFuture<?> scheduledGossipTask;
+    public final static int intervalInMillis = 1000;
+    public final static int QUARANTINE_DELAY = StorageService.RING_DELAY * 2;
+    private static Logger logger = LoggerFactory.getLogger(Gossiper.class);
+    public static final Gossiper instance = new Gossiper();
 
-  protected Directory dir;
-  protected IndexWriter writer;
+    private long aVeryLongTime;
+    private long FatClientTimeout;
+    private Random random = new Random();
+    private Comparator<InetAddress> inetcomparator = new Comparator<InetAddress>()
+    {
+        public int compare(InetAddress addr1,  InetAddress addr2)
+        {
+            return addr1.getHostAddress().compareTo(addr2.getHostAddress());
+        }
+    };
 
-  private static class SubDocs {
-    public final String packID;
-    public final List<String> subIDs;
-    public boolean deleted;
+    /* subscribers for interest in EndpointState change */
+    private List<IEndpointStateChangeSubscriber> subscribers = new CopyOnWriteArrayList<IEndpointStateChangeSubscriber>();
 
-    public SubDocs(String packID, List<String> subIDs) {
-      this.packID = packID;
-      this.subIDs = subIDs;
-    }
-  }
+    /* live member set */
+    private Set<InetAddress> liveEndpoints = new ConcurrentSkipListSet<InetAddress>(inetcomparator);
 
-  // Called per-search
-  protected abstract IndexSearcher getCurrentSearcher() throws Exception;
+    /* unreachable member set */
+    private Map<InetAddress, Long> unreachableEndpoints = new ConcurrentHashMap<InetAddress, Long>();
 
-  protected abstract IndexSearcher getFinalSearcher() throws Exception;
+    /* initial seeds for joining the cluster */
+    private Set<InetAddress> seeds = new ConcurrentSkipListSet<InetAddress>(inetcomparator);
 
-  protected void releaseSearcher(IndexSearcher s) throws Exception {
-  }
+    /* map where key is the endpoint and value is the state associated with the endpoint */
+    Map<InetAddress, EndpointState> endpointStateMap = new ConcurrentHashMap<InetAddress, EndpointState>();
 
-  // Called once to run searching
-  protected abstract void doSearching(ExecutorService es, long stopTime) throws Exception;
+    /* map where key is endpoint and value is timestamp when this endpoint was removed from
+     * gossip. We will ignore any gossip regarding these endpoints for QUARANTINE_DELAY time
+     * after removal to prevent nodes from falsely reincarnating during the time when removal
+     * gossip gets propagated to all nodes */
+    private Map<InetAddress, Long> justRemovedEndpoints = new ConcurrentHashMap<InetAddress, Long>();
+    
+    // protocol versions of the other nodes in the cluster
+    private final ConcurrentMap<InetAddress, Integer> versions = new NonBlockingHashMap<InetAddress, Integer>();
 
-  protected Directory getDirectory(Directory in) {
-    return in;
-  }
+    private class GossipTask implements Runnable
+    {
+        public void run()
+        {
+            try
+            {
+                //wait on messaging service to start listening
+                MessagingService.instance().waitUntilListening();
+                
+                /* Update the local heartbeat counter. */
+                endpointStateMap.get(FBUtilities.getLocalAddress()).getHeartBeatState().updateHeartBeat();
+                if (logger.isTraceEnabled())
+                    logger.trace("My heartbeat is now " + endpointStateMap.get(FBUtilities.getLocalAddress()).getHeartBeatState().getHeartBeatVersion());
+                final List<GossipDigest> gDigests = new ArrayList<GossipDigest>();
+                Gossiper.instance.makeRandomGossipDigest(gDigests);
 
-  protected void updateDocuments(Term id, List<? extends Iterable<? extends IndexableField>> docs) throws Exception {
-    writer.updateDocuments(id, docs);
-  }
-
-  protected void addDocuments(Term id, List<? extends Iterable<? extends IndexableField>> docs) throws Exception {
-    writer.addDocuments(docs);
-  }
-
-  protected void addDocument(Term id, Iterable<? extends IndexableField> doc) throws Exception {
-    writer.addDocument(doc);
-  }
-
-  protected void updateDocument(Term term, Iterable<? extends IndexableField> doc) throws Exception {
-    writer.updateDocument(term, doc);
-  }
-
-  protected void deleteDocuments(Term term) throws Exception {
-    writer.deleteDocuments(term);
-  }
-
-  protected void doAfterIndexingThreadDone() {
-  }
-
-  private Thread[] launchIndexingThreads(final LineFileDocs docs,
-                                         int numThreads,
-                                         final long stopTime,
-                                         final Set<String> delIDs,
-                                         final Set<String> delPackIDs,
-                                         final List<SubDocs> allSubDocs)
-    throws Exception {
-    final Thread[] threads = new Thread[numThreads];
-    for(int thread=0;thread<numThreads;thread++) {
-      threads[thread] = new Thread() {
-          @Override
-          public void run() {
-            // TODO: would be better if this were cross thread, so that we make sure one thread deleting anothers added docs works:
-            final List<String> toDeleteIDs = new ArrayList<String>();
-            final List<SubDocs> toDeleteSubDocs = new ArrayList<SubDocs>();
-            while(System.currentTimeMillis() < stopTime && !failed.get()) {
-              try {
-
-                // Occasional longish pause if running
-                // nightly
-                if (LuceneTestCase.TEST_NIGHTLY && random.nextInt(6) == 3) {
-                  if (VERBOSE) {
-                    System.out.println(Thread.currentThread().getName() + ": now long sleep");
-                  }
-                  Thread.sleep(_TestUtil.nextInt(random, 50, 500));
-                }
-
-                // Rate limit ingest rate:
-                if (random.nextInt(7) == 5) {
-                  Thread.sleep(_TestUtil.nextInt(random, 1, 10));
-                  if (VERBOSE) {
-                    System.out.println(Thread.currentThread().getName() + ": done sleep");
-                  }
-                }
-
-                Document doc = docs.nextDoc();
-                if (doc == null) {
-                  break;
-                }
-
-                // Maybe add randomly named field
-                final String addedField;
-                if (random.nextBoolean()) {
-                  addedField = "extra" + random.nextInt(40);
-                  doc.add(newField(addedField, "a random field", TextField.TYPE_STORED));
-                } else {
-                  addedField = null;
-                }
-
-                if (random.nextBoolean()) {
-
-                  if (random.nextBoolean()) {
-                    // Add/update doc block:
-                    final String packID;
-                    final SubDocs delSubDocs;
-                    if (toDeleteSubDocs.size() > 0 && random.nextBoolean()) {
-                      delSubDocs = toDeleteSubDocs.get(random.nextInt(toDeleteSubDocs.size()));
-                      assert !delSubDocs.deleted;
-                      toDeleteSubDocs.remove(delSubDocs);
-                      // Update doc block, replacing prior packID
-                      packID = delSubDocs.packID;
-                    } else {
-                      delSubDocs = null;
-                      // Add doc block, using new packID
-                      packID = packCount.getAndIncrement() + "";
-                    }
-
-                    final Field packIDField = newField("packID", packID, StringField.TYPE_STORED);
-                    final List<String> docIDs = new ArrayList<String>();
-                    final SubDocs subDocs = new SubDocs(packID, docIDs);
-                    final List<Document> docsList = new ArrayList<Document>();
-
-                    allSubDocs.add(subDocs);
-                    doc.add(packIDField);
-                    docsList.add(_TestUtil.cloneDocument(doc));
-                    docIDs.add(doc.get("docid"));
-
-                    final int maxDocCount = _TestUtil.nextInt(random, 1, 10);
-                    while(docsList.size() < maxDocCount) {
-                      doc = docs.nextDoc();
-                      if (doc == null) {
-                        break;
-                      }
-                      docsList.add(_TestUtil.cloneDocument(doc));
-                      docIDs.add(doc.get("docid"));
-                    }
-                    addCount.addAndGet(docsList.size());
-
-                    final Term packIDTerm = new Term("packID", packID);
-
-                    if (delSubDocs != null) {
-                      delSubDocs.deleted = true;
-                      delIDs.addAll(delSubDocs.subIDs);
-                      delCount.addAndGet(delSubDocs.subIDs.size());
-                      if (VERBOSE) {
-                        System.out.println(Thread.currentThread().getName() + ": update pack packID=" + delSubDocs.packID + " count=" + docsList.size() + " docs=" + docIDs);
-                      }
-                      updateDocuments(packIDTerm, docsList);
-                    } else {
-                      if (VERBOSE) {
-                        System.out.println(Thread.currentThread().getName() + ": add pack packID=" + packID + " count=" + docsList.size() + " docs=" + docIDs);
-                      }
-                      addDocuments(packIDTerm, docsList);
-                    }
-                    doc.removeField("packID");
-
-                    if (random.nextInt(5) == 2) {
-                      if (VERBOSE) {
-                        System.out.println(Thread.currentThread().getName() + ": buffer del id:" + packID);
-                      }
-                      toDeleteSubDocs.add(subDocs);
-                    }
-
-                  } else {
-                    // Add single doc
-                    final String docid = doc.get("docid");
-                    if (VERBOSE) {
-                      System.out.println(Thread.currentThread().getName() + ": add doc docid:" + docid);
-                    }
-                    addDocument(new Term("docid", docid), doc);
-                    addCount.getAndIncrement();
-
-                    if (random.nextInt(5) == 3) {
-                      if (VERBOSE) {
-                        System.out.println(Thread.currentThread().getName() + ": buffer del id:" + doc.get("docid"));
-                      }
-                      toDeleteIDs.add(docid);
-                    }
-                  }
-                } else {
-
-                  // Update single doc, but we never re-use
-                  // and ID so the delete will never
-                  // actually happen:
-                  if (VERBOSE) {
-                    System.out.println(Thread.currentThread().getName() + ": update doc id:" + doc.get("docid"));
-                  }
-                  final String docid = doc.get("docid");
-                  updateDocument(new Term("docid", docid), doc);
-                  addCount.getAndIncrement();
-
-                  if (random.nextInt(5) == 3) {
-                    if (VERBOSE) {
-                      System.out.println(Thread.currentThread().getName() + ": buffer del id:" + doc.get("docid"));
-                    }
-                    toDeleteIDs.add(docid);
-                  }
-                }
-
-                if (random.nextInt(30) == 17) {
-                  if (VERBOSE) {
-                    System.out.println(Thread.currentThread().getName() + ": apply " + toDeleteIDs.size() + " deletes");
-                  }
-                  for(String id : toDeleteIDs) {
-                    if (VERBOSE) {
-                      System.out.println(Thread.currentThread().getName() + ": del term=id:" + id);
-                    }
-                    deleteDocuments(new Term("docid", id));
-                  }
-                  final int count = delCount.addAndGet(toDeleteIDs.size());
-                  if (VERBOSE) {
-                    System.out.println(Thread.currentThread().getName() + ": tot " + count + " deletes");
-                  }
-                  delIDs.addAll(toDeleteIDs);
-                  toDeleteIDs.clear();
-
-                  for(SubDocs subDocs : toDeleteSubDocs) {
-                    assert !subDocs.deleted;
-                    delPackIDs.add(subDocs.packID);
-                    deleteDocuments(new Term("packID", subDocs.packID));
-                    subDocs.deleted = true;
-                    if (VERBOSE) {
-                      System.out.println(Thread.currentThread().getName() + ": del subs: " + subDocs.subIDs + " packID=" + subDocs.packID);
-                    }
-                    delIDs.addAll(subDocs.subIDs);
-                    delCount.addAndGet(subDocs.subIDs.size());
-                  }
-                  toDeleteSubDocs.clear();
-                }
-                if (addedField != null) {
-                  doc.removeField(addedField);
-                }
-              } catch (Throwable t) {
-                System.out.println(Thread.currentThread().getName() + ": hit exc");
-                t.printStackTrace();
-                failed.set(true);
-                throw new RuntimeException(t);
-              }
-            }
-            if (VERBOSE) {
-              System.out.println(Thread.currentThread().getName() + ": indexing done");
-            }
-
-            doAfterIndexingThreadDone();
-          }
-        };
-      threads[thread].setDaemon(true);
-      threads[thread].start();
-    }
-
-    return threads;
-  }
-
-  protected void runSearchThreads(final long stopTimeMS) throws Exception {
-    final int numThreads = _TestUtil.nextInt(random, 1, 5);
-    final Thread[] searchThreads = new Thread[numThreads];
-    final AtomicInteger totHits = new AtomicInteger();
-
-    // silly starting guess:
-    final AtomicInteger totTermCount = new AtomicInteger(100);
-
-    // TODO: we should enrich this to do more interesting searches
-    for(int thread=0;thread<searchThreads.length;thread++) {
-      searchThreads[thread] = new Thread() {
-          @Override
-          public void run() {
-            while (System.currentTimeMillis() < stopTimeMS) {
-              try {
-                final IndexSearcher s = getCurrentSearcher();
-                try {
-                  if (s.getIndexReader().numDocs() > 0) {
-                    smokeTestSearcher(s);
-                    Fields fields = MultiFields.getFields(s.getIndexReader());
-                    if (fields == null) {
-                      continue;
-                    }
-                    Terms terms = fields.terms("body");
-                    if (terms == null) {
-                      continue;
-                    }
-                    TermsEnum termsEnum = terms.iterator(null);
-                    int seenTermCount = 0;
-                    int shift;
-                    int trigger; 
-                    if (totTermCount.get() < 10) {
-                      shift = 0;
-                      trigger = 1;
-                    } else {
-                      trigger = totTermCount.get()/30;
-                      shift = random.nextInt(trigger);
-                    }
-                    while (true) {
-                      BytesRef term = termsEnum.next();
-                      if (term == null) {
-                        if (seenTermCount == 0) {
-                          break;
+                if ( gDigests.size() > 0 )
+                {
+                    MessageProducer prod = new MessageProducer()
+                    {
+                        public Message getMessage(int version) throws IOException
+                        {
+                            return makeGossipDigestSynMessage(gDigests, version);
                         }
-                        totTermCount.set(seenTermCount);
-                        break;
-                      }
-                      seenTermCount++;
-                      // search 30 terms
-                      if (trigger == 0) {
-                        trigger = 1;
-                      }
-                      if ((seenTermCount + shift) % trigger == 0) {
-                        //if (VERBOSE) {
-                        //System.out.println(Thread.currentThread().getName() + " now search body:" + term.utf8ToString());
-                        //}
-                        totHits.addAndGet(runQuery(s, new TermQuery(new Term("body", term))));
-                      }
-                    }
-                    //if (VERBOSE) {
-                    //System.out.println(Thread.currentThread().getName() + ": search done");
-                    //}
-                  }
-                } finally {
-                  releaseSearcher(s);
+                    };
+                    /* Gossip to some random live member */
+                    boolean gossipedToSeed = doGossipToLiveMember(prod);
+
+                    /* Gossip to some unreachable member with some probability to check if he is back up */
+                    doGossipToUnreachableMember(prod);
+
+                    /* Gossip to a seed if we did not do so above, or we have seen less nodes
+                       than there are seeds.  This prevents partitions where each group of nodes
+                       is only gossiping to a subset of the seeds.
+
+                       The most straightforward check would be to check that all the seeds have been
+                       verified either as live or unreachable.  To avoid that computation each round,
+                       we reason that:
+
+                       either all the live nodes are seeds, in which case non-seeds that come online
+                       will introduce themselves to a member of the ring by definition,
+
+                       or there is at least one non-seed node in the list, in which case eventually
+                       someone will gossip to it, and then do a gossip to a random seed from the
+                       gossipedToSeed check.
+
+                       See CASSANDRA-150 for more exposition. */
+                    if (!gossipedToSeed || liveEndpoints.size() < seeds.size())
+                        doGossipToSeed(prod);
+
+                    if (logger.isTraceEnabled())
+                        logger.trace("Performing status check ...");
+                    doStatusCheck();
                 }
-              } catch (Throwable t) {
-                System.out.println(Thread.currentThread().getName() + ": hit exc");
-                failed.set(true);
-                t.printStackTrace(System.out);
-                throw new RuntimeException(t);
-              }
             }
-          }
-        };
-      searchThreads[thread].setDaemon(true);
-      searchThreads[thread].start();
-    }
-
-    for(int thread=0;thread<searchThreads.length;thread++) {
-      searchThreads[thread].join();
-    }
-
-    if (VERBOSE) {
-      System.out.println("TEST: DONE search: totHits=" + totHits);
-    }
-  }
-
-  protected void doAfterWriter(ExecutorService es) throws Exception {
-  }
-
-  protected void doClose() throws Exception {
-  }
-
-  public void runTest(String testName) throws Exception {
-
-    failed.set(false);
-    addCount.set(0);
-    delCount.set(0);
-    packCount.set(0);
-
-    final long t0 = System.currentTimeMillis();
-
-    final LineFileDocs docs = new LineFileDocs(random, defaultCodecSupportsDocValues());
-    final File tempDir = _TestUtil.getTempDir(testName);
-    dir = newFSDirectory(tempDir);
-    ((MockDirectoryWrapper) dir).setCheckIndexOnClose(false); // don't double-checkIndex, we do it ourselves.
-    final IndexWriterConfig conf = newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random)).
-        setInfoStream(new FailOnNonBulkMergesInfoStream());
-
-    if (LuceneTestCase.TEST_NIGHTLY) {
-      // newIWConfig makes smallish max seg size, which
-      // results in tons and tons of segments for this test
-      // when run nightly:
-      MergePolicy mp = conf.getMergePolicy();
-      if (mp instanceof TieredMergePolicy) {
-        ((TieredMergePolicy) mp).setMaxMergedSegmentMB(5000.);
-      } else if (mp instanceof LogByteSizeMergePolicy) {
-        ((LogByteSizeMergePolicy) mp).setMaxMergeMB(1000.);
-      } else if (mp instanceof LogMergePolicy) {
-        ((LogMergePolicy) mp).setMaxMergeDocs(100000);
-      }
-    }
-
-    conf.setMergedSegmentWarmer(new IndexWriter.IndexReaderWarmer() {
-      @Override
-      public void warm(AtomicReader reader) throws IOException {
-        if (VERBOSE) {
-          System.out.println("TEST: now warm merged reader=" + reader);
+            catch (Exception e)
+            {
+                logger.error("Gossip error", e);
+            }
         }
-        final int maxDoc = reader.maxDoc();
-        final Bits liveDocs = reader.getLiveDocs();
-        int sum = 0;
-        final int inc = Math.max(1, maxDoc/50);
-        for(int docID=0;docID<maxDoc;docID += inc) {
-          if (liveDocs == null || liveDocs.get(docID)) {
-            final Document doc = reader.document(docID);
-            sum += doc.getFields().size();
-          }
-        }
-
-        IndexSearcher searcher = newSearcher(reader);
-        sum += searcher.search(new TermQuery(new Term("body", "united")), 10).totalHits;
-
-        if (VERBOSE) {
-          System.out.println("TEST: warm visited " + sum + " fields");
-        }
-      }
-      });
-
-    writer = new IndexWriter(dir, conf);
-    _TestUtil.reduceOpenFiles(writer);
-
-    final ExecutorService es = random.nextBoolean() ? null : Executors.newCachedThreadPool(new NamedThreadFactory(testName));
-
-    doAfterWriter(es);
-
-    final int NUM_INDEX_THREADS = _TestUtil.nextInt(random, 2, 4);
-
-    final int RUN_TIME_SEC = LuceneTestCase.TEST_NIGHTLY ? 300 : RANDOM_MULTIPLIER;
-
-    final Set<String> delIDs = Collections.synchronizedSet(new HashSet<String>());
-    final Set<String> delPackIDs = Collections.synchronizedSet(new HashSet<String>());
-    final List<SubDocs> allSubDocs = Collections.synchronizedList(new ArrayList<SubDocs>());
-
-    final long stopTime = System.currentTimeMillis() + RUN_TIME_SEC*1000;
-
-    final Thread[] indexThreads = launchIndexingThreads(docs, NUM_INDEX_THREADS, stopTime, delIDs, delPackIDs, allSubDocs);
-
-    if (VERBOSE) {
-      System.out.println("TEST: DONE start indexing threads [" + (System.currentTimeMillis()-t0) + " ms]");
     }
 
-    // Let index build up a bit
-    Thread.sleep(100);
+    private Gossiper()
+    {
+        // 3 days
+        aVeryLongTime = 259200 * 1000;
+        // half of QUARATINE_DELAY, to ensure justRemovedEndpoints has enough leeway to prevent re-gossip
+        FatClientTimeout = (long)(QUARANTINE_DELAY / 2);
+        /* register with the Failure Detector for receiving Failure detector events */
+        FailureDetector.instance.registerFailureDetectionEventListener(this);
+    }
 
-    doSearching(es, stopTime);
+    /**
+     * Register for interesting state changes.
+     * @param subscriber module which implements the IEndpointStateChangeSubscriber
+     */
+    public void register(IEndpointStateChangeSubscriber subscriber)
+    {
+        subscribers.add(subscriber);
+    }
 
-    if (VERBOSE) {
-      System.out.println("TEST: all searching done [" + (System.currentTimeMillis()-t0) + " ms]");
+    /**
+     * Unregister interest for state changes.
+     * @param subscriber module which implements the IEndpointStateChangeSubscriber
+     */
+    public void unregister(IEndpointStateChangeSubscriber subscriber)
+    {
+        subscribers.remove(subscriber);
     }
     
-    for(int thread=0;thread<indexThreads.length;thread++) {
-      indexThreads[thread].join();
+    public void setVersion(InetAddress address, int version)
+    {
+        Integer old = versions.put(address, version);
     }
-
-    if (VERBOSE) {
-      System.out.println("TEST: done join indexing threads [" + (System.currentTimeMillis()-t0) + " ms]; addCount=" + addCount + " delCount=" + delCount);
-    }
-
-    final IndexSearcher s = getFinalSearcher();
-    if (VERBOSE) {
-      System.out.println("TEST: finalSearcher=" + s);
-    }
-
-    assertFalse(failed.get());
-
-    boolean doFail = false;
-
-    // Verify: make sure delIDs are in fact deleted:
-    for(String id : delIDs) {
-      final TopDocs hits = s.search(new TermQuery(new Term("docid", id)), 1);
-      if (hits.totalHits != 0) {
-        System.out.println("doc id=" + id + " is supposed to be deleted, but got " + hits.totalHits + " hits; first docID=" + hits.scoreDocs[0].doc);
-        doFail = true;
-      }
-    }
-
-    // Verify: make sure delPackIDs are in fact deleted:
-    for(String id : delPackIDs) {
-      final TopDocs hits = s.search(new TermQuery(new Term("packID", id)), 1);
-      if (hits.totalHits != 0) {
-        System.out.println("packID=" + id + " is supposed to be deleted, but got " + hits.totalHits + " matches");
-        doFail = true;
-      }
-    }
-
-    // Verify: make sure each group of sub-docs are still in docID order:
-    for(SubDocs subDocs : allSubDocs) {
-      TopDocs hits = s.search(new TermQuery(new Term("packID", subDocs.packID)), 20);
-      if (!subDocs.deleted) {
-        // We sort by relevance but the scores should be identical so sort falls back to by docID:
-        if (hits.totalHits != subDocs.subIDs.size()) {
-          System.out.println("packID=" + subDocs.packID + ": expected " + subDocs.subIDs.size() + " hits but got " + hits.totalHits);
-          doFail = true;
-        } else {
-          int lastDocID = -1;
-          int startDocID = -1;
-          for(ScoreDoc scoreDoc : hits.scoreDocs) {
-            final int docID = scoreDoc.doc;
-            if (lastDocID != -1) {
-              assertEquals(1+lastDocID, docID);
-            } else {
-              startDocID = docID;
-            }
-            lastDocID = docID;
-            final Document doc = s.doc(docID);
-            assertEquals(subDocs.packID, doc.get("packID"));
-          }
-
-          lastDocID = startDocID - 1;
-          for(String subID : subDocs.subIDs) {
-            hits = s.search(new TermQuery(new Term("docid", subID)), 1);
-            assertEquals(1, hits.totalHits);
-            final int docID = hits.scoreDocs[0].doc;
-            if (lastDocID != -1) {
-              assertEquals(1+lastDocID, docID);
-            }
-            lastDocID = docID;
-          }
-        }
-      } else {
-        // Pack was deleted -- make sure its docs are
-        // deleted.  We can't verify packID is deleted
-        // because we can re-use packID for update:
-        for(String subID : subDocs.subIDs) {
-          assertEquals(0, s.search(new TermQuery(new Term("docid", subID)), 1).totalHits);
-        }
-      }
-    }
-
-    // Verify: make sure all not-deleted docs are in fact
-    // not deleted:
-    final int endID = Integer.parseInt(docs.nextDoc().get("docid"));
-    docs.close();
-
-    for(int id=0;id<endID;id++) {
-      String stringID = ""+id;
-      if (!delIDs.contains(stringID)) {
-        final TopDocs hits = s.search(new TermQuery(new Term("docid", stringID)), 1);
-        if (hits.totalHits != 1) {
-          System.out.println("doc id=" + stringID + " is not supposed to be deleted, but got hitCount=" + hits.totalHits);
-          doFail = true;
-        }
-      }
-    }
-    assertFalse(doFail);
     
-    assertEquals("index=" + writer.segString() + " addCount=" + addCount + " delCount=" + delCount, addCount.get() - delCount.get(), s.getIndexReader().numDocs());
-    releaseSearcher(s);
+    public Integer getVersion(InetAddress address)
+    {
+        Integer v = versions.get(address);
+        if (v == null)
+        {
+            // we don't know the version. assume current. we'll know soon enough if that was incorrect.
+            logger.debug("Assuming current protocol version for {}", address);
+            return MessagingService.version_;
+        }
+        else
+            return v;
+    }
+    
 
-    writer.commit();
-
-    assertEquals("index=" + writer.segString() + " addCount=" + addCount + " delCount=" + delCount, addCount.get() - delCount.get(), writer.numDocs());
-
-    doClose();
-    writer.close(false);
-
-    // Cannot shutdown until after writer is closed because
-    // writer has merged segment warmer that uses IS to run
-    // searches, and that IS may be using this es!
-    if (es != null) {
-      es.shutdown();
-      es.awaitTermination(1, TimeUnit.SECONDS);
+    public Set<InetAddress> getLiveMembers()
+    {
+        Set<InetAddress> liveMbrs = new HashSet<InetAddress>(liveEndpoints);
+        if (!liveMbrs.contains(FBUtilities.getLocalAddress()))
+            liveMbrs.add(FBUtilities.getLocalAddress());
+        return liveMbrs;
     }
 
-    _TestUtil.checkIndex(dir);
-    dir.close();
-    _TestUtil.rmDir(tempDir);
-
-    if (VERBOSE) {
-      System.out.println("TEST: done [" + (System.currentTimeMillis()-t0) + " ms]");
+    public Set<InetAddress> getUnreachableMembers()
+    {
+        return unreachableEndpoints.keySet();
     }
-  }
 
-  private int runQuery(IndexSearcher s, Query q) throws Exception {
-    s.search(q, 10);
-    int hitCount = s.search(q, null, 10, new Sort(new SortField("title", SortField.Type.STRING))).totalHits;
-    if (defaultCodecSupportsDocValues()) {
-      final Sort dvSort = new Sort(new SortField("title", SortField.Type.STRING));
-      dvSort.getSort()[0].setUseIndexValues(true);
-      int hitCount2 = s.search(q, null, 10, dvSort).totalHits;
-      assertEquals(hitCount, hitCount2);
+    public long getEndpointDowntime(InetAddress ep)
+    {
+        Long downtime = unreachableEndpoints.get(ep);
+        if (downtime != null)
+            return System.currentTimeMillis() - downtime;
+        else
+            return 0L;
     }
-    return hitCount;
-  }
 
-  protected void smokeTestSearcher(IndexSearcher s) throws Exception {
-    runQuery(s, new TermQuery(new Term("body", "united")));
-    runQuery(s, new TermQuery(new Term("titleTokenized", "states")));
-    PhraseQuery pq = new PhraseQuery();
-    pq.add(new Term("body", "united"));
-    pq.add(new Term("body", "states"));
-    runQuery(s, pq);
-  }
+    /**
+     * This method is part of IFailureDetectionEventListener interface. This is invoked
+     * by the Failure Detector when it convicts an end point.
+     *
+     * param @ endpoint end point that is convicted.
+    */
+    public void convict(InetAddress endpoint)
+    {
+        EndpointState epState = endpointStateMap.get(endpoint);
+        if (epState.isAlive())
+        {
+            markDead(endpoint, epState);
+        }
+    }
+
+    /**
+     * Return either: the greatest heartbeat or application state
+     * @param epState
+     * @return
+     */
+    int getMaxEndpointStateVersion(EndpointState epState)
+    {
+        int maxVersion = epState.getHeartBeatState().getHeartBeatVersion();
+        for (VersionedValue value : epState.getApplicationStateMap().values())
+            maxVersion = Math.max(maxVersion,  value.version);
+        return maxVersion;
+    }
+
+    /**
+     * Removes the endpoint from unreachable endpoint set
+     *
+     * @param endpoint endpoint to be removed from the current membership.
+    */
+    private void evictFromMembership(InetAddress endpoint)
+    {
+        unreachableEndpoints.remove(endpoint);
+    }
+
+    /**
+     * Removes the endpoint completely from Gossip
+     */
+    public void removeEndpoint(InetAddress endpoint)
+    {
+        // do subscribers first so anything in the subscriber that depends on gossiper state won't get confused
+        for (IEndpointStateChangeSubscriber subscriber : subscribers)
+            subscriber.onRemove(endpoint);
+
+        liveEndpoints.remove(endpoint);
+        unreachableEndpoints.remove(endpoint);
+        // do not remove endpointState until the quarantine expires
+        FailureDetector.instance.remove(endpoint);
+        versions.remove(endpoint);
+        justRemovedEndpoints.put(endpoint, System.currentTimeMillis());
+    }
+
+    /**
+     * The gossip digest is built based on randomization
+     * rather than just looping through the collection of live endpoints.
+     *
+     * @param gDigests list of Gossip Digests.
+    */
+    private void makeRandomGossipDigest(List<GossipDigest> gDigests)
+    {
+        EndpointState epState;
+        int generation = 0;
+        int maxVersion = 0;
+
+        // local epstate will be part of endpointStateMap
+        List<InetAddress> endpoints = new ArrayList<InetAddress>(endpointStateMap.keySet());
+        Collections.shuffle(endpoints, random);
+        for (InetAddress endpoint : endpoints)
+        {
+            epState = endpointStateMap.get(endpoint);
+            if (epState != null)
+            {
+                generation = epState.getHeartBeatState().getGeneration();
+                maxVersion = getMaxEndpointStateVersion(epState);
+            }
+            gDigests.add(new GossipDigest(endpoint, generation, maxVersion));
+        }
+
+        if (logger.isTraceEnabled())
+        {
+            StringBuilder sb = new StringBuilder();
+            for ( GossipDigest gDigest : gDigests )
+            {
+                sb.append(gDigest);
+                sb.append(" ");
+            }
+                logger.trace("Gossip Digests are : " + sb.toString());
+        }
+    }
+
+    public boolean isKnownEndpoint(InetAddress endpoint)
+    {
+        return endpointStateMap.containsKey(endpoint);
+    }
+
+    public int getCurrentGenerationNumber(InetAddress endpoint)
+    {
+    	return endpointStateMap.get(endpoint).getHeartBeatState().getGeneration();
+    }
+
+    Message makeGossipDigestSynMessage(List<GossipDigest> gDigests, int version) throws IOException
+    {
+        GossipDigestSynMessage gDigestMessage = new GossipDigestSynMessage(DatabaseDescriptor.getClusterName(), gDigests);
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        DataOutputStream dos = new DataOutputStream( bos );
+        GossipDigestSynMessage.serializer().serialize(gDigestMessage, dos, version);
+        return new Message(FBUtilities.getLocalAddress(), StorageService.Verb.GOSSIP_DIGEST_SYN, bos.toByteArray(), version);
+    }
+
+    Message makeGossipDigestAckMessage(GossipDigestAckMessage gDigestAckMessage, int version) throws IOException
+    {
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        DataOutputStream dos = new DataOutputStream(bos);
+        GossipDigestAckMessage.serializer().serialize(gDigestAckMessage, dos, version);
+        return new Message(FBUtilities.getLocalAddress(), StorageService.Verb.GOSSIP_DIGEST_ACK, bos.toByteArray(), version);
+    }
+
+    Message makeGossipDigestAck2Message(GossipDigestAck2Message gDigestAck2Message, int version) throws IOException
+    {
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        DataOutputStream dos = new DataOutputStream(bos);
+        GossipDigestAck2Message.serializer().serialize(gDigestAck2Message, dos, version);
+        return new Message(FBUtilities.getLocalAddress(), StorageService.Verb.GOSSIP_DIGEST_ACK2, bos.toByteArray(), version);
+    }
+
+    /**
+     * Returns true if the chosen target was also a seed. False otherwise
+     *
+     *  @param prod produces a message to send
+     *  @param epSet a set of endpoint from which a random endpoint is chosen.
+     *  @return true if the chosen endpoint is also a seed.
+     */
+    private boolean sendGossip(MessageProducer prod, Set<InetAddress> epSet)
+    {
+        int size = epSet.size();
+        /* Generate a random number from 0 -> size */
+        List<InetAddress> liveEndpoints = new ArrayList<InetAddress>(epSet);
+        int index = (size == 1) ? 0 : random.nextInt(size);
+        InetAddress to = liveEndpoints.get(index);
+        if (logger.isTraceEnabled())
+            logger.trace("Sending a GossipDigestSynMessage to {} ...", to);
+        try
+        {
+            MessagingService.instance().sendOneWay(prod.getMessage(getVersion(to)), to);
+        }
+        catch (IOException ex)
+        {
+            throw new IOError(ex);
+        }        
+        return seeds.contains(to);
+    }
+
+    /* Sends a Gossip message to a live member and returns true if the recipient was a seed */
+    private boolean doGossipToLiveMember(MessageProducer prod)
+    {
+        int size = liveEndpoints.size();
+        if ( size == 0 )
+            return false;
+        return sendGossip(prod, liveEndpoints);
+    }
+
+    /* Sends a Gossip message to an unreachable member */
+    private void doGossipToUnreachableMember(MessageProducer prod)
+    {
+        double liveEndpointCount = liveEndpoints.size();
+        double unreachableEndpointCount = unreachableEndpoints.size();
+        if ( unreachableEndpointCount > 0 )
+        {
+            /* based on some probability */
+            double prob = unreachableEndpointCount / (liveEndpointCount + 1);
+            double randDbl = random.nextDouble();
+            if ( randDbl < prob )
+                sendGossip(prod, unreachableEndpoints.keySet());
+        }
+    }
+
+    /* Gossip to a seed for facilitating partition healing */
+    private void doGossipToSeed(MessageProducer prod)
+    {
+        int size = seeds.size();
+        if ( size > 0 )
+        {
+            if ( size == 1 && seeds.contains(FBUtilities.getLocalAddress()) )
+            {
+                return;
+            }
+
+            if ( liveEndpoints.size() == 0 )
+            {
+                sendGossip(prod, seeds);
+            }
+            else
+            {
+                /* Gossip with the seed with some probability. */
+                double probability = seeds.size() / (double)( liveEndpoints.size() + unreachableEndpoints.size() );
+                double randDbl = random.nextDouble();
+                if ( randDbl <= probability )
+                    sendGossip(prod, seeds);
+            }
+        }
+    }
+
+    private void doStatusCheck()
+    {
+        long now = System.currentTimeMillis();
+
+        Set<InetAddress> eps = endpointStateMap.keySet();
+        for ( InetAddress endpoint : eps )
+        {
+            if ( endpoint.equals(FBUtilities.getLocalAddress()) )
+                continue;
+
+            FailureDetector.instance.interpret(endpoint);
+            EndpointState epState = endpointStateMap.get(endpoint);
+            if ( epState != null )
+            {
+                long duration = now - epState.getUpdateTimestamp();
+
+                // check if this is a fat client. fat clients are removed automatically from
+                // gosip after FatClientTimeout
+                if (!epState.getHasToken() && !epState.isAlive() && (duration > FatClientTimeout))
+                {
+                    if (StorageService.instance.getTokenMetadata().isMember(endpoint))
+                        epState.setHasToken(true);
+                    else
+                    {
+                        if (!justRemovedEndpoints.containsKey(endpoint)) // if the node was decommissioned, it will have been removed but still appear as a fat client
+                        {
+                            logger.info("FatClient " + endpoint + " has been silent for " + FatClientTimeout + "ms, removing from gossip");
+                            removeEndpoint(endpoint); // after quarantine justRemoveEndpoints will remove the state
+                        }
+                    }
+                }
+
+                if ( !epState.isAlive() && (duration > aVeryLongTime) )
+                {
+                    evictFromMembership(endpoint);
+                }
+            }
+        }
+        
+        if (!justRemovedEndpoints.isEmpty())
+        {
+            for (Map.Entry<InetAddress, Long> entry : justRemovedEndpoints.entrySet())
+            {
+                if ((now - entry.getValue()) > QUARANTINE_DELAY)
+                {
+                    if (logger.isDebugEnabled())
+                        logger.debug(QUARANTINE_DELAY + " elapsed, " + entry.getKey() + " gossip quarantine over");
+                    justRemovedEndpoints.remove(entry.getKey());
+                    endpointStateMap.remove(entry.getKey());
+                }
+            }
+        }
+    }
+
+    public EndpointState getEndpointStateForEndpoint(InetAddress ep)
+    {
+        return endpointStateMap.get(ep);
+    }
+
+    EndpointState getStateForVersionBiggerThan(InetAddress forEndpoint, int version)
+    {
+        EndpointState epState = endpointStateMap.get(forEndpoint);
+        EndpointState reqdEndpointState = null;
+
+        if ( epState != null )
+        {
+            /*
+             * Here we try to include the Heart Beat state only if it is
+             * greater than the version passed in. It might happen that
+             * the heart beat version maybe lesser than the version passed
+             * in and some application state has a version that is greater
+             * than the version passed in. In this case we also send the old
+             * heart beat and throw it away on the receiver if it is redundant.
+            */
+            int localHbVersion = epState.getHeartBeatState().getHeartBeatVersion();
+            if ( localHbVersion > version )
+            {
+                reqdEndpointState = new EndpointState(epState.getHeartBeatState());
+                if (logger.isTraceEnabled())
+                    logger.trace("local heartbeat version " + localHbVersion + " greater than " + version + " for " + forEndpoint);
+            }
+            /* Accumulate all application states whose versions are greater than "version" variable */
+            for (Entry<ApplicationState, VersionedValue> entry : epState.getApplicationStateMap().entrySet())
+            {
+                VersionedValue value = entry.getValue();
+                if ( value.version > version )
+                {
+                    if ( reqdEndpointState == null )
+                    {
+                        reqdEndpointState = new EndpointState(epState.getHeartBeatState());
+                    }
+                    final ApplicationState key = entry.getKey();
+                    if (logger.isTraceEnabled())
+                        logger.trace("Adding state " + key + ": " + value.value);
+                    reqdEndpointState.addApplicationState(key, value);
+                }
+            }
+        }
+        return reqdEndpointState;
+    }
+
+    /** determine which endpoint started up earlier */
+    public int compareEndpointStartup(InetAddress addr1, InetAddress addr2)
+    {
+        EndpointState ep1 = getEndpointStateForEndpoint(addr1);
+        EndpointState ep2 = getEndpointStateForEndpoint(addr2);
+        assert ep1 != null && ep2 != null;
+        return ep1.getHeartBeatState().getGeneration() - ep2.getHeartBeatState().getGeneration();
+    }    
+
+    void notifyFailureDetector(List<GossipDigest> gDigests)
+    {
+        for ( GossipDigest gDigest : gDigests )
+        {
+            notifyFailureDetector(gDigest.endpoint, endpointStateMap.get(gDigest.endpoint));
+        }
+    }
+
+    void notifyFailureDetector(Map<InetAddress, EndpointState> remoteEpStateMap)
+    {
+        for (Entry<InetAddress, EndpointState> entry : remoteEpStateMap.entrySet())
+        {
+            notifyFailureDetector(entry.getKey(), entry.getValue());
+        }
+    }
+
+    void notifyFailureDetector(InetAddress endpoint, EndpointState remoteEndpointState)
+    {
+        IFailureDetector fd = FailureDetector.instance;
+        EndpointState localEndpointState = endpointStateMap.get(endpoint);
+        /*
+         * If the local endpoint state exists then report to the FD only
+         * if the versions workout.
+        */
+        if ( localEndpointState != null )
+        {
+            int localGeneration = localEndpointState.getHeartBeatState().getGeneration();
+            int remoteGeneration = remoteEndpointState.getHeartBeatState().getGeneration();
+            if ( remoteGeneration > localGeneration )
+            {
+                fd.report(endpoint);
+                return;
+            }
+
+            if ( remoteGeneration == localGeneration )
+            {
+                int localVersion = getMaxEndpointStateVersion(localEndpointState);
+                int remoteVersion = remoteEndpointState.getHeartBeatState().getHeartBeatVersion();
+                if ( remoteVersion > localVersion )
+                {
+                    fd.report(endpoint);
+                }
+            }
+        }
+
+    }
+
+    private void markAlive(InetAddress addr, EndpointState localState)
+    {
+        if (logger.isTraceEnabled())
+            logger.trace("marking as alive {}", addr);
+        localState.markAlive();
+        liveEndpoints.add(addr);
+        unreachableEndpoints.remove(addr);
+        logger.info("InetAddress {} is now UP", addr);
+        for (IEndpointStateChangeSubscriber subscriber : subscribers)
+            subscriber.onAlive(addr, localState);
+        if (logger.isTraceEnabled())
+            logger.trace("Notified " + subscribers);
+    }
+
+    private void markDead(InetAddress addr, EndpointState localState)
+    {
+        if (logger.isTraceEnabled())
+            logger.trace("marking as dead {}", addr);
+        localState.markDead();
+        liveEndpoints.remove(addr);
+        unreachableEndpoints.put(addr, System.currentTimeMillis());
+        logger.info("InetAddress {} is now dead.", addr);
+        for (IEndpointStateChangeSubscriber subscriber : subscribers)
+            subscriber.onDead(addr, localState);
+        if (logger.isTraceEnabled())
+            logger.trace("Notified " + subscribers);
+    }
+
+    /**
+     * This method is called whenever there is a "big" change in ep state (a generation change for a known node).
+     *
+     * @param ep endpoint
+     * @param epState EndpointState for the endpoint
+     */
+    private void handleMajorStateChange(InetAddress ep, EndpointState epState)
+    {
+        if (endpointStateMap.get(ep) != null)
+            logger.info("Node {} has restarted, now UP again", ep);
+        else
+            logger.info("Node {} is now part of the cluster", ep);
+        if (logger.isTraceEnabled())
+            logger.trace("Adding endpoint state for " + ep);
+        endpointStateMap.put(ep, epState);
+        markAlive(ep, epState);
+        for (IEndpointStateChangeSubscriber subscriber : subscribers)
+            subscriber.onJoin(ep, epState);
+    }
+
+    void applyStateLocally(Map<InetAddress, EndpointState> epStateMap)
+    {
+        for (Entry<InetAddress, EndpointState> entry : epStateMap.entrySet())
+        {
+            InetAddress ep = entry.getKey();
+            if ( ep.equals(FBUtilities.getLocalAddress()))
+                continue;
+            if (justRemovedEndpoints.containsKey(ep))
+            {
+                if (logger.isTraceEnabled())
+                    logger.trace("Ignoring gossip for " + ep + " because it is quarantined");
+                continue;
+            }
+
+            EndpointState localEpStatePtr = endpointStateMap.get(ep);
+            EndpointState remoteState = entry.getValue();
+            /*
+                If state does not exist just add it. If it does then add it if the remote generation is greater.
+                If there is a generation tie, attempt to break it by heartbeat version.
+            */
+            if ( localEpStatePtr != null )
+            {
+            	int localGeneration = localEpStatePtr.getHeartBeatState().getGeneration();
+            	int remoteGeneration = remoteState.getHeartBeatState().getGeneration();
+                if (logger.isTraceEnabled())
+                    logger.trace(ep + "local generation " + localGeneration + ", remote generation " + remoteGeneration);
+
+            	if (remoteGeneration > localGeneration)
+            	{
+                    if (logger.isTraceEnabled())
+                        logger.trace("Updating heartbeat state generation to " + remoteGeneration + " from " + localGeneration + " for " + ep);
+                    // major state change will handle the update by inserting the remote state directly
+                    handleMajorStateChange(ep, remoteState);
+            	}
+            	else if ( remoteGeneration == localGeneration ) // generation has not changed, apply new states
+            	{
+	                /* find maximum state */
+	                int localMaxVersion = getMaxEndpointStateVersion(localEpStatePtr);
+	                int remoteMaxVersion = getMaxEndpointStateVersion(remoteState);
+	                if ( remoteMaxVersion > localMaxVersion )
+	                {
+                        // apply states, but do not notify since there is no major change
+	                    applyNewStates(ep, localEpStatePtr, remoteState);
+	                }
+                    else if (logger.isTraceEnabled())
+                            logger.trace("Ignoring remote version " + remoteMaxVersion + " <= " + localMaxVersion + " for " + ep);
+            	}
+                else
+                {
+                    if (logger.isTraceEnabled())
+                        logger.trace("Ignoring remote generation " + remoteGeneration + " < " + localGeneration);
+                }
+            }
+            else
+            {
+                // this is a new node
+            	handleMajorStateChange(ep, remoteState);
+            }
+        }
+    }
+
+    private void applyNewStates(InetAddress addr, EndpointState localState, EndpointState remoteState)
+    {
+        // don't assert here, since if the node restarts the version will go back to zero
+        int oldVersion = localState.getHeartBeatState().getHeartBeatVersion();
+        Map<ApplicationState, VersionedValue> localAppStateMap = localState.getApplicationStateMap();
+
+        localState.setHeartBeatState(remoteState.getHeartBeatState());
+        if (logger.isTraceEnabled())
+            logger.trace("Updating heartbeat state version to " + localState.getHeartBeatState().getHeartBeatVersion() + " from " + oldVersion + " for " + addr + " ...");
+
+        for (Entry<ApplicationState, VersionedValue> remoteEntry : remoteState.getApplicationStateMap().entrySet())
+        {
+            ApplicationState remoteKey = remoteEntry.getKey();
+            VersionedValue remoteValue = remoteEntry.getValue();
+
+            assert remoteState.getHeartBeatState().getGeneration() == localState.getHeartBeatState().getGeneration();
+            localState.addApplicationState(remoteKey, remoteValue);
+            doNotifications(addr, remoteKey, remoteValue);
+        }
+    }
+
+    // notify that an application state has changed
+    private void doNotifications(InetAddress addr, ApplicationState state, VersionedValue value)
+    {
+        for (IEndpointStateChangeSubscriber subscriber : subscribers)
+        {
+            subscriber.onChange(addr, state, value);
+        }
+    }
+
+    /* Request all the state for the endpoint in the gDigest */
+    private void requestAll(GossipDigest gDigest, List<GossipDigest> deltaGossipDigestList, int remoteGeneration)
+    {
+        /* We are here since we have no data for this endpoint locally so request everthing. */
+        deltaGossipDigestList.add( new GossipDigest(gDigest.getEndpoint(), remoteGeneration, 0) );
+        if (logger.isTraceEnabled())
+            logger.trace("requestAll for " + gDigest.getEndpoint());
+    }
+
+    /* Send all the data with version greater than maxRemoteVersion */
+    private void sendAll(GossipDigest gDigest, Map<InetAddress, EndpointState> deltaEpStateMap, int maxRemoteVersion)
+    {
+        EndpointState localEpStatePtr = getStateForVersionBiggerThan(gDigest.getEndpoint(), maxRemoteVersion) ;
+        if ( localEpStatePtr != null )
+            deltaEpStateMap.put(gDigest.getEndpoint(), localEpStatePtr);
+    }
+
+    /*
+        This method is used to figure the state that the Gossiper has but Gossipee doesn't. The delta digests
+        and the delta state are built up.
+    */
+    void examineGossiper(List<GossipDigest> gDigestList, List<GossipDigest> deltaGossipDigestList, Map<InetAddress, EndpointState> deltaEpStateMap)
+    {
+        for ( GossipDigest gDigest : gDigestList )
+        {
+            int remoteGeneration = gDigest.getGeneration();
+            int maxRemoteVersion = gDigest.getMaxVersion();
+            /* Get state associated with the end point in digest */
+            EndpointState epStatePtr = endpointStateMap.get(gDigest.getEndpoint());
+            /*
+                Here we need to fire a GossipDigestAckMessage. If we have some data associated with this endpoint locally
+                then we follow the "if" path of the logic. If we have absolutely nothing for this endpoint we need to
+                request all the data for this endpoint.
+            */
+            if ( epStatePtr != null )
+            {
+                int localGeneration = epStatePtr.getHeartBeatState().getGeneration();
+                /* get the max version of all keys in the state associated with this endpoint */
+                int maxLocalVersion = getMaxEndpointStateVersion(epStatePtr);
+                if ( remoteGeneration == localGeneration && maxRemoteVersion == maxLocalVersion )
+                    continue;
+
+                if ( remoteGeneration > localGeneration )
+                {
+                    /* we request everything from the gossiper */
+                    requestAll(gDigest, deltaGossipDigestList, remoteGeneration);
+                }
+                else if ( remoteGeneration < localGeneration )
+                {
+                    /* send all data with generation = localgeneration and version > 0 */
+                    sendAll(gDigest, deltaEpStateMap, 0);
+                }
+                else if ( remoteGeneration == localGeneration )
+                {
+                    /*
+                        If the max remote version is greater then we request the remote endpoint send us all the data
+                        for this endpoint with version greater than the max version number we have locally for this
+                        endpoint.
+                        If the max remote version is lesser, then we send all the data we have locally for this endpoint
+                        with version greater than the max remote version.
+                    */
+                    if ( maxRemoteVersion > maxLocalVersion )
+                    {
+                        deltaGossipDigestList.add( new GossipDigest(gDigest.getEndpoint(), remoteGeneration, maxLocalVersion) );
+                    }
+                    else if ( maxRemoteVersion < maxLocalVersion )
+                    {
+                        /* send all data with generation = localgeneration and version > maxRemoteVersion */
+                        sendAll(gDigest, deltaEpStateMap, maxRemoteVersion);
+                    }
+                }
+            }
+            else
+            {
+                /* We are here since we have no data for this endpoint locally so request everything. */
+                requestAll(gDigest, deltaGossipDigestList, remoteGeneration);
+            }
+        }
+    }
+
+    /**
+     * Start the gossiper with the generation # retrieved from the System
+     * table
+     */
+    public void start(int generationNbr)
+    {
+        /* Get the seeds from the config and initialize them. */
+        Set<InetAddress> seedHosts = DatabaseDescriptor.getSeeds();
+        for (InetAddress seed : seedHosts)
+        {
+            if (seed.equals(FBUtilities.getLocalAddress()))
+                continue;
+            seeds.add(seed);
+        }
+
+        /* initialize the heartbeat state for this localEndpoint */
+        EndpointState localState = endpointStateMap.get(FBUtilities.getLocalAddress());
+        if ( localState == null )
+        {
+            HeartBeatState hbState = new HeartBeatState(generationNbr);
+            localState = new EndpointState(hbState);
+            localState.markAlive();
+            endpointStateMap.put(FBUtilities.getLocalAddress(), localState);
+        }
+
+        //notify snitches that Gossiper is about to start
+        DatabaseDescriptor.getEndpointSnitch().gossiperStarting();
+        if (logger.isTraceEnabled())
+            logger.trace("gossip started with generation " + localState.getHeartBeatState().getGeneration());
+
+        scheduledGossipTask = StorageService.scheduledTasks.scheduleWithFixedDelay(new GossipTask(),
+                                                                                   Gossiper.intervalInMillis,
+                                                                                   Gossiper.intervalInMillis,
+                                                                                   TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * Add an endpoint we knew about previously, but whose state is unknown
+     */
+    public void addSavedEndpoint(InetAddress ep)
+    {
+        EndpointState epState = endpointStateMap.get(ep);
+        if (epState == null)
+        {
+            epState = new EndpointState(new HeartBeatState(0));
+            epState.markDead();
+            epState.setHasToken(true);
+            endpointStateMap.put(ep, epState);
+            unreachableEndpoints.put(ep, System.currentTimeMillis());
+            if (logger.isTraceEnabled())
+                logger.trace("Adding saved endpoint " + ep + " " + epState.getHeartBeatState().getGeneration());
+        }
+    }
+
+    public void addLocalApplicationState(ApplicationState state, VersionedValue value)
+    {
+        assert !StorageService.instance.isClientMode();
+        EndpointState epState = endpointStateMap.get(FBUtilities.getLocalAddress());
+        assert epState != null;
+        epState.addApplicationState(state, value);
+    }
+
+    public void stop()
+    {
+        scheduledGossipTask.cancel(false);
+    }
+
+    public boolean isEnabled()
+    {
+        return !scheduledGossipTask.isCancelled();
+    }
+
+    /**
+     * This should *only* be used for testing purposes.
+     */
+    public void initializeNodeUnsafe(InetAddress addr, int generationNbr) {
+        /* initialize the heartbeat state for this localEndpoint */
+        EndpointState localState = endpointStateMap.get(addr);
+        if ( localState == null )
+        {
+            HeartBeatState hbState = new HeartBeatState(generationNbr);
+            localState = new EndpointState(hbState);
+            localState.markAlive();
+            endpointStateMap.put(addr, localState);
+        }
+    }
 }

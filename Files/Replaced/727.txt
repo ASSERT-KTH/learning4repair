@@ -1,11 +1,13 @@
-cmd.indexedId = null;  // reset the id for this add
+pool_.reset();
 
 /**
- * Copyright 2006 The Apache Software Foundation
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -16,932 +18,485 @@ cmd.indexedId = null;  // reset the id for this add
  * limitations under the License.
  */
 
-package org.apache.solr.core;
-
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.search.BooleanQuery;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.FSDirectory;
-import org.apache.solr.request.SolrRequestHandler;
-import org.apache.solr.request.SolrQueryRequest;
-import org.apache.solr.request.SolrQueryResponse;
-import org.apache.solr.schema.IndexSchema;
-import org.apache.solr.search.SolrIndexSearcher;
-import org.apache.solr.update.*;
-import org.apache.solr.util.DOMUtil;
-import org.apache.solr.util.RefCounted;
-import org.apache.solr.util.StrUtils;
-import org.apache.solr.util.XML;
-import org.w3c.dom.Node;
-import org.w3c.dom.NodeList;
-import org.xmlpull.v1.XmlPullParser;
-import org.xmlpull.v1.XmlPullParserException;
-import org.xmlpull.v1.XmlPullParserFactory;
-
-import javax.xml.xpath.XPathConstants;
-import java.io.File;
-import java.io.IOException;
-import java.io.Reader;
-import java.io.Writer;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.concurrent.Callable;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.logging.Logger;
-
-
-/**
- * @author yonik
- * @version $Id$
- */
-
-public final class SolrCore {
-  public static final String version="1.0";  
-
-  public static Logger log = Logger.getLogger(SolrCore.class.getName());
-
-  private final IndexSchema schema;
-  private final String dataDir;
-  private final String index_path;
-  private final UpdateHandler updateHandler;
-  private static final long startTime = System.currentTimeMillis();
-
-  public long getStartTime() { return startTime; }
-
-  public static SolrIndexConfig mainIndexConfig = new SolrIndexConfig("mainIndex");
-
-  static {
-    BooleanQuery.setMaxClauseCount(SolrConfig.config.getInt("query/maxBooleanClauses",BooleanQuery.getMaxClauseCount()));
-  }
-
-
-  public static List<SolrEventListener> parseListener(String path) {
-    List<SolrEventListener> lst = new ArrayList<SolrEventListener>();
-    log.info("Searching for listeners: " +path);
-    NodeList nodes = (NodeList)SolrConfig.config.evaluate(path, XPathConstants.NODESET);
-    if (nodes!=null) {
-      for (int i=0; i<nodes.getLength(); i++) {
-        Node node = nodes.item(i);
-          String className = DOMUtil.getAttr(node,"class");
-          SolrEventListener listener = (SolrEventListener)Config.newInstance(className);
-          listener.init(DOMUtil.childNodesToNamedList(node));
-          lst.add(listener);
-          log.info("added SolrEventListener: " + listener);
-      }
-    }
-    return lst;
-  }
-
-  List<SolrEventListener> firstSearcherListeners;
-  List<SolrEventListener> newSearcherListeners;
-  private void parseListeners() {
-    firstSearcherListeners = parseListener("//listener[@event=\"firstSearcher\"]");
-    newSearcherListeners = parseListener("//listener[@event=\"newSearcher\"]");
-  }
-
-  public IndexSchema getSchema() { return schema; }
-  public String getDataDir() { return index_path; }
-  public String getIndexDir() { return index_path; }
-
-  private final RequestHandlers reqHandlers = new RequestHandlers(SolrConfig.config);
-
-  public SolrRequestHandler getRequestHandler(String handlerName) {
-    return reqHandlers.get(handlerName);
-  }
-
-
-  // gets a non-caching searcher
-  public SolrIndexSearcher newSearcher(String name) throws IOException {
-    return new SolrIndexSearcher(schema, name,getDataDir(),false);
-  }
-
-
-  void initIndex() {
-    try {
-      File dirFile = new File(getIndexDir());
-      boolean indexExists = dirFile.canRead();
-
-      boolean removeLocks = SolrConfig.config.getBool("mainIndex/unlockOnStartup", false);
-      if (removeLocks) {
-        // to remove locks, the directory must already exist... so we create it
-        // if it didn't exist already...
-        Directory dir = FSDirectory.getDirectory(dirFile, !indexExists);
-        if (IndexReader.isLocked(dir)) {
-          log.warning("WARNING: Solr index directory '" + getDataDir() + "' is locked.  Unlocking...");
-          IndexReader.unlock(dir);
-        }
-      }
-
-      // Create the index if it doesn't exist. Note that indexExists was tested *before*
-      // lock removal, since that will result in the creation of the directory.
-      if(!indexExists) {
-        log.warning("Solr index directory '" + dirFile + "' doesn't exist."
-                + " Creating new index...");
-
-        SolrIndexWriter writer = new SolrIndexWriter("SolrCore.initIndex",getDataDir(), true, schema, mainIndexConfig);
-        writer.close();
-
-      }
-
-    } catch (IOException e) {
-      throw new RuntimeException(e);
-    }
-  }
-
-
-  private UpdateHandler createUpdateHandler(String className) {
-    try {
-      Class handlerClass = Config.findClass(className);
-      java.lang.reflect.Constructor cons = handlerClass.getConstructor(new Class[]{SolrCore.class});
-      return (UpdateHandler)cons.newInstance(new Object[]{this});
-    } catch (SolrException e) {
-      throw e;
-    } catch (Exception e) {
-      throw new SolrException(500,"Error Instantiating Update Handler "+className, e);
-    }
-  }
-
-
-  // Singleton for now...
-  private static SolrCore core;
-
-  public static SolrCore getSolrCore() {
-    synchronized (SolrCore.class) {
-      if (core==null) core = new SolrCore(null,null);
-      return core;
-    }
-  }
-
-
-  public SolrCore(String dataDir, IndexSchema schema) {
-    synchronized (SolrCore.class) {
-      // this is for backward compatibility (and also the reason
-      // the sync block is needed)
-      core = this;   // set singleton
-
-      if (dataDir ==null) {
-        dataDir =SolrConfig.config.get("dataDir",Config.getInstanceDir()+"data");
-      }
-
-      log.info("Opening new SolrCore at " + Config.getInstanceDir() + ", dataDir="+dataDir);
-
-      if (schema==null) {
-        schema = new IndexSchema("schema.xml");
-      }
-
-      this.schema = schema;
-      this.dataDir = dataDir;
-      this.index_path = dataDir + "/" + "index";
-
-      parseListeners();
-
-      initIndex();
-
-      try {
-        // Open the searcher *before* the handler so we don't end up opening
-        // one in the middle.
-        getSearcher(false,false,null);
-
-        updateHandler = createUpdateHandler(
-                SolrConfig.config.get("updateHandler/@class", DirectUpdateHandler.class.getName())
-        );
-
-      } catch (IOException e) {
-        throw new RuntimeException(e);
-      }
-    }
-  }
-
-
-  public void close() {
-    log.info("CLOSING SolrCore!");
-    try {
-      closeSearcher();
-    } catch (Exception e) {
-      SolrException.log(log,e);
-    }
-    try {
-      searcherExecutor.shutdown();
-    } catch (Exception e) {
-      SolrException.log(log,e);
-    }
-    try {
-      updateHandler.close();
-    } catch (Exception e) {
-      SolrException.log(log,e);
-    }
-  }
-
-
-  void finalizer() { close(); }
-
-
-  ////////////////////////////////////////////////////////////////////////////////
-  // Searcher Control
-  ////////////////////////////////////////////////////////////////////////////////
-
-  // The current searcher used to service queries.
-  // Don't access this directly!!!! use getSearcher() to
-  // get it (and it will increment the ref count at the same time)
-  private RefCounted<SolrIndexSearcher> _searcher;
-
-  final ExecutorService searcherExecutor = Executors.newSingleThreadExecutor();
-  private int onDeckSearchers;  // number of searchers preparing
-  private Object searcherLock = new Object();  // the sync object for the searcher
-
-
-  public RefCounted<SolrIndexSearcher> getSearcher() {
-    try {
-      return getSearcher(false,true,null);
-    } catch (IOException e) {
-      SolrException.log(log,null,e);
-      return null;
-    }
-  }
-
-  /**
-   * Get a {@link SolrIndexSearcher} or start the process of creating a new one.
-   * <p>
-   * The registered searcher is the default searcher used to service queries.
-   * A searcher will normally be registered after all of the warming
-   * and event handlers (newSearcher or firstSearcher events) have run.
-   * In the case where there is no registered searcher, the newly created searcher will
-   * be registered before running the event handlers (a slow searcher is better than no searcher).
-   *
-   * <p>
-   * If <tt>forceNew==true</tt> then
-   *  A new searcher will be opened and registered irregardless if there is already
-   *    a registered searcher or other searchers in the process of being created.
-   * <p>
-   * If <tt>forceNew==false</tt> then:<ul>
-   *   <li>If a searcher is already registered, that searcher will be returned</li>
-   *   <li>If no searcher is currently registered, but at least one is in the process of being created, then
-   * this call will block until the first searcher is registered</li>
-   *   <li>If no searcher is currently registered, and no searchers in the process of being registered, a new
-   * searcher will be created.</li>
-   * </ul>
-   * <p>
-   * If <tt>returnSearcher==true</tt> then a {@link RefCounted}&lt{@link SolrIndexSearcher}&gt will be returned with
-   * the reference count incremented.  It <b>must</b> be decremented when no longer needed.
-   * <p>
-   * If <tt>waitSearcher!=null</tt> and a new {@link SolrIndexSearcher} was created,
-   * then it is filled in with a Future that will return after the searcher is registered.  The Future may be set to
-   * <tt>null</tt> in which case the SolrIndexSearcher created has already been registered at the time
-   * this method returned.
-   * <p>
-   * @param forceNew           if true, force the open of a new index searcher regardless if there is already one open.
-   * @param returnSearcher     if true, returns a {@link &ltSolrIndexSearcher&gt} holder with the refcount already incremented.
-   * @param waitSearcher       if non-null, will be filled in with a {@link Future} that will return after the new searcher is registered.
-   * @return
-   * @throws IOException
-   */
-  public RefCounted<SolrIndexSearcher> getSearcher(boolean forceNew, boolean returnSearcher, final Future[] waitSearcher) throws IOException {
-    // it may take some time to open an index.... we may need to make
-    // sure that two threads aren't trying to open one at the same time
-    // if it isn't necessary.
-
-    synchronized (searcherLock) {
-      // see if we can return the current searcher
-      if (_searcher!=null && !forceNew) {
-        if (returnSearcher) {
-          _searcher.incref();
-          return _searcher;
-        } else {
-          return null;
-        }
-      }
-
-      // check to see if we can wait for someone elses searcher to be set
-      if (onDeckSearchers>0 && !forceNew && _searcher==null) {
-        try {
-          searcherLock.wait();
-        } catch (InterruptedException e) {
-          log.info(SolrException.toStr(e));
-        }
-      }
-
-      // check again: see if we can return right now
-      if (_searcher!=null && !forceNew) {
-        if (returnSearcher) {
-          _searcher.incref();
-          return _searcher;
-        } else {
-          return null;
-        }
-      }
-
-      // At this point, we know we need to open a new searcher...
-      // first: increment count to signal other threads that we are
-      //        opening a new searcher.
-      onDeckSearchers++;
-    }
-
-    // open the index synchronously
-    // if this fails, we need to decrement onDeckSearchers again.
-    SolrIndexSearcher tmp;
-    try {
-      if (onDeckSearchers < 1) {
-        // should never happen... just a sanity check
-        log.severe("ERROR!!! onDeckSearchers is " + onDeckSearchers);
-        // reset to 1 (don't bother synchronizing)
-        onDeckSearchers=1;
-      } else if (onDeckSearchers > 1) {
-        log.info("PERFORMANCE WARNING: Overlapping onDeckSearchers=" + onDeckSearchers);
-      }
-      tmp = new SolrIndexSearcher(schema, "main", index_path, true);
-    } catch (Throwable th) {
-      synchronized(searcherLock) {
-        onDeckSearchers--;
-        // notify another waiter to continue... it may succeed
-        // and wake any others.
-        searcherLock.notify();
-      }
-      // need to close the searcher here??? we shouldn't have to.
-      throw new RuntimeException(th);
-    }
-
-    final SolrIndexSearcher newSearcher=tmp;
-
-    RefCounted<SolrIndexSearcher> currSearcherHolder=null;
-    final RefCounted<SolrIndexSearcher> newSearchHolder=newHolder(newSearcher);
-    if (returnSearcher) newSearchHolder.incref();
-
-    // a signal to decrement onDeckSearchers if something goes wrong.
-    final boolean[] decrementOnDeckCount=new boolean[1];
-    decrementOnDeckCount[0]=true;
-
-    try {
-
-      synchronized (searcherLock) {
-        if (_searcher == null) {
-          // if there isn't a current searcher then register this one
-          // before warming is complete instead of waiting.
-          registerSearcher(newSearchHolder);
-          decrementOnDeckCount[0]=false;
-        } else {
-          // get a reference to the current searcher for purposes of autowarming.
-          currSearcherHolder=_searcher;
-          currSearcherHolder.incref();
-        }
-      }
-
-
-      final SolrIndexSearcher currSearcher = currSearcherHolder==null ? null : currSearcherHolder.get();
-
-      //
-      // Note! if we registered the new searcher (but didn't increment it's
-      // reference count because returnSearcher==false, it's possible for
-      // someone else to register another searcher, and thus cause newSearcher
-      // to close while we are warming.
-      //
-      // Should we protect against that by incrementing the reference count?
-      // Maybe we should just let it fail?   After all, if returnSearcher==false
-      // and newSearcher has been de-registered, what's the point of continuing?
-      //
-
-      Future future=null;
-
-      // warm the new searcher based on the current searcher.
-      // should this go before the other event handlers or after?
-      if (currSearcher != null) {
-        future = searcherExecutor.submit(
-                new Callable() {
-                  public Object call() throws Exception {
-                    try {
-                      newSearcher.warm(currSearcher);
-                    } catch (Throwable e) {
-                      SolrException.logOnce(log,null,e);
-                    }
-                    return null;
-                  }
-                }
-        );
-      }
-
-      if (currSearcher==null && firstSearcherListeners.size() > 0) {
-        future = searcherExecutor.submit(
-                new Callable() {
-                  public Object call() throws Exception {
-                    try {
-                      for (SolrEventListener listener : firstSearcherListeners) {
-                        listener.newSearcher(newSearcher,null);
-                      }
-                    } catch (Throwable e) {
-                      SolrException.logOnce(log,null,e);
-                    }
-                    return null;
-                  }
-                }
-        );
-      }
-
-      if (currSearcher!=null && newSearcherListeners.size() > 0) {
-        future = searcherExecutor.submit(
-                new Callable() {
-                  public Object call() throws Exception {
-                    try {
-                      for (SolrEventListener listener : newSearcherListeners) {
-                        listener.newSearcher(newSearcher,null);
-                      }
-                    } catch (Throwable e) {
-                      SolrException.logOnce(log,null,e);
-                    }
-                    return null;
-                  }
-                }
-        );
-      }
-
-      // WARNING: this code assumes a single threaded executor (that all tasks
-      // queued will finish first).
-      final RefCounted<SolrIndexSearcher> currSearcherHolderF = currSearcherHolder;
-      Future finalFuture=null;
-      if (currSearcherHolder != null) {
-        finalFuture = searcherExecutor.submit(
-                new Callable() {
-                  public Object call() throws Exception {
-                    try {
-                      // signal that we no longer need to decrement
-                      // the count *before* registering the searcher since
-                      // registertSearcher will decrement even if it errors.
-                      decrementOnDeckCount[0]=false;
-                      registerSearcher(newSearchHolder);
-                    } catch (Throwable e) {
-                      SolrException.logOnce(log,null,e);
-                    } finally {
-                      // we are all done with the old searcher we used
-                      // for warming...
-                      currSearcherHolderF.decref();
-                    }
-                    return null;
-                  }
-                }
-        );
-      }
-
-      if (waitSearcher != null) {
-        waitSearcher[0] = finalFuture;
-      }
-
-      // Return the searcher as the warming tasks run in parallel
-      // callers may wait on the waitSearcher future returned.
-      return returnSearcher ? newSearchHolder : null;
-
-    }
-    catch (Exception e) {
-      SolrException.logOnce(log,null,e);
-      if (currSearcherHolder != null) currSearcherHolder.decref();
-
-      synchronized (searcherLock) {
-        if (decrementOnDeckCount[0]) {
-          onDeckSearchers--;
-        }
-        if (onDeckSearchers < 0) {
-          // sanity check... should never happen
-          log.severe("ERROR!!! onDeckSearchers after decrement=" + onDeckSearchers);
-          onDeckSearchers=0; // try and recover
-        }
-        // if we failed, we need to wake up at least one waiter to continue the process
-        searcherLock.notify();
-      }
-
-      // since the indexreader was already opened, assume we can continue on
-      // even though we got an exception.
-      return returnSearcher ? newSearchHolder : null;
-    }
-
-  }
-
-
-  private RefCounted<SolrIndexSearcher> newHolder(SolrIndexSearcher newSearcher) {
-    RefCounted<SolrIndexSearcher> holder = new RefCounted<SolrIndexSearcher>(newSearcher)
+package org.apache.cassandra.net;
+
+import java.io.*;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.SocketChannel;
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.net.io.FastSerializer;
+import org.apache.cassandra.net.io.ISerializer;
+import org.apache.cassandra.net.io.ProtocolState;
+import org.apache.cassandra.net.io.StartState;
+import org.apache.cassandra.net.io.TcpReader;
+import org.apache.cassandra.utils.LogUtil;
+import org.apache.log4j.Logger;
+
+public class TcpConnection extends SelectionKeyHandler implements Comparable
+{
+    // logging and profiling.
+    private static Logger logger_ = Logger.getLogger(TcpConnection.class);  
+    private static ISerializer serializer_ = new FastSerializer();
+    private SocketChannel socketChannel_;
+    private SelectionKey key_;
+    private TcpConnectionManager pool_;
+    private boolean isIncoming_ = false;       
+    private TcpReader tcpReader_;    
+    private ReadWorkItem readWork_ = new ReadWorkItem(); 
+    private Queue<ByteBuffer> pendingWrites_ = new ConcurrentLinkedQueue<ByteBuffer>();
+    private InetAddress localEp_;
+    private InetAddress remoteEp_;
+    boolean inUse_ = false;
+         
+    /* 
+     * Added for streaming support. We need the boolean
+     * to indicate that this connection is used for 
+     * streaming. The Condition and the Lock are used
+     * to signal the stream() that it can continue
+     * streaming when the socket becomes writable.
+    */
+    private boolean bStream_ = false;
+    private Lock lock_;
+    private Condition condition_;
+
+    private TcpConnection(InetAddress from, InetAddress to, TcpConnectionManager pool, boolean streaming) throws IOException
     {
-      public void close() {
-        try {
-          resource.close();
-        } catch (IOException e) {
-          log.severe("Error closing searcher:" + SolrException.toStr(e));
+        socketChannel_ = SocketChannel.open();
+        socketChannel_.socket().bind(new InetSocketAddress(from, 0));
+        socketChannel_.configureBlocking(false);
+
+        localEp_ = from;
+        remoteEp_ = to;
+
+        if (!socketChannel_.connect(new InetSocketAddress(remoteEp_, DatabaseDescriptor.getStoragePort())))
+        {
+            key_ = SelectorManager.getSelectorManager().register(socketChannel_, this, SelectionKey.OP_CONNECT);
         }
-      }
-    };
-    holder.incref();  // set ref count to 1 to account for this._searcher
-    return holder;
-  }
-
-
-  // Take control of newSearcherHolder (which should have a reference count of at
-  // least 1 already.  If the caller wishes to use the newSearcherHolder directly
-  // after registering it, then they should increment the reference count *before*
-  // calling this method.
-  //
-  // onDeckSearchers will also be decremented (it should have been incremented
-  // as a result of opening a new searcher).
-  private void registerSearcher(RefCounted<SolrIndexSearcher> newSearcherHolder) throws IOException {
-    synchronized (searcherLock) {
-      try {
-        if (_searcher != null) {
-          _searcher.decref();   // dec refcount for this._searcher
-          _searcher=null;
+        else
+        {
+            key_ = SelectorManager.getSelectorManager().register(socketChannel_, this, SelectionKey.OP_READ);
         }
 
-        _searcher = newSearcherHolder;
-        SolrIndexSearcher newSearcher = newSearcherHolder.get();
+        if ((pool != null && streaming) || (pool == null && !streaming))
+            throw new RuntimeException("Invalid configuration. You must either specify a pool or streaming, not both or neither.");
 
-        newSearcher.register(); // register subitems (caches)
-        log.info("Registered new searcher " + newSearcher);
-
-      } catch (Throwable e) {
-        log(e);
-      } finally {
-        // wake up anyone waiting for a searcher
-        // even in the face of errors.
-        onDeckSearchers--;
-        searcherLock.notifyAll();
-      }
-    }
-  }
-
-
-
-  public void closeSearcher() {
-    log.info("Closing main searcher on request.");
-    synchronized (searcherLock) {
-      if (_searcher != null) {
-        _searcher.decref();   // dec refcount for this._searcher
-        _searcher=null;
-        SolrInfoRegistry.getRegistry().remove("currentSearcher");
-      }
-    }
-  }
-
-
-
-  public void execute(SolrQueryRequest req, SolrQueryResponse rsp) {
-    SolrRequestHandler handler = getRequestHandler(req.getQueryType());
-    if (handler==null) {
-      log.warning("Unknown Request Handler '" + req.getQueryType() +"' :" + req);
-      throw new SolrException(400,"Unknown Request Handler '" + req.getQueryType() + "'", true);
-    }
-    handler.handleRequest(req,rsp);
-    log.info(req.getParamString()+ " 0 "+
-	     (int)(rsp.getEndTime() - req.getStartTime()));
-  }
-
-
-
-
-
-  XmlPullParserFactory factory;
-  {
-    try {
-      factory = XmlPullParserFactory.newInstance();
-    } catch (XmlPullParserException e) {
-      throw new RuntimeException(e);
-    }
-    factory.setNamespaceAware(false);
-  }
-
-
-  private int findNextTag(XmlPullParser xpp, String tag) throws XmlPullParserException, IOException {
-    int eventType;
-    while((eventType=xpp.next()) != XmlPullParser.END_DOCUMENT) {
-      if(eventType == XmlPullParser.START_TAG) {
-        if (tag.equals(xpp.getName())) break;
-      }
-    }
-    return eventType;
-  }
-
-
-  public void update(Reader reader, Writer writer) {
-
-    // TODO: add param to specify maximum time to commit?
-
-    // todo - might be nice to separate command parsing w/ a factory
-    // then new commands could be added w/o risk to old ones
-
-
-    XmlPullParser xpp = null;
-    try {
-      xpp = factory.newPullParser();
-    } catch (XmlPullParserException e) {
-      throw new RuntimeException(e);
-    }
-
-    long startTime=System.currentTimeMillis();
-
-    try {
-      xpp.setInput(reader);
-      xpp.nextTag();
-
-      String currTag = xpp.getName();
-      if ("add".equals(currTag)) {
-        log.finest("SolrCore.update(add)");
-        AddUpdateCommand cmd = new AddUpdateCommand();
-        cmd.allowDups=false;  // the default
-
-        int status=0;
-        boolean pendingAttr=false, committedAttr=false;
-        int attrcount = xpp.getAttributeCount();
-        for (int i=0; i<attrcount; i++) {
-          String attrName = xpp.getAttributeName(i);
-          String attrVal = xpp.getAttributeValue(i);
-          if ("allowDups".equals(attrName)) {
-            cmd.allowDups = StrUtils.parseBoolean(attrVal);
-          } else if ("overwritePending".equals(attrName)) {
-            cmd.overwritePending = StrUtils.parseBoolean(attrVal);
-            pendingAttr=true;
-          } else if ("overwriteCommitted".equals(attrName)) {
-            cmd.overwriteCommitted = StrUtils.parseBoolean(attrVal);
-            committedAttr=true;
-          } else {
-            log.warning("Unknown attribute id in add:" + attrName);
-          }
+        if (pool != null)
+            pool_ = pool;
+        if (streaming)
+        {
+            bStream_ = true;
+            lock_ = new ReentrantLock();
+            condition_ = lock_.newCondition();
         }
+    }
+    
+    // used from getConnection - outgoing
+    TcpConnection(TcpConnectionManager pool, InetAddress from, InetAddress to) throws IOException
+    {          
+        this(from, to, pool, false);
+    }
+    
+    /*
+     * Used for streaming purposes has no pooling semantics.
+    */
+    TcpConnection(InetAddress from, InetAddress to) throws IOException
+    {
+        this(from, to, null, true);
+    }
+    
+    /*
+     * This method is invoked by the TcpConnectionHandler to accept incoming TCP connections.
+     * Accept the connection and then register interest for reads.
+    */
+    static void acceptConnection(SocketChannel socketChannel, InetAddress localEp, boolean isIncoming) throws IOException
+    {
+        TcpConnection tcpConnection = new TcpConnection(socketChannel, localEp, true);
+        tcpConnection.registerReadInterest();
+    }
+    
+    private void registerReadInterest() throws IOException
+    {
+        key_ = SelectorManager.getSelectorManager().register(socketChannel_, this, SelectionKey.OP_READ);
+    }
+    
+    // used for incoming connections
+    TcpConnection(SocketChannel socketChannel, InetAddress localEp, boolean isIncoming) throws IOException
+    {       
+        socketChannel_ = socketChannel;
+        socketChannel_.configureBlocking(false);                           
+        isIncoming_ = isIncoming;
+        localEp_ = localEp;
+    }
 
-        //set defaults for committed and pending based on allowDups value
-        if (!pendingAttr) cmd.overwritePending=!cmd.allowDups;
-        if (!committedAttr) cmd.overwriteCommitted=!cmd.allowDups;
 
-        DocumentBuilder builder = new DocumentBuilder(schema);
-        int eventType=0;
-        while(true) {
-          // this may be our second time through the loop in the case
-          // that there are multiple docs in the add... so make sure that
-          // objects can handle that.
+    public InetAddress getEndPoint()
+    {
+        return remoteEp_;
+    }
 
-          cmd.id = null;  // reset the id for this add     
-
-          if (eventType !=0) {
-            eventType=xpp.getEventType();
-            if (eventType==XmlPullParser.END_DOCUMENT) break;
-          }
-          // eventType = xpp.next();
-          eventType = xpp.nextTag();
-          if (eventType == XmlPullParser.END_TAG || eventType == XmlPullParser.END_DOCUMENT) break;  // should match </add>
-
-          try {
-            readDoc(builder,xpp);
-            builder.endDoc();
-            cmd.doc = builder.getDoc();
-            log.finest("adding doc...");
-            updateHandler.addDoc(cmd);
-	          log.info("add "+status+" "+(System.currentTimeMillis()-startTime));
-            writer.write("<result status=\"" + status + "\"></result>");
-          } catch (SolrException e) {
-            log(e);
-	          log.info("add "+e.code+" "+(System.currentTimeMillis()-startTime));
-            writeResult(writer,e);
-            // we may not have finised reading the XML for this cmd,
-            // so eat any unused input up till "</add>"
-            eventType = xpp.getEventType();
-            while (true)  {
-              if ( eventType == XmlPullParser.END_DOCUMENT
-                      || (eventType == XmlPullParser.END_TAG && "add".equals(xpp.getName())))
-              {
-                break;
-              }
-              eventType = xpp.next();
+    public SocketChannel getSocketChannel()
+    {
+        return socketChannel_;
+    }    
+    
+    public void write(Message message) throws IOException
+    {           
+        byte[] data = serializer_.serialize(message);        
+        if ( data.length > 0 )
+        {    
+            ByteBuffer buffer = MessagingService.packIt(data , false, false);
+            synchronized(this)
+            {
+                if (!pendingWrites_.isEmpty() || !socketChannel_.isConnected())
+                {                     
+                    pendingWrites_.add(buffer);                
+                    return;
+                }
+                
+                socketChannel_.write(buffer);                
+                
+                if (buffer.remaining() > 0) 
+                {                   
+                    pendingWrites_.add(buffer);
+                    turnOnInterestOps(key_, SelectionKey.OP_WRITE);
+                }
             }
-          }
         }
-
-      /***
-      while (findNextTag(xpp,"doc") != XmlPullParser.END_DOCUMENT) {
-        readDoc(builder,xpp);
-        Document doc = builder.endDoc();
-        indexWriter.addDocument(doc);
-        docsAdded++;
-      }
-      ***/
-
-    } // end add
-
-      else if ("commit".equals(currTag) || "optimize".equals(currTag)) {
-        log.finest("parsing "+currTag);
-        try {
-          CommitUpdateCommand cmd = new CommitUpdateCommand("optimize".equals(currTag));
-
-          boolean sawWaitSearcher=false, sawWaitFlush=false;
-          int attrcount = xpp.getAttributeCount();
-          for (int i=0; i<attrcount; i++) {
-            String attrName = xpp.getAttributeName(i);
-            String attrVal = xpp.getAttributeValue(i);
-            if ("waitFlush".equals(attrName)) {
-              cmd.waitFlush = StrUtils.parseBoolean(attrVal);
-              sawWaitFlush=true;
-            } else if ("waitSearcher".equals(attrName)) {
-              cmd.waitSearcher = StrUtils.parseBoolean(attrVal);
-              sawWaitSearcher=true;
-            } else {
-              log.warning("unexpected attribute commit/@" + attrName);
+    }
+    
+    public void stream(File file, long startPosition, long endPosition) throws IOException, InterruptedException
+    {
+        if ( !bStream_ )
+            throw new IllegalStateException("Cannot stream since we are not set up to stream data.");
+                
+        lock_.lock();        
+        try
+        {            
+            /* transfer 64MB in each attempt */
+            int limit = 64*1024*1024;  
+            long total = endPosition - startPosition;
+            /* keeps track of total number of bytes transferred */
+            long bytesWritten = 0L;                          
+            RandomAccessFile raf = new RandomAccessFile(file, "r");            
+            FileChannel fc = raf.getChannel();            
+            
+            /* 
+             * If the connection is not yet established then wait for
+             * the timeout period of 2 seconds. Attempt to reconnect 3 times and then 
+             * bail with an IOException.
+            */
+            long waitTime = 2;
+            int retry = 0;
+            while (!socketChannel_.isConnected())
+            {
+                if ( retry == 3 )
+                    throw new IOException("Unable to connect to " + remoteEp_ + " after " + retry + " attempts.");
+                condition_.await(waitTime, TimeUnit.SECONDS);
+                ++retry;
             }
-          }
-
-          // If waitFlush is specified and waitSearcher wasn't, then
-          // clear waitSearcher.
-          if (sawWaitFlush && !sawWaitSearcher) {
-            cmd.waitSearcher=false;
-          }
-
-          updateHandler.commit(cmd);
-          if ("optimize".equals(currTag)) {
-            log.info("optimize 0 "+(System.currentTimeMillis()-startTime));
-          }
-          else {
-            log.info("commit 0 "+(System.currentTimeMillis()-startTime));
-          }
-          while (true) {
-            int eventType = xpp.nextTag();
-            if (eventType == XmlPullParser.END_TAG) break; // match </commit>
-          }
-          writer.write("<result status=\"0\"></result>");
-        } catch (SolrException e) {
-          log(e);
-          if ("optimize".equals(currTag)) {
-            log.info("optimize "+e.code+" "+
-                    (System.currentTimeMillis()-startTime));
-          }
-          else {
-            log.info("commit "+e.code+" "+
-                    (System.currentTimeMillis()-startTime));
-          }
-          writeResult(writer,e);
-        } catch (Exception e) {
-          SolrException.log(log, "Exception during commit/optimize",e);
-          writeResult(writer,e);
+            
+            while ( bytesWritten < total )
+            {                                
+                if ( startPosition == 0 )
+                {
+                    ByteBuffer buffer = MessagingService.constructStreamHeader(false, true);                      
+                    socketChannel_.write(buffer);
+                    if (buffer.remaining() > 0)
+                    {
+                        pendingWrites_.add(buffer);
+                        turnOnInterestOps(key_, SelectionKey.OP_WRITE);
+                        condition_.await();
+                    }
+                }
+                
+                long bytesTransferred;
+                try
+                {
+                    /* returns the number of bytes transferred from file to the socket */
+                    bytesTransferred = fc.transferTo(startPosition, limit, socketChannel_);
+                }
+                catch (IOException e)
+                {
+                    // at least jdk1.6.0 on Linux seems to throw IOException
+                    // when the socket is full. (Bug fixed for 1.7: http://bugs.sun.com/view_bug.do?bug_id=5103988)
+                    // For now look for a specific string in for the message for the exception.
+                    if (!e.getMessage().startsWith("Resource temporarily unavailable"))
+                        throw e;
+                    Thread.sleep(10);
+                    continue;
+                }
+                if (logger_.isDebugEnabled())
+                    logger_.debug("Bytes transferred " + bytesTransferred);                
+                bytesWritten += bytesTransferred;
+                startPosition += bytesTransferred; 
+                /*
+                 * If the number of bytes transferred is less than intended 
+                 * then we need to wait till socket becomes writeable again. 
+                */
+                if ( bytesTransferred < limit && bytesWritten != total )
+                {                    
+                    turnOnInterestOps(key_, SelectionKey.OP_WRITE);
+                    condition_.await();
+                }
+            }
         }
-      }  // end commit
-
-    else if ("delete".equals(currTag)) {
-      log.finest("parsing delete");
-      try {
-        DeleteUpdateCommand cmd = new DeleteUpdateCommand();
-        cmd.fromPending=true;
-        cmd.fromCommitted=true;
-        int attrcount = xpp.getAttributeCount();
-        for (int i=0; i<attrcount; i++) {
-          String attrName = xpp.getAttributeName(i);
-          String attrVal = xpp.getAttributeValue(i);
-          if ("fromPending".equals(attrName)) {
-            cmd.fromPending = StrUtils.parseBoolean(attrVal);
-          } else if ("fromCommitted".equals(attrName)) {
-            cmd.fromCommitted = StrUtils.parseBoolean(attrVal);
-          } else {
-            log.warning("unexpected attribute delete/@" + attrName);
-          }
-        }
-
-        int eventType = xpp.nextTag();
-        currTag = xpp.getName();
-        String val = xpp.nextText();
-
-        if ("id".equals(currTag)) {
-          cmd.id =  val;
-          updateHandler.delete(cmd);
-          log.info("delete(id " + val + ") 0 " +
-                   (System.currentTimeMillis()-startTime));
-        } else if ("query".equals(currTag)) {
-          cmd.query =  val;
-          updateHandler.deleteByQuery(cmd);
-          log.info("deleteByQuery(query " + val + ") 0 " +
-                   (System.currentTimeMillis()-startTime));
-        } else {
-          log.warning("unexpected XML tag /delete/"+currTag);
-          throw new SolrException(400,"unexpected XML tag /delete/"+currTag);
-        }
-
-        writer.write("<result status=\"0\"></result>");
-
-        while (xpp.nextTag() != XmlPullParser.END_TAG);
-
-      } catch (SolrException e) {
-        log(e);
-        log.info("delete "+e.code+" "+(System.currentTimeMillis()-startTime));
-        writeResult(writer,e);
-      } catch (Exception e) {
-        log(e);
-        writeResult(writer,e);
-      }
-    } // end delete
-
-
-    } catch (XmlPullParserException e) {
-      log(e);
-      writeResult(writer,e);
-    } catch (IOException e) {
-      log(e);
-      writeResult(writer,e);
-    } catch (SolrException e) {
-      log(e);
-      log.info("update "+e.code+" "+(System.currentTimeMillis()-startTime));
-      writeResult(writer,e);
-    } catch (Throwable e) {
-      log(e);
-      writeResult(writer,e);
+        finally
+        {
+            lock_.unlock();
+        }        
     }
 
-  }
-
-  private void readDoc(DocumentBuilder builder, XmlPullParser xpp) throws IOException, XmlPullParserException {
-    // xpp should be at <doc> at this point
-
-    builder.startDoc();
-
-    int attrcount = xpp.getAttributeCount();
-    float docBoost = 1.0f;
-
-    for (int i=0; i<attrcount; i++) {
-      String attrName = xpp.getAttributeName(i);
-      String attrVal = xpp.getAttributeValue(i);
-      if ("boost".equals(attrName)) {
-        docBoost = Float.parseFloat(attrVal);
-      } else {
-        log.warning("Unknown attribute doc/@" + attrName);
-      }
-    }
-    if (docBoost != 1.0f) builder.setBoost(docBoost);
-
-    // while (findNextTag(xpp,"field") != XmlPullParser.END_DOCUMENT) {
-
-    while(true) {
-      int eventType = xpp.nextTag();
-      if (eventType == XmlPullParser.END_TAG) break;  // </doc>
-
-      String tname=xpp.getName();
-      // System.out.println("FIELD READER AT TAG " + tname);
-
-      if (!"field".equals(tname)) {
-        log.warning("unexpected XML tag doc/"+tname);
-        throw new SolrException(400,"unexpected XML tag doc/"+tname);
-      }
-
-      //
-      // get field name and parse field attributes
-      //
-      attrcount = xpp.getAttributeCount();
-      String name=null;
-      float boost=1.0f;
-      boolean isNull=false;
-
-      for (int i=0; i<attrcount; i++) {
-        String attrName = xpp.getAttributeName(i);
-        String attrVal = xpp.getAttributeValue(i);
-        if ("name".equals(attrName)) {
-          name=attrVal;
-        } else if ("boost".equals(attrName)) {
-          boost=Float.parseFloat(attrVal);
-        } else if ("null".equals(attrName)) {
-          isNull=StrUtils.parseBoolean(attrVal);
-        } else {
-          log.warning("Unknown attribute doc/field/@" + attrName);
+    private void resumeStreaming()
+    {
+        /* if not in streaming mode do nothing */
+        if ( !bStream_ )
+            return;
+        
+        lock_.lock();
+        try
+        {
+            condition_.signal();
         }
-      }
-
-      // now get the field value
-      String val = xpp.nextText();      // todo... text event for <field></field>???
-                                        // need this line for isNull???
-      // Don't add fields marked as null (for now at least)
-      if (!isNull) {
-        if (docBoost != 1.0f) {
-          builder.addField(name,val,docBoost);
-        } else {
-          builder.addField(name,val);
+        finally
+        {
+            lock_.unlock();
         }
-      }
-
-      // do I have to do a nextTag here to read the end_tag?
-
-    } // end field loop
-
-  }
-
-
-  final public static void log(Throwable e) {
-    SolrException.logOnce(log,null,e);
-  }
-
-
-  final static void writeResult(Writer out, SolrException e) {
-    try {
-      XML.writeXML(out,"result",e.getMessage(),"status",e.code());
-    } catch (Exception ee) {
-      log.severe("Error writing to putput stream: "+ee);
     }
-  }
-
-  final static void writeResult(Writer out, Throwable e) {
-    try {
-      XML.writeXML(out,"result",SolrException.toStr(e),"status","1");
-    } catch (Exception ee) {
-      log.severe("Error writing to putput stream: "+ee);
+    
+    public void close()
+    {
+        inUse_ = false;
     }
-  }
 
+    public boolean isConnected()
+    {
+        return socketChannel_.isConnected();
+    }
+    
+    public boolean equals(Object o)
+    {
+        if ( !(o instanceof TcpConnection) )
+            return false;
+        
+        TcpConnection rhs = (TcpConnection)o;        
+        return localEp_.equals(rhs.localEp_) && remoteEp_.equals(rhs.remoteEp_);
+    }
+    
+    public int hashCode()
+    {
+        return (localEp_ + ":" + remoteEp_).hashCode();
+    }
 
+    public String toString()
+    {        
+        return socketChannel_.toString();
+    }
+    
+    void closeSocket()
+    {
+        if (pendingWrites_.size() > 0)
+            logger_.error("Closing down connection " + socketChannel_ + " with " + pendingWrites_.size() + " writes remaining.");
+        cancel(key_);
+        pendingWrites_.clear();
+    }
+    
+    void errorClose() 
+    {        
+        logger_.info("Closing errored connection " + socketChannel_);
+        pendingWrites_.clear();
+        cancel(key_);
+        pendingWrites_.clear();
+        if (pool_ != null)
+            pool_.destroy(this);
+    }
+    
+    private void cancel(SelectionKey key)
+    {
+        if ( key != null )
+        {
+            key.cancel();
+            try
+            {
+                key.channel().close();
+            }
+            catch (IOException e) {}
+        }
+    }
+    
+    // called in the selector thread
+    public void connect(SelectionKey key)
+    {       
+        turnOffInterestOps(key, SelectionKey.OP_CONNECT);
+        try
+        {
+            if (socketChannel_.finishConnect())
+            {
+                turnOnInterestOps(key, SelectionKey.OP_READ);
+                
+                synchronized(this)
+                {
+                    // this will flush the pending                
+                    if (!pendingWrites_.isEmpty()) 
+                    {
+                        turnOnInterestOps(key_, SelectionKey.OP_WRITE);
+                    }
+                }
+                resumeStreaming();
+            } 
+            else 
+            {  
+                logger_.error("Closing connection because socket channel could not finishConnect.");;
+                errorClose();
+            }
+        } 
+        catch(IOException e) 
+        {               
+            logger_.error("Encountered IOException on connection: "  + socketChannel_, e);
+            errorClose();
+        }
+    }
+    
+    // called in the selector thread
+    public void write(SelectionKey key)
+    {   
+        turnOffInterestOps(key, SelectionKey.OP_WRITE);                
+        doPendingWrites();
+        /*
+         * This is executed only if we are in streaming mode.
+         * Idea is that we read a chunk of data from a source
+         * and wait to read the next from the source until we 
+         * are siganlled to do so from here. 
+        */
+         resumeStreaming();        
+    }
+    
+    public void doPendingWrites()
+    {
+        synchronized(this)
+        {
+            try
+            {                     
+                while(!pendingWrites_.isEmpty()) 
+                {
+                    ByteBuffer buffer = pendingWrites_.peek();
+                    socketChannel_.write(buffer);                    
+                    if (buffer.remaining() > 0) 
+                    {   
+                        break;
+                    }               
+                    pendingWrites_.remove();
+                } 
+            
+            }
+            catch(IOException ex)
+            {
+                logger_.error(LogUtil.throwableToString(ex));
+                // This is to fix the wierd Linux bug with NIO.
+                errorClose();
+            }
+            finally
+            {    
+                if (!pendingWrites_.isEmpty())
+                {                    
+                    turnOnInterestOps(key_, SelectionKey.OP_WRITE);
+                }
+            }
+        }
+    }
+    
+    // called in the selector thread
+    public void read(SelectionKey key)
+    {
+        turnOffInterestOps(key, SelectionKey.OP_READ);
+        // publish this event onto to the TCPReadEvent Queue.
+        MessagingService.getReadExecutor().execute(readWork_);
+    }
+    
+    class ReadWorkItem implements Runnable
+    {                 
+        // called from the TCP READ thread pool
+        public void run()
+        {                         
+            if ( tcpReader_ == null )
+            {
+                tcpReader_ = new TcpReader(TcpConnection.this);    
+                StartState nextState = tcpReader_.getSocketState(TcpReader.TcpReaderState.PREAMBLE);
+                if ( nextState == null )
+                {
+                    nextState = new ProtocolState(tcpReader_);
+                    tcpReader_.putSocketState(TcpReader.TcpReaderState.PREAMBLE, nextState);
+                }
+                tcpReader_.morphState(nextState);
+            }
+            
+            try
+            {           
+                byte[] bytes;
+                while ( (bytes = tcpReader_.read()).length > 0 )
+                {                       
+                    ProtocolHeader pH = tcpReader_.getProtocolHeader();                    
+                    if ( !pH.isStreamingMode_ )
+                    {
+                        /* first message received */
+                        if (remoteEp_ == null)
+                        {
+                            remoteEp_ = socketChannel_.socket().getInetAddress();
+                        }
+                        
+                        /* Deserialize and handle the message */
+                        MessagingService.getDeserializationExecutor().submit( new MessageDeserializationTask(pH.serializerType_, bytes) );                                                  
+                        tcpReader_.resetState();
+                    }
+                    else
+                    {
+                        /* Close this socket connection  used for streaming */
+                        closeSocket();
+                    }                    
+                }
+            }
+            catch ( IOException ex )
+            {                   
+                handleException(ex);
+            }
+            catch ( Throwable th )
+            {
+                handleException(th);
+            }
+            finally
+            {
+                if (key_.isValid()) //not valid if closeSocket has been called above
+                    turnOnInterestOps(key_, SelectionKey.OP_READ);
+            }
+        }
+        
+        private void handleException(Throwable th)
+        {
+            logger_.warn("Problem reading from socket connected to : " + socketChannel_);
+            logger_.warn(LogUtil.throwableToString(th));
+            // This is to fix the weird Linux bug with NIO.
+            errorClose();
+        }
+    }
+    
+    public int compareTo(Object o)
+    {
+        if (o instanceof TcpConnection) 
+        {
+            return pendingWrites_.size() - ((TcpConnection) o).pendingWrites_.size();            
+        }
+                    
+        throw new IllegalArgumentException();
+    }
 }
-
-
-

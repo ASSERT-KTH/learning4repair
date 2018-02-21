@@ -1,12 +1,13 @@
-org.apache.lucene.util.IOUtils.closeWhileHandlingException(loader); // best effort
+assert row.dataSize != 0;
 
-/*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -17,1234 +18,1191 @@ org.apache.lucene.util.IOUtils.closeWhileHandlingException(loader); // best effo
  * limitations under the License.
  */
 
-package org.apache.solr.core;
+package org.apache.cassandra.db;
 
-import org.apache.commons.io.IOUtils;
-import org.apache.solr.cloud.ZkController;
-import org.apache.solr.cloud.ZkSolrResourceLoader;
-import org.apache.solr.common.SolrException;
-import org.apache.solr.common.SolrException.ErrorCode;
-import org.apache.solr.common.cloud.ZooKeeperException;
-import org.apache.solr.common.util.ExecutorUtil;
-import org.apache.solr.handler.admin.CollectionsHandler;
-import org.apache.solr.handler.admin.CoreAdminHandler;
-import org.apache.solr.handler.component.HttpShardHandlerFactory;
-import org.apache.solr.handler.component.ShardHandlerFactory;
-import org.apache.solr.logging.LogWatcher;
-import org.apache.solr.logging.jul.JulWatcher;
-import org.apache.solr.schema.IndexSchema;
-import org.apache.solr.schema.IndexSchemaFactory;
-import org.apache.solr.util.DefaultSolrThreadFactory;
-import org.apache.solr.util.FileUtils;
-import org.apache.solr.util.PropertiesUtil;
-import org.apache.solr.util.plugin.PluginInfoInitialized;
-import org.apache.zookeeper.KeeperException;
+import java.io.DataOutput;
+import java.io.File;
+import java.io.IOError;
+import java.io.IOException;
+import java.lang.management.ManagementFactory;
+import java.nio.ByteBuffer;
+import java.security.MessageDigest;
+import java.util.*;
+import java.util.Map.Entry;
+import java.util.concurrent.*;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+import javax.management.MBeanServer;
+import javax.management.ObjectName;
+
+import org.apache.commons.collections.PredicateUtils;
+import org.apache.commons.collections.iterators.FilterIterator;
+import org.apache.commons.lang.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.w3c.dom.Document;
-import org.w3c.dom.Node;
-import org.xml.sax.InputSource;
 
-import javax.xml.transform.Transformer;
-import javax.xml.transform.TransformerException;
-import javax.xml.transform.TransformerFactory;
-import javax.xml.transform.dom.DOMResult;
-import javax.xml.transform.dom.DOMSource;
-import javax.xml.xpath.XPathExpressionException;
-import java.io.ByteArrayInputStream;
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileNotFoundException;
-import java.io.InputStream;
-import java.text.SimpleDateFormat;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.Date;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Locale;
-import java.util.Map;
-import java.util.Properties;
-import java.util.Set;
-import java.util.concurrent.Callable;
-import java.util.concurrent.CompletionService;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorCompletionService;
-import java.util.concurrent.Future;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
+import org.apache.cassandra.concurrent.DebuggableThreadPoolExecutor;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.io.*;
+import org.apache.cassandra.io.sstable.*;
+import org.apache.cassandra.io.util.BufferedRandomAccessFile;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.io.util.PageCacheInformer;
+import org.apache.cassandra.service.AntiEntropyService;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.WrappedRunnable;
+import org.cliffc.high_scale_lib.NonBlockingHashMap;
 
-
-/**
- *
- * @since solr 1.3
- */
-public class CoreContainer
+public class CompactionManager implements CompactionManagerMBean
 {
-  private static final String LEADER_VOTE_WAIT = "180000";  // 3 minutes
-  private static final int CORE_LOAD_THREADS = 3;
+    public static final String MBEAN_OBJECT_NAME = "org.apache.cassandra.db:type=CompactionManager";
+    private static final Logger logger = LoggerFactory.getLogger(CompactionManager.class);
+    public static final CompactionManager instance;
+    private final ReentrantLock compactionLock = new ReentrantLock();
+    // todo: should provide a way to unlock in mbean?
 
-  private static final int DEFAULT_ZK_CLIENT_TIMEOUT = 15000;
-  public static final String DEFAULT_DEFAULT_CORE_NAME = "collection1";
-  private static final boolean DEFAULT_SHARE_SCHEMA = false;
-
-  protected static Logger log = LoggerFactory.getLogger(CoreContainer.class);
-
-
-  private final SolrCores solrCores = new SolrCores(this);
-
-  protected final Map<String,Exception> coreInitFailures =
-    Collections.synchronizedMap(new LinkedHashMap<String,Exception>());
-  
-  protected boolean persistent = false;
-  protected String adminPath = null;
-  protected volatile String managementPath = null;
-
-  protected CoreAdminHandler coreAdminHandler = null;
-  protected CollectionsHandler collectionsHandler = null;
-  protected File configFile = null;
-  protected String libDir = null;
-  protected SolrResourceLoader loader = null;
-  protected Properties containerProperties;
-  protected Map<String ,IndexSchema> indexSchemaCache;
-  protected String adminHandler;
-  protected boolean shareSchema;
-  protected Integer zkClientTimeout;
-  protected String solrHome;
-  protected String defaultCoreName = null;
-
-  protected ZkContainer zkSys = new ZkContainer();
-
-  private ShardHandlerFactory shardHandlerFactory;
-  protected LogWatcher logging = null;
-  private String zkHost;
-  private int transientCacheSize = Integer.MAX_VALUE;
-
-  private int coreLoadThreads;
-  private CloserThread backgroundCloser = null;
-  protected volatile ConfigSolr cfg;
-  private Config origCfg;
-  
-  {
-    log.info("New CoreContainer " + System.identityHashCode(this));
-  }
-
-  /**
-   * Deprecated
-   * @deprecated use the single arg constructor with locateSolrHome()
-   * @see SolrResourceLoader#locateSolrHome
-   */
-  @Deprecated
-  public CoreContainer() {
-    this(SolrResourceLoader.locateSolrHome());
-  }
-
-  /**
-   * Initalize CoreContainer directly from the constructor
-   */
-  public CoreContainer(String dir, File configFile) throws FileNotFoundException {
-    this(dir);
-    this.load(dir, configFile);
-  }
-
-  /**
-   * Minimal CoreContainer constructor.
-   * @param loader the CoreContainer resource loader
-   */
-  public CoreContainer(SolrResourceLoader loader) {
-    this(loader.getInstanceDir());
-    this.loader = loader;
-  }
-
-  public CoreContainer(String solrHome) {
-    this.solrHome = solrHome;
-  }
-  
-  public Properties getContainerProperties() {
-    return containerProperties;
-  }
-
-  // Helper class to initialize the CoreContainer
-  public static class Initializer {
-
-    // core container instantiation
-    public CoreContainer initialize() throws FileNotFoundException {
-      CoreContainer cores = null;
-      String solrHome = SolrResourceLoader.locateSolrHome();
-      // ContainerConfigFilename could  could be a properties file
-      File fconf = new File(solrHome, "solr.xml");
-
-      log.info("looking for solr config file: " + fconf.getAbsolutePath());
-      cores = new CoreContainer(solrHome);
-
-      // first we find zkhost, then we check for solr.xml in zk
-      // 1. look for zkhost from sys prop 2. look for zkhost in {solr.home}/solr.properties
-      
-      // Either we have a config file or not.
-      
-      if (fconf.exists()) {
-        cores.load(solrHome, fconf);
-      } else {
-        // Back compart support
-        log.info("no solr.xml found. using default old-style solr.xml");
-        try {
-          cores.load(solrHome, new ByteArrayInputStream(ConfigSolrXmlOld.DEF_SOLR_XML.getBytes("UTF-8")), null);
-        } catch (Exception e) {
-          throw new SolrException(ErrorCode.SERVER_ERROR,
-              "CoreContainer.Initialize failed when trying to load default solr.xml file", e);
+    static
+    {
+        instance = new CompactionManager();
+        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+        try
+        {
+            mbs.registerMBean(instance, new ObjectName(MBEAN_OBJECT_NAME));
         }
-        cores.configFile = fconf;
-      }
-      
-      return cores;
+        catch (Exception e)
+        {
+            throw new RuntimeException(e);
+        }
     }
-  }
 
+    private CompactionExecutor executor = new CompactionExecutor();
+    private Map<ColumnFamilyStore, Integer> estimatedCompactions = new NonBlockingHashMap<ColumnFamilyStore, Integer>();
 
-  //-------------------------------------------------------------------
-  // Initialization / Cleanup
-  //-------------------------------------------------------------------
-  
-  /**
-   * Load a config file listing the available solr cores.
-   * @param dir the home directory of all resources.
-   * @param configFile the configuration file
-   */
-  public void load(String dir, File configFile) throws FileNotFoundException {
-    this.configFile = configFile;
-    InputStream in = new FileInputStream(configFile);
-    try {
-      this.load(dir, in,  configFile.getName());
-    } finally {
-      IOUtils.closeQuietly(in);
+    public Lock getCompactionLock()
+    {
+        return compactionLock;
     }
-  } 
 
-  /**
-   * Load a config file listing the available solr cores.
-   * 
-   * @param dir the home directory of all resources.
-   * @param is the configuration file InputStream. May be a properties file or an xml file
-   */
-
-  // Let's keep this ugly boolean out of public circulation.
-  protected void load(String dir, InputStream is, String fileName)  {
-    ThreadPoolExecutor coreLoadExecutor = null;
-    if (null == dir) {
-      // don't rely on SolrResourceLoader(), determine explicitly first
-      dir = SolrResourceLoader.locateSolrHome();
-    }
-    log.info("Loading CoreContainer using Solr Home: '{}'", dir);
+    /**
+     * Call this whenever a compaction might be needed on the given columnfamily.
+     * It's okay to over-call (within reason) since the compactions are single-threaded,
+     * and if a call is unnecessary, it will just be no-oped in the bucketing phase.
+     */
+    public Future<Integer> submitMinorIfNeeded(final ColumnFamilyStore cfs)
+    {
+        Callable<Integer> callable = new Callable<Integer>()
+        {
+            public Integer call() throws IOException
+            {
+                compactionLock.lock();
+                try
+                {
+                    if (cfs.isInvalid())
+                        return 0;
+                    Integer minThreshold = cfs.getMinimumCompactionThreshold();
+                    Integer maxThreshold = cfs.getMaximumCompactionThreshold();
     
-    this.loader = new SolrResourceLoader(dir);
-    solrHome = loader.getInstanceDir();
-
-    try {
-      Config config = new Config(loader, null, new InputSource(is), null, false);
-
-      // old style defines cores in solr.xml, new style disovers them by 
-      // directory structure
-      boolean oldStyle = (config.getNode("solr/cores", false) != null);
-      
-      if (oldStyle) {
-        // ConfigSolr handles keep orig values around for non solrcore level items,
-        // but this is still how original core lvl attributes are kept around
-        this.origCfg = new Config(loader, null, copyDoc(config.getDocument()));
-        
-        this.cfg = new ConfigSolrXmlOld(config, this);
-      } else {
-        this.cfg = new ConfigSolrXml(config, this);
-
-      }
-    } catch (Exception e) {
-      throw new SolrException(ErrorCode.SERVER_ERROR, "", e);
-    }
-    // Since the cores var is now initialized to null, let's set it up right
-    // now.
-    cfg.substituteProperties();
-
-    // add the sharedLib to the shared resource loader before initializing cfg based plugins
-    libDir = cfg.get(ConfigSolr.CfgProp.SOLR_SHAREDLIB , null);
-    if (libDir != null) {
-      File f = FileUtils.resolvePath(new File(dir), libDir);
-      log.info("loading shared library: " + f.getAbsolutePath());
-      loader.addToClassLoader(libDir, null, false);
-      loader.reloadLuceneSPI();
-    }
-
-    shardHandlerFactory = initShardHandler(cfg);
-
-    solrCores.allocateLazyCores(cfg, loader);
-
-    logging = JulWatcher.newRegisteredLogWatcher(cfg, loader);
-
-    if (cfg instanceof ConfigSolrXmlOld) { //TODO: Remove for 5.0
-      String dcoreName = cfg.get(ConfigSolr.CfgProp.SOLR_CORES_DEFAULT_CORE_NAME, null);
-      if (dcoreName != null && !dcoreName.isEmpty()) {
-        defaultCoreName = dcoreName;
-      }
-      persistent = cfg.getBool(ConfigSolr.CfgProp.SOLR_PERSISTENT, false);
-      adminPath = cfg.get(ConfigSolr.CfgProp.SOLR_ADMINPATH, "/admin/cores");
-    } else {
-      adminPath = "/admin/cores";
-    }
-    zkHost = cfg.get(ConfigSolr.CfgProp.SOLR_ZKHOST, null);
-    coreLoadThreads = cfg.getInt(ConfigSolr.CfgProp.SOLR_CORELOADTHREADS, CORE_LOAD_THREADS);
-    
-
-    shareSchema = cfg.getBool(ConfigSolr.CfgProp.SOLR_SHARESCHEMA, DEFAULT_SHARE_SCHEMA);
-    zkClientTimeout = cfg.getInt(ConfigSolr.CfgProp.SOLR_ZKCLIENTTIMEOUT, DEFAULT_ZK_CLIENT_TIMEOUT);
-    
-    int distribUpdateConnTimeout = cfg.getInt(ConfigSolr.CfgProp.SOLR_DISTRIBUPDATECONNTIMEOUT, 0);
-    int distribUpdateSoTimeout = cfg.getInt(ConfigSolr.CfgProp.SOLR_DISTRIBUPDATESOTIMEOUT, 0);
-
-    // Note: initZooKeeper will apply hardcoded default if cloud mode
-    String hostPort = cfg.get(ConfigSolr.CfgProp.SOLR_HOSTPORT, null);
-    // Note: initZooKeeper will apply hardcoded default if cloud mode
-    String hostContext = cfg.get(ConfigSolr.CfgProp.SOLR_HOSTCONTEXT, null);
-
-    String host = cfg.get(ConfigSolr.CfgProp.SOLR_HOST, null);
-    
-    String leaderVoteWait = cfg.get(ConfigSolr.CfgProp.SOLR_LEADERVOTEWAIT, LEADER_VOTE_WAIT);
-
-    adminHandler = cfg.get(ConfigSolr.CfgProp.SOLR_ADMINHANDLER, null);
-    managementPath = cfg.get(ConfigSolr.CfgProp.SOLR_MANAGEMENTPATH, null);
-
-    transientCacheSize = cfg.getInt(ConfigSolr.CfgProp.SOLR_TRANSIENTCACHESIZE, Integer.MAX_VALUE);
-
-    if (shareSchema) {
-      indexSchemaCache = new ConcurrentHashMap<String,IndexSchema>();
-    }
-
-    zkClientTimeout = Integer.parseInt(System.getProperty("zkClientTimeout",
-        Integer.toString(zkClientTimeout)));
-    zkSys.initZooKeeper(this, solrHome, zkHost, zkClientTimeout, hostPort, hostContext, host, leaderVoteWait, distribUpdateConnTimeout, distribUpdateSoTimeout);
-    
-    if (isZooKeeperAware() && coreLoadThreads <= 1) {
-      throw new SolrException(ErrorCode.SERVER_ERROR,
-          "SolrCloud requires a value of at least 2 in solr.xml for coreLoadThreads");
-    }
-    
-    if (adminPath != null) {
-      if (adminHandler == null) {
-        coreAdminHandler = new CoreAdminHandler(this);
-      } else {
-        coreAdminHandler = this.createMultiCoreHandler(adminHandler);
-      }
-    }
-    
-    collectionsHandler = new CollectionsHandler(this);
-    containerProperties = cfg.getSolrProperties("solr");
-
-    // setup executor to load cores in parallel
-    coreLoadExecutor = new ThreadPoolExecutor(coreLoadThreads, coreLoadThreads, 1,
-        TimeUnit.SECONDS, new LinkedBlockingQueue<Runnable>(),
-        new DefaultSolrThreadFactory("coreLoadExecutor"));
-    try {
-      CompletionService<SolrCore> completionService = new ExecutorCompletionService<SolrCore>(
-          coreLoadExecutor);
-      Set<Future<SolrCore>> pending = new HashSet<Future<SolrCore>>();
-
-      List<String> allCores = cfg.getAllCoreNames();
-
-      for (String oneCoreName : allCores) {
-
-        try {
-          String rawName = cfg.getProperty(oneCoreName, CoreDescriptor.CORE_NAME, null);
-
-          if (null == rawName) {
-            throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
-                "Each core in solr.xml must have a 'name'");
-          }
-          final String name = rawName;
-          final CoreDescriptor p = new CoreDescriptor(this, name,
-              cfg.getProperty(oneCoreName, CoreDescriptor.CORE_INSTDIR, null));
-          
-          // deal with optional settings
-          String opt = cfg.getProperty(oneCoreName, CoreDescriptor.CORE_CONFIG, null);
-          
-          if (opt != null) {
-            p.setConfigName(opt);
-          }
-          opt = cfg.getProperty(oneCoreName, CoreDescriptor.CORE_SCHEMA, null);
-          if (opt != null) {
-            p.setSchemaName(opt);
-          }
-          
-          if (zkSys.getZkController() != null) {
-            opt = cfg.getProperty(oneCoreName, CoreDescriptor.CORE_SHARD, null);
-            if (opt != null && opt.length() > 0) {
-              p.getCloudDescriptor().setShardId(opt);
-            }
-            opt = cfg.getProperty(oneCoreName, CoreDescriptor.CORE_COLLECTION, null);
-            if (opt != null) {
-              p.getCloudDescriptor().setCollectionName(opt);
-            }
-            opt = cfg.getProperty(oneCoreName, CoreDescriptor.CORE_ROLES, null);
-            if (opt != null) {
-              p.getCloudDescriptor().setRoles(opt);
-            }
-
-            opt = cfg.getProperty(oneCoreName, CoreDescriptor.CORE_NODE_NAME, null);
-            if (opt != null && opt.length() > 0) {
-              p.getCloudDescriptor().setCoreNodeName(opt);
-            }
-          }
-          opt = cfg.getProperty(oneCoreName, CoreDescriptor.CORE_PROPERTIES, null);
-          if (opt != null) {
-            p.setPropertiesName(opt);
-          }
-          opt = cfg.getProperty(oneCoreName, CoreDescriptor.CORE_DATADIR, null);
-          if (opt != null) {
-            p.setDataDir(opt);
-          }
-          
-          p.setCoreProperties(cfg.readCoreProperties(oneCoreName));
-          
-          opt = cfg.getProperty(oneCoreName, CoreDescriptor.CORE_LOADONSTARTUP, null);
-          if (opt != null) {
-            p.setLoadOnStartup(("true".equalsIgnoreCase(opt) || "on"
-                .equalsIgnoreCase(opt)) ? true : false);
-          }
-          
-          opt = cfg.getProperty(oneCoreName, CoreDescriptor.CORE_TRANSIENT, null);
-          if (opt != null) {
-            p.setTransient(("true".equalsIgnoreCase(opt) || "on"
-                .equalsIgnoreCase(opt)) ? true : false);
-          }
-          
-          if (p.isLoadOnStartup()) { // The normal case
-
-            Callable<SolrCore> task = new Callable<SolrCore>() {
-              @Override
-              public SolrCore call() {
-                SolrCore c = null;
-                try {
-                  c = create(p);
-                  registerCore(p.isTransient(), name, c, false);
-                } catch (Throwable t) {
-                  SolrException.log(log, null, t);
-                  if (c != null) {
-                    c.close();
-                  }
+                    if (minThreshold == 0 || maxThreshold == 0)
+                    {
+                        logger.debug("Compaction is currently disabled.");
+                        return 0;
+                    }
+                    logger.debug("Checking to see if compaction of " + cfs.columnFamily + " would be useful");
+                    Set<List<SSTableReader>> buckets = getBuckets(convertSSTablesToPairs(cfs.getSSTables()), 50L * 1024L * 1024L);
+                    updateEstimateFor(cfs, buckets);
+                    
+                    for (List<SSTableReader> sstables : buckets)
+                    {
+                        if (sstables.size() >= minThreshold)
+                        {
+                            // if we have too many to compact all at once, compact older ones first -- this avoids
+                            // re-compacting files we just created.
+                            Collections.sort(sstables);
+                            int gcBefore = cfs.isIndex()
+                                         ? Integer.MAX_VALUE
+                                         : getDefaultGcBefore(cfs);
+                            return doCompaction(cfs,
+                                                sstables.subList(0, Math.min(sstables.size(), maxThreshold)),
+                                                gcBefore);
+                        }
+                    }
                 }
-                return c;
-              }
+                finally 
+                {
+                    compactionLock.unlock();
+                }
+                return 0;
+            }
+        };
+        return executor.submit(callable);
+    }
+
+    private void updateEstimateFor(ColumnFamilyStore cfs, Set<List<SSTableReader>> buckets)
+    {
+        Integer minThreshold = cfs.getMinimumCompactionThreshold();
+        Integer maxThreshold = cfs.getMaximumCompactionThreshold();
+
+        if (minThreshold > 0 && maxThreshold > 0)
+        {
+            int n = 0;
+            for (List<SSTableReader> sstables : buckets)
+            {
+                if (sstables.size() >= minThreshold)
+                {
+                    n += Math.ceil((double)sstables.size() / maxThreshold);
+                }
+            }
+            estimatedCompactions.put(cfs, n);
+        }
+        else
+        {
+            logger.debug("Compaction is currently disabled.");
+        }
+    }
+
+    public void performCleanup(final ColumnFamilyStore cfStore) throws InterruptedException, ExecutionException
+    {
+        Callable<Object> runnable = new Callable<Object>()
+        {
+            public Object call() throws IOException
+            {
+                compactionLock.lock();
+                try 
+                {
+                    if (!cfStore.isInvalid())
+                        doCleanupCompaction(cfStore);
+                    return this;
+                }
+                finally 
+                {
+                    compactionLock.unlock();
+                }
+            }
+        };
+        executor.submit(runnable).get();
+    }
+
+    public void performScrub(final ColumnFamilyStore cfStore) throws InterruptedException, ExecutionException
+    {
+        Callable<Object> runnable = new Callable<Object>()
+        {
+            public Object call() throws IOException
+            {
+                compactionLock.lock();
+                try
+                {
+                    if (!cfStore.isInvalid())
+                        doScrub(cfStore);
+                    return this;
+                }
+                finally
+                {
+                    compactionLock.unlock();
+                }
+            }
+        };
+        executor.submit(runnable).get();
+    }
+
+    public void performMajor(final ColumnFamilyStore cfStore) throws InterruptedException, ExecutionException
+    {
+        submitMajor(cfStore, 0, getDefaultGcBefore(cfStore)).get();
+    }
+
+    public Future<Object> submitMajor(final ColumnFamilyStore cfStore, final long skip, final int gcBefore)
+    {
+        Callable<Object> callable = new Callable<Object>()
+        {
+            public Object call() throws IOException
+            {
+                compactionLock.lock();
+                try
+                {
+                    if (cfStore.isInvalid())
+                        return this;
+                    Collection<SSTableReader> sstables;
+                    if (skip > 0)
+                    {
+                        sstables = new ArrayList<SSTableReader>();
+                        for (SSTableReader sstable : cfStore.getSSTables())
+                        {
+                            if (sstable.length() < skip * 1024L * 1024L * 1024L)
+                            {
+                                sstables.add(sstable);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        sstables = cfStore.getSSTables();
+                    }
+    
+                    doCompaction(cfStore, sstables, gcBefore);
+                    return this;
+                }
+                finally 
+                {
+                    compactionLock.unlock();
+                }
+            }
+        };
+        return executor.submit(callable);
+    }
+
+    public void forceUserDefinedCompaction(String ksname, String dataFiles)
+    {
+        if (!DatabaseDescriptor.getTables().contains(ksname))
+            throw new IllegalArgumentException("Unknown keyspace " + ksname);
+
+        File directory = new File(ksname);
+        String[] filenames = dataFiles.split(",");
+        Collection<Descriptor> descriptors = new ArrayList<Descriptor>(filenames.length);
+
+        String cfname = null;
+        for (String filename : filenames)
+        {
+            Pair<Descriptor, String> p = Descriptor.fromFilename(directory, filename.trim());
+            if (!p.right.equals(Component.DATA.name()))
+            {
+                throw new IllegalArgumentException(filename + " does not appear to be a data file");
+            }
+            if (cfname == null)
+            {
+                cfname = p.left.cfname;
+            }
+            else if (!cfname.equals(p.left.cfname))
+            {
+                throw new IllegalArgumentException("All provided sstables should be for the same column family");
+            }
+
+            descriptors.add(p.left);
+        }
+
+        ColumnFamilyStore cfs = Table.open(ksname).getColumnFamilyStore(cfname);
+        submitUserDefined(cfs, descriptors, getDefaultGcBefore(cfs));
+    }
+
+    private Future<Object> submitUserDefined(final ColumnFamilyStore cfs, final Collection<Descriptor> dataFiles, final int gcBefore)
+    {
+        Callable<Object> callable = new Callable<Object>()
+        {
+            public Object call() throws IOException
+            {
+                compactionLock.lock();
+                try
+                {
+                    if (cfs.isInvalid())
+                        return this;
+
+                    // look up the sstables now that we're on the compaction executor, so we don't try to re-compact
+                    // something that was already being compacted earlier.
+                    Collection<SSTableReader> sstables = new ArrayList<SSTableReader>();
+                    for (Descriptor desc : dataFiles)
+                    {
+                        // inefficient but not in a performance sensitive path
+                        SSTableReader sstable = lookupSSTable(cfs, desc);
+                        if (sstable == null)
+                        {
+                            logger.info("Will not compact {}: it is not an active sstable", desc);
+                        }
+                        else
+                        {
+                            sstables.add(sstable);
+                        }
+                    }
+
+                    if (sstables.isEmpty())
+                    {
+                        logger.error("No file to compact for user defined compaction");
+                    }
+                    else
+                    {
+                        doCompaction(cfs, sstables, gcBefore);
+                    }
+
+                    return this;
+                }
+                finally
+                {
+                    compactionLock.unlock();
+                }
+            }
+        };
+        return executor.submit(callable);
+    }
+
+    private SSTableReader lookupSSTable(final ColumnFamilyStore cfs, Descriptor descriptor)
+    {
+        for (SSTableReader sstable : cfs.getSSTables())
+        {
+            // .equals() with no other changes won't work because in sstable.descriptor, the directory is an absolute path.
+            // We could construct descriptor with an absolute path too but I haven't found any satisfying way to do that
+            // (DB.getDataFileLocationForTable() may not return the right path if you have multiple volumes). Hence the
+            // endsWith.
+            if (sstable.descriptor.toString().endsWith(descriptor.toString()))
+                return sstable;
+        }
+        return null;
+    }
+
+    public Future<Object> submitValidation(final ColumnFamilyStore cfStore, final AntiEntropyService.Validator validator)
+    {
+        Callable<Object> callable = new Callable<Object>()
+        {
+            public Object call() throws IOException
+            {
+                compactionLock.lock();
+                try
+                {
+                    if (!cfStore.isInvalid())
+                        doValidationCompaction(cfStore, validator);
+                    return this;
+                }
+                finally
+                {
+                    compactionLock.unlock();
+                }
+            }
+        };
+        return executor.submit(callable);
+    }
+
+    /* Used in tests. */
+    public void disableAutoCompaction()
+    {
+        for (String ksname : DatabaseDescriptor.getNonSystemTables())
+        {
+            Table ks = Table.open(ksname);
+            for (ColumnFamilyStore cfs : ks.columnFamilyStores.values())
+                cfs.disableAutoCompaction();
+        }
+    }
+
+    /**
+     * For internal use and testing only.  The rest of the system should go through the submit* methods,
+     * which are properly serialized.
+     */
+    int doCompaction(ColumnFamilyStore cfs, Collection<SSTableReader> sstables, int gcBefore) throws IOException
+    {
+        // The collection of sstables passed may be empty (but not null); even if
+        // it is not empty, it may compact down to nothing if all rows are deleted.
+        assert sstables != null;
+
+        Table table = cfs.table;
+
+        if (DatabaseDescriptor.isSnapshotBeforeCompaction())
+            table.snapshot("compact-" + cfs.columnFamily);
+
+        // sanity check: all sstables must belong to the same cfs
+        logger.info("Compacting [" + StringUtils.join(sstables, ",") + "]");
+        for (SSTableReader sstable : sstables)
+            assert sstable.descriptor.cfname.equals(cfs.columnFamily);
+
+        String compactionFileLocation = table.getDataFileLocation(cfs.getExpectedCompactedFileSize(sstables));
+
+        // If the compaction file path is null that means we have no space left for this compaction.
+        // try again w/o the largest one.
+        List<SSTableReader> smallerSSTables = new ArrayList<SSTableReader>(sstables);
+
+        while (compactionFileLocation == null && smallerSSTables.size() > 1)
+        {
+            logger.warn("insufficient space to compact all requested files " + StringUtils.join(smallerSSTables, ", "));
+            smallerSSTables.remove(cfs.getMaxSizeFile(smallerSSTables));
+            compactionFileLocation = table.getDataFileLocation(cfs.getExpectedCompactedFileSize(smallerSSTables));
+        }
+        if (compactionFileLocation == null)
+        {
+            logger.error("insufficient space to compact even the two smallest files, aborting");
+            return 0;
+        }
+
+        sstables = smallerSSTables;
+
+        // new sstables from flush can be added during a compaction, but only the compaction can remove them,
+        // so in our single-threaded compaction world this is a valid way of determining if we're compacting
+        // all the sstables (that existed when we started)
+        boolean major = cfs.isCompleteSSTables(sstables);
+
+        long startTime = System.currentTimeMillis();
+        long totalkeysWritten = 0;
+
+        // TODO the int cast here is potentially buggy
+        int expectedBloomFilterSize = Math.max(DatabaseDescriptor.getIndexInterval(), (int) SSTableReader.getApproximateKeyCount(sstables));
+        if (logger.isDebugEnabled())
+            logger.debug("Expected bloom filter size : " + expectedBloomFilterSize);
+
+        SSTableWriter writer;
+        CompactionIterator ci = new CompactionIterator(cfs, sstables, gcBefore, major); // retain a handle so we can call close()
+        Iterator<AbstractCompactedRow> nni = new FilterIterator(ci, PredicateUtils.notNullPredicate());
+        executor.beginCompaction(cfs.columnFamily, ci);
+
+        Map<DecoratedKey, Long> cachedKeys = new HashMap<DecoratedKey, Long>();
+
+        try
+        {
+            if (!nni.hasNext())
+            {
+                // don't mark compacted in the finally block, since if there _is_ nondeleted data,
+                // we need to sync it (via closeAndOpen) first, so there is no period during which
+                // a crash could cause data loss.
+                cfs.markCompacted(sstables);
+                return 0;
+            }
+
+            writer = cfs.createCompactionWriter(expectedBloomFilterSize, compactionFileLocation, ci.hasRowsInPageCache());
+            while (nni.hasNext())
+            {
+                AbstractCompactedRow row = nni.next();
+
+                long position = writer.append(row);
+
+                totalkeysWritten++;
+
+                if (DatabaseDescriptor.getPreheatKeyCache())
+                {
+                    for (SSTableReader sstable : sstables)
+                    {
+                        if (sstable.getCachedPosition(row.key) != null)
+                        {
+                            cachedKeys.put(row.key, position);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        finally
+        {
+            ci.close();
+        }
+
+        SSTableReader ssTable = writer.closeAndOpenReader(getMaxDataAge(sstables));
+        cfs.replaceCompactedSSTables(sstables, Arrays.asList(ssTable));
+        for (Entry<DecoratedKey, Long> entry : cachedKeys.entrySet()) // empty if preheat is off
+            ssTable.cacheKey(entry.getKey(), entry.getValue());
+        submitMinorIfNeeded(cfs);
+
+        long dTime = System.currentTimeMillis() - startTime;
+        long startsize = SSTable.getTotalBytes(sstables);
+        long endsize = ssTable.length();
+        double ratio = (double) endsize / (double) startsize;
+        logger.info(String.format("Compacted to %s.  %,d to %,d (~%d%% of original) bytes for %,d keys.  Time: %,dms.",
+                                  writer.getFilename(), startsize, endsize, (int) (ratio * 100), totalkeysWritten, dTime));
+        return sstables.size();
+    }
+
+    private static long getMaxDataAge(Collection<SSTableReader> sstables)
+    {
+        long max = 0;
+        for (SSTableReader sstable : sstables)
+        {
+            if (sstable.maxDataAge > max)
+                max = sstable.maxDataAge;
+        }
+        return max;
+    }
+
+    /**
+     * Deserialize everything in the CFS and re-serialize w/ the newest version.  Also attempts to recover
+     * from bogus row keys / sizes using data from the index, and skips rows with garbage columns that resulted
+     * from early ByteBuffer bugs.
+     *
+     * @throws IOException
+     */
+    private void doScrub(ColumnFamilyStore cfs) throws IOException
+    {
+        assert !cfs.isIndex();
+
+        for (final SSTableReader sstable : cfs.getSSTables())
+        {
+            logger.info("Scrubbing " + sstable);
+
+            // Calculate the expected compacted filesize
+            String compactionFileLocation = cfs.table.getDataFileLocation(sstable.length());
+            if (compactionFileLocation == null)
+                throw new IOException("disk full");
+            int expectedBloomFilterSize = Math.max(DatabaseDescriptor.getIndexInterval(),
+                                                   (int)(SSTableReader.getApproximateKeyCount(Arrays.asList(sstable))));
+
+            // loop through each row, deserializing to check for damage.
+            // we'll also loop through the index at the same time, using the position from the index to recover if the
+            // row header (key or data size) is corrupt. (This means our position in the index file will be one row
+            // "ahead" of the data file.)
+            final BufferedRandomAccessFile dataFile = BufferedRandomAccessFile.getUncachingReader(sstable.getFilename());
+            String indexFilename = sstable.descriptor.filenameFor(Component.PRIMARY_INDEX);
+            BufferedRandomAccessFile indexFile = BufferedRandomAccessFile.getUncachingReader(indexFilename);
+            ByteBuffer nextIndexKey = ByteBufferUtil.readWithShortLength(indexFile);
+            {
+                // throw away variable so we don't have a side effect in the assert
+                long firstRowPositionFromIndex = indexFile.readLong();
+                assert firstRowPositionFromIndex == 0 : firstRowPositionFromIndex;
+            }
+
+            SSTableWriter writer = maybeCreateWriter(cfs, compactionFileLocation, expectedBloomFilterSize, null, false);
+            executor.beginCompaction(cfs.columnFamily, new ScrubInfo(dataFile, sstable));
+            int goodRows = 0, badRows = 0;
+
+            while (!dataFile.isEOF())
+            {
+                long rowStart = dataFile.getFilePointer();
+                if (logger.isDebugEnabled())
+                    logger.debug("Reading row at " + rowStart);
+
+                DecoratedKey key = null;
+                long dataSize = -1;
+                try
+                {
+                    key = SSTableReader.decodeKey(sstable.partitioner, sstable.descriptor, ByteBufferUtil.readWithShortLength(dataFile));
+                    dataSize = sstable.descriptor.hasIntRowSize ? dataFile.readInt() : dataFile.readLong();
+                    if (logger.isDebugEnabled())
+                        logger.debug(String.format("row %s is %s bytes", ByteBufferUtil.bytesToHex(key.key), dataSize));
+                }
+                catch (Throwable th)
+                {
+                    throwIfFatal(th);
+                    // check for null key below
+                }
+
+                ByteBuffer currentIndexKey = nextIndexKey;
+                long nextRowPositionFromIndex;
+                try
+                {
+                    nextIndexKey = indexFile.isEOF() ? null : ByteBufferUtil.readWithShortLength(indexFile);
+                    nextRowPositionFromIndex = indexFile.isEOF() ? dataFile.length() : indexFile.readLong();
+                }
+                catch (Throwable th)
+                {
+                    logger.warn("Error reading index file", th);
+                    nextIndexKey = null;
+                    nextRowPositionFromIndex = dataFile.length();
+                }
+
+                long dataStart = dataFile.getFilePointer();
+                long dataStartFromIndex = currentIndexKey == null
+                                        ? -1
+                                        : rowStart + 2 + currentIndexKey.remaining() + (sstable.descriptor.hasIntRowSize ? 4 : 8);
+                long dataSizeFromIndex = nextRowPositionFromIndex - dataStartFromIndex;
+                assert currentIndexKey != null || indexFile.isEOF();
+                if (logger.isDebugEnabled() && currentIndexKey != null)
+                    logger.debug(String.format("Index doublecheck: row %s is %s bytes", ByteBufferUtil.bytesToHex(currentIndexKey),  dataSizeFromIndex));
+
+                writer.mark();
+                try
+                {
+                    if (key == null)
+                        throw new IOError(new IOException("Unable to read row key from data file"));
+                    if (dataSize > dataFile.length())
+                        throw new IOError(new IOException("Impossible row size " + dataSize));
+                    SSTableIdentityIterator row = new SSTableIdentityIterator(sstable, dataFile, key, dataStart, dataSize, null, true);
+                    writer.append(getCompactedRow(row, cfs, sstable.descriptor, true));
+                    goodRows++;
+                    if (!key.key.equals(currentIndexKey) || dataStart != dataStartFromIndex)
+                        logger.warn("Row scrubbed successfully but index file contains a different key or row size; consider rebuilding the index as described in http://www.mail-archive.com/user@cassandra.apache.org/msg03325.html");
+                }
+                catch (Throwable th)
+                {
+                    throwIfFatal(th);
+                    logger.warn("Non-fatal error reading row (stacktrace follows)", th);
+                    writer.reset();
+
+                    if (currentIndexKey != null
+                        && (key == null || !key.key.equals(currentIndexKey) || dataStart != dataStartFromIndex || dataSize != dataSizeFromIndex))
+                    {
+                        logger.info(String.format("Retrying from row index; data is %s bytes starting at %s",
+                                                  dataSizeFromIndex, dataStartFromIndex));
+                        key = SSTableReader.decodeKey(sstable.partitioner, sstable.descriptor, currentIndexKey);
+                        try
+                        {
+                            SSTableIdentityIterator row = new SSTableIdentityIterator(sstable, dataFile, key, dataStartFromIndex, dataSizeFromIndex, null, true);
+                            writer.append(getCompactedRow(row, cfs, sstable.descriptor, true));
+                            goodRows++;
+                        }
+                        catch (Throwable th2)
+                        {
+                            throwIfFatal(th2);
+                            logger.warn("Retry failed too.  Skipping to next row (retry's stacktrace follows)", th2);
+                            writer.reset();
+                            dataFile.seek(nextRowPositionFromIndex);
+                            badRows++;
+                        }
+                    }
+                    else
+                    {
+                        logger.warn("Row at " + dataStart + " is unreadable; skipping to next");
+                        if (currentIndexKey != null)
+                            dataFile.seek(nextRowPositionFromIndex);
+                        badRows++;
+                    }
+                }
+            }
+
+            if (writer.getFilePointer() > 0)
+            {
+                SSTableReader newSstable = writer.closeAndOpenReader(sstable.maxDataAge);
+                cfs.replaceCompactedSSTables(Arrays.asList(sstable), Arrays.asList(newSstable));
+                logger.info("Scrub of " + sstable + " complete: " + goodRows + " rows in new sstable");
+                if (badRows > 0)
+                    logger.warn("Unable to recover " + badRows + " rows that were skipped.  You can attempt manual recovery from the pre-scrub snapshot.  You can also run nodetool repair to transfer the data from a healthy replica, if any");
+            }
+            else
+            {
+                cfs.markCompacted(Arrays.asList(sstable));
+                logger.warn("No valid rows found while scrubbing " + sstable + "; it is marked for deletion now. If you want to attempt manual recovery, you can find a copy in the pre-scrub snapshot");
+            }
+        }
+    }
+
+    private void throwIfFatal(Throwable th)
+    {
+        if (th instanceof Error && !(th instanceof AssertionError || th instanceof IOError))
+            throw (Error) th;
+    }
+
+    /**
+     * This function goes over each file and removes the keys that the node is not responsible for
+     * and only keeps keys that this node is responsible for.
+     *
+     * @throws IOException
+     */
+    private void doCleanupCompaction(ColumnFamilyStore cfs) throws IOException
+    {
+        assert !cfs.isIndex();
+        Table table = cfs.table;
+        Collection<Range> ranges = StorageService.instance.getLocalRanges(table.name);
+
+        for (SSTableReader sstable : cfs.getSSTables())
+        {
+            logger.info("Cleaning up " + sstable);
+            // Calculate the expected compacted filesize
+            long expectedRangeFileSize = cfs.getExpectedCompactedFileSize(Arrays.asList(sstable)) / 2;
+            String compactionFileLocation = table.getDataFileLocation(expectedRangeFileSize);
+            if (compactionFileLocation == null)
+                throw new IOException("disk full");
+
+            long startTime = System.currentTimeMillis();
+            long totalkeysWritten = 0;
+
+            int expectedBloomFilterSize = Math.max(DatabaseDescriptor.getIndexInterval(),
+                                                   (int)(SSTableReader.getApproximateKeyCount(Arrays.asList(sstable))));
+            if (logger.isDebugEnabled())
+              logger.debug("Expected bloom filter size : " + expectedBloomFilterSize);
+
+            SSTableWriter writer = null;
+            SSTableScanner scanner = sstable.getDirectScanner(CompactionIterator.FILE_BUFFER_SIZE);
+            SortedSet<ByteBuffer> indexedColumns = cfs.getIndexedColumns();
+            executor.beginCompaction(cfs.columnFamily, new CleanupInfo(sstable, scanner));
+            try
+            {
+                while (scanner.hasNext())
+                {
+                    SSTableIdentityIterator row = (SSTableIdentityIterator) scanner.next();
+                    if (Range.isTokenInRanges(row.getKey().token, ranges))
+                    {
+                        writer = maybeCreateWriter(cfs, compactionFileLocation, expectedBloomFilterSize, writer, row.hasRowsInPageCache());
+                        writer.append(getCompactedRow(row, cfs, sstable.descriptor, false));
+                        totalkeysWritten++;
+                    }
+                    else
+                    {
+                        while (row.hasNext())
+                        {
+                            IColumn column = row.next();
+                            if (indexedColumns.contains(column.name()))
+                                Table.cleanupIndexEntry(cfs, row.getKey().key, column);
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                scanner.close();
+            }
+
+            List<SSTableReader> results = new ArrayList<SSTableReader>();
+            if (writer != null)
+            {
+                SSTableReader newSstable = writer.closeAndOpenReader(sstable.maxDataAge);
+                results.add(newSstable);
+
+                String format = "Cleaned up to %s.  %,d to %,d (~%d%% of original) bytes for %,d keys.  Time: %,dms.";
+                long dTime = System.currentTimeMillis() - startTime;
+                long startsize = sstable.length();
+                long endsize = newSstable.length();
+                double ratio = (double)endsize / (double)startsize;
+                logger.info(String.format(format, writer.getFilename(), startsize, endsize, (int)(ratio*100), totalkeysWritten, dTime));
+            }
+
+            // flush to ensure we don't lose the tombstones on a restart, since they are not commitlog'd
+            for (ByteBuffer columnName : cfs.getIndexedColumns())
+            {
+                try
+                {
+                    cfs.getIndexedColumnFamilyStore(columnName).forceBlockingFlush();
+                }
+                catch (ExecutionException e)
+                {
+                    throw new RuntimeException(e);
+                }
+                catch (InterruptedException e)
+                {
+                    throw new AssertionError(e);
+                }
+            }
+            cfs.replaceCompactedSSTables(Arrays.asList(sstable), results);
+        }
+    }
+
+    /**
+     * @return an AbstractCompactedRow implementation to write the row in question.
+     * If the data is from a current-version sstable, write it unchanged.  Otherwise,
+     * re-serialize it in the latest version.
+     */
+    private AbstractCompactedRow getCompactedRow(SSTableIdentityIterator row, ColumnFamilyStore cfs, Descriptor descriptor, boolean forceDeserialize)
+    {
+        if (descriptor.isLatestVersion && !forceDeserialize)
+            return new EchoedRow(row);
+
+        return row.dataSize > DatabaseDescriptor.getInMemoryCompactionLimit()
+               ? new LazilyCompactedRow(cfs, Arrays.asList(row), false, getDefaultGcBefore(cfs), forceDeserialize)
+               : new PrecompactedRow(cfs, Arrays.asList(row), false, getDefaultGcBefore(cfs), forceDeserialize);
+    }
+
+    private SSTableWriter maybeCreateWriter(ColumnFamilyStore cfs, String compactionFileLocation, int expectedBloomFilterSize, SSTableWriter writer, boolean migrateCachedPages)
+            throws IOException
+    {
+        if (writer == null)
+        {
+            FileUtils.createDirectory(compactionFileLocation);
+            writer = cfs.createCompactionWriter(expectedBloomFilterSize, compactionFileLocation, migrateCachedPages);
+        }
+        return writer;
+    }
+
+    /**
+     * Performs a readonly "compaction" of all sstables in order to validate complete rows,
+     * but without writing the merge result
+     */
+    private void doValidationCompaction(ColumnFamilyStore cfs, AntiEntropyService.Validator validator) throws IOException
+    {
+        // flush first so everyone is validating data that is as similar as possible
+        try
+        {
+            StorageService.instance.forceTableFlush(cfs.table.name, cfs.getColumnFamilyName());
+        }
+        catch (ExecutionException e)
+        {
+            throw new IOException(e);
+        }
+        catch (InterruptedException e)
+        {
+            throw new AssertionError(e);
+        }
+
+        CompactionIterator ci = new ValidationCompactionIterator(cfs);
+        executor.beginCompaction(cfs.columnFamily, ci);
+        try
+        {
+            Iterator<AbstractCompactedRow> nni = new FilterIterator(ci, PredicateUtils.notNullPredicate());
+
+            // validate the CF as we iterate over it
+            validator.prepare(cfs);
+            while (nni.hasNext())
+            {
+                AbstractCompactedRow row = nni.next();
+                validator.add(row);
+            }
+            validator.complete();
+        }
+        finally
+        {
+            ci.close();
+        }
+    }
+
+    /*
+    * Group files of similar size into buckets.
+    */
+    static <T> Set<List<T>> getBuckets(Collection<Pair<T, Long>> files, long min)
+    {
+        // Sort the list in order to get deterministic results during the grouping below
+        List<Pair<T, Long>> sortedFiles = new ArrayList<Pair<T, Long>>(files);
+        Collections.sort(sortedFiles, new Comparator<Pair<T, Long>>()
+        {
+            public int compare(Pair<T, Long> p1, Pair<T, Long> p2)
+            {
+                return p1.right.compareTo(p2.right);
+            }
+        });
+
+        Map<List<T>, Long> buckets = new HashMap<List<T>, Long>();
+
+        for (Pair<T, Long> pair: sortedFiles)
+        {
+            long size = pair.right;
+
+            boolean bFound = false;
+            // look for a bucket containing similar-sized files:
+            // group in the same bucket if it's w/in 50% of the average for this bucket,
+            // or this file and the bucket are all considered "small" (less than `min`)
+            for (Entry<List<T>, Long> entry : buckets.entrySet())
+            {
+                List<T> bucket = entry.getKey();
+                long averageSize = entry.getValue();
+                if ((size > (averageSize / 2) && size < (3 * averageSize) / 2)
+                    || (size < min && averageSize < min))
+                {
+                    // remove and re-add because adding changes the hash
+                    buckets.remove(bucket);
+                    long totalSize = bucket.size() * averageSize;
+                    averageSize = (totalSize + size) / (bucket.size() + 1);
+                    bucket.add(pair.left);
+                    buckets.put(bucket, averageSize);
+                    bFound = true;
+                    break;
+                }
+            }
+            // no similar bucket found; put it in a new one
+            if (!bFound)
+            {
+                ArrayList<T> bucket = new ArrayList<T>();
+                bucket.add(pair.left);
+                buckets.put(bucket, size);
+            }
+        }
+
+        return buckets.keySet();
+    }
+
+    private static Collection<Pair<SSTableReader, Long>> convertSSTablesToPairs(Collection<SSTableReader> collection)
+    {
+        Collection<Pair<SSTableReader, Long>> tablePairs = new ArrayList<Pair<SSTableReader, Long>>();
+        for(SSTableReader table: collection)
+        {
+            tablePairs.add(new Pair<SSTableReader, Long>(table, table.length()));
+        }
+        return tablePairs;
+    }
+    
+    public Future submitIndexBuild(final ColumnFamilyStore cfs, final Table.IndexBuilder builder)
+    {
+        Runnable runnable = new Runnable()
+        {
+            public void run()
+            {
+                compactionLock.lock();
+                try
+                {
+                    if (cfs.isInvalid())
+                        return;
+                    executor.beginCompaction(cfs.columnFamily, builder);
+                    builder.build();
+                }
+                finally
+                {
+                    compactionLock.unlock();
+                }
+            }
+        };
+        
+        // don't submit to the executor if the compaction lock is held by the current thread. Instead return a simple
+        // future that will be immediately immediately get()ed and executed. Happens during a migration, which locks
+        // the compaction thread and then reinitializes a ColumnFamilyStore. Under normal circumstances, CFS spawns
+        // index jobs to the compaction manager (this) and blocks on them.
+        if (compactionLock.isHeldByCurrentThread())
+            return new SimpleFuture(runnable);
+        else
+            return executor.submit(runnable);
+    }
+    
+    public Future<SSTableReader> submitSSTableBuild(Descriptor desc)
+    {
+        // invalid descriptions due to missing or dropped CFS are handled by SSTW and StreamInSession.
+        final SSTableWriter.Builder builder = SSTableWriter.createBuilder(desc);
+        Callable<SSTableReader> callable = new Callable<SSTableReader>()
+        {
+            public SSTableReader call() throws IOException
+            {
+                compactionLock.lock();
+                try
+                {
+                    executor.beginCompaction(builder.cfs.columnFamily, builder);
+                    return builder.build();
+                }
+                finally
+                {
+                    compactionLock.unlock();
+                }
+            }
+        };
+        return executor.submit(callable);
+    }
+
+    public Future<?> submitCacheWrite(final CacheWriter writer)
+    {
+        Runnable runnable = new WrappedRunnable()
+        {
+            public void runMayThrow() throws IOException
+            {
+                executor.beginCompaction(writer.getColumnFamily(), writer);
+                writer.saveCache();
+            }
+        };
+        return executor.submit(runnable);
+    }
+
+    private static int getDefaultGcBefore(ColumnFamilyStore cfs)
+    {
+        return (int) (System.currentTimeMillis() / 1000) - cfs.metadata.getGcGraceSeconds();
+    }
+
+    private static class ValidationCompactionIterator extends CompactionIterator
+    {
+        public ValidationCompactionIterator(ColumnFamilyStore cfs) throws IOException
+        {
+            super(cfs, cfs.getSSTables(), getDefaultGcBefore(cfs), true);
+        }
+
+        @Override
+        public String getTaskType()
+        {
+            return "Validation";
+        }
+    }
+
+    public void checkAllColumnFamilies() throws IOException
+    {
+        // perform estimates
+        for (final ColumnFamilyStore cfs : ColumnFamilyStore.all())
+        {
+            Runnable runnable = new Runnable()
+            {
+                public void run ()
+                {
+                    logger.debug("Estimating compactions for " + cfs.columnFamily);
+                    final Set<List<SSTableReader>> buckets = getBuckets(convertSSTablesToPairs(cfs.getSSTables()), 50L * 1024L * 1024L);
+                    updateEstimateFor(cfs, buckets);
+                }
             };
-            pending.add(completionService.submit(task));
-
-          } else {
-            // Store it away for later use. includes non-transient but not
-            // loaded at startup cores.
-            solrCores.putDynamicDescriptor(rawName, p);
-          }
-        } catch (Throwable ex) {
-          SolrException.log(log, null, ex);
+            executor.submit(runnable);
         }
-      }
-      
-      while (pending != null && pending.size() > 0) {
-        try {
 
-          Future<SolrCore> future = completionService.take();
-          if (future == null) return;
-          pending.remove(future);
+        // actually schedule compactions.  done in a second pass so all the estimates occur before we
+        // bog down the executor in actual compactions.
+        for (ColumnFamilyStore cfs : ColumnFamilyStore.all())
+        {
+            submitMinorIfNeeded(cfs);
+        }
+    }
 
-          try {
-            SolrCore c = future.get();
-            // track original names
-            if (c != null) {
-              solrCores.putCoreToOrigName(c, c.getName());
+    private static class CompactionExecutor extends DebuggableThreadPoolExecutor
+    {
+        private volatile String columnFamily;
+        private volatile ICompactionInfo ci;
+
+        public CompactionExecutor()
+        {
+            super("CompactionExecutor", DatabaseDescriptor.getCompactionThreadPriority());
+        }
+
+        @Override
+        public void afterExecute(Runnable r, Throwable t)
+        {
+            super.afterExecute(r, t);
+            columnFamily = null;
+            ci = null;
+        }
+
+        void beginCompaction(String columnFamily, ICompactionInfo ci)
+        {
+            this.columnFamily = columnFamily;
+            this.ci = ci;
+        }
+
+        public String getColumnFamilyName()
+        {
+            return columnFamily == null ? null : columnFamily;
+        }
+
+        public Long getBytesTotal()
+        {
+            return ci == null ? null : ci.getTotalBytes();
+        }
+
+        public Long getBytesCompleted()
+        {
+            return ci == null ? null : ci.getBytesComplete();
+        }
+
+        public String getType()
+        {
+            return ci == null ? null : ci.getTaskType();
+        }
+    }
+
+    public String getColumnFamilyInProgress()
+    {
+        return executor.getColumnFamilyName();
+    }
+
+    public Long getBytesTotalInProgress()
+    {
+        return executor.getBytesTotal();
+    }
+
+    public Long getBytesCompacted()
+    {
+        return executor.getBytesCompleted();
+    }
+
+    public String getCompactionType()
+    {
+        return executor.getType();
+    }
+
+    public int getPendingTasks()
+    {
+        int n = 0;
+        for (Integer i : estimatedCompactions.values())
+            n += i;
+        return (int) (executor.getTaskCount() - executor.getCompletedTaskCount()) + n;
+    }
+
+    public long getCompletedTasks()
+    {
+        return executor.getCompletedTaskCount();
+    }
+    
+    private static class SimpleFuture implements Future
+    {
+        private Runnable runnable;
+        
+        private SimpleFuture(Runnable r) 
+        {
+            runnable = r;
+        }
+        
+        public boolean cancel(boolean mayInterruptIfRunning)
+        {
+            throw new IllegalStateException("May not call SimpleFuture.cancel()");
+        }
+
+        public boolean isCancelled()
+        {
+            return false;
+        }
+
+        public boolean isDone()
+        {
+            return runnable == null;
+        }
+
+        public Object get() throws InterruptedException, ExecutionException
+        {
+            runnable.run();
+            runnable = null;
+            return runnable;
+        }
+
+        public Object get(long timeout, TimeUnit unit) throws InterruptedException, ExecutionException, TimeoutException
+        {
+            throw new IllegalStateException("May not call SimpleFuture.get(long, TimeUnit)");
+        }
+    }
+
+    private static class EchoedRow extends AbstractCompactedRow
+    {
+        private final SSTableIdentityIterator row;
+
+        public EchoedRow(SSTableIdentityIterator row)
+        {
+            super(row.getKey());
+            this.row = row;
+        }
+
+        public void write(PageCacheInformer out) throws IOException
+        {
+            out.writeLong(row.dataSize);
+            row.echoData(out);
+        }
+
+        public void update(MessageDigest digest)
+        {
+            // EchoedRow is not used in anti-entropy validation
+            throw new UnsupportedOperationException();
+        }
+
+        public boolean isEmpty()
+        {
+            return !row.hasNext();
+        }
+
+        public int columnCount()
+        {
+            return row.columnCount;
+        }
+    }
+
+    private static class CleanupInfo implements ICompactionInfo
+    {
+        private final SSTableReader sstable;
+        private final SSTableScanner scanner;
+
+        public CleanupInfo(SSTableReader sstable, SSTableScanner scanner)
+        {
+            this.sstable = sstable;
+            this.scanner = scanner;
+        }
+
+        public long getTotalBytes()
+        {
+            return scanner.getFileLength();
+        }
+
+        public long getBytesComplete()
+        {
+            return scanner.getFilePointer();
+        }
+
+        public String getTaskType()
+        {
+            return "Cleanup of " + sstable.getColumnFamilyName();
+        }
+    }
+
+    private static class ScrubInfo implements ICompactionInfo
+    {
+        private final BufferedRandomAccessFile dataFile;
+        private final SSTableReader sstable;
+
+        public ScrubInfo(BufferedRandomAccessFile dataFile, SSTableReader sstable)
+        {
+            this.dataFile = dataFile;
+            this.sstable = sstable;
+        }
+
+        public long getTotalBytes()
+        {
+            try
+            {
+                return dataFile.length();
             }
-          } catch (ExecutionException e) {
-            SolrException.log(SolrCore.log, "Error loading core", e);
-          }
-          
-        } catch (InterruptedException e) {
-          throw new SolrException(SolrException.ErrorCode.SERVICE_UNAVAILABLE,
-              "interrupted while loading core", e);
-        }
-      }
-
-      // Start the background thread
-      backgroundCloser = new CloserThread(this, solrCores, cfg);
-      backgroundCloser.start();
-
-    } finally {
-      if (coreLoadExecutor != null) {
-        ExecutorUtil.shutdownNowAndAwaitTermination(coreLoadExecutor);
-      }
-    }
-  }
-  
-  private ShardHandlerFactory initShardHandler(ConfigSolr configSolr) {
-    PluginInfo info = null;
-    Node shfn = configSolr.getConfig().getNode("solr/cores/shardHandlerFactory", false);
-
-    if (shfn != null) {
-      info = new PluginInfo(shfn, "shardHandlerFactory", false, true);
-    } else {
-      Map m = new HashMap();
-      m.put("class", HttpShardHandlerFactory.class.getName());
-      info = new PluginInfo("shardHandlerFactory", m, null, Collections.<PluginInfo>emptyList());
-    }
-
-    ShardHandlerFactory fac;
-    try {
-       fac = configSolr.getConfig().getResourceLoader().findClass(info.className, ShardHandlerFactory.class).newInstance();
-    } catch (Exception e) {
-      throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
-                              "Error instantiating shardHandlerFactory class " + info.className);
-    }
-    if (fac instanceof PluginInfoInitialized) {
-      ((PluginInfoInitialized) fac).init(info);
-    }
-    return fac;
-  }
-
-  // To make this available to TestHarness.
-  protected void initShardHandler() {
-    if (cfg != null) {
-      initShardHandler(cfg);
-    } else {
-      // Cough! Hack! But tests run this way.
-      HttpShardHandlerFactory fac = new HttpShardHandlerFactory();
-      shardHandlerFactory = fac;
-    }
-  }
-
-  private volatile boolean isShutDown = false;
-  
-  public boolean isShutDown() {
-    return isShutDown;
-  }
-
-  /**
-   * Stops all cores.
-   */
-  public void shutdown() {
-    log.info("Shutting down CoreContainer instance="
-        + System.identityHashCode(this));
-    
-    if (isZooKeeperAware()) {
-      try {
-        zkSys.getZkController().publishAndWaitForDownStates();
-      } catch (KeeperException e) {
-        log.error("", e);
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-        log.warn("", e);
-      }
-    }
-    isShutDown = true;
-
-    if (isZooKeeperAware()) {
-      zkSys.publishCoresAsDown(solrCores.getCores());
-      cancelCoreRecoveries();
-    }
-
-
-    try {
-      // First wake up the closer thread, it'll terminate almost immediately since it checks isShutDown.
-      synchronized (solrCores.getModifyLock()) {
-        solrCores.getModifyLock().notifyAll(); // wake up anyone waiting
-      }
-      if (backgroundCloser != null) { // Doesn't seem right, but tests get in here without initializing the core.
-        try {
-          backgroundCloser.join();
-        } catch (InterruptedException e) {
-          Thread.currentThread().interrupt();
-          if (log.isDebugEnabled()) {
-            log.debug("backgroundCloser thread was interrupted before finishing");
-          }
-        }
-      }
-      // Now clear all the cores that are being operated upon.
-      solrCores.close();
-
-      // It's still possible that one of the pending dynamic load operation is waiting, so wake it up if so.
-      // Since all the pending operations queues have been drained, there should be nothing to do.
-      synchronized (solrCores.getModifyLock()) {
-        solrCores.getModifyLock().notifyAll(); // wake up the thread
-      }
-
-    } finally {
-      if (shardHandlerFactory != null) {
-        shardHandlerFactory.close();
-      }
-      
-      // we want to close zk stuff last
-
-      zkSys.close();
-
-    }
-  }
-
-  public void cancelCoreRecoveries() {
-
-    List<SolrCore> cores = solrCores.getCores();
-
-    // we must cancel without holding the cores sync
-    // make sure we wait for any recoveries to stop
-    for (SolrCore core : cores) {
-      try {
-        core.getSolrCoreState().cancelRecovery();
-      } catch (Throwable t) {
-        SolrException.log(log, "Error canceling recovery for core", t);
-      }
-    }
-  }
-  
-  @Override
-  protected void finalize() throws Throwable {
-    try {
-      if(!isShutDown){
-        log.error("CoreContainer was not shutdown prior to finalize(), indicates a bug -- POSSIBLE RESOURCE LEAK!!!  instance=" + System.identityHashCode(this));
-      }
-    } finally {
-      super.finalize();
-    }
-  }
-
-  protected SolrCore registerCore(boolean isTransientCore, String name, SolrCore core, boolean returnPrevNotClosed) {
-    if( core == null ) {
-      throw new RuntimeException( "Can not register a null core." );
-    }
-    if( name == null ||
-        name.indexOf( '/'  ) >= 0 ||
-        name.indexOf( '\\' ) >= 0 ){
-      throw new RuntimeException( "Invalid core name: "+name );
-    }
-
-    if (zkSys.getZkController() != null) {
-      // this happens before we can receive requests
-      try {
-        zkSys.getZkController().preRegister(core);
-      } catch (KeeperException e) {
-        log.error("", e);
-        throw new ZooKeeperException(SolrException.ErrorCode.SERVER_ERROR,
-            "", e);
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-        log.error("", e);
-        throw new ZooKeeperException(SolrException.ErrorCode.SERVER_ERROR,
-            "", e);
-      }
-    }
-    
-    SolrCore old = null;
-
-    if (isShutDown) {
-      core.close();
-      throw new IllegalStateException("This CoreContainer has been shutdown");
-    }
-    if (isTransientCore) {
-      old = solrCores.putTransientCore(cfg, name, core, loader);
-    } else {
-      old = solrCores.putCore(name, core);
-    }
-      /*
-      * set both the name of the descriptor and the name of the
-      * core, since the descriptors name is used for persisting.
-      */
-
-    core.setName(name);
-    core.getCoreDescriptor().putProperty(CoreDescriptor.CORE_NAME, name);
-
-    synchronized (coreInitFailures) {
-      coreInitFailures.remove(name);
-    }
-
-    if( old == null || old == core) {
-      log.info( "registering core: "+name );
-      zkSys.registerInZk(core);
-      return null;
-    }
-    else {
-      log.info( "replacing core: "+name );
-      if (!returnPrevNotClosed) {
-        old.close();
-      }
-      zkSys.registerInZk(core);
-      return old;
-    }
-  }
-
-  /**
-   * Registers a SolrCore descriptor in the registry using the core's name.
-   * If returnPrev==false, the old core, if different, is closed.
-   * @return a previous core having the same name if it existed and returnPrev==true
-   */
-  public SolrCore register(SolrCore core, boolean returnPrev) {
-    return registerCore(false, core.getName(), core, returnPrev);
-  }
-
-  public SolrCore register(String name, SolrCore core, boolean returnPrev) {
-    return registerCore(false, name, core, returnPrev);
-  }
-
-  // Helper method to separate out creating a core from local configuration files. See create()
-  private SolrCore createFromLocal(String instanceDir, CoreDescriptor dcore) {
-    SolrResourceLoader solrLoader = null;
-
-    SolrConfig config = null;
-    solrLoader = new SolrResourceLoader(instanceDir, loader.getClassLoader(), ConfigSolrXml.getCoreProperties(instanceDir, dcore));
-    try {
-      config = new SolrConfig(solrLoader, dcore.getConfigName(), null);
-    } catch (Exception e) {
-      log.error("Failed to load file {}", new File(instanceDir, dcore.getConfigName()).getAbsolutePath());
-      throw new SolrException(ErrorCode.SERVER_ERROR, "Could not load config for " + dcore.getConfigName(), e);
-    }
-
-    IndexSchema schema = null;
-    if (indexSchemaCache != null) {
-      final String resourceNameToBeUsed = IndexSchemaFactory.getResourceNameToBeUsed(dcore.getSchemaName(), config);
-      File schemaFile = new File(resourceNameToBeUsed);
-      if (!schemaFile.isAbsolute()) {
-        schemaFile = new File(solrLoader.getConfigDir(), schemaFile.getPath());
-      }
-      if (schemaFile.exists()) {
-        String key = schemaFile.getAbsolutePath()
-            + ":"
-            + new SimpleDateFormat("yyyyMMddHHmmss", Locale.ROOT).format(new Date(
-            schemaFile.lastModified()));
-        schema = indexSchemaCache.get(key);
-        if (schema == null) {
-          log.info("creating new schema object for core: " + dcore.getProperty(CoreDescriptor.CORE_NAME));
-          schema = IndexSchemaFactory.buildIndexSchema(dcore.getSchemaName(), config);
-          indexSchemaCache.put(key, schema);
-        } else {
-          log.info("re-using schema object for core: " + dcore.getProperty(CoreDescriptor.CORE_NAME));
-        }
-      }
-    }
-
-    if (schema == null) {
-      schema = IndexSchemaFactory.buildIndexSchema(dcore.getSchemaName(), config);
-    }
-
-    SolrCore core = new SolrCore(dcore.getName(), null, config, schema, dcore);
-
-    if (core.getUpdateHandler().getUpdateLog() != null) {
-      // always kick off recovery if we are in standalone mode.
-      core.getUpdateHandler().getUpdateLog().recoverFromLog();
-    }
-    return core;
-  }
-
-  /**
-   * Creates a new core based on a descriptor but does not register it.
-   *
-   * @param dcore a core descriptor
-   * @return the newly created core
-   */
-  public SolrCore create(CoreDescriptor dcore) {
-
-    if (isShutDown) {
-      throw new SolrException(ErrorCode.SERVICE_UNAVAILABLE, "Solr has shutdown.");
-    }
-    
-    final String name = dcore.getName();
-
-    try {
-      // Make the instanceDir relative to the cores instanceDir if not absolute
-      File idir = new File(dcore.getInstanceDir());
-      String instanceDir = idir.getPath();
-      log.info("Creating SolrCore '{}' using instanceDir: {}",
-               dcore.getName(), instanceDir);
-
-      // Initialize the solr config
-      SolrCore created = null;
-      if (zkSys.getZkController() != null) {
-        created = zkSys.createFromZk(instanceDir, dcore, loader);
-      } else {
-        created = createFromLocal(instanceDir, dcore);
-      }
-
-      solrCores.addCreated(created); // For persisting newly-created cores.
-      return created;
-
-      // :TODO: Java7...
-      // http://docs.oracle.com/javase/7/docs/technotes/guides/language/catch-multiple.html
-    } catch (Exception ex) {
-      throw recordAndThrow(name, "Unable to create core: " + name, ex);
-    }
-  }
-
-  /**
-   * @return a Collection of registered SolrCores
-   */
-  public Collection<SolrCore> getCores() {
-    return solrCores.getCores();
-  }
-
-  /**
-   * @return a Collection of the names that cores are mapped to
-   */
-  public Collection<String> getCoreNames() {
-    return solrCores.getCoreNames();
-  }
-
-  /** This method is currently experimental.
-   * @return a Collection of the names that a specific core is mapped to.
-   */
-  public Collection<String> getCoreNames(SolrCore core) {
-    return solrCores.getCoreNames(core);
-  }
-
-  /**
-   * get a list of all the cores that are currently loaded
-   * @return a list of al lthe available core names in either permanent or transient core lists.
-   */
-  public Collection<String> getAllCoreNames() {
-    return solrCores.getAllCoreNames();
-
-  }
-
-  /**
-   * Returns an immutable Map of Exceptions that occured when initializing 
-   * SolrCores (either at startup, or do to runtime requests to create cores) 
-   * keyed off of the name (String) of the SolrCore that had the Exception 
-   * during initialization.
-   * <p>
-   * While the Map returned by this method is immutable and will not change 
-   * once returned to the client, the source data used to generate this Map 
-   * can be changed as various SolrCore operations are performed:
-   * </p>
-   * <ul>
-   *  <li>Failed attempts to create new SolrCores will add new Exceptions.</li>
-   *  <li>Failed attempts to re-create a SolrCore using a name already contained in this Map will replace the Exception.</li>
-   *  <li>Failed attempts to reload a SolrCore will cause an Exception to be added to this list -- even though the existing SolrCore with that name will continue to be available.</li>
-   *  <li>Successful attempts to re-created a SolrCore using a name already contained in this Map will remove the Exception.</li>
-   *  <li>Registering an existing SolrCore with a name already contained in this Map (ie: ALIAS or SWAP) will remove the Exception.</li>
-   * </ul>
-   */
-  public Map<String,Exception> getCoreInitFailures() {
-    synchronized ( coreInitFailures ) {
-      return Collections.unmodifiableMap(new LinkedHashMap<String,Exception>
-                                         (coreInitFailures));
-    }
-  }
-
-
-  // ---------------- Core name related methods --------------- 
-  /**
-   * Recreates a SolrCore.
-   * While the new core is loading, requests will continue to be dispatched to
-   * and processed by the old core
-   * 
-   * @param name the name of the SolrCore to reload
-   */
-  public void reload(String name) {
-    try {
-      name = checkDefault(name);
-
-      SolrCore core = solrCores.getCore(name);
-      if (core == null)
-        throw new SolrException( SolrException.ErrorCode.BAD_REQUEST, "No such core: " + name );
-
-      try {
-        solrCores.waitAddPendingCoreOps(name);
-        CoreDescriptor cd = core.getCoreDescriptor();
-
-        File instanceDir = new File(cd.getInstanceDir());
-
-        log.info("Reloading SolrCore '{}' using instanceDir: {}",
-                 cd.getName(), instanceDir.getAbsolutePath());
-        SolrResourceLoader solrLoader;
-        if(zkSys.getZkController() == null) {
-          solrLoader = new SolrResourceLoader(instanceDir.getAbsolutePath(), loader.getClassLoader(), ConfigSolrXml.getCoreProperties(instanceDir.getAbsolutePath(), cd));
-        } else {
-          try {
-            String collection = cd.getCloudDescriptor().getCollectionName();
-            zkSys.getZkController().createCollectionZkNode(cd.getCloudDescriptor());
-
-            String zkConfigName = zkSys.getZkController().readConfigName(collection);
-            if (zkConfigName == null) {
-              log.error("Could not find config name for collection:" + collection);
-              throw new ZooKeeperException(SolrException.ErrorCode.SERVER_ERROR,
-                                           "Could not find config name for collection:" + collection);
+            catch (IOException e)
+            {
+                throw new RuntimeException(e);
             }
-            solrLoader = new ZkSolrResourceLoader(instanceDir.getAbsolutePath(), zkConfigName, loader.getClassLoader(),
-                ConfigSolrXml.getCoreProperties(instanceDir.getAbsolutePath(), cd), zkSys.getZkController());
-          } catch (KeeperException e) {
-            log.error("", e);
-            throw new ZooKeeperException(SolrException.ErrorCode.SERVER_ERROR,
-                                         "", e);
-          } catch (InterruptedException e) {
-            // Restore the interrupted status
-            Thread.currentThread().interrupt();
-            log.error("", e);
-            throw new ZooKeeperException(SolrException.ErrorCode.SERVER_ERROR,
-                                         "", e);
-          }
         }
-        SolrCore newCore = core.reload(solrLoader, core);
-        // keep core to orig name link
-        solrCores.removeCoreToOrigName(newCore, core);
-        registerCore(false, name, newCore, false);
-      } finally {
-        solrCores.removeFromPendingOps(name);
-      }
-      // :TODO: Java7...
-      // http://docs.oracle.com/javase/7/docs/technotes/guides/language/catch-multiple.html
-    } catch (Exception ex) {
-      throw recordAndThrow(name, "Unable to reload core: " + name, ex);
-    }
-  }
 
-  //5.0 remove all checkDefaults?
-  private String checkDefault(String name) {
-    return (null == name || name.isEmpty()) ? defaultCoreName : name;
-  } 
-
-  /**
-   * Swaps two SolrCore descriptors.
-   */
-  public void swap(String n0, String n1) {
-    if( n0 == null || n1 == null ) {
-      throw new SolrException( SolrException.ErrorCode.BAD_REQUEST, "Can not swap unnamed cores." );
-    }
-    n0 = checkDefault(n0);
-    n1 = checkDefault(n1);
-    solrCores.swap(n0, n1);
-
-    log.info("swapped: "+n0 + " with " + n1);
-  }
-  
-  /** Removes and returns registered core w/o decrementing it's reference count */
-  public SolrCore remove( String name ) {
-    name = checkDefault(name);    
-
-    return solrCores.remove(name, true);
-
-  }
-
-  public void rename(String name, String toName) {
-    SolrCore core = getCore(name);
-    try {
-      if (core != null) {
-        registerCore(false, toName, core, false);
-        name = checkDefault(name);
-        solrCores.remove(name, false);
-      }
-    } finally {
-      if (core != null) {
-        core.close();
-      }
-    }
-  }
-  /** 
-   * Gets a core by name and increase its refcount.
-   *
-   * @see SolrCore#close() 
-   * @param name the core name
-   * @return the core if found, null if a SolrCore by this name does not exist
-   * @exception SolrException if a SolrCore with this name failed to be initialized
-   */
-  public SolrCore getCore(String name) {
-
-    name = checkDefault(name);
-
-    // Do this in two phases since we don't want to lock access to the cores over a load.
-    SolrCore core = solrCores.getCoreFromAnyList(name);
-
-    if (core != null) {
-      core.open();
-      return core;
-    }
-
-    // OK, it's not presently in any list, is it in the list of dynamic cores but not loaded yet? If so, load it.
-    CoreDescriptor desc = solrCores.getDynamicDescriptor(name);
-    if (desc == null) { //Nope, no transient core with this name
-      
-      // if there was an error initalizing this core, throw a 500
-      // error with the details for clients attempting to access it.
-      Exception e = getCoreInitFailures().get(name);
-      if (null != e) {
-        throw new SolrException(ErrorCode.SERVER_ERROR, "SolrCore '" + name +
-                                "' is not available due to init failure: " +
-                                e.getMessage(), e);
-      }
-      // otherwise the user is simply asking for something that doesn't exist.
-      return null;
-    }
-
-    // This will put an entry in pending core ops if the core isn't loaded
-    core = solrCores.waitAddPendingCoreOps(name);
-
-    if (isShutDown) return null; // We're quitting, so stop. This needs to be after the wait above since we may come off
-                                 // the wait as a consequence of shutting down.
-    try {
-      if (core == null) {
-        core = create(desc); // This should throw an error if it fails.
-        core.open();
-        registerCore(desc.isTransient(), name, core, false);
-      } else {
-        core.open();
-      }
-    } catch(Exception ex){
-      throw recordAndThrow(name, "Unable to create core: " + name, ex);
-    } finally {
-      solrCores.removeFromPendingOps(name);
-    }
-
-    return core;
-  }
-
-  // ---------------- Multicore self related methods ---------------
-  /** 
-   * Creates a CoreAdminHandler for this MultiCore.
-   * @return a CoreAdminHandler
-   */
-  protected CoreAdminHandler createMultiCoreHandler(final String adminHandlerClass) {
-    return loader.newAdminHandlerInstance(CoreContainer.this, adminHandlerClass);
-  }
-
-  public CoreAdminHandler getMultiCoreHandler() {
-    return coreAdminHandler;
-  }
-  
-  public CollectionsHandler getCollectionsHandler() {
-    return collectionsHandler;
-  }
-  
-  /**
-   * the default core name, or null if there is no default core name
-   */
-  public String getDefaultCoreName() {
-    return defaultCoreName;
-  }
-  
-  // all of the following properties aren't synchronized
-  // but this should be OK since they normally won't be changed rapidly
-  @Deprecated
-  public boolean isPersistent() {
-    return persistent;
-  }
-  
-  @Deprecated
-  public void setPersistent(boolean persistent) {
-    this.persistent = persistent;
-  }
-  
-  public String getAdminPath() {
-    return adminPath;
-  }
-
-  public String getManagementPath() {
-    return managementPath;
-  }
-  
-  /**
-   * Sets the alternate path for multicore handling:
-   * This is used in case there is a registered unnamed core (aka name is "") to
-   * declare an alternate way of accessing named cores.
-   * This can also be used in a pseudo single-core environment so admins can prepare
-   * a new version before swapping.
-   */
-  public void setManagementPath(String path) {
-    this.managementPath = path;
-  }
-  
-  public LogWatcher getLogging() {
-    return logging;
-  }
-  public void setLogging(LogWatcher v) {
-    logging = v;
-  }
-  
-  public File getConfigFile() {
-    return configFile;
-  }
-
-  /**
-   * Determines whether the core is already loaded or not but does NOT load the core
-   *
-   */
-  public boolean isLoaded(String name) {
-    return solrCores.isLoaded(name);
-  }
-
-  /** Persists the cores config file in cores.xml. */
-  @Deprecated
-  public void persist() {
-    persistFile(configFile);
-  }
-
-  /**
-   * Gets a solr core descriptor for a core that is not loaded. Note that if the caller calls this on a
-   * loaded core, the unloaded descriptor will be returned.
-   *
-   * @param cname - name of the unloaded core descriptor to load. NOTE:
-   * @return a coreDescriptor. May return null
-   */
-  public CoreDescriptor getUnloadedCoreDescriptor(String cname) {
-    return solrCores.getUnloadedCoreDescriptor(cname);
-  }
-
-  /** Persists the cores config file in a user provided file. */
-  @Deprecated
-  public void persistFile(File file) {
-    assert file != null;
-    // only the old solrxml persists
-    if (cfg != null && !(cfg instanceof ConfigSolrXmlOld)) return;
-
-    log.info("Persisting cores config to " + (file == null ? configFile : file));
-
-    
-    // <solr attrib="value">
-    Map<String,String> rootSolrAttribs = new HashMap<String,String>();
-    if (libDir != null) rootSolrAttribs.put("sharedLib", libDir);
-    rootSolrAttribs.put("persistent", Boolean.toString(isPersistent()));
-    
-    // <solr attrib="value"> <cores attrib="value">
-    Map<String,String> coresAttribs = new HashMap<String,String>();
-    addCoresAttrib(coresAttribs, ConfigSolr.CfgProp.SOLR_ADMINPATH, "adminPath", this.adminPath, null);
-    addCoresAttrib(coresAttribs, ConfigSolr.CfgProp.SOLR_ADMINHANDLER, "adminHandler", this.adminHandler, null);
-    addCoresAttrib(coresAttribs, ConfigSolr.CfgProp.SOLR_SHARESCHEMA,"shareSchema",
-        Boolean.toString(this.shareSchema),
-        Boolean.toString(DEFAULT_SHARE_SCHEMA));
-    addCoresAttrib(coresAttribs, ConfigSolr.CfgProp.SOLR_HOST, "host", zkSys.getHost(), null);
-
-    if (! (null == defaultCoreName || defaultCoreName.equals("")) ) {
-      coresAttribs.put("defaultCoreName", defaultCoreName);
-    }
-
-    addCoresAttrib(coresAttribs, ConfigSolr.CfgProp.SOLR_HOSTPORT, "hostPort",zkSys.getHostPort(), ZkContainer.DEFAULT_HOST_PORT);
-    addCoresAttrib(coresAttribs, ConfigSolr.CfgProp.SOLR_ZKCLIENTTIMEOUT, "zkClientTimeout",
-        intToString(this.zkClientTimeout),
-        Integer.toString(DEFAULT_ZK_CLIENT_TIMEOUT));
-    addCoresAttrib(coresAttribs, ConfigSolr.CfgProp.SOLR_HOSTCONTEXT, "hostContext",
-        zkSys.getHostContext(), ZkContainer.DEFAULT_HOST_CONTEXT);
-    addCoresAttrib(coresAttribs, ConfigSolr.CfgProp.SOLR_LEADERVOTEWAIT, "leaderVoteWait",
-        zkSys.getLeaderVoteWait(), LEADER_VOTE_WAIT);
-    addCoresAttrib(coresAttribs, ConfigSolr.CfgProp.SOLR_CORELOADTHREADS, "coreLoadThreads",
-        Integer.toString(this.coreLoadThreads), Integer.toString(CORE_LOAD_THREADS));
-    if (transientCacheSize != Integer.MAX_VALUE) { // This test
-    // is a consequence of testing. I really hate it.
-      addCoresAttrib(coresAttribs, ConfigSolr.CfgProp.SOLR_TRANSIENTCACHESIZE, "transientCacheSize",
-          Integer.toString(this.transientCacheSize), Integer.toString(Integer.MAX_VALUE));
-    }
-
-    try {
-      solrCores.persistCores(origCfg, containerProperties, rootSolrAttribs, coresAttribs, file, configFile, loader);
-    } catch (XPathExpressionException e) {
-      throw new SolrException(ErrorCode.SERVER_ERROR, null, e);
-    }
-
-  }
-  private String intToString(Integer integer) {
-    if (integer == null) return null;
-    return Integer.toString(integer);
-  }
-
-  private void addCoresAttrib(Map<String,String> coresAttribs, ConfigSolr.CfgProp prop,
-                              String attribName, String attribValue, String defaultValue) {
-    if (cfg == null) {
-      coresAttribs.put(attribName, attribValue);
-      return;
-    }
-    
-    if (attribValue != null) {
-      String origValue = cfg.getOrigProp(prop, null);
-      
-      if (origValue == null && defaultValue != null && attribValue.equals(defaultValue)) return;
-
-      if (attribValue.equals(PropertiesUtil.substituteProperty(origValue, loader.getCoreProperties()))) {
-        coresAttribs.put(attribName, origValue);
-      } else {
-        coresAttribs.put(attribName, attribValue);
-      }
-    }
-  }
-
-  public String getSolrHome() {
-    return solrHome;
-  }
-  
-  public boolean isZooKeeperAware() {
-    return zkSys.getZkController() != null;
-  }
-  
-  public ZkController getZkController() {
-    return zkSys.getZkController();
-  }
-  
-  public boolean isShareSchema() {
-    return shareSchema;
-  }
-
-  /** The default ShardHandlerFactory used to communicate with other solr instances */
-  public ShardHandlerFactory getShardHandlerFactory() {
-    return shardHandlerFactory;
-  }
-  
-  // Just to tidy up the code where it did this in-line.
-  private SolrException recordAndThrow(String name, String msg, Exception ex) {
-    synchronized (coreInitFailures) {
-      coreInitFailures.remove(name);
-      coreInitFailures.put(name, ex);
-    }
-    log.error(msg, ex);
-    return new SolrException(ErrorCode.SERVER_ERROR, msg, ex);
-  }
-  
-  String getCoreToOrigName(SolrCore core) {
-    return solrCores.getCoreToOrigName(core);
-  }
-  
-  private Document copyDoc(Document document) throws TransformerException {
-    TransformerFactory tfactory = TransformerFactory.newInstance();
-    Transformer tx   = tfactory.newTransformer();
-    DOMSource source = new DOMSource(document);
-    DOMResult result = new DOMResult();
-    tx.transform(source,result);
-    return (Document)result.getNode();
-  }
-}
-
-class CloserThread extends Thread {
-  CoreContainer container;
-  SolrCores solrCores;
-  ConfigSolr cfg;
-
-
-  CloserThread(CoreContainer container, SolrCores solrCores, ConfigSolr cfg) {
-    this.container = container;
-    this.solrCores = solrCores;
-    this.cfg = cfg;
-  }
-
-  // It's important that this be the _only_ thread removing things from pendingDynamicCloses!
-  // This is single-threaded, but I tried a multi-threaded approach and didn't see any performance gains, so
-  // there's no good justification for the complexity. I suspect that the locking on things like DefaultSolrCoreState
-  // essentially create a single-threaded process anyway.
-  @Override
-  public void run() {
-    while (! container.isShutDown()) {
-      synchronized (solrCores.getModifyLock()) { // need this so we can wait and be awoken.
-        try {
-          solrCores.getModifyLock().wait();
-        } catch (InterruptedException e) {
-          // Well, if we've been told to stop, we will. Otherwise, continue on and check to see if there are
-          // any cores to close.
+        public long getBytesComplete()
+        {
+            return dataFile.getFilePointer();
         }
-      }
-      for (SolrCore removeMe = solrCores.getCoreToClose();
-           removeMe != null && !container.isShutDown();
-           removeMe = solrCores.getCoreToClose()) {
-        try {
-          removeMe.close();
-        } finally {
-          solrCores.removeFromPendingOps(removeMe.getName());
+
+        public String getTaskType()
+        {
+            return "Scrub " + sstable;
         }
-      }
     }
-  }
-  
 }

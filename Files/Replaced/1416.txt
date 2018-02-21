@@ -1,157 +1,178 @@
-samplingParams.setSamplingThreshold(11000); //force sampling
+compressed = new byte[Snappy.maxCompressedLength(metadata.chunkLength)];
 
-package org.apache.lucene.facet.search.sampling;
-
-import java.util.List;
-import java.util.Random;
-
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.Term;
-import org.apache.lucene.search.Query;
-import org.apache.lucene.search.TermQuery;
-
-import org.apache.lucene.search.MultiCollector;
-import org.apache.lucene.facet.search.BaseTestTopK;
-import org.apache.lucene.facet.search.FacetsAccumulator;
-import org.apache.lucene.facet.search.FacetsCollector;
-import org.apache.lucene.facet.search.ScoredDocIDs;
-import org.apache.lucene.facet.search.ScoredDocIdCollector;
-import org.apache.lucene.facet.search.params.FacetRequest;
-import org.apache.lucene.facet.search.params.FacetRequest.ResultMode;
-import org.apache.lucene.facet.search.params.FacetSearchParams;
-import org.apache.lucene.facet.search.results.FacetResult;
-import org.apache.lucene.facet.taxonomy.TaxonomyReader;
-
-/*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ *   http://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
  */
+package org.apache.cassandra.io.compress;
 
-public abstract class BaseSampleTestTopK extends BaseTestTopK {
-  
-  /** Number of top results */
-  protected static final int K = 2; 
-  
-  /** since there is a chance that this test would fail even if the code is correct, retry the sampling */
-  protected static final int RETRIES = 10;
-  
-  @Override
-  protected FacetSearchParams searchParamsWithRequests(int numResults, int partitionSize) {
-    FacetSearchParams res = super.searchParamsWithRequests(numResults, partitionSize);
-    for (FacetRequest req : res.getFacetRequests()) {
-      // randomize the way we aggregate results
-      if (random().nextBoolean()) {
-        req.setResultMode(ResultMode.GLOBAL_FLAT);
-      } else {
-        req.setResultMode(ResultMode.PER_NODE_IN_TREE);
-      }
-    }
-    return res;
-  }
-  
-  protected abstract FacetsAccumulator getSamplingAccumulator(Sampler sampler,
-      TaxonomyReader taxoReader, IndexReader indexReader,
-      FacetSearchParams searchParams);
-  
-  /**
-   * Try out faceted search with sampling enabled and complements either disabled or enforced
-   * Lots of randomly generated data is being indexed, and later on a "90% docs" faceted search
-   * is performed. The results are compared to non-sampled ones.
-   */
-  public void testCountUsingSampling() throws Exception {
-    boolean useRandomSampler = random().nextBoolean();
-    for (int partitionSize : partitionSizes) {
-      try {
-        initIndex(partitionSize);
-        // Get all of the documents and run the query, then do different
-        // facet counts and compare to control
-        Query q = new TermQuery(new Term(CONTENT_FIELD, BETA)); // 90% of the docs
-        ScoredDocIdCollector docCollector = ScoredDocIdCollector.create(indexReader.maxDoc(), false);
-        
-        FacetSearchParams expectedSearchParams = searchParamsWithRequests(K, partitionSize); 
-        FacetsCollector fc = new FacetsCollector(expectedSearchParams, indexReader, taxoReader);
-        
-        searcher.search(q, MultiCollector.wrap(docCollector, fc));
-        
-        List<FacetResult> expectedResults = fc.getFacetResults();
-        
-        FacetSearchParams samplingSearchParams = searchParamsWithRequests(K, partitionSize); 
-        
-        // try several times in case of failure, because the test has a chance to fail 
-        // if the top K facets are not sufficiently common with the sample set
-        for (int nTrial=0; nTrial<RETRIES; nTrial++) {
-          try {
-            // complement with sampling!
-            final Sampler sampler = createSampler(nTrial, docCollector.getScoredDocIDs(), useRandomSampler);
-            
-            assertSampling(expectedResults, q, sampler, samplingSearchParams, false);
-            assertSampling(expectedResults, q, sampler, samplingSearchParams, true);
-            
-            break; // succeeded
-          } catch (NotSameResultError e) {
-            if (nTrial>=RETRIES-1) {
-              throw e; // no more retries allowed, must fail
+import java.io.*;
+import java.nio.ByteBuffer;
+import java.nio.channels.WritableByteChannel;
+
+import org.apache.cassandra.io.sstable.Component;
+import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.io.util.RandomAccessReader;
+import org.apache.cassandra.streaming.FileStreamTask;
+import org.apache.cassandra.streaming.PendingFile;
+import org.apache.cassandra.utils.Pair;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.xerial.snappy.Snappy;
+
+public class CompressedRandomAccessReader extends RandomAccessReader
+{
+    private static final Logger logger = LoggerFactory.getLogger(CompressedRandomAccessReader.class);
+
+    /**
+     * Transfer sections of the file to the given target channel
+     * This method streams decompressed data so receiving party responsible for compression
+     *
+     * @param file The compressed file to transfer
+     * @param target Channel to transfer data into
+     *
+     * @throws IOException on any I/O error.
+     */
+    public static void transfer(PendingFile file, WritableByteChannel target) throws IOException
+    {
+        RandomAccessReader compressedFile = CompressedRandomAccessReader.open(file.getFilename(), true);
+
+        try
+        {
+            for (Pair<Long, Long> section : file.sections)
+            {
+                long length = section.right - section.left;
+
+                compressedFile.seek(section.left);
+
+                while (length > 0)
+                {
+                    int toRead = (length > FileStreamTask.CHUNK_SIZE) ? FileStreamTask.CHUNK_SIZE : (int) length;
+
+                    ByteBuffer buffer = compressedFile.readBytes(toRead);
+
+                    long bytesTransferred = 0;
+
+                    while (bytesTransferred < toRead)
+                    {
+                        // we don't need to re-read a buffer, it will write starting from buffer.position()
+                        long lastWrite = target.write(buffer);
+                        bytesTransferred += lastWrite;
+                        file.progress += lastWrite;
+                    }
+
+                    length -= bytesTransferred;
+
+                    if (logger.isDebugEnabled())
+                        logger.debug("Bytes transferred " + bytesTransferred + "/" + file.size);
+                }
             }
-          }
         }
-      } finally { 
-        closeAll();
-      }
+        finally
+        {
+            FileUtils.closeQuietly(compressedFile);
+        }
     }
-  }
-  
-  private void assertSampling(List<FacetResult> expected, Query q, Sampler sampler, FacetSearchParams params, boolean complement) throws Exception {
-    FacetsCollector samplingFC = samplingCollector(complement, sampler, params);
-    
-    searcher.search(q, samplingFC);
-    List<FacetResult> sampledResults = samplingFC.getFacetResults();
-    
-    assertSameResults(expected, sampledResults);
-  }
-  
-  private FacetsCollector samplingCollector(
-      final boolean complement,
-      final Sampler sampler,
-      FacetSearchParams samplingSearchParams) {
-    FacetsCollector samplingFC = new FacetsCollector(samplingSearchParams, indexReader, taxoReader) {
-      @Override
-      protected FacetsAccumulator initFacetsAccumulator(
-          FacetSearchParams facetSearchParams, IndexReader indexReader,
-          TaxonomyReader taxonomyReader) {
-        FacetsAccumulator acc = getSamplingAccumulator(sampler, taxonomyReader, indexReader, facetSearchParams);
-        acc.setComplementThreshold(complement ? FacetsAccumulator.FORCE_COMPLEMENT : FacetsAccumulator.DISABLE_COMPLEMENT);
-        return acc;
-      }
-    };
-    return samplingFC;
-  }
-  
-  private Sampler createSampler(int nTrial, ScoredDocIDs scoredDocIDs, boolean useRandomSampler) {
-    SamplingParams samplingParams = new SamplingParams();
-    
-    final double retryFactor = Math.pow(1.01, nTrial);
-    samplingParams.setSampleRatio(0.8 * retryFactor);
-    samplingParams.setMinSampleSize((int) (100 * retryFactor));
-    samplingParams.setMaxSampleSize((int) (10000 * retryFactor));
-    samplingParams.setOversampleFactor(5.0 * retryFactor);
 
-    samplingParams.setSampingThreshold(11000); //force sampling 
-    Sampler sampler = useRandomSampler ? 
-        new RandomSampler(samplingParams, new Random(random().nextLong())) :
-          new RepeatableSampler(samplingParams);
-    assertTrue("must enable sampling for this test!",sampler.shouldSample(scoredDocIDs));
-    return sampler;
-  }
+    /**
+     * Get metadata about given compressed file including uncompressed data length, chunk size
+     * and list of the chunk offsets of the compressed data.
+     *
+     * @param dataFilePath Path to the compressed file
+     *
+     * @return metadata about given compressed file.
+     */
+    public static CompressionMetadata metadata(String dataFilePath)
+    {
+        Descriptor desc = Descriptor.fromFilename(dataFilePath);
+
+        try
+        {
+            return new CompressionMetadata(desc.filenameFor(Component.COMPRESSION_INFO), new File(dataFilePath).length());
+        }
+        catch (IOException e)
+        {
+            throw new IOError(e);
+        }
+    }
+
+    public static RandomAccessReader open(String dataFilePath, boolean skipIOCache) throws IOException
+    {
+        return open(dataFilePath, metadata(dataFilePath), skipIOCache);
+    }
+
+    public static RandomAccessReader open(String dataFilePath, CompressionMetadata metadata) throws IOException
+    {
+        return open(dataFilePath, metadata, false);
+    }
+
+    public static RandomAccessReader open(String dataFilePath, CompressionMetadata metadata, boolean skipIOCache) throws IOException
+    {
+        return new CompressedRandomAccessReader(dataFilePath, metadata, skipIOCache);
+    }
+
+    private final CompressionMetadata metadata;
+    // used by reBuffer() to escape creating lots of temporary buffers
+    private final byte[] compressed;
+
+    private final FileInputStream source;
+
+    public CompressedRandomAccessReader(String dataFilePath, CompressionMetadata metadata, boolean skipIOCache) throws IOException
+    {
+        super(new File(dataFilePath), metadata.chunkLength, skipIOCache);
+        this.metadata = metadata;
+        compressed = new byte[metadata.chunkLength];
+        // can't use super.read(...) methods
+        // that is why we are allocating special InputStream to read data from disk
+        // from already open file descriptor
+        source = new FileInputStream(getFD());
+    }
+
+    @Override
+    protected void reBuffer() throws IOException
+    {
+        decompressChunk(metadata.chunkFor(current));
+    }
+
+    private void decompressChunk(CompressionMetadata.Chunk chunk) throws IOException
+    {
+        if (source.getChannel().position() != chunk.offset)
+            source.getChannel().position(chunk.offset);
+
+        if (source.read(compressed, 0, chunk.length) != chunk.length)
+            throw new IOException(String.format("(%s) failed to read %d bytes from offset %d.", getPath(), chunk.length, chunk.offset));
+
+        validBufferBytes = Snappy.rawUncompress(compressed, 0, chunk.length, buffer, 0);
+
+        // buffer offset is always aligned
+        bufferOffset = current & ~(buffer.length - 1);
+    }
+
+    @Override
+    public long length() throws IOException
+    {
+        return metadata.dataLength;
+    }
+
+    @Override
+    public String toString()
+    {
+        return String.format("%s - chunk length %d, data length %d.", getPath(), metadata.chunkLength, metadata.dataLength);
+    }
 }

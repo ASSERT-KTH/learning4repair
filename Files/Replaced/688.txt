@@ -1,108 +1,131 @@
-SSTableReader sstable = SSTableUtils.prepare().write(rows);
+public abstract ColumnIterator getSSTableColumnIterator(SSTableReader sstable);
 
+package org.apache.cassandra.db.filter;
 /*
-* Licensed to the Apache Software Foundation (ASF) under one
-* or more contributor license agreements.  See the NOTICE file
-* distributed with this work for additional information
-* regarding copyright ownership.  The ASF licenses this file
-* to you under the Apache License, Version 2.0 (the
-* "License"); you may not use this file except in compliance
-* with the License.  You may obtain a copy of the License at
-*
-*    http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing,
-* software distributed under the License is distributed on an
-* "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-* KIND, either express or implied.  See the License for the
-* specific language governing permissions and limitations
-* under the License.
-*/
-package org.apache.cassandra.db;
+ * 
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ * 
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ * 
+ */
 
-import java.net.InetAddress;
-import java.util.*;
 
-import org.apache.cassandra.Util;
+import java.io.IOException;
+import java.util.Comparator;
+import java.util.Iterator;
+import java.util.Arrays;
 
-import org.junit.Test;
-
-import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.io.sstable.SSTableReader;
-import org.apache.cassandra.io.sstable.SSTableUtils;
-import org.apache.cassandra.CleanupHelper;
-import org.apache.cassandra.utils.FBUtilities;
-import static junit.framework.Assert.assertEquals;
+import org.apache.cassandra.utils.ReducingIterator;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.marshal.AbstractType;
 
-public class LongCompactionSpeedTest extends CleanupHelper
+public abstract class QueryFilter
 {
-    public static final String TABLE1 = "Keyspace1";
-    public static final InetAddress LOCAL = FBUtilities.getLocalAddress();
+    public final String key;
+    public final QueryPath path;
 
-    /**
-     * Test compaction with a very wide row.
-     */
-    @Test
-    public void testCompactionWide() throws Exception
+    protected QueryFilter(String key, QueryPath path)
     {
-        testCompaction(2, 1, 200000);
+        this.key = key;
+        this.path = path;
     }
 
     /**
-     * Test compaction with lots of skinny rows.
+     * returns an iterator that returns columns from the given memtable
+     * matching the Filter criteria in sorted order.
      */
-    @Test
-    public void testCompactionSlim() throws Exception
+    public abstract ColumnIterator getMemColumnIterator(Memtable memtable, ColumnFamily cf, AbstractType comparator);
+
+    public ColumnIterator getMemColumnIterator(Memtable memtable, AbstractType comparator)
     {
-        testCompaction(2, 200000, 1);
+        return getMemColumnIterator(memtable, memtable.getColumnFamily(key), comparator);
     }
 
     /**
-     * Test compaction with lots of small sstables.
+     * returns an iterator that returns columns from the given SSTable
+     * matching the Filter criteria in sorted order.
      */
-    @Test
-    public void testCompactionMany() throws Exception
+    public abstract ColumnIterator getSSTableColumnIterator(SSTableReader sstable) throws IOException;
+
+    /**
+     * collects columns from reducedColumns into returnCF.  Termination is determined
+     * by the filter code, which should have some limit on the number of columns
+     * to avoid running out of memory on large rows.
+     */
+    public abstract void collectReducedColumns(IColumnContainer container, Iterator<IColumn> reducedColumns, int gcBefore);
+
+    /**
+     * subcolumns of a supercolumn are unindexed, so to pick out parts of those we operate in-memory.
+     * @param superColumn may be modified by filtering op.
+     */
+    public abstract SuperColumn filterSuperColumn(SuperColumn superColumn, int gcBefore);
+
+    public Comparator<IColumn> getColumnComparator(final AbstractType comparator)
     {
-        testCompaction(100, 800, 5);
-    }
-
-    protected void testCompaction(int sstableCount, int rowsPerSSTable, int colsPerRow) throws Exception
-    {
-        CompactionManager.instance.disableAutoCompaction();
-
-        Table table = Table.open(TABLE1);
-        ColumnFamilyStore store = table.getColumnFamilyStore("Standard1");
-
-        ArrayList<SSTableReader> sstables = new ArrayList<SSTableReader>();
-        for (int k = 0; k < sstableCount; k++)
+        return new Comparator<IColumn>()
         {
-            SortedMap<String,ColumnFamily> rows = new TreeMap<String,ColumnFamily>();
-            for (int j = 0; j < rowsPerSSTable; j++)
+            public int compare(IColumn c1, IColumn c2)
             {
-                String key = String.valueOf(j);
-                IColumn[] cols = new IColumn[colsPerRow];
-                for (int i = 0; i < colsPerRow; i++)
-                {
-                    // last sstable has highest timestamps
-                    cols[i] = Util.column(String.valueOf(i), String.valueOf(i), k);
-                }
-                rows.put(key, SSTableUtils.createCF(Long.MIN_VALUE, Integer.MIN_VALUE, cols));
+                return comparator.compare(c1.name(), c2.name());
             }
-            SSTableReader sstable = SSTableUtils.writeSSTable(rows);
-            sstables.add(sstable);
-            store.addSSTable(sstable);
-        }
+        };
+    }
+    
+    public void collectCollatedColumns(final ColumnFamily returnCF, Iterator<IColumn> collatedColumns, int gcBefore)
+    {
+        // define a 'reduced' iterator that merges columns w/ the same name, which
+        // greatly simplifies computing liveColumns in the presence of tombstones.
+        ReducingIterator<IColumn, IColumn> reduced = new ReducingIterator<IColumn, IColumn>(collatedColumns)
+        {
+            ColumnFamily curCF = returnCF.cloneMeShallow();
 
-        // give garbage collection a bit of time to catch up
-        Thread.sleep(1000);
+            protected boolean isEqual(IColumn o1, IColumn o2)
+            {
+                return Arrays.equals(o1.name(), o2.name());
+            }
 
-        long start = System.currentTimeMillis();
-        CompactionManager.instance.doCompaction(store, sstables, (int) (System.currentTimeMillis() / 1000) - DatabaseDescriptor.getCFMetaData(TABLE1, "Standard1").getGcGraceSeconds());
-        System.out.println(String.format("%s: sstables=%d rowsper=%d colsper=%d: %d ms",
-                                         this.getClass().getName(),
-                                         sstableCount,
-                                         rowsPerSSTable,
-                                         colsPerRow,
-                                         System.currentTimeMillis() - start));
+            public void reduce(IColumn current)
+            {
+                curCF.addColumn(current);
+            }
+
+            protected IColumn getReduced()
+            {
+                IColumn c = curCF.getSortedColumns().iterator().next();
+                curCF.clear();
+                return c;
+            }
+        };
+
+        collectReducedColumns(returnCF, reduced, gcBefore);
+    }
+
+    public String getColumnFamilyName()
+    {
+        return path.columnFamilyName;
+    }
+
+    public static boolean isRelevant(IColumn column, IColumnContainer container, int gcBefore)
+    {
+        // the column itself must be not gc-able (it is live, or a still relevant tombstone, or has live subcolumns), (1)
+        // and if its container is deleted, the column must be changed more recently than the container tombstone (2)
+        // (since otherwise, the only thing repair cares about is the container tombstone)
+        long maxChange = column.mostRecentLiveChangeAt();
+        return (!column.isMarkedForDelete() || column.getLocalDeletionTime() > gcBefore || maxChange > column.getMarkedForDeleteAt()) // (1)
+               && (!container.isMarkedForDelete() || maxChange > container.getMarkedForDeleteAt()); // (2)
     }
 }

@@ -1,14 +1,13 @@
-cachedScorer.doc = curDocs[curUpto];
-
-package org.apache.lucene.search;
+if (logger_.isDebugEnabled())
 
 /**
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -19,408 +18,328 @@ package org.apache.lucene.search;
  * limitations under the License.
  */
 
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.List;
+package org.apache.cassandra.cql.compiler.sem;
 
-import org.apache.lucene.index.IndexReader.AtomicReaderContext;
-import org.apache.lucene.util.RamUsageEstimator;
+import java.util.Map;
 
-/**
- * Caches all docs, and optionally also scores, coming from
- * a search, and is then able to replay them to another
- * collector.  You specify the max RAM this class may use.
- * Once the collection is done, call {@link #isCached}.  If
- * this returns true, you can use {@link #replay} against a
- * new collector.  If it returns false, this means too much
- * RAM was required and you must instead re-run the original
- * search.
- *
- * <p><b>NOTE</b>: this class consumes 4 (or 8 bytes, if
- * scoring is cached) per collected document.  If the result
- * set is large this can easily be a very substantial amount
- * of RAM!
- * 
- * <p><b>NOTE</b>: this class caches at least 128 documents
- * before checking RAM limits.
- * 
- * <p>See the Lucene <tt>modules/grouping</tt> module for more
- * details including a full code example.</p>
- *
- * @lucene.experimental
- */
-public abstract class CachingCollector extends Collector {
-  
-  // Max out at 512K arrays
-  private static final int MAX_ARRAY_SIZE = 512 * 1024;
-  private static final int INITIAL_ARRAY_SIZE = 128;
-  private final static int[] EMPTY_INT_ARRAY = new int[0];
+import org.antlr.runtime.tree.CommonTree;
 
-  private static class SegStart {
-    public final AtomicReaderContext readerContext;
-    public final int end;
+import org.apache.cassandra.cql.common.*;
+import org.apache.cassandra.cql.compiler.common.*;
+import org.apache.cassandra.cql.compiler.parse.*;
 
-    public SegStart(AtomicReaderContext readerContext, int end) {
-      this.readerContext = readerContext;
-      this.end = end;
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql.common.ColumnMapExpr;
+import org.apache.cassandra.cql.common.ColumnRangeQueryRSD;
+import org.apache.cassandra.cql.common.ConstantOperand;
+import org.apache.cassandra.cql.common.ExplainPlan;
+import org.apache.cassandra.cql.common.OperandDef;
+import org.apache.cassandra.cql.common.Pair;
+import org.apache.cassandra.cql.common.Plan;
+import org.apache.cassandra.cql.common.QueryPlan;
+import org.apache.cassandra.cql.common.RowSourceDef;
+import org.apache.cassandra.cql.common.SetColumnMap;
+import org.apache.cassandra.cql.common.SetSuperColumnMap;
+import org.apache.cassandra.cql.common.SetUniqueKey;
+import org.apache.cassandra.cql.common.SuperColumnMapExpr;
+import org.apache.cassandra.cql.common.SuperColumnRangeQueryRSD;
+import org.apache.cassandra.cql.common.UniqueKeyQueryRSD;
+import org.apache.cassandra.cql.common.Utils;
+import org.apache.cassandra.cql.compiler.common.CompilerErrorMsg;
+import org.apache.cassandra.cql.compiler.parse.CqlParser;
+import org.apache.log4j.Logger;
+
+//
+// Note: This class is CQL related work in progress.
+//
+// Currently, this phase combines both semantic analysis and code-gen.
+// I expect that as my ideas get refined/cleared up, I'll be drawing
+// a more clear distinction between semantic analysis phase and code-gen.
+//
+public class SemanticPhase
+{
+    private final static Logger logger_ = Logger.getLogger(SemanticPhase.class);    
+
+    // Current code-gen also happens in this phase!
+    public static Plan doSemanticAnalysis(CommonTree ast) throws SemanticException
+    {
+        Plan plan = null;
+
+        logger_.debug("AST: " + ast.toStringTree());
+
+        switch (ast.getType())
+        {
+        case CqlParser.A_GET:
+            plan = compileGet(ast);
+            break;
+        case CqlParser.A_SET:
+            plan = compileSet(ast);
+            break;
+        case CqlParser.A_DELETE:
+            compileDelete(ast);
+            break;
+        case CqlParser.A_SELECT:
+            compileSelect(ast);
+            break;
+        case CqlParser.A_EXPLAIN_PLAN:
+            // Case: EXPLAN PLAN <stmt>
+            // first, generate a plan for <stmt>
+            // and then, wrapper it with a special ExplainPlan plan
+            // whose execution will result in an explain plan rather
+            // than a normal execution of the statement.
+            plan = doSemanticAnalysis((CommonTree)(ast.getChild(0)));
+            plan = new ExplainPlan(plan);
+            break;
+        default:
+            // Unhandled AST node. Raise an internal error. 
+            throw new SemanticException(CompilerErrorMsg.INTERNAL_ERROR.getMsg(ast, "Unknown Node Type: " + ast.getType()));
+        }
+        return plan;
     }
-  }
-  
-  private static final class CachedScorer extends Scorer {
-    
-    // NOTE: these members are package-private b/c that way accessing them from
-    // the outer class does not incur access check by the JVM. The same
-    // situation would be if they were defined in the outer class as private
-    // members.
-    int doc;
-    float score;
-    
-    private CachedScorer() { super(null); }
 
-    @Override
-    public final float score() { return score; }
-    
-    @Override
-    public final int advance(int target) { throw new UnsupportedOperationException(); }
-    
-    @Override
-    public final int docID() { return doc; }
-    
-    @Override
-    public final float freq() { throw new UnsupportedOperationException(); }
-    
-    @Override
-    public final int nextDoc() { throw new UnsupportedOperationException(); }
-    }
+    /** 
+     * Given a CommonTree AST node of type, A_COLUMN_ACCESS related functions, do semantic
+     * checking to ensure table name, column family name, and number of key dimensions
+     * specified are all valid. 
+     */
+    private static CFMetaData getColumnFamilyInfo(CommonTree ast) throws SemanticException
+    {
+        assert(ast.getType() == CqlParser.A_COLUMN_ACCESS);
 
-  // A CachingCollector which caches scores
-  private static final class ScoreCachingCollector extends CachingCollector {
+        CommonTree columnFamilyNode = (CommonTree)(ast.getChild(1)); 
+        CommonTree tableNode = (CommonTree)(ast.getChild(0));
 
-    private final CachedScorer cachedScorer;
-    private final List<float[]> cachedScores;
+        String columnFamily = columnFamilyNode.getText();
+        String table = tableNode.getText();
 
-    private Scorer scorer;
-    private float[] curScores;
-
-    ScoreCachingCollector(Collector other, double maxRAMMB) {
-      super(other, maxRAMMB, true);
-
-      cachedScorer = new CachedScorer();
-      cachedScores = new ArrayList<float[]>();
-      curScores = new float[128];
-      cachedScores.add(curScores);
-    }
-    
-    @Override
-    public void collect(int doc) throws IOException {
-
-      if (curDocs == null) {
-        // Cache was too large
-        cachedScorer.score = scorer.score();
-        cachedScorer.doc = doc;
-        other.collect(doc);
-        return;
-      }
-
-      // Allocate a bigger array or abort caching
-      if (upto == curDocs.length) {
-        base += upto;
-        
-        // Compute next array length - don't allocate too big arrays
-        int nextLength = 8*curDocs.length;
-        if (nextLength > MAX_ARRAY_SIZE) {
-          nextLength = MAX_ARRAY_SIZE;
+        Map<String, CFMetaData> columnFamilies = DatabaseDescriptor.getTableMetaData(table);
+        if (columnFamilies == null)
+        {
+            throw new SemanticException(CompilerErrorMsg.INVALID_TABLE.getMsg(ast, table));
         }
 
-        if (base + nextLength > maxDocsToCache) {
-          // try to allocate a smaller array
-          nextLength = maxDocsToCache - base;
-          if (nextLength <= 0) {
-            // Too many docs to collect -- clear cache
-            curDocs = null;
-            curScores = null;
-            cachedSegs.clear();
-            cachedDocs.clear();
-            cachedScores.clear();
-            cachedScorer.score = scorer.score();
-            cachedScorer.doc = doc;
-            other.collect(doc);
-            return;
-          }
+        CFMetaData cfMetaData = columnFamilies.get(columnFamily);
+        if (cfMetaData == null)
+        {
+            throw new SemanticException(CompilerErrorMsg.INVALID_COLUMN_FAMILY.getMsg(ast, columnFamily, table));
         }
-        
-        curDocs = new int[nextLength];
-        cachedDocs.add(curDocs);
-        curScores = new float[nextLength];
-        cachedScores.add(curScores);
-        upto = 0;
-      }
-      
-      curDocs[upto] = doc;
-      cachedScorer.score = curScores[upto] = scorer.score();
-      upto++;
-      cachedScorer.doc = doc;
-      other.collect(doc);
-    }
 
-    @Override
-    public void replay(Collector other) throws IOException {
-      replayInit(other);
-      
-      int curUpto = 0;
-      int curBase = 0;
-      int chunkUpto = 0;
-      other.setScorer(cachedScorer);
-      curDocs = EMPTY_INT_ARRAY;
-      for (SegStart seg : cachedSegs) {
-        other.setNextReader(seg.readerContext);
-        while (curBase + curUpto < seg.end) {
-          if (curUpto == curDocs.length) {
-            curBase += curDocs.length;
-            curDocs = cachedDocs.get(chunkUpto);
-            curScores = cachedScores.get(chunkUpto);
-            chunkUpto++;
-            curUpto = 0;
-          }
-          cachedScorer.score = curScores[curUpto];
-          other.collect(curDocs[curUpto++]);
+        // Once you have drilled down to a row using a rowKey, a super column
+        // map can be indexed only 2 further levels deep; and a column map may
+        // be indexed up to 1 level deep.
+        int dimensions = numColumnDimensions(ast);
+        if (("Super".equals(cfMetaData.columnType) && (dimensions > 2)) ||
+            ("Standard".equals(cfMetaData.columnType) && dimensions > 1))
+        {
+            throw new SemanticException(CompilerErrorMsg.TOO_MANY_DIMENSIONS.getMsg(ast, cfMetaData.columnType));
         }
-      }
+
+        return cfMetaData; 
     }
 
-    @Override
-    public void setScorer(Scorer scorer) throws IOException {
-      this.scorer = scorer;
-      other.setScorer(cachedScorer);
+    private static String getRowKey(CommonTree ast)
+    {
+        assert(ast.getType() == CqlParser.A_COLUMN_ACCESS);
+        return Utils.unescapeSQLString(ast.getChild(2).getText());
     }
 
-    @Override
-    public String toString() {
-      if (isCached()) {
-        return "CachingCollector (" + (base+upto) + " docs & scores cached)";
-      } else {
-        return "CachingCollector (cache was cleared)";
-      }
+    private static int numColumnDimensions(CommonTree ast)
+    {
+        // Skip over table name, column family and rowKey
+        return ast.getChildCount() - 3;
     }
 
-  }
+    // Returns the pos'th (0-based index) column specifier in the astNode
+    private static String getColumn(CommonTree ast, int pos)
+    {
+        // Skip over table name, column family and rowKey
+        return Utils.unescapeSQLString(ast.getChild(pos + 3).getText()); 
+    }
 
-  // A CachingCollector which does not cache scores
-  private static final class NoScoreCachingCollector extends CachingCollector {
+    // Compile a GET statement
+    private static Plan compileGet(CommonTree ast) throws SemanticException
+    {
+        int childCount = ast.getChildCount();
+        assert(childCount == 1);
+
+        CommonTree columnFamilySpec = (CommonTree)ast.getChild(0);
+        assert(columnFamilySpec.getType() == CqlParser.A_COLUMN_ACCESS);
+
+        CFMetaData cfMetaData = getColumnFamilyInfo(columnFamilySpec);
+        ConstantOperand rowKey = new ConstantOperand(getRowKey(columnFamilySpec));
+        int dimensionCnt = numColumnDimensions(columnFamilySpec);
+
+        RowSourceDef rwsDef;
+        if ("Super".equals(cfMetaData.columnType))
+        {
+            if (dimensionCnt > 2)
+            {
+                // We don't expect this case to arise, since Cql.g grammar disallows this.
+                // therefore, raise this case as an "internal error".
+                throw new SemanticException(CompilerErrorMsg.INTERNAL_ERROR.getMsg(columnFamilySpec));
+            }
+
+            if (dimensionCnt == 2)
+            {
+                // Case: table.super_cf[<rowKey>][<superColumnKey>][<columnKey>]
+                ConstantOperand superColumnKey = new ConstantOperand(getColumn(columnFamilySpec, 0));                
+                ConstantOperand columnKey = new ConstantOperand(getColumn(columnFamilySpec, 1));
+                rwsDef = new UniqueKeyQueryRSD(cfMetaData, rowKey, superColumnKey, columnKey);
+            }
+            else if (dimensionCnt == 1)
+            {
+                // Case: table.super_cf[<rowKey>][<superColumnKey>]
+                ConstantOperand superColumnKey = new ConstantOperand(getColumn(columnFamilySpec, 0));                
+                rwsDef = new ColumnRangeQueryRSD(cfMetaData, rowKey, superColumnKey, Integer.MAX_VALUE);
+            }
+            else
+            {
+                // Case: table.super_cf[<rowKey>]             
+                rwsDef = new SuperColumnRangeQueryRSD(cfMetaData, rowKey, Integer.MAX_VALUE);
+            }
+        }
+        else  // Standard Column Family
+        {
+            if (dimensionCnt == 1)
+            {
+                // Case: table.standard_cf[<rowKey>][<columnKey>]
+                ConstantOperand columnKey = new ConstantOperand(getColumn(columnFamilySpec, 0));
+                rwsDef = new UniqueKeyQueryRSD(cfMetaData, rowKey, columnKey);
+            }
+            else
+            {
+                // Case: table.standard_cf[<rowKey>]
+                logger_.assertLog((dimensionCnt == 0), "invalid dimensionCnt: " + dimensionCnt);
+                rwsDef = new ColumnRangeQueryRSD(cfMetaData, rowKey, Integer.MAX_VALUE);
+            }
+        }
+        return new QueryPlan(rwsDef);
+    }
     
-    NoScoreCachingCollector(Collector other, double maxRAMMB) {
-     super(other, maxRAMMB, false);
-    }
-    
-    @Override
-    public void collect(int doc) throws IOException {
+    private static OperandDef  getSimpleExpr(CommonTree ast) throws SemanticException
+    {
+        int type = ast.getType();
 
-      if (curDocs == null) {
-        // Cache was too large
-        other.collect(doc);
-        return;
-      }
-
-      // Allocate a bigger array or abort caching
-      if (upto == curDocs.length) {
-        base += upto;
-        
-        // Compute next array length - don't allocate too big arrays
-        int nextLength = 8*curDocs.length;
-        if (nextLength > MAX_ARRAY_SIZE) {
-          nextLength = MAX_ARRAY_SIZE;
+        // for now, the only simple expressions support are of string type
+        if (type != CqlParser.StringLiteral)
+        {
+            throw new SemanticException(CompilerErrorMsg.INVALID_TYPE.getMsg(ast));
         }
+        return new ConstantOperand(Utils.unescapeSQLString(ast.getText()));
+    }
 
-        if (base + nextLength > maxDocsToCache) {
-          // try to allocate a smaller array
-          nextLength = maxDocsToCache - base;
-          if (nextLength <= 0) {
-            // Too many docs to collect -- clear cache
-            curDocs = null;
-            cachedSegs.clear();
-            cachedDocs.clear();
-            other.collect(doc);
-            return;
-          }
+    private static ColumnMapExpr getColumnMapExpr(CommonTree ast) throws SemanticException
+    {
+        int type = ast.getType();
+        if (type != CqlParser.A_COLUMN_MAP_VALUE)
+        {
+            throw new SemanticException(CompilerErrorMsg.INVALID_TYPE.getMsg(ast));
         }
         
-        curDocs = new int[nextLength];
-        cachedDocs.add(curDocs);
-        upto = 0;
-      }
-      
-      curDocs[upto] = doc;
-      upto++;
-      other.collect(doc);
-    }
+        int size = ast.getChildCount();
+        ColumnMapExpr result = new ColumnMapExpr();
+        for (int idx = 0; idx < size; idx++)
+        {
+            CommonTree entryNode = (CommonTree)(ast.getChild(idx));
+            OperandDef columnKey   = getSimpleExpr((CommonTree)(entryNode.getChild(0)));
+            OperandDef columnValue = getSimpleExpr((CommonTree)(entryNode.getChild(1)));            
 
-    @Override
-    public void replay(Collector other) throws IOException {
-      replayInit(other);
-      
-      int curUpto = 0;
-      int curbase = 0;
-      int chunkUpto = 0;
-      curDocs = EMPTY_INT_ARRAY;
-      for (SegStart seg : cachedSegs) {
-        other.setNextReader(seg.readerContext);
-        while (curbase + curUpto < seg.end) {
-          if (curUpto == curDocs.length) {
-            curbase += curDocs.length;
-            curDocs = cachedDocs.get(chunkUpto);
-            chunkUpto++;
-            curUpto = 0;
-          }
-          other.collect(curDocs[curUpto++]);
+            Pair<OperandDef, OperandDef> entry = new Pair<OperandDef, OperandDef>(columnKey, columnValue);
+            result.add(entry);
         }
-      }
+        return result;
     }
 
-    @Override
-    public void setScorer(Scorer scorer) throws IOException {
-      other.setScorer(scorer);
+    private static SuperColumnMapExpr getSuperColumnMapExpr(CommonTree ast) throws SemanticException
+    {
+        int type = ast.getType();        
+        if (type != CqlParser.A_SUPERCOLUMN_MAP_VALUE)
+        {
+            throw new SemanticException(CompilerErrorMsg.INVALID_TYPE.getMsg(ast));
+        }
+        int size = ast.getChildCount();
+        SuperColumnMapExpr result = new SuperColumnMapExpr();
+        for (int idx = 0; idx < size; idx++)
+        {
+            CommonTree entryNode = (CommonTree)(ast.getChild(idx));
+            OperandDef    superColumnKey = getSimpleExpr((CommonTree)(entryNode.getChild(0)));
+            ColumnMapExpr columnMapExpr  = getColumnMapExpr((CommonTree)(entryNode.getChild(1)));            
+
+            Pair<OperandDef, ColumnMapExpr> entry = new Pair<OperandDef, ColumnMapExpr>(superColumnKey, columnMapExpr);
+            result.add(entry);
+        }
+        return result;
     }
 
-    @Override
-    public String toString() {
-      if (isCached()) {
-        return "CachingCollector (" + (base+upto) + " docs cached)";
-      } else {
-        return "CachingCollector (cache was cleared)";
-      }
+    // compile a SET statement
+    private static Plan compileSet(CommonTree ast) throws SemanticException
+    {
+        int childCount = ast.getChildCount();
+        assert(childCount == 2);
+
+        CommonTree columnFamilySpec = (CommonTree)ast.getChild(0);
+        assert(columnFamilySpec.getType() == CqlParser.A_COLUMN_ACCESS);
+
+        CFMetaData cfMetaData = getColumnFamilyInfo(columnFamilySpec);
+        ConstantOperand rowKey = new ConstantOperand(getRowKey(columnFamilySpec));
+        int dimensionCnt = numColumnDimensions(columnFamilySpec);
+
+        CommonTree  valueNode = (CommonTree)(ast.getChild(1));
+
+        Plan plan = null;
+        if ("Super".equals(cfMetaData.columnType))
+        {
+            if (dimensionCnt == 2)
+            {
+                // Case: set table.super_cf['key']['supercolumn']['column'] = 'value'
+                OperandDef value = getSimpleExpr(valueNode);
+                ConstantOperand superColumnKey = new ConstantOperand(getColumn(columnFamilySpec, 0));
+                ConstantOperand columnKey = new ConstantOperand(getColumn(columnFamilySpec, 1));
+                plan = new SetUniqueKey(cfMetaData, rowKey, superColumnKey, columnKey, value);
+            }
+            else if (dimensionCnt == 1)
+            {
+                // Case: set table.super_cf['key']['supercolumn'] = <column_map>;
+                ColumnMapExpr columnMapExpr = getColumnMapExpr(valueNode);                
+                ConstantOperand superColumnKey = new ConstantOperand(getColumn(columnFamilySpec, 0));
+                plan = new SetColumnMap(cfMetaData, rowKey, superColumnKey, columnMapExpr);
+            }
+            else
+            {
+                // Case: set table.super_cf['key'] = <super_column_map>;
+                logger_.assertLog(dimensionCnt == 0, "invalid dimensionCnt: " + dimensionCnt);
+                SuperColumnMapExpr superColumnMapExpr = getSuperColumnMapExpr(valueNode);                
+                plan = new SetSuperColumnMap(cfMetaData, rowKey, superColumnMapExpr);
+            }
+        }
+        else  // Standard column family
+        {
+            if (dimensionCnt == 1)
+            {
+                // Case: set table.standard_cf['key']['column'] = 'value'
+                OperandDef value = getSimpleExpr(valueNode);                
+                ConstantOperand columnKey = new ConstantOperand(getColumn(columnFamilySpec, 0));
+                plan = new SetUniqueKey(cfMetaData, rowKey, columnKey, value);
+            } 
+            else
+            {
+                // Case: set table.standard_cf['key'] = <column_map>;
+                logger_.assertLog(dimensionCnt == 0, "invalid dimensionCnt: " + dimensionCnt);
+                ColumnMapExpr columnMapExpr = getColumnMapExpr(valueNode);                
+                plan = new SetColumnMap(cfMetaData, rowKey, columnMapExpr);
+            }
+        }
+        return plan;
     }
 
-  }
-
-  // TODO: would be nice if a collector defined a
-  // needsScores() method so we can specialize / do checks
-  // up front. This is only relevant for the ScoreCaching
-  // version -- if the wrapped Collector does not need
-  // scores, it can avoid cachedScorer entirely.
-  protected final Collector other;
-  
-  protected final int maxDocsToCache;
-  protected final List<SegStart> cachedSegs = new ArrayList<SegStart>();
-  protected final List<int[]> cachedDocs;
-  
-  private AtomicReaderContext lastReaderContext;
-  
-  protected int[] curDocs;
-  protected int upto;
-  protected int base;
-  protected int lastDocBase;
-  
-  /**
-   * Creates a {@link CachingCollector} which does not wrap another collector.
-   * The cached documents and scores can later be {@link #replay(Collector)
-   * replayed}.
-   * 
-   * @param acceptDocsOutOfOrder
-   *          whether documents are allowed to be collected out-of-order
-   */
-  public static CachingCollector create(final boolean acceptDocsOutOfOrder, boolean cacheScores, double maxRAMMB) {
-    Collector other = new Collector() {
-      @Override
-      public boolean acceptsDocsOutOfOrder() {
-        return acceptDocsOutOfOrder;
-      }
-      
-      @Override
-      public void setScorer(Scorer scorer) throws IOException {}
-
-      @Override
-      public void collect(int doc) throws IOException {}
-
-      @Override
-      public void setNextReader(AtomicReaderContext context) throws IOException {}
-
-    };
-    return create(other, cacheScores, maxRAMMB);
-  }
-
-  /**
-   * Create a new {@link CachingCollector} that wraps the given collector and
-   * caches documents and scores up to the specified RAM threshold.
-   * 
-   * @param other
-   *          the Collector to wrap and delegate calls to.
-   * @param cacheScores
-   *          whether to cache scores in addition to document IDs. Note that
-   *          this increases the RAM consumed per doc
-   * @param maxRAMMB
-   *          the maximum RAM in MB to consume for caching the documents and
-   *          scores. If the collector exceeds the threshold, no documents and
-   *          scores are cached.
-   */
-  public static CachingCollector create(Collector other, boolean cacheScores, double maxRAMMB) {
-    return cacheScores ? new ScoreCachingCollector(other, maxRAMMB) : new NoScoreCachingCollector(other, maxRAMMB);
+    private static void compileSelect(CommonTree ast) throws SemanticException
+    {
+        // stub; tbd.
     }
-  
-  // Prevent extension from non-internal classes
-  private CachingCollector(Collector other, double maxRAMMB, boolean cacheScores) {
-    this.other = other;
-    
-    cachedDocs = new ArrayList<int[]>();
-    curDocs = new int[INITIAL_ARRAY_SIZE];
-    cachedDocs.add(curDocs);
-
-    int bytesPerDoc = RamUsageEstimator.NUM_BYTES_INT;
-    if (cacheScores) {
-      bytesPerDoc += RamUsageEstimator.NUM_BYTES_FLOAT;
+    private static void compileDelete(CommonTree ast) throws SemanticException
+    {
+        // stub; tbd.
     }
-    maxDocsToCache = (int) ((maxRAMMB * 1024 * 1024) / bytesPerDoc);
-  }
-  
-  @Override
-  public boolean acceptsDocsOutOfOrder() {
-    return other.acceptsDocsOutOfOrder();
-  }
-
-  public boolean isCached() {
-    return curDocs != null;
-  }
-
-  @Override  
-  public void setNextReader(AtomicReaderContext context) throws IOException {
-    other.setNextReader(context);
-    if (lastReaderContext != null) {
-      cachedSegs.add(new SegStart(lastReaderContext, base+upto));
-    }
-    lastReaderContext = context;
-  }
-
-  /** Reused by the specialized inner classes. */
-  void replayInit(Collector other) {
-    if (!isCached()) {
-      throw new IllegalStateException("cannot replay: cache was cleared because too much RAM was required");
-    }
-    
-    if (!other.acceptsDocsOutOfOrder() && this.other.acceptsDocsOutOfOrder()) {
-      throw new IllegalArgumentException(
-          "cannot replay: given collector does not support "
-              + "out-of-order collection, while the wrapped collector does. "
-              + "Therefore cached documents may be out-of-order.");
-    }
-    
-    //System.out.println("CC: replay totHits=" + (upto + base));
-    if (lastReaderContext != null) {
-      cachedSegs.add(new SegStart(lastReaderContext, base+upto));
-      lastReaderContext = null;
-    }
-  }
-
-  /**
-   * Replays the cached doc IDs (and scores) to the given Collector. If this
-   * instance does not cache scores, then Scorer is not set on
-   * {@code other.setScorer} as well as scores are not replayed.
-   * 
-   * @throws IllegalStateException
-   *           if this collector is not cached (i.e., if the RAM limits were too
-   *           low for the number of documents + scores to cache).
-   * @throws IllegalArgumentException
-   *           if the given Collect's does not support out-of-order collection,
-   *           while the collector passed to the ctor does.
-   */
-  public abstract void replay(Collector other) throws IOException;
-  
 }
+ No newline at end of file

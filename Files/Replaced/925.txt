@@ -1,13 +1,13 @@
-//if (maxscore > 1.0f) doc.score /= maxscore;   // normalize scores
-
-package org.apache.lucene.search;
+void clearUnsafe()
 
 /**
- * Copyright 2004 The Apache Software Foundation
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,339 +18,381 @@ package org.apache.lucene.search;
  * limitations under the License.
  */
 
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.util.PriorityQueue;
+package org.apache.cassandra.db;
 
 import java.io.IOException;
-import java.util.WeakHashMap;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Locale;
-import java.text.Collator;
+import java.util.*;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import org.apache.commons.collections.comparators.ReverseComparator;
+import org.apache.commons.lang.ArrayUtils;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.io.DataOutputBuffer;
+import org.apache.cassandra.io.SSTable;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.BloomFilter;
+import org.apache.cassandra.utils.DestructivePQIterator;
+import org.apache.log4j.Logger;
 
 /**
- * Expert: A hit queue for sorting by hits by terms in more than one field.
- * Uses <code>FieldCache.DEFAULT</code> for maintaining internal term lookup tables.
- *
- * <p>Created: Dec 8, 2003 12:56:03 PM
- *
- * @author  Tim Jones (Nacimiento Software)
- * @since   lucene 1.4
- * @version $Id$
- * @see Searcher#search(Query,Filter,int,Sort)
- * @see FieldCache
+ * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
  */
-class FieldSortedHitQueue
-extends PriorityQueue {
 
-  /**
-   * Creates a hit queue sorted by the given list of fields.
-   * @param reader  Index to use.
-   * @param fields Field names, in priority order (highest priority first).  Cannot be <code>null</code> or empty.
-   * @param size  The number of hits to retain.  Must be greater than zero.
-   * @throws IOException
-   */
-  FieldSortedHitQueue (IndexReader reader, SortField[] fields, int size)
-  throws IOException {
-    final int n = fields.length;
-    comparators = new ScoreDocComparator[n];
-    this.fields = new SortField[n];
-    for (int i=0; i<n; ++i) {
-      String fieldname = fields[i].getField();
-      comparators[i] = getCachedComparator (reader, fieldname, fields[i].getType(), fields[i].getLocale(), fields[i].getFactory());
-      this.fields[i] = new SortField (fieldname, comparators[i].sortType(), fields[i].getReverse());
+public class Memtable implements Comparable<Memtable>
+{
+	private static Logger logger_ = Logger.getLogger( Memtable.class );
+
+    private boolean isFrozen_;
+    private volatile boolean isDirty_;
+    private volatile boolean isFlushed_; // for tests, in particular forceBlockingFlush asserts this
+
+    private int threshold_ = DatabaseDescriptor.getMemtableSize()*1024*1024;
+    private int thresholdCount_ = (int)(DatabaseDescriptor.getMemtableObjectCount()*1024*1024);
+    private AtomicInteger currentSize_ = new AtomicInteger(0);
+    private AtomicInteger currentObjectCount_ = new AtomicInteger(0);
+
+    /* Table and ColumnFamily name are used to determine the ColumnFamilyStore */
+    private String table_;
+    private String cfName_;
+    /* Creation time of this Memtable */
+    private long creationTime_;
+    private Map<String, ColumnFamily> columnFamilies_ = new HashMap<String, ColumnFamily>();
+    /* Lock and Condition for notifying new clients about Memtable switches */
+
+    Memtable(String table, String cfName)
+    {
+        table_ = table;
+        cfName_ = cfName;
+        creationTime_ = System.currentTimeMillis();
     }
-    initialize (size);
-  }
 
-
-  /** Stores a comparator corresponding to each field being sorted by */
-  protected ScoreDocComparator[] comparators;
-
-  /** Stores the sort criteria being used. */
-  protected SortField[] fields;
-
-  /** Stores the maximum score value encountered, needed for normalizing. */
-  protected float maxscore = Float.NEGATIVE_INFINITY;
-
-  /** returns the maximum score encountered by elements inserted via insert()
-   */
-  public float getMaxScore() {
-    return maxscore;
-  }
-
-  // The signature of this method takes a FieldDoc in order to avoid
-  // the unneeded cast to retrieve the score.
-  // inherit javadoc
-  public boolean insert(FieldDoc fdoc) {
-    maxscore = Math.max(maxscore,fdoc.score);
-    return super.insert(fdoc);
-  }
-
-  // This overrides PriorityQueue.insert() so that insert(FieldDoc) that
-  // keeps track of the score isn't accidentally bypassed.  
-  // inherit javadoc
-  public boolean insert(Object fdoc) {
-    return insert((FieldDoc)fdoc);
-  }
-
-  /**
-   * Returns whether <code>a</code> is less relevant than <code>b</code>.
-   * @param a ScoreDoc
-   * @param b ScoreDoc
-   * @return <code>true</code> if document <code>a</code> should be sorted after document <code>b</code>.
-   */
-  protected boolean lessThan (final Object a, final Object b) {
-    final ScoreDoc docA = (ScoreDoc) a;
-    final ScoreDoc docB = (ScoreDoc) b;
-
-    // run comparators
-    final int n = comparators.length;
-    int c = 0;
-    for (int i=0; i<n && c==0; ++i) {
-      c = (fields[i].reverse) ? comparators[i].compare (docB, docA)
-                              : comparators[i].compare (docA, docB);
+    public boolean isFlushed()
+    {
+        return isFlushed_;
     }
-    // avoid random sort order that could lead to duplicates (bug #31241):
-    if (c == 0)
-      return docA.doc > docB.doc;
-    return c > 0;
-  }
 
-
-  /**
-   * Given a FieldDoc object, stores the values used
-   * to sort the given document.  These values are not the raw
-   * values out of the index, but the internal representation
-   * of them.  This is so the given search hit can be collated
-   * by a MultiSearcher with other search hits.
-   * @param  doc  The FieldDoc to store sort values into.
-   * @return  The same FieldDoc passed in.
-   * @see Searchable#search(Weight,Filter,int,Sort)
-   */
-  FieldDoc fillFields (final FieldDoc doc) {
-    final int n = comparators.length;
-    final Comparable[] fields = new Comparable[n];
-    for (int i=0; i<n; ++i)
-      fields[i] = comparators[i].sortValue(doc);
-    doc.fields = fields;
-    if (maxscore > 1.0f) doc.score /= maxscore;   // normalize scores
-    return doc;
-  }
-
-
-  /** Returns the SortFields being used by this hit queue. */
-  SortField[] getFields() {
-    return fields;
-  }
-
-  /** Internal cache of comparators. Similar to FieldCache, only
-   *  caches comparators instead of term values. */
-  static final Map Comparators = new WeakHashMap();
-
-  /** Returns a comparator if it is in the cache. */
-  static ScoreDocComparator lookup (IndexReader reader, String field, int type, Object factory) {
-    FieldCacheImpl.Entry entry = (factory != null)
-      ? new FieldCacheImpl.Entry (field, factory)
-      : new FieldCacheImpl.Entry (field, type);
-    synchronized (Comparators) {
-      HashMap readerCache = (HashMap)Comparators.get(reader);
-      if (readerCache == null) return null;
-      return (ScoreDocComparator) readerCache.get (entry);
+    /**
+     * Compares two Memtable based on creation time.
+     * @param rhs Memtable to compare to.
+     * @return a negative integer, zero, or a positive integer as this object
+     * is less than, equal to, or greater than the specified object.
+     */
+    public int compareTo(Memtable rhs)
+    {
+    	long diff = creationTime_ - rhs.creationTime_;
+    	if ( diff > 0 )
+    		return 1;
+    	else if ( diff < 0 )
+    		return -1;
+    	else
+    		return 0;
     }
-  }
 
-  /** Stores a comparator into the cache. */
-  static Object store (IndexReader reader, String field, int type, Object factory, Object value) {
-    FieldCacheImpl.Entry entry = (factory != null)
-      ? new FieldCacheImpl.Entry (field, factory)
-      : new FieldCacheImpl.Entry (field, type);
-    synchronized (Comparators) {
-      HashMap readerCache = (HashMap)Comparators.get(reader);
-      if (readerCache == null) {
-        readerCache = new HashMap();
-        Comparators.put(reader,readerCache);
-      }
-      return readerCache.put (entry, value);
+    public int getCurrentSize()
+    {
+        return currentSize_.get();
     }
-  }
-
-  static ScoreDocComparator getCachedComparator (IndexReader reader, String fieldname, int type, Locale locale, SortComparatorSource factory)
-  throws IOException {
-    if (type == SortField.DOC) return ScoreDocComparator.INDEXORDER;
-    if (type == SortField.SCORE) return ScoreDocComparator.RELEVANCE;
-    ScoreDocComparator comparator = lookup (reader, fieldname, type, factory);
-    if (comparator == null) {
-      switch (type) {
-        case SortField.AUTO:
-          comparator = comparatorAuto (reader, fieldname);
-          break;
-        case SortField.INT:
-          comparator = comparatorInt (reader, fieldname);
-          break;
-        case SortField.FLOAT:
-          comparator = comparatorFloat (reader, fieldname);
-          break;
-        case SortField.STRING:
-          if (locale != null) comparator = comparatorStringLocale (reader, fieldname, locale);
-          else comparator = comparatorString (reader, fieldname);
-          break;
-        case SortField.CUSTOM:
-          comparator = factory.newComparator (reader, fieldname);
-          break;
-        default:
-          throw new RuntimeException ("unknown field type: "+type);
-      }
-      store (reader, fieldname, type, factory, comparator);
+    
+    public int getCurrentObjectCount()
+    {
+        return currentObjectCount_.get();
     }
-    return comparator;
-  }
 
-  /**
-   * Returns a comparator for sorting hits according to a field containing integers.
-   * @param reader  Index to use.
-   * @param fieldname  Field containg integer values.
-   * @return  Comparator for sorting hits.
-   * @throws IOException If an error occurs reading the index.
-   */
-  static ScoreDocComparator comparatorInt (final IndexReader reader, final String fieldname)
-  throws IOException {
-    final String field = fieldname.intern();
-    final int[] fieldOrder = FieldCache.DEFAULT.getInts (reader, field);
-    return new ScoreDocComparator() {
-
-      public final int compare (final ScoreDoc i, final ScoreDoc j) {
-        final int fi = fieldOrder[i.doc];
-        final int fj = fieldOrder[j.doc];
-        if (fi < fj) return -1;
-        if (fi > fj) return 1;
-        return 0;
-      }
-
-      public Comparable sortValue (final ScoreDoc i) {
-        return new Integer (fieldOrder[i.doc]);
-      }
-
-      public int sortType() {
-        return SortField.INT;
-      }
-    };
-  }
-
-  /**
-   * Returns a comparator for sorting hits according to a field containing floats.
-   * @param reader  Index to use.
-   * @param fieldname  Field containg float values.
-   * @return  Comparator for sorting hits.
-   * @throws IOException If an error occurs reading the index.
-   */
-  static ScoreDocComparator comparatorFloat (final IndexReader reader, final String fieldname)
-  throws IOException {
-    final String field = fieldname.intern();
-    final float[] fieldOrder = FieldCache.DEFAULT.getFloats (reader, field);
-    return new ScoreDocComparator () {
-
-      public final int compare (final ScoreDoc i, final ScoreDoc j) {
-        final float fi = fieldOrder[i.doc];
-        final float fj = fieldOrder[j.doc];
-        if (fi < fj) return -1;
-        if (fi > fj) return 1;
-        return 0;
-      }
-
-      public Comparable sortValue (final ScoreDoc i) {
-        return new Float (fieldOrder[i.doc]);
-      }
-
-      public int sortType() {
-        return SortField.FLOAT;
-      }
-    };
-  }
-
-  /**
-   * Returns a comparator for sorting hits according to a field containing strings.
-   * @param reader  Index to use.
-   * @param fieldname  Field containg string values.
-   * @return  Comparator for sorting hits.
-   * @throws IOException If an error occurs reading the index.
-   */
-  static ScoreDocComparator comparatorString (final IndexReader reader, final String fieldname)
-  throws IOException {
-    final String field = fieldname.intern();
-    final FieldCache.StringIndex index = FieldCache.DEFAULT.getStringIndex (reader, field);
-    return new ScoreDocComparator () {
-
-      public final int compare (final ScoreDoc i, final ScoreDoc j) {
-        final int fi = index.order[i.doc];
-        final int fj = index.order[j.doc];
-        if (fi < fj) return -1;
-        if (fi > fj) return 1;
-        return 0;
-      }
-
-      public Comparable sortValue (final ScoreDoc i) {
-        return index.lookup[index.order[i.doc]];
-      }
-
-      public int sortType() {
-        return SortField.STRING;
-      }
-    };
-  }
-
-  /**
-   * Returns a comparator for sorting hits according to a field containing strings.
-   * @param reader  Index to use.
-   * @param fieldname  Field containg string values.
-   * @return  Comparator for sorting hits.
-   * @throws IOException If an error occurs reading the index.
-   */
-  static ScoreDocComparator comparatorStringLocale (final IndexReader reader, final String fieldname, final Locale locale)
-  throws IOException {
-    final Collator collator = Collator.getInstance (locale);
-    final String field = fieldname.intern();
-    final String[] index = FieldCache.DEFAULT.getStrings (reader, field);
-    return new ScoreDocComparator() {
-
-      public final int compare (final ScoreDoc i, final ScoreDoc j) {
-        return collator.compare (index[i.doc], index[j.doc]);
-      }
-
-      public Comparable sortValue (final ScoreDoc i) {
-        return index[i.doc];
-      }
-
-      public int sortType() {
-        return SortField.STRING;
-      }
-    };
-  }
-
-  /**
-   * Returns a comparator for sorting hits according to values in the given field.
-   * The terms in the field are looked at to determine whether they contain integers,
-   * floats or strings.  Once the type is determined, one of the other static methods
-   * in this class is called to get the comparator.
-   * @param reader  Index to use.
-   * @param fieldname  Field containg values.
-   * @return  Comparator for sorting hits.
-   * @throws IOException If an error occurs reading the index.
-   */
-  static ScoreDocComparator comparatorAuto (final IndexReader reader, final String fieldname)
-  throws IOException {
-    final String field = fieldname.intern();
-    Object lookupArray = FieldCache.DEFAULT.getAuto (reader, field);
-    if (lookupArray instanceof FieldCache.StringIndex) {
-      return comparatorString (reader, field);
-    } else if (lookupArray instanceof int[]) {
-      return comparatorInt (reader, field);
-    } else if (lookupArray instanceof float[]) {
-      return comparatorFloat (reader, field);
-    } else if (lookupArray instanceof String[]) {
-      return comparatorString (reader, field);
-    } else {
-      throw new RuntimeException ("unknown data type in field '"+field+"'");
+    void resolveSize(int oldSize, int newSize)
+    {
+        currentSize_.addAndGet(newSize - oldSize);
     }
-  }
+
+    void resolveCount(int oldCount, int newCount)
+    {
+        currentObjectCount_.addAndGet(newCount - oldCount);
+    }
+
+    boolean isThresholdViolated()
+    {
+        return currentSize_.get() >= threshold_ ||  currentObjectCount_.get() >= thresholdCount_;
+    }
+
+    String getColumnFamily()
+    {
+    	return cfName_;
+    }
+
+    synchronized void enqueueFlush(CommitLog.CommitLogContext cLogCtx)
+    {
+        if (!isFrozen_)
+        {
+            isFrozen_ = true;
+            ColumnFamilyStore.submitFlush(this, cLogCtx);
+        }
+    }
+
+    /**
+     * Should only be called by ColumnFamilyStore.apply.  NOT a public API.
+     * (CFS handles locking to avoid submitting an op
+     *  to a flushing memtable.  Any other way is unsafe.)
+    */
+    void put(String key, ColumnFamily columnFamily)
+    {
+        assert !isFrozen_; // not 100% foolproof but hell, it's an assert
+        isDirty_ = true;
+        resolve(key, columnFamily);
+    }
+
+    /*
+     * This version is used to switch memtable and force flush.
+     * Flushing is still done in a separate executor -- forceFlush only blocks
+     * until the flush runnable is queued.
+    */
+    public void forceflush()
+    {
+        if (isClean())
+            return;
+
+        try
+        {
+            Table.open(table_).getColumnFamilyStore(cfName_).switchMemtable();
+            enqueueFlush(CommitLog.open(table_).getContext());
+        }
+        catch (IOException ex)
+        {
+            throw new RuntimeException(ex);
+        }
+    }
+
+    /** flush synchronously (in the current thread, not on the executor).
+     *  only the recover code should call this. */
+    void flushOnRecovery() throws IOException {
+        if (!isClean())
+            flush(CommitLog.CommitLogContext.NULL);
+    }
+
+    private void resolve(String key, ColumnFamily columnFamily)
+    {
+    	ColumnFamily oldCf = columnFamilies_.get(key);
+        if ( oldCf != null )
+        {
+            int oldSize = oldCf.size();
+            int oldObjectCount = oldCf.getColumnCount();
+            oldCf.addColumns(columnFamily);
+            int newSize = oldCf.size();
+            int newObjectCount = oldCf.getColumnCount();
+            resolveSize(oldSize, newSize);
+            resolveCount(oldObjectCount, newObjectCount);
+            oldCf.delete(columnFamily);
+        }
+        else
+        {
+            columnFamilies_.put(key, columnFamily);
+            currentSize_.addAndGet(columnFamily.size() + key.length());
+            currentObjectCount_.addAndGet(columnFamily.getColumnCount());
+        }
+    }
+
+    // for debugging
+    public String contents()
+    {
+        StringBuilder builder = new StringBuilder();
+        builder.append("{");
+        for (Map.Entry<String, ColumnFamily> entry : columnFamilies_.entrySet())
+        {
+            builder.append(entry.getKey()).append(": ").append(entry.getValue()).append(", ");
+        }
+        builder.append("}");
+        return builder.toString();
+    }
+
+    ColumnFamily getLocalCopy(String key, String columnFamilyColumn, IFilter filter)
+    {
+    	String[] values = RowMutation.getColumnAndColumnFamily(columnFamilyColumn);
+    	ColumnFamily columnFamily = null;
+        if(values.length == 1 )
+        {
+        	columnFamily = columnFamilies_.get(key);
+        }
+        else
+        {
+        	ColumnFamily cFamily = columnFamilies_.get(key);
+        	if (cFamily == null) return null;
+
+        	if (values.length == 2) {
+                IColumn column = cFamily.getColumn(values[1]); // super or normal column
+                if (column != null )
+                {
+                    columnFamily = cFamily.cloneMeShallow();
+                    columnFamily.addColumn(column);
+                }
+        	}
+            else
+            {
+                assert values.length == 3;
+                SuperColumn superColumn = (SuperColumn)cFamily.getColumn(values[1]);
+                if (superColumn != null)
+                {
+                    IColumn subColumn = superColumn.getSubColumn(values[2]);
+                    if (subColumn != null)
+                    {
+                        columnFamily = cFamily.cloneMeShallow();
+                        SuperColumn container = new SuperColumn(superColumn.name());
+                        container.markForDeleteAt(superColumn.getLocalDeletionTime(), superColumn.getMarkedForDeleteAt());
+                        container.addColumn(subColumn);
+                        columnFamily.addColumn(container);
+                    }
+                }
+        	}
+        }
+        /* Filter unnecessary data from the column based on the provided filter */
+        return filter.filter(columnFamilyColumn, columnFamily);
+    }
+
+    void flush(CommitLog.CommitLogContext cLogCtx) throws IOException
+    {
+        logger_.info("Flushing " + this);
+        ColumnFamilyStore cfStore = Table.open(table_).getColumnFamilyStore(cfName_);
+
+        String directory = DatabaseDescriptor.getDataFileLocation();
+        String filename = cfStore.getTempFileName();
+        SSTable ssTable = new SSTable(directory, filename, StorageService.getPartitioner());
+
+        // sort keys in the order they would be in when decorated
+        final IPartitioner partitioner = StorageService.getPartitioner();
+        final Comparator<String> dc = partitioner.getDecoratedKeyComparator();
+        ArrayList<String> orderedKeys = new ArrayList<String>(columnFamilies_.keySet());
+        Collections.sort(orderedKeys, new Comparator<String>()
+        {
+            public int compare(String o1, String o2)
+            {
+                return dc.compare(partitioner.decorateKey(o1), partitioner.decorateKey(o2));
+            }
+        });
+        DataOutputBuffer buffer = new DataOutputBuffer();
+        /* Use this BloomFilter to decide if a key exists in a SSTable */
+        BloomFilter bf = new BloomFilter(columnFamilies_.size(), 15);
+        for (String key : orderedKeys)
+        {
+            buffer.reset();
+            ColumnFamily columnFamily = columnFamilies_.get(key);
+            if ( columnFamily != null )
+            {
+                /* serialize the cf with column indexes */
+                ColumnFamily.serializerWithIndexes().serialize( columnFamily, buffer );
+                /* Now write the key and value to disk */
+                ssTable.append(partitioner.decorateKey(key), buffer);
+                bf.add(key);
+            }
+        }
+        ssTable.closeRename(bf);
+        cfStore.onMemtableFlush(cLogCtx);
+        cfStore.storeLocation( ssTable.getDataFileLocation(), bf );
+        buffer.close();
+        isFlushed_ = true;
+        logger_.info("Completed flushing " + this);
+    }
+
+    public String toString()
+    {
+        return "Memtable(" + cfName_ + ")@" + hashCode();
+    }
+
+    /**
+     * there does not appear to be any data structure that we can pass to PriorityQueue that will
+     * get it to heapify in-place instead of copying first, so we might as well return a Set.
+    */
+    Set<String> getKeys() throws ExecutionException, InterruptedException
+    {
+        return new HashSet<String>(columnFamilies_.keySet());
+    }
+
+    public static Iterator<String> getKeyIterator(Set<String> keys)
+    {
+        if (keys.size() == 0)
+        {
+            // cannot create a PQ of size zero (wtf?)
+            return Arrays.asList(new String[0]).iterator();
+        }
+        PriorityQueue<String> pq = new PriorityQueue<String>(keys.size(), StorageService.getPartitioner().getDecoratedKeyComparator());
+        pq.addAll(keys);
+        return new DestructivePQIterator<String>(pq);
+    }
+
+    public boolean isClean()
+    {
+        // executor taskcount is inadequate for our needs here -- it can return zero under certain
+        // race conditions even though a task has been processed.
+        return !isDirty_;
+    }
+
+    /**
+     * obtain an iterator of columns in this memtable in the specified order starting from a given column.
+     */
+    ColumnIterator getColumnIterator(final String key, final String cfName, final boolean isAscending, String startColumn)
+    {
+        ColumnFamily cf = columnFamilies_.get(key);
+        final ColumnFamily columnFamily;
+        if (cf != null)
+            columnFamily = cf.cloneMeShallow();
+        else
+            columnFamily = new ColumnFamily(cfName, DatabaseDescriptor.getColumnFamilyType(cfName));
+
+        final IColumn columns[] = (cf == null ? columnFamily : cf).getAllColumns().toArray(new IColumn[columnFamily.getAllColumns().size()]);
+        // TODO if we are dealing with supercolumns, we need to clone them while we have the read lock since they can be modified later
+        if (!isAscending)
+            ArrayUtils.reverse(columns);
+        IColumn startIColumn;
+        if (DatabaseDescriptor.getColumnFamilyType(cfName).equals("Standard"))
+            startIColumn = new Column(startColumn);
+        else
+            startIColumn = new SuperColumn(startColumn);
+
+        // can't use a ColumnComparatorFactory comparator since those compare on both name and time (and thus will fail to match
+        // our dummy column, since the time there is arbitrary).
+        Comparator<IColumn> comparator = new Comparator<IColumn>()
+        {
+            public int compare(IColumn column1, IColumn column2)
+            {
+                return column1.name().compareTo(column2.name());
+            }
+        };
+        if (!isAscending)
+        {
+            comparator = new ReverseComparator(comparator);
+        }
+        int index = Arrays.binarySearch(columns, startIColumn, comparator);
+        final int startIndex = index < 0 ? -(index + 1) : index;
+
+        return new ColumnIterator()
+        {
+            private int curIndex_ = startIndex;
+
+            public ColumnFamily getColumnFamily()
+            {
+                return columnFamily;
+            }
+
+            public boolean hasNext()
+            {
+                return curIndex_ < columns.length;
+            }
+
+            public IColumn next()
+            {
+                return columns[curIndex_++];
+            }
+
+            public void close() throws IOException {}
+
+            public void remove()
+            {
+                throw new UnsupportedOperationException();
+            }
+        };
+    }
+
+    public void clearUnsafe()
+    {
+        columnFamilies_.clear();
+    }
 }

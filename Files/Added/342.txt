@@ -1,253 +1,627 @@
-import org.apache.derby.iapi.sql.execute.ConstantAction;
+iterator = null;
+
+package org.apache.lucene.codecs;
 
 /*
-
-   Derby - Class org.apache.derby.impl.sql.execute.GrantRoleConstantAction
-
-   Licensed to the Apache Software Foundation (ASF) under one or more
-   contributor license agreements.  See the NOTICE file distributed with
-   this work for additional information regarding copyright ownership.
-   The ASF licenses this file to you under the Apache License, Version 2.0
-   (the "License"); you may not use this file except in compliance with
-   the License.  You may obtain a copy of the License at
-
-      http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
-
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
-package org.apache.derby.impl.sql.execute;
-
+import java.io.Closeable;
+import java.io.IOException;
 import java.util.Iterator;
 import java.util.List;
-import org.apache.derby.iapi.error.StandardException;
-import org.apache.derby.iapi.sql.Activation;
-import org.apache.derby.iapi.sql.conn.LanguageConnectionContext;
-import org.apache.derby.iapi.sql.conn.Authorizer;
-import org.apache.derby.iapi.sql.dictionary.DataDescriptorGenerator;
-import org.apache.derby.iapi.sql.dictionary.RoleGrantDescriptor;
-import org.apache.derby.iapi.sql.dictionary.DataDictionary;
-import org.apache.derby.iapi.sql.dictionary.RoleClosureIterator;
-import org.apache.derby.iapi.store.access.TransactionController;
-import org.apache.derby.shared.common.reference.SQLState;
-import org.apache.derby.iapi.services.sanity.SanityManager;
+import java.util.NoSuchElementException;
 
-/**
- *  This class performs actions that are ALWAYS performed for a
- *  GRANT role statement at execution time.
+import org.apache.lucene.index.AtomicReader;
+import org.apache.lucene.index.BinaryDocValues;
+import org.apache.lucene.index.FieldInfo;
+import org.apache.lucene.index.FilteredTermsEnum;
+import org.apache.lucene.index.MergeState;
+import org.apache.lucene.index.MultiDocValues.OrdinalMap;
+import org.apache.lucene.index.NumericDocValues;
+import org.apache.lucene.index.SegmentWriteState;
+import org.apache.lucene.index.SortedDocValues;
+import org.apache.lucene.index.SortedDocValuesTermsEnum;
+import org.apache.lucene.index.SortedSetDocValues;
+import org.apache.lucene.index.SortedSetDocValues.OrdIterator;
+import org.apache.lucene.index.SortedSetDocValuesTermsEnum;
+import org.apache.lucene.index.TermsEnum;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.FixedBitSet;
+
+/** 
+ * Abstract API that consumes numeric, binary and
+ * sorted docvalues.  Concrete implementations of this
+ * actually do "something" with the docvalues (write it into
+ * the index in a specific format).
+ * <p>
+ * The lifecycle is:
+ * <ol>
+ *   <li>DocValuesConsumer is created by 
+ *       {@link DocValuesFormat#fieldsConsumer(SegmentWriteState)} or
+ *       {@link NormsFormat#normsConsumer(SegmentWriteState)}.
+ *   <li>{@link #addNumericField}, {@link #addBinaryField},
+ *       or {@link #addSortedField} are called for each Numeric,
+ *       Binary, or Sorted docvalues field. The API is a "pull" rather
+ *       than "push", and the implementation is free to iterate over the 
+ *       values multiple times ({@link Iterable#iterator()}).
+ *   <li>After all fields are added, the consumer is {@link #close}d.
+ * </ol>
  *
- *  Descriptors corresponding to the grants are stored in the
- *  SYS.SYSROLES table, along with the role definitions, cf
- *  CreateRoleConstantAction.
- *
+ * @lucene.experimental
  */
-class GrantRoleConstantAction extends DDLConstantAction {
+public abstract class DocValuesConsumer implements Closeable {
+  
+  /** Sole constructor. (For invocation by subclass 
+   *  constructors, typically implicit.) */
+  protected DocValuesConsumer() {}
 
-    private List roleNames;
-    private List grantees;
-    private final boolean withAdminOption = false; // not impl.
+  /**
+   * Writes numeric docvalues for a field.
+   * @param field field information
+   * @param values Iterable of numeric values (one for each document).
+   * @throws IOException if an I/O error occurred.
+   */
+  public abstract void addNumericField(FieldInfo field, Iterable<Number> values) throws IOException;    
 
-    // CONSTRUCTORS
-    /**
-     *  Make the ConstantAction for a CREATE ROLE statement.
-     *  When executed, will create a role by the given name.
-     *
-     *  @param roleNames     List of the names of the roles being granted
-     *  @param grantees       List of the authorization ids granted to role
-     */
-    public GrantRoleConstantAction(List roleNames, List grantees) {
-        this.roleNames = roleNames;
-        this.grantees = grantees;
+  /**
+   * Writes binary docvalues for a field.
+   * @param field field information
+   * @param values Iterable of binary values (one for each document).
+   * @throws IOException if an I/O error occurred.
+   */
+  public abstract void addBinaryField(FieldInfo field, Iterable<BytesRef> values) throws IOException;
+
+  /**
+   * Writes pre-sorted binary docvalues for a field.
+   * @param field field information
+   * @param values Iterable of binary values in sorted order (deduplicated).
+   * @param docToOrd Iterable of ordinals (one for each document).
+   * @throws IOException if an I/O error occurred.
+   */
+  public abstract void addSortedField(FieldInfo field, Iterable<BytesRef> values, Iterable<Number> docToOrd) throws IOException;
+
+  /**
+   * Writes pre-sorted set docvalues for a field
+   * @param field field information
+   * @param values Iterable of binary values in sorted order (deduplicated).
+   * @param docToOrdCount Iterable of the number of values for each document. 
+   * @param ords Iterable of ordinal occurrences (docToOrdCount*maxDoc total).
+   * @throws IOException if an I/O error occurred.
+   */
+  public abstract void addSortedSetField(FieldInfo field, Iterable<BytesRef> values, Iterable<Number> docToOrdCount, Iterable<Number> ords) throws IOException;
+  
+  /**
+   * Merges the numeric docvalues from <code>toMerge</code>.
+   * <p>
+   * The default implementation calls {@link #addNumericField}, passing
+   * an Iterable that merges and filters deleted documents on the fly.
+   */
+  public void mergeNumericField(FieldInfo fieldInfo, final MergeState mergeState, final List<NumericDocValues> toMerge) throws IOException {
+
+    addNumericField(fieldInfo,
+                    new Iterable<Number>() {
+                      @Override
+                      public Iterator<Number> iterator() {
+                        return new Iterator<Number>() {
+                          int readerUpto = -1;
+                          int docIDUpto;
+                          long nextValue;
+                          AtomicReader currentReader;
+                          NumericDocValues currentValues;
+                          Bits currentLiveDocs;
+                          boolean nextIsSet;
+
+                          @Override
+                          public boolean hasNext() {
+                            return nextIsSet || setNext();
+                          }
+
+                          @Override
+                          public void remove() {
+                            throw new UnsupportedOperationException();
+                          }
+
+                          @Override
+                          public Number next() {
+                            if (!hasNext()) {
+                              throw new NoSuchElementException();
+                            }
+                            assert nextIsSet;
+                            nextIsSet = false;
+                            // TODO: make a mutable number
+                            return nextValue;
+                          }
+
+                          private boolean setNext() {
+                            while (true) {
+                              if (readerUpto == toMerge.size()) {
+                                return false;
+                              }
+
+                              if (currentReader == null || docIDUpto == currentReader.maxDoc()) {
+                                readerUpto++;
+                                if (readerUpto < toMerge.size()) {
+                                  currentReader = mergeState.readers.get(readerUpto);
+                                  currentValues = toMerge.get(readerUpto);
+                                  currentLiveDocs = currentReader.getLiveDocs();
+                                }
+                                docIDUpto = 0;
+                                continue;
+                              }
+
+                              if (currentLiveDocs == null || currentLiveDocs.get(docIDUpto)) {
+                                nextIsSet = true;
+                                nextValue = currentValues.get(docIDUpto);
+                                docIDUpto++;
+                                return true;
+                              }
+
+                              docIDUpto++;
+                            }
+                          }
+                        };
+                      }
+                    });
+  }
+  
+  /**
+   * Merges the binary docvalues from <code>toMerge</code>.
+   * <p>
+   * The default implementation calls {@link #addBinaryField}, passing
+   * an Iterable that merges and filters deleted documents on the fly.
+   */
+  public void mergeBinaryField(FieldInfo fieldInfo, final MergeState mergeState, final List<BinaryDocValues> toMerge) throws IOException {
+
+    addBinaryField(fieldInfo,
+                   new Iterable<BytesRef>() {
+                     @Override
+                     public Iterator<BytesRef> iterator() {
+                       return new Iterator<BytesRef>() {
+                         int readerUpto = -1;
+                         int docIDUpto;
+                         BytesRef nextValue = new BytesRef();
+                         AtomicReader currentReader;
+                         BinaryDocValues currentValues;
+                         Bits currentLiveDocs;
+                         boolean nextIsSet;
+
+                         @Override
+                         public boolean hasNext() {
+                           return nextIsSet || setNext();
+                         }
+
+                         @Override
+                         public void remove() {
+                           throw new UnsupportedOperationException();
+                         }
+
+                         @Override
+                         public BytesRef next() {
+                           if (!hasNext()) {
+                             throw new NoSuchElementException();
+                           }
+                           assert nextIsSet;
+                           nextIsSet = false;
+                           // TODO: make a mutable number
+                           return nextValue;
+                         }
+
+                         private boolean setNext() {
+                           while (true) {
+                             if (readerUpto == toMerge.size()) {
+                               return false;
+                             }
+
+                             if (currentReader == null || docIDUpto == currentReader.maxDoc()) {
+                               readerUpto++;
+                               if (readerUpto < toMerge.size()) {
+                                 currentReader = mergeState.readers.get(readerUpto);
+                                 currentValues = toMerge.get(readerUpto);
+                                 currentLiveDocs = currentReader.getLiveDocs();
+                               }
+                               docIDUpto = 0;
+                               continue;
+                             }
+
+                             if (currentLiveDocs == null || currentLiveDocs.get(docIDUpto)) {
+                               nextIsSet = true;
+                               currentValues.get(docIDUpto, nextValue);
+                               docIDUpto++;
+                               return true;
+                             }
+
+                             docIDUpto++;
+                           }
+                         }
+                       };
+                     }
+                   });
+  }
+
+
+  /**
+   * Merges the sorted docvalues from <code>toMerge</code>.
+   * <p>
+   * The default implementation calls {@link #addSortedField}, passing
+   * an Iterable that merges ordinals and values and filters deleted documents .
+   */
+  public void mergeSortedField(FieldInfo fieldInfo, final MergeState mergeState, List<SortedDocValues> toMerge) throws IOException {
+    final AtomicReader readers[] = mergeState.readers.toArray(new AtomicReader[toMerge.size()]);
+    final SortedDocValues dvs[] = toMerge.toArray(new SortedDocValues[toMerge.size()]);
+    
+    // step 1: iterate thru each sub and mark terms still in use
+    TermsEnum liveTerms[] = new TermsEnum[dvs.length];
+    for (int sub = 0; sub < liveTerms.length; sub++) {
+      AtomicReader reader = readers[sub];
+      SortedDocValues dv = dvs[sub];
+      Bits liveDocs = reader.getLiveDocs();
+      if (liveDocs == null) {
+        liveTerms[sub] = new SortedDocValuesTermsEnum(dv);
+      } else {
+        FixedBitSet bitset = new FixedBitSet(dv.getValueCount());
+        for (int i = 0; i < reader.maxDoc(); i++) {
+          if (liveDocs.get(i)) {
+            bitset.set(dv.getOrd(i));
+          }
+        }
+        liveTerms[sub] = new BitsFilteredTermsEnum(new SortedDocValuesTermsEnum(dv), bitset);
+      }
     }
+    
+    // step 2: create ordinal map (this conceptually does the "merging")
+    final OrdinalMap map = new OrdinalMap(this, liveTerms);
+    
+    // step 3: add field
+    addSortedField(fieldInfo,
+        // ord -> value
+        new Iterable<BytesRef>() {
+          @Override
+          public Iterator<BytesRef> iterator() {
+            return new Iterator<BytesRef>() {
+              final BytesRef scratch = new BytesRef();
+              int currentOrd;
 
-    // INTERFACE METHODS
+              @Override
+              public boolean hasNext() {
+                return currentOrd < map.getValueCount();
+              }
 
-    /**
-     *  This is the guts of the Execution-time logic for GRANT role.
-     *
-     *  @see ConstantAction#executeConstantAction
-     *
-     * @exception StandardException     Thrown on failure
-     */
-    public void executeConstantAction(Activation activation)
-            throws StandardException {
-
-        LanguageConnectionContext lcc =
-            activation.getLanguageConnectionContext();
-        DataDictionary dd = lcc.getDataDictionary();
-        TransactionController tc = lcc.getTransactionExecute();
-        DataDescriptorGenerator ddg = dd.getDataDescriptorGenerator();
-
-        final String grantor = lcc.getAuthorizationId();
-
-        dd.startWriting(lcc);
-
-        for (Iterator rIter = roleNames.iterator(); rIter.hasNext();) {
-            String role = (String)rIter.next();
-
-            if (role.equals(Authorizer.PUBLIC_AUTHORIZATION_ID)) {
-                throw StandardException.
-                    newException(SQLState.AUTH_PUBLIC_ILLEGAL_AUTHORIZATION_ID);
-            }
-
-            for (Iterator gIter = grantees.iterator(); gIter.hasNext();) {
-                String grantee = (String)gIter.next();
-
-                // check that role exists
-                RoleGrantDescriptor rdDef =
-                    dd.getRoleDefinitionDescriptor(role);
-
-                if (rdDef == null) {
-                    throw StandardException.
-                        newException(SQLState.ROLE_INVALID_SPECIFICATION, role);
+              @Override
+              public BytesRef next() {
+                if (!hasNext()) {
+                  throw new NoSuchElementException();
                 }
+                int segmentNumber = map.getSegmentNumber(currentOrd);
+                int segmentOrd = (int)map.getSegmentOrd(segmentNumber, currentOrd);
+                dvs[segmentNumber].lookupOrd(segmentOrd, scratch);
+                currentOrd++;
+                return scratch;
+              }
 
-                // Check that role is granted to us (or PUBLIC) with
-                // WITH ADMIN option so we can grant it. For database
-                // owner, a role definition always fulfills this
-                // requirement.  If we implement granting with WITH ADMIN
-                // option later, we need to look for a grant to us (or
-                // PUBLIC) which has WITH ADMIN. The role definition
-                // descriptor will not suffice in that case, so we
-                // need something like:
-                //
-                // rdDef = dd.findRoleGrantWithAdminToRoleOrPublic(grantor)
-                // if (rdDef != null) {
-                //   :
-                if (grantor.equals(lcc.getDataDictionary().
-                                       getAuthorizationDatabaseOwner())) {
-                    // All ok, we are database owner
-                    if (SanityManager.DEBUG) {
-                        SanityManager.ASSERT(
-                            rdDef.getGrantee().equals(grantor),
-                            "expected database owner in role grant descriptor");
-                        SanityManager.ASSERT(
-                            rdDef.isWithAdminOption(),
-                            "expected role definition to have ADMIN OPTION");
+              @Override
+              public void remove() {
+                throw new UnsupportedOperationException();
+              }
+            };
+          }
+        },
+        // doc -> ord
+        new Iterable<Number>() {
+          @Override
+          public Iterator<Number> iterator() {
+            return new Iterator<Number>() {
+              int readerUpto = -1;
+              int docIDUpto;
+              int nextValue;
+              AtomicReader currentReader;
+              Bits currentLiveDocs;
+              boolean nextIsSet;
+
+              @Override
+              public boolean hasNext() {
+                return nextIsSet || setNext();
+              }
+
+              @Override
+              public void remove() {
+                throw new UnsupportedOperationException();
+              }
+
+              @Override
+              public Number next() {
+                if (!hasNext()) {
+                  throw new NoSuchElementException();
+                }
+                assert nextIsSet;
+                nextIsSet = false;
+                // TODO make a mutable number
+                return nextValue;
+              }
+
+              private boolean setNext() {
+                while (true) {
+                  if (readerUpto == readers.length) {
+                    return false;
+                  }
+
+                  if (currentReader == null || docIDUpto == currentReader.maxDoc()) {
+                    readerUpto++;
+                    if (readerUpto < readers.length) {
+                      currentReader = readers[readerUpto];
+                      currentLiveDocs = currentReader.getLiveDocs();
                     }
-                } else {
-                    throw StandardException.newException
-                        (SQLState.AUTH_ROLE_DBO_ONLY, "GRANT role");
+                    docIDUpto = 0;
+                    continue;
+                  }
+
+                  if (currentLiveDocs == null || currentLiveDocs.get(docIDUpto)) {
+                    nextIsSet = true;
+                    int segOrd = dvs[readerUpto].getOrd(docIDUpto);
+                    nextValue = (int) map.getGlobalOrd(readerUpto, segOrd);
+                    docIDUpto++;
+                    return true;
+                  }
+
+                  docIDUpto++;
                 }
+              }
+            };
+          }
+        }
+    );
+  }
+  
+  /**
+   * Merges the sortedset docvalues from <code>toMerge</code>.
+   * <p>
+   * The default implementation calls {@link #addSortedSetField}, passing
+   * an Iterable that merges ordinals and values and filters deleted documents .
+   */
+  public void mergeSortedSetField(FieldInfo fieldInfo, final MergeState mergeState, List<SortedSetDocValues> toMerge) throws IOException {
+    final AtomicReader readers[] = mergeState.readers.toArray(new AtomicReader[toMerge.size()]);
+    final SortedSetDocValues dvs[] = toMerge.toArray(new SortedSetDocValues[toMerge.size()]);
+    
+    // step 1: iterate thru each sub and mark terms still in use
+    TermsEnum liveTerms[] = new TermsEnum[dvs.length];
+    for (int sub = 0; sub < liveTerms.length; sub++) {
+      AtomicReader reader = readers[sub];
+      SortedSetDocValues dv = dvs[sub];
+      Bits liveDocs = reader.getLiveDocs();
+      if (liveDocs == null) {
+        liveTerms[sub] = new SortedSetDocValuesTermsEnum(dv);
+      } else {
+        // nocommit: need a "pagedbits"
+        if (dv.getValueCount() > Integer.MAX_VALUE) {
+          throw new UnsupportedOperationException();
+        }
+        FixedBitSet bitset = new FixedBitSet((int)dv.getValueCount());
+        OrdIterator iterator = null;
+        for (int i = 0; i < reader.maxDoc(); i++) {
+          if (liveDocs.get(i)) {
+            iterator = dv.getOrds(i, iterator);
+            long ord;
+            while ((ord = iterator.nextOrd()) != OrdIterator.NO_MORE_ORDS) {
+              bitset.set((int)ord); // nocommit
+            }
+          }
+        }
+        liveTerms[sub] = new BitsFilteredTermsEnum(new SortedSetDocValuesTermsEnum(dv), bitset);
+      }
+    }
+    
+    // step 2: create ordinal map (this conceptually does the "merging")
+    final OrdinalMap map = new OrdinalMap(this, liveTerms);
+    
+    // step 3: add field
+    addSortedSetField(fieldInfo,
+        // ord -> value
+        new Iterable<BytesRef>() {
+          @Override
+          public Iterator<BytesRef> iterator() {
+            return new Iterator<BytesRef>() {
+              final BytesRef scratch = new BytesRef();
+              long currentOrd;
 
-                // Has it already been granted?
-                RoleGrantDescriptor rgd =
-                    dd.getRoleGrantDescriptor(role, grantee, grantor);
+              @Override
+              public boolean hasNext() {
+                return currentOrd < map.getValueCount();
+              }
 
-                if (rgd != null &&
-                        withAdminOption && !rgd.isWithAdminOption()) {
+              @Override
+              public BytesRef next() {
+                if (!hasNext()) {
+                  throw new NoSuchElementException();
+                }
+                int segmentNumber = map.getSegmentNumber(currentOrd);
+                long segmentOrd = map.getSegmentOrd(segmentNumber, currentOrd);
+                dvs[segmentNumber].lookupOrd(segmentOrd, scratch);
+                currentOrd++;
+                return scratch;
+              }
 
-                    // NOTE: Never called yet, withAdminOption not yet
-                    // implemented.
+              @Override
+              public void remove() {
+                throw new UnsupportedOperationException();
+              }
+            };
+          }
+        },
+        // doc -> ord count
+        new Iterable<Number>() {
+          @Override
+          public Iterator<Number> iterator() {
+            return new Iterator<Number>() {
+              int readerUpto = -1;
+              int docIDUpto;
+              int nextValue;
+              AtomicReader currentReader;
+              OrdIterator iterator;
+              Bits currentLiveDocs;
+              boolean nextIsSet;
 
-                    // Remove old descriptor and add a new one with admin
-                    // option: cf. SQL 2003, section 12.5, general rule 3
-                    rgd.drop(lcc);
-                    rgd.setWithAdminOption(true);
-                    dd.addDescriptor(rgd,
-                                     null,  // parent
-                                     DataDictionary.SYSROLES_CATALOG_NUM,
-                                     false, // no duplicatesAllowed
-                                     tc);
-                } else if (rgd == null) {
-                    // Check if the grantee is a role (if not, it is a user)
-                    RoleGrantDescriptor granteeDef =
-                        dd.getRoleDefinitionDescriptor(grantee);
+              @Override
+              public boolean hasNext() {
+                return nextIsSet || setNext();
+              }
 
-                    if (granteeDef != null) {
-                        checkCircularity(role, grantee, grantor, tc, dd);
+              @Override
+              public void remove() {
+                throw new UnsupportedOperationException();
+              }
+
+              @Override
+              public Number next() {
+                if (!hasNext()) {
+                  throw new NoSuchElementException();
+                }
+                assert nextIsSet;
+                nextIsSet = false;
+                // TODO make a mutable number
+                return nextValue;
+              }
+
+              private boolean setNext() {
+                while (true) {
+                  if (readerUpto == readers.length) {
+                    return false;
+                  }
+
+                  if (currentReader == null || docIDUpto == currentReader.maxDoc()) {
+                    readerUpto++;
+                    if (readerUpto < readers.length) {
+                      currentReader = readers[readerUpto];
+                      currentLiveDocs = currentReader.getLiveDocs();
                     }
+                    docIDUpto = 0;
+                    continue;
+                  }
 
-                    rgd = ddg.newRoleGrantDescriptor(
-                        dd.getUUIDFactory().createUUID(),
-                        role,
-                        grantee,
-                        grantor, // dbo for now
-                        withAdminOption,
-                        false);  // not definition
-                    dd.addDescriptor(
-                        rgd,
-                        null,  // parent
-                        DataDictionary.SYSROLES_CATALOG_NUM,
-                        false, // no duplicatesAllowed
-                        tc);
-                } // else exists already, no need to add
-            }
-        }
-    }
+                  if (currentLiveDocs == null || currentLiveDocs.get(docIDUpto)) {
+                    nextIsSet = true;
+                    iterator = dvs[readerUpto].getOrds(docIDUpto, iterator);
+                    nextValue = 0;
+                    while (iterator.nextOrd() != OrdIterator.NO_MORE_ORDS) {
+                      nextValue++;
+                    }
+                    docIDUpto++;
+                    return true;
+                  }
 
-    /**
-     * Check that allowing this grant to go ahead does nto create a
-     * circularity in the GRANT role relation graph, cf. Section 12.5,
-     * Syntax rule 1 of ISO/IEC 9075-2 2003.
-     *
-     * @param role The role about to be granted
-     * @param grantee The role to which {@code role} is to be granted
-     * @param grantor Who does the granting
-     * @throws StandardException normal error policy. Throws
-     *                           AUTH_ROLE_GRANT_CIRCULARITY if a
-     *                           circularity is detected.
-     */
-    private void checkCircularity(String role,
-                                  String grantee,
-                                  String grantor,
-                                  TransactionController tc,
-                                  DataDictionary dd)
-            throws StandardException {
-
-        // The grantee is role, not a user id, so we need to check for
-        // circularity. If there exists a grant back to the role being
-        // granted now, from one of the roles in the grant closure of
-        // grantee, there is a circularity.
-
-        // Via grant closure of grantee
-        RoleClosureIterator rci =
-            dd.createRoleClosureIterator(tc, grantee, false);
-        try {
-            String r;
-            while ((r = rci.next()) != null) {
-                if (role.equals(r)) {
-                    throw StandardException.newException
-                        (SQLState.AUTH_ROLE_GRANT_CIRCULARITY,
-                         role, grantee);
+                  docIDUpto++;
                 }
-            }
-        } finally {
-            rci.close();
+              }
+            };
+          }
+        },
+        // ords
+        new Iterable<Number>() {
+          @Override
+          public Iterator<Number> iterator() {
+            return new Iterator<Number>() {
+              int readerUpto = -1;
+              int docIDUpto;
+              long nextValue;
+              AtomicReader currentReader;
+              OrdIterator iterator;
+              Bits currentLiveDocs;
+              boolean nextIsSet;
+
+              @Override
+              public boolean hasNext() {
+                return nextIsSet || setNext();
+              }
+
+              @Override
+              public void remove() {
+                throw new UnsupportedOperationException();
+              }
+
+              @Override
+              public Number next() {
+                if (!hasNext()) {
+                  throw new NoSuchElementException();
+                }
+                assert nextIsSet;
+                nextIsSet = false;
+                // TODO make a mutable number
+                return nextValue;
+              }
+
+              private boolean setNext() {
+                while (true) {
+                  if (readerUpto == readers.length) {
+                    return false;
+                  }
+                  
+                  if (iterator != null) {
+                    final long segmentOrd = iterator.nextOrd();
+                    if (segmentOrd != OrdIterator.NO_MORE_ORDS) {
+                      nextValue = map.getGlobalOrd(readerUpto, segmentOrd);
+                      nextIsSet = true;
+                      return true;
+                    } else {
+                      docIDUpto++;
+                    }
+                  }
+
+                  if (currentReader == null || docIDUpto == currentReader.maxDoc()) {
+                    readerUpto++;
+                    if (readerUpto < readers.length) {
+                      currentReader = readers[readerUpto];
+                      currentLiveDocs = currentReader.getLiveDocs();
+                    }
+                    docIDUpto = 0;
+                    iterator = null;
+                    continue;
+                  }
+                  
+                  if (currentLiveDocs == null || currentLiveDocs.get(docIDUpto)) {
+                    assert docIDUpto < currentReader.maxDoc();
+                    iterator = dvs[readerUpto].getOrds(docIDUpto, iterator);
+                    continue;
+                  }
+
+                  docIDUpto++;
+                }
+              }
+            };
+          }
         }
+     );
+  }
+  
+  // nocommit: need a "pagedbits"
+  static class BitsFilteredTermsEnum extends FilteredTermsEnum {
+    final Bits liveTerms;
+    
+    BitsFilteredTermsEnum(TermsEnum in, Bits liveTerms) {
+      super(in, false); // <-- not passing false here wasted about 3 hours of my time!!!!!!!!!!!!!
+      assert liveTerms != null;
+      this.liveTerms = liveTerms;
     }
-
-    // OBJECT SHADOWS
-
-    public  String  toString()
-    {
-        // Do not put this under SanityManager.DEBUG - it is needed for
-        // error reporting.
-
-        StringBuffer sb1 = new StringBuffer();
-        for (Iterator it = roleNames.iterator(); it.hasNext();) {
-            if( sb1.length() > 0) {
-                sb1.append( ", ");
-            }
-            sb1.append( it.next().toString());
-        }
-
-        StringBuffer sb2 = new StringBuffer();
-        for (Iterator it = grantees.iterator(); it.hasNext();) {
-            if( sb2.length() > 0) {
-                sb2.append( ", ");
-            }
-            sb2.append( it.next().toString());
-        }
-        return ("GRANT " +
-                sb1.toString() +
-                " TO: " +
-                sb2.toString() +
-                "\n");
+    
+    @Override
+    protected AcceptStatus accept(BytesRef term) throws IOException {
+      if (liveTerms.get((int) ord())) {
+        return AcceptStatus.YES;
+      } else {
+        return AcceptStatus.NO;
+      }
     }
+  }
 }

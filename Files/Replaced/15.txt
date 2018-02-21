@@ -1,14 +1,13 @@
-if (refCount.compareAndSet(count, count+1)) {
-
-package org.apache.lucene.index;
+assert request.range.contains(sample.token): "Token " + sample.token + " is not within range " + request.range;
 
 /**
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -19,1776 +18,936 @@ package org.apache.lucene.index;
  * limitations under the License.
  */
 
-import java.io.Closeable;
-import java.io.File;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.util.Collection;
-import java.util.List;
-import java.util.Map;
+package org.apache.cassandra.service;
+
+import java.io.*;
+import java.net.InetAddress;
+import java.security.MessageDigest;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.Condition;
 
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.DocumentStoredFieldVisitor;
-import org.apache.lucene.index.codecs.Codec;
-import org.apache.lucene.index.codecs.CodecProvider;
-import org.apache.lucene.index.codecs.PerDocValues;
-import org.apache.lucene.index.values.IndexDocValues;
-import org.apache.lucene.search.FieldCache; // javadocs
-import org.apache.lucene.search.similarities.Similarity;
-import org.apache.lucene.store.*;
-import org.apache.lucene.util.ArrayUtil;
-import org.apache.lucene.util.Bits;
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.ReaderUtil;         // for javadocs
+import com.google.common.base.Objects;
 
-/** IndexReader is an abstract class, providing an interface for accessing an
- index.  Search of an index is done entirely through this abstract interface,
- so that any subclass which implements it is searchable.
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
- <p> Concrete subclasses of IndexReader are usually constructed with a call to
- one of the static <code>open()</code> methods, e.g. {@link
- #open(Directory, boolean)}.
+import org.apache.cassandra.concurrent.*;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.compaction.AbstractCompactedRow;
+import org.apache.cassandra.db.compaction.CompactionManager;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.Table;
+import org.apache.cassandra.dht.AbstractBounds;
+import org.apache.cassandra.dht.RandomPartitioner;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.gms.*;
+import org.apache.cassandra.io.ICompactSerializer;
+import org.apache.cassandra.io.sstable.SSTableReader;
+import org.apache.cassandra.net.CompactEndpointSerializationHelper;
+import org.apache.cassandra.net.IVerbHandler;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.streaming.OperationType;
+import org.apache.cassandra.streaming.StreamIn;
+import org.apache.cassandra.streaming.StreamOut;
+import org.apache.cassandra.streaming.StreamOutSession;
+import org.apache.cassandra.utils.*;
 
- <p> For efficiency, in this API documents are often referred to via
- <i>document numbers</i>, non-negative integers which each name a unique
- document in the index.  These document numbers are ephemeral--they may change
- as documents are added to and deleted from an index.  Clients should thus not
- rely on a given document having the same number between sessions.
+/**
+ * AntiEntropyService encapsulates "validating" (hashing) individual column families,
+ * exchanging MerkleTrees with remote nodes via a TreeRequest/Response conversation,
+ * and then triggering repairs for disagreeing ranges.
+ *
+ * Every Tree conversation has an 'initiator', where valid trees are sent after generation
+ * and where the local and remote tree will rendezvous in rendezvous(cf, endpoint, tree).
+ * Once the trees rendezvous, a Differencer is executed and the service can trigger repairs
+ * for disagreeing ranges.
+ *
+ * Tree comparison and repair triggering occur in the single threaded Stage.ANTIENTROPY.
+ *
+ * The steps taken to enact a repair are as follows:
+ * 1. A major compaction is triggered via nodeprobe:
+ *   * Nodeprobe sends TreeRequest messages to all neighbors of the target node: when a node
+ *     receives a TreeRequest, it will perform a readonly compaction to immediately validate
+ *     the column family.
+ * 2. The compaction process validates the column family by:
+ *   * Calling Validator.prepare(), which samples the column family to determine key distribution,
+ *   * Calling Validator.add() in order for every row in the column family,
+ *   * Calling Validator.complete() to indicate that all rows have been added.
+ *     * Calling complete() indicates that a valid MerkleTree has been created for the column family.
+ *     * The valid tree is returned to the requesting node via a TreeResponse.
+ * 3. When a node receives a TreeResponse, it passes the tree to rendezvous(), which checks for trees to
+ *    rendezvous with / compare to:
+ *   * If the tree is local, it is cached, and compared to any trees that were received from neighbors.
+ *   * If the tree is remote, it is immediately compared to a local tree if one is cached. Otherwise,
+ *     the remote tree is stored until a local tree can be generated.
+ *   * A Differencer object is enqueued for each comparison.
+ * 4. Differencers are executed in Stage.ANTIENTROPY, to compare the two trees, and perform repair via the
+ *    streaming api.
+ */
+public class AntiEntropyService
+{
+    private static final Logger logger = LoggerFactory.getLogger(AntiEntropyService.class);
 
- <p> An IndexReader can be opened on a directory for which an IndexWriter is
- opened already, but it cannot be used to delete documents from the index then.
+    // singleton enforcement
+    public static final AntiEntropyService instance = new AntiEntropyService();
 
- <p>
- <b>NOTE</b>: for backwards API compatibility, several methods are not listed 
- as abstract, but have no useful implementations in this base class and 
- instead always throw UnsupportedOperationException.  Subclasses are 
- strongly encouraged to override these methods, but in many cases may not 
- need to.
- </p>
-
- <p>
-
- <b>NOTE</b>: as of 2.4, it's possible to open a read-only
- IndexReader using the static open methods that accept the 
- boolean readOnly parameter.  Such a reader may have better 
- concurrency.  You must specify false if you want to 
- make changes with the resulting IndexReader.
- </p>
-
- <a name="thread-safety"></a><p><b>NOTE</b>: {@link
- IndexReader} instances are completely thread
- safe, meaning multiple threads can call any of its methods,
- concurrently.  If your application requires external
- synchronization, you should <b>not</b> synchronize on the
- <code>IndexReader</code> instance; use your own
- (non-Lucene) objects instead.
-*/
-public abstract class IndexReader implements Cloneable,Closeable {
-
-  /**
-   * A custom listener that's invoked when the IndexReader
-   * is finished.
-   *
-   * <p>For a SegmentReader, this listener is called only
-   * once all SegmentReaders sharing the same core are
-   * closed.  At this point it is safe for apps to evict
-   * this reader from any caches keyed on {@link
-   * #getCoreCacheKey}.  This is the same interface that
-   * {@link FieldCache} uses, internally, to evict
-   * entries.</p>
-   *
-   * <p>For other readers, this listener is called when they
-   * are closed.</p>
-   *
-   * @lucene.experimental
-   */
-  public static interface ReaderFinishedListener {
-    public void finished(IndexReader reader);
-  }
-
-  // Impls must set this if they may call add/removeReaderFinishedListener:
-  protected volatile Collection<ReaderFinishedListener> readerFinishedListeners;
-
-  /** Expert: adds a {@link ReaderFinishedListener}.  The
-   * provided listener is also added to any sub-readers, if
-   * this is a composite reader.  Also, any reader reopened
-   * or cloned from this one will also copy the listeners at
-   * the time of reopen.
-   *
-   * @lucene.experimental */
-  public void addReaderFinishedListener(ReaderFinishedListener listener) {
-    ensureOpen();
-    readerFinishedListeners.add(listener);
-  }
-
-  /** Expert: remove a previously added {@link ReaderFinishedListener}.
-   *
-   * @lucene.experimental */
-  public void removeReaderFinishedListener(ReaderFinishedListener listener) {
-    ensureOpen();
-    readerFinishedListeners.remove(listener);
-  }
-
-  protected void notifyReaderFinishedListeners() {
-    // Defensive (should never be null -- all impls must set
-    // this):
-    if (readerFinishedListeners != null) {
-      for(ReaderFinishedListener listener : readerFinishedListeners) {
-        listener.finished(this);
-      }
+    private static final ThreadPoolExecutor executor;
+    static
+    {
+        executor = new JMXConfigurableThreadPoolExecutor(4,
+                                                         60,
+                                                         TimeUnit.SECONDS,
+                                                         new LinkedBlockingQueue<Runnable>(),
+                                                         new NamedThreadFactory("AntiEntropySessions"),
+                                                         "internal");
     }
-  }
 
-  protected void readerFinished() {
-    notifyReaderFinishedListeners();
-  }
+    /**
+     * A map of active session.
+     */
+    private final ConcurrentMap<String, RepairSession> sessions;
 
-  /**
-   * Constants describing field properties, for example used for
-   * {@link IndexReader#getFieldNames(FieldOption)}.
-   */
-  public static enum FieldOption {
-    /** All fields */
-    ALL,
-    /** All indexed fields */
-    INDEXED,
-    /** All fields that store payloads */
-    STORES_PAYLOADS,
-    /** All fields that omit tf */
-    OMIT_TERM_FREQ_AND_POSITIONS,
-    /** All fields that omit positions */
-    OMIT_POSITIONS,
-    /** All fields which are not indexed */
-    UNINDEXED,
-    /** All fields which are indexed with termvectors enabled */
-    INDEXED_WITH_TERMVECTOR,
-    /** All fields which are indexed but don't have termvectors enabled */
-    INDEXED_NO_TERMVECTOR,
-    /** All fields with termvectors enabled. Please note that only standard termvector fields are returned */
-    TERMVECTOR,
-    /** All fields with termvectors with position values enabled */
-    TERMVECTOR_WITH_POSITION,
-    /** All fields with termvectors with offset values enabled */
-    TERMVECTOR_WITH_OFFSET,
-    /** All fields with termvectors with offset values and position values enabled */
-    TERMVECTOR_WITH_POSITION_OFFSET,
-    /** All fields holding doc values */
-    DOC_VALUES
-  }
-
-  private volatile boolean closed;
-  protected boolean hasChanges;
-  
-  private final AtomicInteger refCount = new AtomicInteger();
-
-  static int DEFAULT_TERMS_INDEX_DIVISOR = 1;
-
-  /** Expert: returns the current refCount for this reader */
-  public int getRefCount() {
-    return refCount.get();
-  }
-  
-  /**
-   * Expert: increments the refCount of this IndexReader
-   * instance.  RefCounts are used to determine when a
-   * reader can be closed safely, i.e. as soon as there are
-   * no more references.  Be sure to always call a
-   * corresponding {@link #decRef}, in a finally clause;
-   * otherwise the reader may never be closed.  Note that
-   * {@link #close} simply calls decRef(), which means that
-   * the IndexReader will not really be closed until {@link
-   * #decRef} has been called for all outstanding
-   * references.
-   *
-   * @see #decRef
-   * @see #tryIncRef
-   */
-  public void incRef() {
-    ensureOpen();
-    refCount.incrementAndGet();
-  }
-  
-  /**
-   * Expert: increments the refCount of this IndexReader
-   * instance only if the IndexReader has not been closed yet
-   * and returns <code>true</code> iff the refCount was
-   * successfully incremented, otherwise <code>false</code>.
-   * If this method returns <code>false</code> the reader is either
-   * already closed or is currently been closed. Either way this
-   * reader instance shouldn't be used by an application unless
-   * <code>true</code> is returned.
-   * <p>
-   * RefCounts are used to determine when a
-   * reader can be closed safely, i.e. as soon as there are
-   * no more references.  Be sure to always call a
-   * corresponding {@link #decRef}, in a finally clause;
-   * otherwise the reader may never be closed.  Note that
-   * {@link #close} simply calls decRef(), which means that
-   * the IndexReader will not really be closed until {@link
-   * #decRef} has been called for all outstanding
-   * references.
-   *
-   * @see #decRef
-   * @see #incRef
-   */
-  public boolean tryIncRef() {
-    int count;
-    while ((count = refCount.get()) > 0) {
-      if(refCount.compareAndSet(count, count+1)) {
-        return true;
-      }
+    /**
+     * Protected constructor. Use AntiEntropyService.instance.
+     */
+    protected AntiEntropyService()
+    {
+        sessions = new ConcurrentHashMap<String, RepairSession>();
     }
-    return false;
-  }
 
-  /** {@inheritDoc} */
-  @Override
-  public String toString() {
-    final StringBuilder buffer = new StringBuilder();
-    if (hasChanges) {
-      buffer.append('*');
+    /**
+     * Requests repairs for the given table and column families, and blocks until all repairs have been completed.
+     */
+    public RepairFuture submitRepairSession(Range range, String tablename, String... cfnames)
+    {
+        RepairFuture futureTask = new RepairSession(range, tablename, cfnames).getFuture();
+        executor.execute(futureTask);
+        return futureTask;
     }
-    buffer.append(getClass().getSimpleName());
-    buffer.append('(');
-    final IndexReader[] subReaders = getSequentialSubReaders();
-    if ((subReaders != null) && (subReaders.length > 0)) {
-      buffer.append(subReaders[0]);
-      for (int i = 1; i < subReaders.length; ++i) {
-        buffer.append(" ").append(subReaders[i]);
-      }
-    }
-    buffer.append(')');
-    return buffer.toString();
-  }
 
-  /**
-   * Expert: decreases the refCount of this IndexReader
-   * instance.  If the refCount drops to 0, then pending
-   * changes (if any) are committed to the index and this
-   * reader is closed.  If an exception is hit, the refCount
-   * is unchanged.
-   *
-   * @throws IOException in case an IOException occurs in commit() or doClose()
-   *
-   * @see #incRef
-   */
-  public void decRef() throws IOException {
-    ensureOpen();
-    final int rc = refCount.getAndDecrement();
-    if (rc == 1) {
-      boolean success = false;
-      try {
-        commit();
-        doClose();
-        success = true;
-      } finally {
-        if (!success) {
-          // Put reference back on failure
-          refCount.incrementAndGet();
+    RepairFuture submitArtificialRepairSession(TreeRequest req, String tablename, String... cfnames)
+    {
+        RepairFuture futureTask = new RepairSession(req, tablename, cfnames).getFuture();
+        executor.execute(futureTask);
+        return futureTask;
+    }
+
+    /**
+     * Return all of the neighbors with whom we share data.
+     */
+    static Set<InetAddress> getNeighbors(String table, Range range)
+    {
+        StorageService ss = StorageService.instance;
+        Map<Range, List<InetAddress>> replicaSets = ss.getRangeToAddressMap(table);
+        if (!replicaSets.containsKey(range))
+            return Collections.emptySet();
+        Set<InetAddress> neighbors = new HashSet<InetAddress>(replicaSets.get(range));
+        neighbors.remove(FBUtilities.getLocalAddress());
+        // Excluding all node with version <= 0.7 since they don't know how to
+        // create a correct merkle tree (they build it over the full range)
+        Iterator<InetAddress> iter = neighbors.iterator();
+        while (iter.hasNext())
+        {
+            InetAddress endpoint = iter.next();
+            if (Gossiper.instance.getVersion(endpoint) <= MessagingService.VERSION_07)
+            {
+                logger.info("Excluding " + endpoint + " from repair because it is on version 0.7 or sooner. You should consider updating this node before running repair again.");
+                iter.remove();
+            }
         }
-      }
-      readerFinished();
-    } else if (rc <= 0) {
-      throw new IllegalStateException("too many decRef calls: refCount was " + rc + " before decrement");
+        return neighbors;
     }
-  }
-  
-  protected IndexReader() { 
-    refCount.set(1);
-  }
-  
-  /**
-   * @throws AlreadyClosedException if this IndexReader is closed
-   */
-  protected final void ensureOpen() throws AlreadyClosedException {
-    if (refCount.get() <= 0) {
-      throw new AlreadyClosedException("this IndexReader is closed");
+
+    /**
+     * Register a tree for the given request to be compared to the appropriate trees in Stage.ANTIENTROPY when they become available.
+     */
+    private void rendezvous(TreeRequest request, MerkleTree tree)
+    {
+        RepairSession session = sessions.get(request.sessionid);
+        if (session == null)
+        {
+            logger.warn("Got a merkle tree response for unknown repair session {}: either this node has been restarted since the session was started, or the session has been interrupted for an unknown reason. ", request.sessionid);
+            return;
+        }
+
+        RepairSession.RepairJob job = session.jobs.peek();
+        assert job != null : "A repair should have at least some jobs scheduled";
+
+        if (job.addTree(request, tree) == 0)
+        {
+            logger.debug("All trees received for " + session.getName() + "/" + request.cf.right);
+            job.submitDifferencers();
+
+            // This job is complete, switching to next in line (note that only
+            // one thread will can ever do this)
+            session.jobs.poll();
+            RepairSession.RepairJob nextJob = session.jobs.peek();
+            if (nextJob == null)
+                // We are done with this repair session as far as differencing
+                // is considern. Just inform the session
+                session.differencingDone.signalAll();
+            else
+                nextJob.sendTreeRequests();
+        }
     }
-  }
-  
-  /** Returns a IndexReader reading the index in the given
-   *  Directory, with readOnly=true.
-   * @param directory the index directory
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   */
-  public static IndexReader open(final Directory directory) throws CorruptIndexException, IOException {
-    return open(directory, null, null, true, DEFAULT_TERMS_INDEX_DIVISOR, null);
-  }
 
-  /** Returns an IndexReader reading the index in the given
-   *  Directory.  You should pass readOnly=true, since it
-   *  gives much better concurrent performance, unless you
-   *  intend to do write operations (delete documents or
-   *  change norms) with the reader.
-   * @param directory the index directory
-   * @param readOnly true if no changes (deletions, norms) will be made with this IndexReader
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   */
-  public static IndexReader open(final Directory directory, boolean readOnly) throws CorruptIndexException, IOException {
-    return open(directory, null, null, readOnly, DEFAULT_TERMS_INDEX_DIVISOR, null);
-  }
-
-  /**
-   * Open a near real time IndexReader from the {@link org.apache.lucene.index.IndexWriter}.
-   *
-   * @param writer The IndexWriter to open from
-   * @param applyAllDeletes If true, all buffered deletes will
-   * be applied (made visible) in the returned reader.  If
-   * false, the deletes are not applied but remain buffered
-   * (in IndexWriter) so that they will be applied in the
-   * future.  Applying deletes can be costly, so if your app
-   * can tolerate deleted documents being returned you might
-   * gain some performance by passing false.
-   * @return The new IndexReader
-   * @throws CorruptIndexException
-   * @throws IOException if there is a low-level IO error
-   *
-   * @see #openIfChanged(IndexReader,IndexWriter,boolean)
-   *
-   * @lucene.experimental
-   */
-  public static IndexReader open(final IndexWriter writer, boolean applyAllDeletes) throws CorruptIndexException, IOException {
-    return writer.getReader(applyAllDeletes);
-  }
-
-  /** Expert: returns an IndexReader reading the index in the given
-   *  {@link IndexCommit}.  You should pass readOnly=true, since it
-   *  gives much better concurrent performance, unless you
-   *  intend to do write operations (delete documents or
-   *  change norms) with the reader.
-   * @param commit the commit point to open
-   * @param readOnly true if no changes (deletions, norms) will be made with this IndexReader
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   */
-  public static IndexReader open(final IndexCommit commit, boolean readOnly) throws CorruptIndexException, IOException {
-    return open(commit.getDirectory(), null, commit, readOnly, DEFAULT_TERMS_INDEX_DIVISOR, null);
-  }
-
-  /** Expert: returns an IndexReader reading the index in
-   *  the given Directory, with a custom {@link
-   *  IndexDeletionPolicy}.  You should pass readOnly=true,
-   *  since it gives much better concurrent performance,
-   *  unless you intend to do write operations (delete
-   *  documents or change norms) with the reader.
-   * @param directory the index directory
-   * @param deletionPolicy a custom deletion policy (only used
-   *  if you use this reader to perform deletes or to set
-   *  norms); see {@link IndexWriter} for details.
-   * @param readOnly true if no changes (deletions, norms) will be made with this IndexReader
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   */
-  public static IndexReader open(final Directory directory, IndexDeletionPolicy deletionPolicy, boolean readOnly) throws CorruptIndexException, IOException {
-    return open(directory, deletionPolicy, null, readOnly, DEFAULT_TERMS_INDEX_DIVISOR, null);
-  }
-
-  /** Expert: returns an IndexReader reading the index in
-   *  the given Directory, with a custom {@link
-   *  IndexDeletionPolicy}.  You should pass readOnly=true,
-   *  since it gives much better concurrent performance,
-   *  unless you intend to do write operations (delete
-   *  documents or change norms) with the reader.
-   * @param directory the index directory
-   * @param deletionPolicy a custom deletion policy (only used
-   *  if you use this reader to perform deletes or to set
-   *  norms); see {@link IndexWriter} for details.
-   * @param readOnly true if no changes (deletions, norms) will be made with this IndexReader
-   * @param termInfosIndexDivisor Subsamples which indexed
-   *  terms are loaded into RAM. This has the same effect as {@link
-   *  IndexWriterConfig#setTermIndexInterval} except that setting
-   *  must be done at indexing time while this setting can be
-   *  set per reader.  When set to N, then one in every
-   *  N*termIndexInterval terms in the index is loaded into
-   *  memory.  By setting this to a value > 1 you can reduce
-   *  memory usage, at the expense of higher latency when
-   *  loading a TermInfo.  The default value is 1.  Set this
-   *  to -1 to skip loading the terms index entirely.
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   */
-  public static IndexReader open(final Directory directory, IndexDeletionPolicy deletionPolicy, boolean readOnly, int termInfosIndexDivisor) throws CorruptIndexException, IOException {
-    return open(directory, deletionPolicy, null, readOnly, termInfosIndexDivisor, null);
-  }
-
-  /** Expert: returns an IndexReader reading the index in
-   *  the given Directory, using a specific commit and with
-   *  a custom {@link IndexDeletionPolicy}.  You should pass
-   *  readOnly=true, since it gives much better concurrent
-   *  performance, unless you intend to do write operations
-   *  (delete documents or change norms) with the reader.
-   * @param commit the specific {@link IndexCommit} to open;
-   * see {@link IndexReader#listCommits} to list all commits
-   * in a directory
-   * @param deletionPolicy a custom deletion policy (only used
-   *  if you use this reader to perform deletes or to set
-   *  norms); see {@link IndexWriter} for details.
-   * @param readOnly true if no changes (deletions, norms) will be made with this IndexReader
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   */
-  public static IndexReader open(final IndexCommit commit, IndexDeletionPolicy deletionPolicy, boolean readOnly) throws CorruptIndexException, IOException {
-    return open(commit.getDirectory(), deletionPolicy, commit, readOnly, DEFAULT_TERMS_INDEX_DIVISOR, null);
-  }
-
-  /** Expert: returns an IndexReader reading the index in
-   *  the given Directory, using a specific commit and with
-   *  a custom {@link IndexDeletionPolicy}.  You should pass
-   *  readOnly=true, since it gives much better concurrent
-   *  performance, unless you intend to do write operations
-   *  (delete documents or change norms) with the reader.
-   * @param commit the specific {@link IndexCommit} to open;
-   * see {@link IndexReader#listCommits} to list all commits
-   * in a directory
-   * @param deletionPolicy a custom deletion policy (only used
-   *  if you use this reader to perform deletes or to set
-   *  norms); see {@link IndexWriter} for details.
-   * @param readOnly true if no changes (deletions, norms) will be made with this IndexReader
-   * @param termInfosIndexDivisor Subsamples which indexed
-   *  terms are loaded into RAM. This has the same effect as {@link
-   *  IndexWriterConfig#setTermIndexInterval} except that setting
-   *  must be done at indexing time while this setting can be
-   *  set per reader.  When set to N, then one in every
-   *  N*termIndexInterval terms in the index is loaded into
-   *  memory.  By setting this to a value > 1 you can reduce
-   *  memory usage, at the expense of higher latency when
-   *  loading a TermInfo.  The default value is 1.  Set this
-   *  to -1 to skip loading the terms index entirely. This is only useful in 
-   *  advanced situations when you will only .next() through all terms; 
-   *  attempts to seek will hit an exception.
-   *  
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   */
-  public static IndexReader open(final IndexCommit commit, IndexDeletionPolicy deletionPolicy, boolean readOnly, int termInfosIndexDivisor) throws CorruptIndexException, IOException {
-    return open(commit.getDirectory(), deletionPolicy, commit, readOnly, termInfosIndexDivisor, null);
-  }
-
-  /** Expert: returns an IndexReader reading the index in
-   *  the given Directory, with a custom {@link
-   *  IndexDeletionPolicy}, and specified {@link CodecProvider}.
-   *  You should pass readOnly=true, since it gives much
-   *  better concurrent performance, unless you intend to do
-   *  write operations (delete documents or change norms)
-   *  with the reader.
-   * @param directory the index directory
-   * @param deletionPolicy a custom deletion policy (only used
-   *  if you use this reader to perform deletes or to set
-   *  norms); see {@link IndexWriter} for details.
-   * @param readOnly true if no changes (deletions, norms) will be made with this IndexReader
-   * @param termInfosIndexDivisor Subsamples which indexed
-   *  terms are loaded into RAM. This has the same effect as {@link
-   *  IndexWriterConfig#setTermIndexInterval} except that setting
-   *  must be done at indexing time while this setting can be
-   *  set per reader.  When set to N, then one in every
-   *  N*termIndexInterval terms in the index is loaded into
-   *  memory.  By setting this to a value > 1 you can reduce
-   *  memory usage, at the expense of higher latency when
-   *  loading a TermInfo.  The default value is 1.  Set this
-   *  to -1 to skip loading the terms index entirely.
-   * @param codecs CodecProvider to use when opening index
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   */
-  public static IndexReader open(final Directory directory, IndexDeletionPolicy deletionPolicy, boolean readOnly, int termInfosIndexDivisor, CodecProvider codecs) throws CorruptIndexException, IOException {
-    return open(directory, deletionPolicy, null, readOnly, termInfosIndexDivisor, codecs);
-  }
-
-  /** Expert: returns an IndexReader reading the index in
-   *  the given Directory, using a specific commit and with
-   *  a custom {@link IndexDeletionPolicy} and specified
-   *  {@link CodecProvider}.  You should pass readOnly=true, since
-   *  it gives much better concurrent performance, unless
-   *  you intend to do write operations (delete documents or
-   *  change norms) with the reader.
-
-   * @param commit the specific {@link IndexCommit} to open;
-   * see {@link IndexReader#listCommits} to list all commits
-   * in a directory
-   * @param deletionPolicy a custom deletion policy (only used
-   *  if you use this reader to perform deletes or to set
-   *  norms); see {@link IndexWriter} for details.
-   * @param readOnly true if no changes (deletions, norms) will be made with this IndexReader
-   * @param termInfosIndexDivisor Subsamples which indexed
-   *  terms are loaded into RAM. This has the same effect as {@link
-   *  IndexWriterConfig#setTermIndexInterval} except that setting
-   *  must be done at indexing time while this setting can be
-   *  set per reader.  When set to N, then one in every
-   *  N*termIndexInterval terms in the index is loaded into
-   *  memory.  By setting this to a value > 1 you can reduce
-   *  memory usage, at the expense of higher latency when
-   *  loading a TermInfo.  The default value is 1.  Set this
-   *  to -1 to skip loading the terms index entirely.
-   * @param codecs CodecProvider to use when opening index
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   */
-  public static IndexReader open(final IndexCommit commit, IndexDeletionPolicy deletionPolicy, boolean readOnly, int termInfosIndexDivisor, CodecProvider codecs) throws CorruptIndexException, IOException {
-    return open(commit.getDirectory(), deletionPolicy, commit, readOnly, termInfosIndexDivisor, codecs);
-  }
-
-  private static IndexReader open(final Directory directory, final IndexDeletionPolicy deletionPolicy, final IndexCommit commit, final boolean readOnly, int termInfosIndexDivisor,
-      CodecProvider codecs) throws CorruptIndexException, IOException {
-    if (codecs == null) {
-      codecs = CodecProvider.getDefault();
+    /**
+     * Requests a tree from the given node, and returns the request that was sent.
+     */
+    TreeRequest request(String sessionid, InetAddress remote, Range range, String ksname, String cfname)
+    {
+        TreeRequest request = new TreeRequest(sessionid, remote, range, new CFPair(ksname, cfname));
+        MessagingService.instance().sendOneWay(TreeRequestVerbHandler.makeVerb(request, Gossiper.instance.getVersion(remote)), remote);
+        return request;
     }
-    return DirectoryReader.open(directory, deletionPolicy, commit, readOnly, termInfosIndexDivisor, codecs);
-  }
 
-  /**
-   * If the index has changed since the provided reader was
-   * opened, open and return a new reader; else, return
-   * null.  The new reader, if not null, will be the same
-   * type of reader as the previous one, ie an NRT reader
-   * will open a new NRT reader, a MultiReader will open a
-   * new MultiReader,  etc.
-   *
-   * <p>This method is typically far less costly than opening a
-   * fully new <code>IndexReader</code> as it shares
-   * resources (for example sub-readers) with the provided
-   * <code>IndexReader</code>, when possible.
-   *
-   * <p>The provided reader is not closed (you are responsible
-   * for doing so); if a new reader is returned you also
-   * must eventually close it.  Be sure to never close a
-   * reader while other threads are still using it; see
-   * <code>SearcherManager</code> in
-   * <code>contrib/misc</code> to simplify managing this.
-   *
-   * <p>If a new reader is returned, it's safe to make changes
-   * (deletions, norms) with it.  All shared mutable state
-   * with the old reader uses "copy on write" semantics to
-   * ensure the changes are not seen by other readers.
-   *
-   * <p><b>NOTE</b>: If the provided reader is a near real-time
-   * reader, this method will return another near-real-time
-   * reader.
-   * 
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   * @return null if there are no changes; else, a new
-   * IndexReader instance which you must eventually close
-   */  
-  public static IndexReader openIfChanged(IndexReader oldReader) throws IOException {
-    final IndexReader newReader = oldReader.doOpenIfChanged();
-    assert newReader != oldReader;
-    return newReader;
-  }
+    /**
+     * Responds to the node that requested the given valid tree.
+     * @param validator A locally generated validator
+     * @param local localhost (parameterized for testing)
+     */
+    void respond(Validator validator, InetAddress local)
+    {
+        MessagingService ms = MessagingService.instance();
 
-  /**
-   * If the index has changed since the provided reader was
-   * opened, open and return a new reader, with the
-   * specified <code>readOnly</code>; else, return
-   * null.
-   *
-   * @see #openIfChanged(IndexReader)
-   */
-  public static IndexReader openIfChanged(IndexReader oldReader, boolean readOnly) throws IOException {
-    final IndexReader newReader = oldReader.doOpenIfChanged(readOnly);
-    assert newReader != oldReader;
-    return newReader;
-  }
+        try
+        {
+            Message message = TreeResponseVerbHandler.makeVerb(local, validator);
+            logger.info("Sending AEService tree for " + validator.request);
+            ms.sendOneWay(message, validator.request.endpoint);
+        }
+        catch (Exception e)
+        {
+            logger.error("Could not send valid tree for request " + validator.request, e);
+        }
+    }
 
-  /**
-   * If the IndexCommit differs from what the
-   * provided reader is searching, or the provided reader is
-   * not already read-only, open and return a new
-   * <code>readOnly=true</code> reader; else, return null.
-   *
-   * @see #openIfChanged(IndexReader)
-   */
-  // TODO: should you be able to specify readOnly?
-  public static IndexReader openIfChanged(IndexReader oldReader, IndexCommit commit) throws IOException {
-    final IndexReader newReader = oldReader.doOpenIfChanged(commit);
-    assert newReader != oldReader;
-    return newReader;
-  }
+    /**
+     * A Strategy to handle building and validating a merkle tree for a column family.
+     *
+     * Lifecycle:
+     * 1. prepare() - Initialize tree with samples.
+     * 2. add() - 0 or more times, to add hashes to the tree.
+     * 3. complete() - Enqueues any operations that were blocked waiting for a valid tree.
+     */
+    public static class Validator implements Runnable
+    {
+        public final TreeRequest request;
+        public final MerkleTree tree;
 
-  /**
-   * Expert: If there changes (committed or not) in the
-   * {@link IndexWriter} versus what the provided reader is
-   * searching, then open and return a new read-only
-   * IndexReader searching both committed and uncommitted
-   * changes from the writer; else, return null (though, the
-   * current implementation never returns null).
-   *
-   * <p>This provides "near real-time" searching, in that
-   * changes made during an {@link IndexWriter} session can be
-   * quickly made available for searching without closing
-   * the writer nor calling {@link #commit}.
-   *
-   * <p>It's <i>near</i> real-time because there is no hard
-   * guarantee on how quickly you can get a new reader after
-   * making changes with IndexWriter.  You'll have to
-   * experiment in your situation to determine if it's
-   * fast enough.  As this is a new and experimental
-   * feature, please report back on your findings so we can
-   * learn, improve and iterate.</p>
-   *
-   * <p>The very first time this method is called, this
-   * writer instance will make every effort to pool the
-   * readers that it opens for doing merges, applying
-   * deletes, etc.  This means additional resources (RAM,
-   * file descriptors, CPU time) will be consumed.</p>
-   *
-   * <p>For lower latency on reopening a reader, you should
-   * call {@link IndexWriterConfig#setMergedSegmentWarmer} to
-   * pre-warm a newly merged segment before it's committed
-   * to the index.  This is important for minimizing
-   * index-to-search delay after a large merge.  </p>
-   *
-   * <p>If an addIndexes* call is running in another thread,
-   * then this reader will only search those segments from
-   * the foreign index that have been successfully copied
-   * over, so far.</p>
-   *
-   * <p><b>NOTE</b>: Once the writer is closed, any
-   * outstanding readers may continue to be used.  However,
-   * if you attempt to reopen any of those readers, you'll
-   * hit an {@link AlreadyClosedException}.</p>
-   *
-   * @return IndexReader that covers entire index plus all
-   * changes made so far by this IndexWriter instance, or
-   * null if there are no new changes
-   *
-   * @param writer The IndexWriter to open from
-   *
-   * @param applyAllDeletes If true, all buffered deletes will
-   * be applied (made visible) in the returned reader.  If
-   * false, the deletes are not applied but remain buffered
-   * (in IndexWriter) so that they will be applied in the
-   * future.  Applying deletes can be costly, so if your app
-   * can tolerate deleted documents being returned you might
-   * gain some performance by passing false.
-   *
-   * @throws IOException
-   *
-   * @lucene.experimental
-   */
-  public static IndexReader openIfChanged(IndexReader oldReader, IndexWriter writer, boolean applyAllDeletes) throws IOException {
-    final IndexReader newReader = oldReader.doOpenIfChanged(writer, applyAllDeletes);
-    assert newReader != oldReader;
-    return newReader;
-  }
+        // the minimum token sorts first, but falls into the last range
+        private transient List<MerkleTree.RowHash> minrows;
+        // null when all rows with the min token have been consumed
+        private transient long validated;
+        private transient MerkleTree.TreeRange range;
+        private transient MerkleTree.TreeRangeIterator ranges;
+        private transient DecoratedKey lastKey;
 
-  protected IndexReader doOpenIfChanged() throws CorruptIndexException, IOException {
-    throw new UnsupportedOperationException("This reader does not support reopen().");
-  }
-  
-  protected IndexReader doOpenIfChanged(boolean openReadOnly) throws CorruptIndexException, IOException {
-    throw new UnsupportedOperationException("This reader does not support reopen().");
-  }
+        public final static MerkleTree.RowHash EMPTY_ROW = new MerkleTree.RowHash(null, new byte[0]);
+        
+        Validator(TreeRequest request)
+        {
+            this(request,
+                 // TODO: memory usage (maxsize) should either be tunable per
+                 // CF, globally, or as shared for all CFs in a cluster
+                 new MerkleTree(DatabaseDescriptor.getPartitioner(), request.range, MerkleTree.RECOMMENDED_DEPTH, (int)Math.pow(2, 15)));
+        }
 
-  protected IndexReader doOpenIfChanged(final IndexCommit commit) throws CorruptIndexException, IOException {
-    throw new UnsupportedOperationException("This reader does not support reopen(IndexCommit).");
-  }
+        Validator(TreeRequest request, MerkleTree tree)
+        {
+            this.request = request;
+            this.tree = tree;
+            // Reestablishing the range because we don't serialize it (for bad
+            // reason - see MerkleTree for details)
+            this.tree.fullRange = this.request.range;
+            minrows = new ArrayList<MerkleTree.RowHash>();
+            validated = 0;
+            range = null;
+            ranges = null;
+        }
 
-  protected IndexReader doOpenIfChanged(IndexWriter writer, boolean applyAllDeletes) throws CorruptIndexException, IOException {
-    return writer.getReader(applyAllDeletes);
-  }
+        public void prepare(ColumnFamilyStore cfs)
+        {
+            if (tree.partitioner() instanceof RandomPartitioner)
+            {
+                // You can't beat an even tree distribution for md5
+                tree.init();
+            }
+            else
+            {
+                List<DecoratedKey> keys = new ArrayList<DecoratedKey>();
+                for (DecoratedKey sample : cfs.keySamples(request.range))
+                {
+                    assert request.range.contains(sample.token);
+                    keys.add(sample);
+                }
 
-  /**
-   * Efficiently clones the IndexReader (sharing most
-   * internal state).
-   * <p>
-   * On cloning a reader with pending changes (deletions,
-   * norms), the original reader transfers its write lock to
-   * the cloned reader.  This means only the cloned reader
-   * may make further changes to the index, and commit the
-   * changes to the index on close, but the old reader still
-   * reflects all changes made up until it was cloned.
-   * <p>
-   * Like {@link #openIfChanged(IndexReader)}, it's safe to make changes to
-   * either the original or the cloned reader: all shared
-   * mutable state obeys "copy on write" semantics to ensure
-   * the changes are not seen by other readers.
-   * <p>
-   */
-  @Override
-  public synchronized Object clone() {
-    throw new UnsupportedOperationException("This reader does not implement clone()");
-  }
-  
-  /**
-   * Clones the IndexReader and optionally changes readOnly.  A readOnly 
-   * reader cannot open a writeable reader.  
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   */
-  public synchronized IndexReader clone(boolean openReadOnly) throws CorruptIndexException, IOException {
-    throw new UnsupportedOperationException("This reader does not implement clone()");
-  }
+                if (keys.isEmpty())
+                {
+                    // use an even tree distribution
+                    tree.init();
+                }
+                else
+                {
+                    int numkeys = keys.size();
+                    Random random = new Random();
+                    // sample the column family using random keys from the index
+                    while (true)
+                    {
+                        DecoratedKey dk = keys.get(random.nextInt(numkeys));
+                        if (!tree.split(dk.token))
+                            break;
+                    }
+                }
+            }
+            logger.debug("Prepared AEService tree of size " + tree.size() + " for " + request);
+            ranges = tree.invalids();
+        }
 
-  /** 
-   * Returns the directory associated with this index.  The Default 
-   * implementation returns the directory specified by subclasses when 
-   * delegating to the IndexReader(Directory) constructor, or throws an 
-   * UnsupportedOperationException if one was not specified.
-   * @throws UnsupportedOperationException if no directory
-   */
-  public Directory directory() {
-    ensureOpen();
-    throw new UnsupportedOperationException("This reader does not support this method.");  
-  }
+        /**
+         * Called (in order) for every row present in the CF.
+         * Hashes the row, and adds it to the tree being built.
+         *
+         * There are four possible cases:
+         *  1. Token is greater than range.right (we haven't generated a range for it yet),
+         *  2. Token is less than/equal to range.left (the range was valid),
+         *  3. Token is contained in the range (the range is in progress),
+         *  4. No more invalid ranges exist.
+         *
+         * TODO: Because we only validate completely empty trees at the moment, we
+         * do not bother dealing with case 2 and case 4 should result in an error.
+         *
+         * Additionally, there is a special case for the minimum token, because
+         * although it sorts first, it is contained in the last possible range.
+         *
+         * @param row The row.
+         */
+        public void add(AbstractCompactedRow row)
+        {
+            assert request.range.contains(row.key.token) : row.key.token + " is not contained in " + request.range;
+            assert lastKey == null || lastKey.compareTo(row.key) < 0
+                   : "row " + row.key + " received out of order wrt " + lastKey;
+            lastKey = row.key;
 
-  /**
-   * Returns the time the index in the named directory was last modified. 
-   * Do not use this to check whether the reader is still up-to-date, use
-   * {@link #isCurrent()} instead. 
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   */
-  public static long lastModified(final Directory directory2) throws CorruptIndexException, IOException {
-    return ((Long) new SegmentInfos.FindSegmentsFile(directory2) {
+            if (range == null)
+                range = ranges.next();
+
+            // generate new ranges as long as case 1 is true
+            while (!range.contains(row.key.token))
+            {
+                // add the empty hash, and move to the next range
+                range.addHash(EMPTY_ROW);
+                range = ranges.next();
+            }
+
+            // case 3 must be true: mix in the hashed row
+            range.addHash(rowHash(row));
+        }
+
+        private MerkleTree.RowHash rowHash(AbstractCompactedRow row)
+        {
+            validated++;
+            // MerkleTree uses XOR internally, so we want lots of output bits here
+            MessageDigest digest = FBUtilities.newMessageDigest("SHA-256");
+            row.update(digest);
+            return new MerkleTree.RowHash(row.key.token, digest.digest());
+        }
+
+        /**
+         * Registers the newly created tree for rendezvous in Stage.ANTIENTROPY.
+         */
+        public void complete()
+        {
+            completeTree();
+
+            StageManager.getStage(Stage.ANTI_ENTROPY).execute(this);
+            logger.debug("Validated " + validated + " rows into AEService tree for " + request);
+        }
+
+        void completeTree()
+        {
+            assert ranges != null : "Validator was not prepared()";
+
+            if (range != null)
+                range.addHash(EMPTY_ROW);
+            while (ranges.hasNext())
+            {
+                range = ranges.next();
+                range.addHash(EMPTY_ROW);
+            }
+        }
+
+        /**
+         * Called after the validation lifecycle to respond with the now valid tree. Runs in Stage.ANTIENTROPY.
+         *
+         * @return A meaningless object.
+         */
+        public void run()
+        {
+            // respond to the request that triggered this validation
+            AntiEntropyService.instance.respond(this, FBUtilities.getLocalAddress());
+        }
+    }
+
+    /**
+     * Handler for requests from remote nodes to generate a valid tree.
+     * The payload is a CFPair representing the columnfamily to validate.
+     */
+    public static class TreeRequestVerbHandler implements IVerbHandler, ICompactSerializer<TreeRequest>
+    {
+        public static final TreeRequestVerbHandler SERIALIZER = new TreeRequestVerbHandler();
+        static Message makeVerb(TreeRequest request, int version)
+        {
+            try
+            {
+                ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                DataOutputStream dos = new DataOutputStream(bos);
+                SERIALIZER.serialize(request, dos, version);
+                return new Message(FBUtilities.getLocalAddress(), StorageService.Verb.TREE_REQUEST, bos.toByteArray(), version);
+            }
+            catch(IOException e)
+            {
+                throw new RuntimeException(e);
+            }
+        }
+
+        public void serialize(TreeRequest request, DataOutputStream dos, int version) throws IOException
+        {
+            dos.writeUTF(request.sessionid);
+            CompactEndpointSerializationHelper.serialize(request.endpoint, dos);
+            dos.writeUTF(request.cf.left);
+            dos.writeUTF(request.cf.right);
+            if (version > MessagingService.VERSION_07)
+                AbstractBounds.serializer().serialize(request.range, dos);
+        }
+
+        public TreeRequest deserialize(DataInputStream dis, int version) throws IOException
+        {
+            String sessId = dis.readUTF();
+            InetAddress endpoint = CompactEndpointSerializationHelper.deserialize(dis);
+            CFPair cfpair = new CFPair(dis.readUTF(), dis.readUTF());
+            Range range;
+            if (version > MessagingService.VERSION_07)
+                range = (Range) AbstractBounds.serializer().deserialize(dis);
+            else
+                range = new Range(StorageService.getPartitioner().getMinimumToken(), StorageService.getPartitioner().getMinimumToken());
+
+            return new TreeRequest(sessId, endpoint, range, cfpair);
+        }
+
+        /**
+         * Trigger a validation compaction which will return the tree upon completion.
+         */
+        public void doVerb(Message message, String id)
+        { 
+            byte[] bytes = message.getMessageBody();
+            
+            DataInputStream buffer = new DataInputStream(new ByteArrayInputStream(bytes));
+            try
+            {
+                TreeRequest remotereq = this.deserialize(buffer, message.getVersion());
+                TreeRequest request = new TreeRequest(remotereq.sessionid, message.getFrom(), remotereq.range, remotereq.cf);
+
+                // trigger readonly-compaction
+                ColumnFamilyStore store = Table.open(request.cf.left).getColumnFamilyStore(request.cf.right);
+                Validator validator = new Validator(request);
+                logger.debug("Queueing validation compaction for " + request);
+                CompactionManager.instance.submitValidation(store, validator);
+            }
+            catch (IOException e)
+            {
+                throw new IOError(e);            
+            }
+        }
+    }
+
+    /**
+     * Handler for responses from remote nodes which contain a valid tree.
+     * The payload is a completed Validator object from the remote endpoint.
+     */
+    public static class TreeResponseVerbHandler implements IVerbHandler, ICompactSerializer<Validator>
+    {
+        public static final TreeResponseVerbHandler SERIALIZER = new TreeResponseVerbHandler();
+        static Message makeVerb(InetAddress local, Validator validator)
+        {
+            try
+            {
+                ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                DataOutputStream dos = new DataOutputStream(bos);
+                SERIALIZER.serialize(validator, dos, Gossiper.instance.getVersion(validator.request.endpoint));
+                return new Message(local, 
+                                   StorageService.Verb.TREE_RESPONSE, 
+                                   bos.toByteArray(), 
+                                   Gossiper.instance.getVersion(validator.request.endpoint));
+            }
+            catch(IOException e)
+            {
+                throw new RuntimeException(e);
+            }
+        }
+
+        public void serialize(Validator v, DataOutputStream dos, int version) throws IOException
+        {
+            TreeRequestVerbHandler.SERIALIZER.serialize(v.request, dos, version);
+            MerkleTree.serializer.serialize(v.tree, dos, version);
+            dos.flush();
+        }
+
+        public Validator deserialize(DataInputStream dis, int version) throws IOException
+        {
+            final TreeRequest request = TreeRequestVerbHandler.SERIALIZER.deserialize(dis, version);
+            try
+            {
+                return new Validator(request, MerkleTree.serializer.deserialize(dis, version));
+            }
+            catch(Exception e)
+            {
+                throw new RuntimeException(e);
+            }
+        }
+
+        public void doVerb(Message message, String id)
+        { 
+            byte[] bytes = message.getMessageBody();
+            DataInputStream buffer = new DataInputStream(new ByteArrayInputStream(bytes));
+
+            try
+            {
+                // deserialize the remote tree, and register it
+                Validator response = this.deserialize(buffer, message.getVersion());
+                TreeRequest request = new TreeRequest(response.request.sessionid, message.getFrom(), response.request.range, response.request.cf);
+                AntiEntropyService.instance.rendezvous(request, response.tree);
+            }
+            catch (IOException e)
+            {
+                throw new IOError(e);
+            }
+        }
+    }
+
+    /**
+     * A tuple of table and cf.
+     */
+    static class CFPair extends Pair<String,String>
+    {
+        public CFPair(String table, String cf)
+        {
+            super(table, cf);
+            assert table != null && cf != null;
+        }
+    }
+
+    /**
+     * A tuple of a local and remote tree.
+     */
+    static class TreePair extends Pair<MerkleTree,MerkleTree>
+    {
+        public TreePair(MerkleTree local, MerkleTree remote)
+        {
+            super(local, remote);
+        }
+    }
+
+    /**
+     * A tuple of table, cf, address and range that represents a location we have an outstanding TreeRequest for.
+     */
+    public static class TreeRequest
+    {
+        public final String sessionid;
+        public final InetAddress endpoint;
+        public final Range range;
+        public final CFPair cf;
+
+        public TreeRequest(String sessionid, InetAddress endpoint, Range range, CFPair cf)
+        {
+            this.sessionid = sessionid;
+            this.endpoint = endpoint;
+            this.cf = cf;
+            this.range = range;
+        }
+
         @Override
-        public Object doBody(String segmentFileName) throws IOException {
-          return Long.valueOf(directory2.fileModified(segmentFileName));
+        public final int hashCode()
+        {
+            return Objects.hashCode(sessionid, endpoint, cf, range);
         }
-      }.run()).longValue();
-  }
-
-  /**
-   * Reads version number from segments files. The version number is
-   * initialized with a timestamp and then increased by one for each change of
-   * the index.
-   * 
-   * @param directory where the index resides.
-   * @return version number.
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   */
-  public static long getCurrentVersion(Directory directory) throws CorruptIndexException, IOException {
-    return getCurrentVersion(directory, CodecProvider.getDefault());
-  }
-  
-  /**
-   * Reads version number from segments files. The version number is
-   * initialized with a timestamp and then increased by one for each change of
-   * the index.
-   * 
-   * @param directory where the index resides.
-   * @param codecs the {@link CodecProvider} holding all {@link Codec}s required to open the index
-   * @return version number.
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   */
-  public static long getCurrentVersion(Directory directory, CodecProvider codecs) throws CorruptIndexException, IOException {
-    return SegmentInfos.readCurrentVersion(directory, codecs);
-  }
-
-  /**
-   * Reads commitUserData, previously passed to {@link
-   * IndexWriter#commit(Map)}, from current index
-   * segments file.  This will return null if {@link
-   * IndexWriter#commit(Map)} has never been called for
-   * this index.
-   * 
-   * @param directory where the index resides.
-   * @return commit userData.
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   *
-   * @see #getCommitUserData()
-   */
-  public static Map<String,String> getCommitUserData(Directory directory) throws CorruptIndexException, IOException {
-    return getCommitUserData(directory,  CodecProvider.getDefault());
-  }
-  
-  
-  /**
-   * Reads commitUserData, previously passed to {@link
-   * IndexWriter#commit(Map)}, from current index
-   * segments file.  This will return null if {@link
-   * IndexWriter#commit(Map)} has never been called for
-   * this index.
-   * 
-   * @param directory where the index resides.
-   * @param codecs the {@link CodecProvider} provider holding all {@link Codec}s required to open the index
-   * @return commit userData.
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   *
-   * @see #getCommitUserData()
-   */
-  public static Map<String, String> getCommitUserData(Directory directory, CodecProvider codecs) throws CorruptIndexException, IOException {
-    return SegmentInfos.readCurrentUserData(directory, codecs);
-  }
-
-  /**
-   * Version number when this IndexReader was opened. Not
-   * implemented in the IndexReader base class.
-   *
-   * <p>If this reader is based on a Directory (ie, was
-   * created by calling {@link #open}, or {@link #openIfChanged} on
-   * a reader based on a Directory), then this method
-   * returns the version recorded in the commit that the
-   * reader opened.  This version is advanced every time
-   * {@link IndexWriter#commit} is called.</p>
-   *
-   * <p>If instead this reader is a near real-time reader
-   * (ie, obtained by a call to {@link
-   * IndexWriter#getReader}, or by calling {@link #openIfChanged}
-   * on a near real-time reader), then this method returns
-   * the version of the last commit done by the writer.
-   * Note that even as further changes are made with the
-   * writer, the version will not changed until a commit is
-   * completed.  Thus, you should not rely on this method to
-   * determine when a near real-time reader should be
-   * opened.  Use {@link #isCurrent} instead.</p>
-   *
-   * @throws UnsupportedOperationException unless overridden in subclass
-   */
-  public long getVersion() {
-    throw new UnsupportedOperationException("This reader does not support this method.");
-  }
-
-  /**
-   * Retrieve the String userData optionally passed to
-   * IndexWriter#commit.  This will return null if {@link
-   * IndexWriter#commit(Map)} has never been called for
-   * this index.
-   *
-   * @see #getCommitUserData(Directory)
-   */
-  public Map<String,String> getCommitUserData() {
-    throw new UnsupportedOperationException("This reader does not support this method.");
-  }
-
-
-  /**
-   * Check whether any new changes have occurred to the
-   * index since this reader was opened.
-   *
-   * <p>If this reader is based on a Directory (ie, was
-   * created by calling {@link #open}, or {@link #openIfChanged} on
-   * a reader based on a Directory), then this method checks
-   * if any further commits (see {@link IndexWriter#commit}
-   * have occurred in that directory).</p>
-   *
-   * <p>If instead this reader is a near real-time reader
-   * (ie, obtained by a call to {@link
-   * IndexWriter#getReader}, or by calling {@link #openIfChanged}
-   * on a near real-time reader), then this method checks if
-   * either a new commmit has occurred, or any new
-   * uncommitted changes have taken place via the writer.
-   * Note that even if the writer has only performed
-   * merging, this method will still return false.</p>
-   *
-   * <p>In any event, if this returns false, you should call
-   * {@link #openIfChanged} to get a new reader that sees the
-   * changes.</p>
-   *
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException           if there is a low-level IO error
-   * @throws UnsupportedOperationException unless overridden in subclass
-   */
-  public boolean isCurrent() throws CorruptIndexException, IOException {
-    throw new UnsupportedOperationException("This reader does not support this method.");
-  }
-
-  /**
-   * Checks is the index is optimized (if it has a single segment and 
-   * no deletions).  Not implemented in the IndexReader base class.
-   * @return <code>true</code> if the index is optimized; <code>false</code> otherwise
-   * @throws UnsupportedOperationException unless overridden in subclass
-   */
-  public boolean isOptimized() {
-    throw new UnsupportedOperationException("This reader does not support this method.");
-  }
-  
-  /**
-   * Return an array of term frequency vectors for the specified document.
-   * The array contains a vector for each vectorized field in the document.
-   * Each vector contains terms and frequencies for all terms in a given vectorized field.
-   * If no such fields existed, the method returns null. The term vectors that are
-   * returned may either be of type {@link TermFreqVector}
-   * or of type {@link TermPositionVector} if
-   * positions or offsets have been stored.
-   * 
-   * @param docNumber document for which term frequency vectors are returned
-   * @return array of term frequency vectors. May be null if no term vectors have been
-   *  stored for the specified document.
-   * @throws IOException if index cannot be accessed
-   */
-  abstract public TermFreqVector[] getTermFreqVectors(int docNumber)
-          throws IOException;
-
-
-  /**
-   * Return a term frequency vector for the specified document and field. The
-   * returned vector contains terms and frequencies for the terms in
-   * the specified field of this document, if the field had the storeTermVector
-   * flag set. If termvectors had been stored with positions or offsets, a 
-   * {@link TermPositionVector} is returned.
-   * 
-   * @param docNumber document for which the term frequency vector is returned
-   * @param field field for which the term frequency vector is returned.
-   * @return term frequency vector May be null if field does not exist in the specified
-   * document or term vector was not stored.
-   * @throws IOException if index cannot be accessed
-   */
-  abstract public TermFreqVector getTermFreqVector(int docNumber, String field)
-          throws IOException;
-
-  /**
-   * Load the Term Vector into a user-defined data structure instead of relying on the parallel arrays of
-   * the {@link TermFreqVector}.
-   * @param docNumber The number of the document to load the vector for
-   * @param field The name of the field to load
-   * @param mapper The {@link TermVectorMapper} to process the vector.  Must not be null
-   * @throws IOException if term vectors cannot be accessed or if they do not exist on the field and doc. specified.
-   * 
-   */
-  abstract public void getTermFreqVector(int docNumber, String field, TermVectorMapper mapper) throws IOException;
-
-  /**
-   * Map all the term vectors for all fields in a Document
-   * @param docNumber The number of the document to load the vector for
-   * @param mapper The {@link TermVectorMapper} to process the vector.  Must not be null
-   * @throws IOException if term vectors cannot be accessed or if they do not exist on the field and doc. specified.
-   */
-  abstract public void getTermFreqVector(int docNumber, TermVectorMapper mapper) throws IOException;
-
-  /**
-   * Returns <code>true</code> if an index exists at the specified directory.
-   * @param  directory the directory to check for an index
-   * @return <code>true</code> if an index exists; <code>false</code> otherwise
-   * @throws IOException if there is a problem with accessing the index
-   */
-  public static boolean indexExists(Directory directory) throws IOException {
-    try {
-      new SegmentInfos().read(directory);
-      return true;
-    } catch (IOException ioe) {
-      return false;
-    }
-  }
-
-  /**
-   * Returns <code>true</code> if an index exists at the specified directory.
-   * @param  directory the directory to check for an index
-   * @param  codecProvider provides a CodecProvider in case the index uses non-core codecs
-   * @return <code>true</code> if an index exists; <code>false</code> otherwise
-   * @throws IOException if there is a problem with accessing the index
-   */
-  public static boolean indexExists(Directory directory, CodecProvider codecProvider) throws IOException {
-    try {
-      new SegmentInfos().read(directory, codecProvider);
-      return true;
-    } catch (IOException ioe) {
-      return false;
-    }
-  }
-
-  /** Returns the number of documents in this index. */
-  public abstract int numDocs();
-
-  /** Returns one greater than the largest possible document number.
-   * This may be used to, e.g., determine how big to allocate an array which
-   * will have an element for every document number in an index.
-   */
-  public abstract int maxDoc();
-
-  /** Returns the number of deleted documents. */
-  public int numDeletedDocs() {
-    return maxDoc() - numDocs();
-  }
-
-  /** Expert: visits the fields of a stored document, for
-   *  custom processing/loading of each field.  If you
-   *  simply want to load all fields, use {@link
-   *  #document(int)}.  If you want to load a subset, use
-   *  {@link DocumentStoredFieldVisitor}.  */
-  public abstract void document(int docID, StoredFieldVisitor visitor) throws CorruptIndexException, IOException;
-  
-  /**
-   * Returns the stored fields of the <code>n</code><sup>th</sup>
-   * <code>Document</code> in this index.  This is just
-   * sugar for using {@link DocumentStoredFieldVisitor}.
-   * <p>
-   * <b>NOTE:</b> for performance reasons, this method does not check if the
-   * requested document is deleted, and therefore asking for a deleted document
-   * may yield unspecified results. Usually this is not required, however you
-   * can test if the doc is deleted by checking the {@link
-   * Bits} returned from {@link MultiFields#getLiveDocs}.
-   *
-   * <b>NOTE:</b> only the content of a field is returned,
-   * if that field was stored during indexing.  Metadata
-   * like boost, omitNorm, IndexOptions, tokenized, etc.,
-   * are not preserved.
-   * 
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   */
-  // TODO: we need a separate StoredField, so that the
-  // Document returned here contains that class not
-  // IndexableField
-  public Document document(int docID) throws CorruptIndexException, IOException {
-    ensureOpen();
-    if (docID < 0 || docID >= maxDoc()) {
-      throw new IllegalArgumentException("docID must be >= 0 and < maxDoc=" + maxDoc() + " (got docID=" + docID + ")");
-    }
-    final DocumentStoredFieldVisitor visitor = new DocumentStoredFieldVisitor();
-    document(docID, visitor);
-    return visitor.getDocument();
-  }
-
-  /** Returns true if any documents have been deleted */
-  public abstract boolean hasDeletions();
-
-  /** Returns true if there are norms stored for this field. */
-  public boolean hasNorms(String field) throws IOException {
-    // backward compatible implementation.
-    // SegmentReader has an efficient implementation.
-    ensureOpen();
-    return norms(field) != null;
-  }
-
-  /** Returns the byte-encoded normalization factor for the named field of
-   *  every document.  This is used by the search code to score documents.
-   *  Returns null if norms were not indexed for this field.
-   *
-   * @see org.apache.lucene.document.Field#setBoost(float)
-   */
-  public abstract byte[] norms(String field) throws IOException;
-
-  /** Expert: Resets the normalization factor for the named field of the named
-   * document.  By default, the norm represents the product of the field's {@link
-   * org.apache.lucene.document.Field#setBoost(float) boost} and its
-   * length normalization}.  Thus, to preserve the length normalization
-   * values when resetting this, one should base the new value upon the old.
-   *
-   * <b>NOTE:</b> If this field does not index norms, then
-   * this method throws {@link IllegalStateException}.
-   *
-   * @see #norms(String)
-   * @see Similarity#computeNorm(FieldInvertState)
-   * @see org.apache.lucene.search.similarities.DefaultSimilarity#decodeNormValue(byte)
-   * @throws StaleReaderException if the index has changed
-   *  since this reader was opened
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws LockObtainFailedException if another writer
-   *  has this index open (<code>write.lock</code> could not
-   *  be obtained)
-   * @throws IOException if there is a low-level IO error
-   * @throws IllegalStateException if the field does not index norms
-   */
-  public synchronized  void setNorm(int doc, String field, byte value)
-          throws StaleReaderException, CorruptIndexException, LockObtainFailedException, IOException {
-    ensureOpen();
-    acquireWriteLock();
-    hasChanges = true;
-    doSetNorm(doc, field, value);
-  }
-
-  /** Implements setNorm in subclass.*/
-  protected abstract void doSetNorm(int doc, String field, byte value)
-          throws CorruptIndexException, IOException;
-
-  /**
-   * Returns {@link Fields} for this reader.
-   * This method may return null if the reader has no
-   * postings.
-   *
-   * <p><b>NOTE</b>: if this is a multi reader ({@link
-   * #getSequentialSubReaders} is not null) then this
-   * method will throw UnsupportedOperationException.  If
-   * you really need a {@link Fields} for such a reader,
-   * use {@link MultiFields#getFields}.  However, for
-   * performance reasons, it's best to get all sub-readers
-   * using {@link ReaderUtil#gatherSubReaders} and iterate
-   * through them yourself. */
-  public abstract Fields fields() throws IOException;
-  
-  /**
-   * Returns {@link PerDocValues} for this reader.
-   * This method may return null if the reader has no per-document
-   * values stored.
-   *
-   * <p><b>NOTE</b>: if this is a multi reader ({@link
-   * #getSequentialSubReaders} is not null) then this
-   * method will throw UnsupportedOperationException.  If
-   * you really need {@link PerDocValues} for such a reader,
-   * use {@link MultiPerDocValues#getPerDocs(IndexReader)}.  However, for
-   * performance reasons, it's best to get all sub-readers
-   * using {@link ReaderUtil#gatherSubReaders} and iterate
-   * through them yourself. */
-  public abstract PerDocValues perDocValues() throws IOException;
-
-  public int docFreq(Term term) throws IOException {
-    return docFreq(term.field(), term.bytes());
-  }
-
-  /** Returns the number of documents containing the term
-   * <code>t</code>.  This method returns 0 if the term or
-   * field does not exists.  This method does not take into
-   * account deleted documents that have not yet been merged
-   * away. */
-  public int docFreq(String field, BytesRef term) throws IOException {
-    final Fields fields = fields();
-    if (fields == null) {
-      return 0;
-    }
-    final Terms terms = fields.terms(field);
-    if (terms == null) {
-      return 0;
-    }
-    return terms.docFreq(term);
-  }
-
-  /** Returns the number of documents containing the term
-   * <code>t</code>.  This method returns 0 if the term or
-   * field does not exists.  This method does not take into
-   * account deleted documents that have not yet been merged
-   * away. */
-  public long totalTermFreq(String field, BytesRef term) throws IOException {
-    final Fields fields = fields();
-    if (fields == null) {
-      return 0;
-    }
-    final Terms terms = fields.terms(field);
-    if (terms == null) {
-      return 0;
-    }
-    return terms.totalTermFreq(term);
-  }
-
-  /** This may return null if the field does not exist.*/
-  public Terms terms(String field) throws IOException {
-    final Fields fields = fields();
-    if (fields == null) {
-      return null;
-    }
-    return fields.terms(field);
-  }
-
-  /** Returns {@link DocsEnum} for the specified field &
-   *  term.  This may return null, if either the field or
-   *  term does not exist. */
-  public DocsEnum termDocsEnum(Bits liveDocs, String field, BytesRef term) throws IOException {
-    assert field != null;
-    assert term != null;
-    final Fields fields = fields();
-    if (fields == null) {
-      return null;
-    }
-    final Terms terms = fields.terms(field);
-    if (terms != null) {
-      return terms.docs(liveDocs, term, null);
-    } else {
-      return null;
-    }
-  }
-
-  /** Returns {@link DocsAndPositionsEnum} for the specified
-   *  field & term.  This may return null, if either the
-   *  field or term does not exist, or, positions were not
-   *  stored for this term. */
-  public DocsAndPositionsEnum termPositionsEnum(Bits liveDocs, String field, BytesRef term) throws IOException {
-    assert field != null;
-    assert term != null;
-    final Fields fields = fields();
-    if (fields == null) {
-      return null;
-    }
-    final Terms terms = fields.terms(field);
-    if (terms != null) {
-      return terms.docsAndPositions(liveDocs, term, null);
-    } else {
-      return null;
-    }
-  }
-  
-  /**
-   * Returns {@link DocsEnum} for the specified field and
-   * {@link TermState}. This may return null, if either the field or the term
-   * does not exists or the {@link TermState} is invalid for the underlying
-   * implementation.*/
-  public DocsEnum termDocsEnum(Bits liveDocs, String field, BytesRef term, TermState state) throws IOException {
-    assert state != null;
-    assert field != null;
-    final Fields fields = fields();
-    if (fields == null) {
-      return null;
-    }
-    final Terms terms = fields.terms(field);
-    if (terms != null) {
-      return terms.docs(liveDocs, term, state, null);
-    } else {
-      return null;
-    }
-  }
-  
-  /**
-   * Returns {@link DocsAndPositionsEnum} for the specified field and
-   * {@link TermState}. This may return null, if either the field or the term
-   * does not exists, the {@link TermState} is invalid for the underlying
-   * implementation, or positions were not stored for this term.*/
-  public DocsAndPositionsEnum termPositionsEnum(Bits liveDocs, String field, BytesRef term, TermState state) throws IOException {
-    assert state != null;
-    assert field != null;
-    final Fields fields = fields();
-    if (fields == null) {
-      return null;
-    }
-    final Terms terms = fields.terms(field);
-    if (terms != null) {
-      return terms.docsAndPositions(liveDocs, term, state, null);
-    } else {
-      return null;
-    }
-  }
-
-
-  /** Deletes the document numbered <code>docNum</code>.  Once a document is
-   * deleted it will not appear in TermDocs or TermPositions enumerations.
-   * Attempts to read its field with the {@link #document}
-   * method will result in an error.  The presence of this document may still be
-   * reflected in the {@link #docFreq} statistic, though
-   * this will be corrected eventually as the index is further modified.
-   *
-   * @throws StaleReaderException if the index has changed
-   * since this reader was opened
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws LockObtainFailedException if another writer
-   *  has this index open (<code>write.lock</code> could not
-   *  be obtained)
-   * @throws IOException if there is a low-level IO error
-   */
-  public synchronized void deleteDocument(int docNum) throws StaleReaderException, CorruptIndexException, LockObtainFailedException, IOException {
-    ensureOpen();
-    acquireWriteLock();
-    hasChanges = true;
-    doDelete(docNum);
-  }
-
-
-  /** Implements deletion of the document numbered <code>docNum</code>.
-   * Applications should call {@link #deleteDocument(int)} or {@link #deleteDocuments(Term)}.
-   */
-  protected abstract void doDelete(int docNum) throws CorruptIndexException, IOException;
-
-
-  /** Deletes all documents that have a given <code>term</code> indexed.
-   * This is useful if one uses a document field to hold a unique ID string for
-   * the document.  Then to delete such a document, one merely constructs a
-   * term with the appropriate field and the unique ID string as its text and
-   * passes it to this method.
-   * See {@link #deleteDocument(int)} for information about when this deletion will 
-   * become effective.
-   *
-   * @return the number of documents deleted
-   * @throws StaleReaderException if the index has changed
-   *  since this reader was opened
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws LockObtainFailedException if another writer
-   *  has this index open (<code>write.lock</code> could not
-   *  be obtained)
-   * @throws IOException if there is a low-level IO error
-   */
-  public int deleteDocuments(Term term) throws StaleReaderException, CorruptIndexException, LockObtainFailedException, IOException {
-    ensureOpen();
-    DocsEnum docs = MultiFields.getTermDocsEnum(this,
-                                                MultiFields.getLiveDocs(this),
-                                                term.field(),
-                                                term.bytes());
-    if (docs == null) return 0;
-    int n = 0;
-    int doc;
-    while ((doc = docs.nextDoc()) != DocsEnum.NO_MORE_DOCS) {
-      deleteDocument(doc);
-      n++;
-    }
-    return n;
-  }
-
-  /** Undeletes all documents currently marked as deleted in
-   * this index.
-   *
-   * <p>NOTE: this method can only recover documents marked
-   * for deletion but not yet removed from the index; when
-   * and how Lucene removes deleted documents is an
-   * implementation detail, subject to change from release
-   * to release.  However, you can use {@link
-   * #numDeletedDocs} on the current IndexReader instance to
-   * see how many documents will be un-deleted.
-   *
-   * @throws StaleReaderException if the index has changed
-   *  since this reader was opened
-   * @throws LockObtainFailedException if another writer
-   *  has this index open (<code>write.lock</code> could not
-   *  be obtained)
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   */
-  public synchronized void undeleteAll() throws StaleReaderException, CorruptIndexException, LockObtainFailedException, IOException {
-    ensureOpen();
-    acquireWriteLock();
-    hasChanges = true;
-    doUndeleteAll();
-  }
-
-  /** Implements actual undeleteAll() in subclass. */
-  protected abstract void doUndeleteAll() throws CorruptIndexException, IOException;
-
-  /** Does nothing by default. Subclasses that require a write lock for
-   *  index modifications must implement this method. */
-  protected synchronized void acquireWriteLock() throws IOException {
-    /* NOOP */
-  }
-  
-  /**
-   * 
-   * @throws IOException
-   */
-  public final synchronized void flush() throws IOException {
-    ensureOpen();
-    commit();
-  }
-
-  /**
-   * @param commitUserData Opaque Map (String -> String)
-   *  that's recorded into the segments file in the index,
-   *  and retrievable by {@link
-   *  IndexReader#getCommitUserData}.
-   * @throws IOException
-   */
-  public final synchronized void flush(Map<String, String> commitUserData) throws IOException {
-    ensureOpen();
-    commit(commitUserData);
-  }
-  
-  /**
-   * Commit changes resulting from delete, undeleteAll, or
-   * setNorm operations
-   *
-   * If an exception is hit, then either no changes or all
-   * changes will have been committed to the index
-   * (transactional semantics).
-   * @throws IOException if there is a low-level IO error
-   */
-  protected final synchronized void commit() throws IOException {
-    commit(null);
-  }
-  
-  /**
-   * Commit changes resulting from delete, undeleteAll, or
-   * setNorm operations
-   *
-   * If an exception is hit, then either no changes or all
-   * changes will have been committed to the index
-   * (transactional semantics).
-   * @throws IOException if there is a low-level IO error
-   */
-  public final synchronized void commit(Map<String, String> commitUserData) throws IOException {
-    // Don't call ensureOpen since we commit() on close
-    doCommit(commitUserData);
-    hasChanges = false;
-  }
-
-  /** Implements commit.  */
-  protected abstract void doCommit(Map<String, String> commitUserData) throws IOException;
-
-  /**
-   * Closes files associated with this index.
-   * Also saves any new deletions to disk.
-   * No other methods should be called after this has been called.
-   * @throws IOException if there is a low-level IO error
-   */
-  public final synchronized void close() throws IOException {
-    if (!closed) {
-      decRef();
-      closed = true;
-    }
-  }
-  
-  /** Implements close. */
-  protected abstract void doClose() throws IOException;
-
-
-  /**
-   * Get a list of unique field names that exist in this index and have the specified
-   * field option information.
-   * @param fldOption specifies which field option should be available for the returned fields
-   * @return Collection of Strings indicating the names of the fields.
-   * @see IndexReader.FieldOption
-   */
-  public abstract Collection<String> getFieldNames(FieldOption fldOption);
-
-  /** Returns the {@link Bits} representing live (not
-   *  deleted) docs.  A set bit indicates the doc ID has not
-   *  been deleted.  If this method returns null it means
-   *  there are no deleted documents (all documents are
-   *  live).
-   *
-   *  The returned instance has been safely published for
-   *  use by multiple threads without additional
-   *  synchronization.
-   * @lucene.experimental */
-  public abstract Bits getLiveDocs();
-
-  /**
-   * Expert: return the IndexCommit that this reader has
-   * opened.  This method is only implemented by those
-   * readers that correspond to a Directory with its own
-   * segments_N file.
-   *
-   * @lucene.experimental
-   */
-  public IndexCommit getIndexCommit() throws IOException {
-    throw new UnsupportedOperationException("This reader does not support this method.");
-  }
-  
-  /**
-   * Prints the filename and size of each file within a given compound file.
-   * Add the -extract flag to extract files to the current working directory.
-   * In order to make the extracted version of the index work, you have to copy
-   * the segments file from the compound index into the directory where the extracted files are stored.
-   * @param args Usage: org.apache.lucene.index.IndexReader [-extract] &lt;cfsfile&gt;
-   */
-  public static void main(String [] args) {
-    String filename = null;
-    boolean extract = false;
-
-    for (int i = 0; i < args.length; ++i) {
-      if (args[i].equals("-extract")) {
-        extract = true;
-      } else if (filename == null) {
-        filename = args[i];
-      }
-    }
-
-    if (filename == null) {
-      System.out.println("Usage: org.apache.lucene.index.IndexReader [-extract] <cfsfile>");
-      return;
-    }
-
-    Directory dir = null;
-    CompoundFileDirectory cfr = null;
-    IOContext context = IOContext.READ;
-
-    try {
-      File file = new File(filename);
-      String dirname = file.getAbsoluteFile().getParent();
-      filename = file.getName();
-      dir = FSDirectory.open(new File(dirname));
-      cfr = new CompoundFileDirectory(dir, filename, IOContext.DEFAULT, false);
-
-      String [] files = cfr.listAll();
-      ArrayUtil.mergeSort(files);   // sort the array of filename so that the output is more readable
-
-      for (int i = 0; i < files.length; ++i) {
-        long len = cfr.fileLength(files[i]);
-
-        if (extract) {
-          System.out.println("extract " + files[i] + " with " + len + " bytes to local directory...");
-          IndexInput ii = cfr.openInput(files[i], context);
-
-          FileOutputStream f = new FileOutputStream(files[i]);
-
-          // read and write with a small buffer, which is more effective than reading byte by byte
-          byte[] buffer = new byte[1024];
-          int chunk = buffer.length;
-          while(len > 0) {
-            final int bufLen = (int) Math.min(chunk, len);
-            ii.readBytes(buffer, 0, bufLen);
-            f.write(buffer, 0, bufLen);
-            len -= bufLen;
-          }
-
-          f.close();
-          ii.close();
+        
+        @Override
+        public final boolean equals(Object o)
+        {
+            if(!(o instanceof TreeRequest))
+                return false;
+            TreeRequest that = (TreeRequest)o;
+            // handles nulls properly
+            return Objects.equal(sessionid, that.sessionid) && Objects.equal(endpoint, that.endpoint) && Objects.equal(cf, that.cf) && Objects.equal(range, that.range);
         }
-        else
-          System.out.println(files[i] + ": " + len + " bytes");
-      }
-    } catch (IOException ioe) {
-      ioe.printStackTrace();
+        
+        @Override
+        public String toString()
+        {
+            return "#<TreeRequest " + sessionid + ", " + endpoint + ", " + cf + ", " + range + ">";
+        }
     }
-    finally {
-      try {
-        if (dir != null)
-          dir.close();
-        if (cfr != null)
-          cfr.close();
-      }
-      catch (IOException ioe) {
-        ioe.printStackTrace();
-      }
-    }
-  }
 
-  /** Returns all commit points that exist in the Directory.
-   *  Normally, because the default is {@link
-   *  KeepOnlyLastCommitDeletionPolicy}, there would be only
-   *  one commit point.  But if you're using a custom {@link
-   *  IndexDeletionPolicy} then there could be many commits.
-   *  Once you have a given commit, you can open a reader on
-   *  it by calling {@link IndexReader#open(IndexCommit,boolean)}
-   *  There must be at least one commit in
-   *  the Directory, else this method throws {@link
-   *  IndexNotFoundException}.  Note that if a commit is in
-   *  progress while this method is running, that commit
-   *  may or may not be returned.
-   *  
-   *  @return a sorted list of {@link IndexCommit}s, from oldest 
-   *  to latest. */
-  public static List<IndexCommit> listCommits(Directory dir) throws IOException {
-    return DirectoryReader.listCommits(dir);
-  }
-
-  /** Expert: returns the sequential sub readers that this
-   *  reader is logically composed of. If this reader is not composed
-   *  of sequential child readers, it should return null.
-   *  If this method returns an empty array, that means this
-   *  reader is a null reader (for example a MultiReader
-   *  that has no sub readers).
-   *  <p>
-   *  NOTE: You should not try using sub-readers returned by
-   *  this method to make any changes (setNorm, deleteDocument,
-   *  etc.). While this might succeed for one composite reader
-   *  (like MultiReader), it will most likely lead to index
-   *  corruption for other readers (like DirectoryReader obtained
-   *  through {@link #open}. Use the parent reader directly. */
-  public IndexReader[] getSequentialSubReaders() {
-    ensureOpen();
-    return null;
-  }
-  
-  /**
-   * Expert: Returns a the root {@link ReaderContext} for this
-   * {@link IndexReader}'s sub-reader tree. Iff this reader is composed of sub
-   * readers ,ie. this reader being a composite reader, this method returns a
-   * {@link CompositeReaderContext} holding the reader's direct children as well as a
-   * view of the reader tree's atomic leaf contexts. All sub-
-   * {@link ReaderContext} instances referenced from this readers top-level
-   * context are private to this reader and are not shared with another context
-   * tree. For example, IndexSearcher uses this API to drive searching by one
-   * atomic leaf reader at a time. If this reader is not composed of child
-   * readers, this method returns an {@link AtomicReaderContext}.
-   * <p>
-   * Note: Any of the sub-{@link CompositeReaderContext} instances reference from this
-   * top-level context holds a <code>null</code> {@link CompositeReaderContext#leaves}
-   * reference. Only the top-level context maintains the convenience leaf-view
-   * for performance reasons.
-   * <p>
-   * NOTE: You should not try using sub-readers returned by this method to make
-   * any changes (setNorm, deleteDocument, etc.). While this might succeed for
-   * one composite reader (like MultiReader), it will most likely lead to index
-   * corruption for other readers (like DirectoryReader obtained through
-   * {@link #open}. Use the top-level context's reader directly.
-   * 
-   * @lucene.experimental
-   */
-  public abstract ReaderContext getTopReaderContext();
-
-  /** Expert */
-  public Object getCoreCacheKey() {
-    // Don't can ensureOpen since FC calls this (to evict)
-    // on close
-    return this;
-  }
-
-  /** Returns the number of unique terms (across all fields)
-   *  in this reader.
-   *
-   *  @throws UnsupportedOperationException if this count
-   *  cannot be easily determined (eg Multi*Readers).
-   *  Instead, you should call {@link
-   *  #getSequentialSubReaders} and ask each sub reader for
-   *  its unique term count. */
-  public long getUniqueTermCount() throws IOException {
-    long numTerms = 0;
-    final Fields fields = fields();
-    if (fields == null) {
-      return 0;
-    }
-    FieldsEnum it = fields.iterator();
-    while(true) {
-      String field = it.next();
-      if (field == null) {
-        break;
-      }
-      numTerms += fields.terms(field).getUniqueTermCount();
-    }
-    return numTerms;
-  }
-
-  /** For IndexReader implementations that use
-   *  TermInfosReader to read terms, this returns the
-   *  current indexDivisor as specified when the reader was
-   *  opened.
-   */
-  public int getTermInfosIndexDivisor() {
-    throw new UnsupportedOperationException("This reader does not support this method.");
-  }
-  
-  public final IndexDocValues docValues(String field) throws IOException {
-    ensureOpen();
-    final PerDocValues perDoc = perDocValues();
-    if (perDoc == null) {
-      return null;
-    }
-    return perDoc.docValues(field);
-  }
-
-  private volatile Fields fields;
-
-  /** @lucene.internal */
-  void storeFields(Fields fields) {
-    ensureOpen();
-    this.fields = fields;
-  }
-
-  /** @lucene.internal */
-  Fields retrieveFields() {
-    ensureOpen();
-    return fields;
-  }
-  
-  private volatile PerDocValues perDocValues;
-  
-  /** @lucene.internal */
-  void storePerDoc(PerDocValues perDocValues) {
-    ensureOpen();
-    this.perDocValues = perDocValues;
-  }
-
-  /** @lucene.internal */
-  PerDocValues retrievePerDoc() {
-    ensureOpen();
-    return perDocValues;
-  }  
-  
-
-  /**
-   * A struct like class that represents a hierarchical relationship between
-   * {@link IndexReader} instances. 
-   * @lucene.experimental
-   */
-  public static abstract class ReaderContext {
-    /** The reader context for this reader's immediate parent, or null if none */
-    public final ReaderContext parent;
-    /** The actual reader */
-    public final IndexReader reader;
-    /** <code>true</code> iff the reader is an atomic reader */
-    public final boolean isAtomic;
-    /** <code>true</code> if this context struct represents the top level reader within the hierarchical context */
-    public final boolean isTopLevel;
-    /** the doc base for this reader in the parent, <tt>0</tt> if parent is null */
-    public final int docBaseInParent;
-    /** the ord for this reader in the parent, <tt>0</tt> if parent is null */
-    public final int ordInParent;
-    
-    ReaderContext(ReaderContext parent, IndexReader reader,
-        boolean isAtomic, int ordInParent, int docBaseInParent) {
-      this.parent = parent;
-      this.reader = reader;
-      this.isAtomic = isAtomic;
-      this.docBaseInParent = docBaseInParent;
-      this.ordInParent = ordInParent;
-      this.isTopLevel = parent==null;
-    }
-    
     /**
-     * Returns the context's leaves if this context is a top-level context
-     * otherwise <code>null</code>.
-     * <p>
-     * Note: this is convenience method since leaves can always be obtained by
-     * walking the context tree.
+     * Triggers repairs with all neighbors for the given table, cfs and range.
+     * Typical lifecycle is: start() then join(). Executed in client threads.
      */
-    public AtomicReaderContext[] leaves() {
-      return null;
-    }
-    
-    /**
-     * Returns the context's children iff this context is a composite context
-     * otherwise <code>null</code>.
-     * <p>
-     * Note: this method is a convenience method to prevent
-     * <code>instanceof</code> checks and type-casts to
-     * {@link CompositeReaderContext}.
-     */
-    public ReaderContext[] children() {
-      return null;
-    }
-  }
-  
-  /**
-   * {@link ReaderContext} for composite {@link IndexReader} instance.
-   * @lucene.experimental
-   */
-  public static final class CompositeReaderContext extends ReaderContext {
-    /** the composite readers immediate children */
-    public final ReaderContext[] children;
-    /** the composite readers leaf reader contexts if this is the top level reader in this context */
-    public final AtomicReaderContext[] leaves;
+    class RepairSession extends WrappedRunnable implements IEndpointStateChangeSubscriber, IFailureDetectionEventListener
+    {
+        private final String sessionName;
+        private final String tablename;
+        private final String[] cfnames;
+        private final Range range;
+        private volatile Exception exception;
+        private final AtomicBoolean isFailed = new AtomicBoolean(false);
 
-    /**
-     * Creates a {@link CompositeReaderContext} for intermediate readers that aren't
-     * not top-level readers in the current context
-     */
-    public CompositeReaderContext(ReaderContext parent, IndexReader reader,
-        int ordInParent, int docbaseInParent, ReaderContext[] children) {
-      this(parent, reader, ordInParent, docbaseInParent, children, null);
-    }
-    
-    /**
-     * Creates a {@link CompositeReaderContext} for top-level readers with parent set to <code>null</code>
-     */
-    public CompositeReaderContext(IndexReader reader, ReaderContext[] children, AtomicReaderContext[] leaves) {
-      this(null, reader, 0, 0, children, leaves);
-    }
-    
-    private CompositeReaderContext(ReaderContext parent, IndexReader reader,
-        int ordInParent, int docbaseInParent, ReaderContext[] children,
-        AtomicReaderContext[] leaves) {
-      super(parent, reader, false, ordInParent, docbaseInParent);
-      this.children = children;
-      this.leaves = leaves;
+        private final Set<InetAddress> endpoints;
+        final Queue<RepairJob> jobs = new ConcurrentLinkedQueue<RepairJob>();
+        final Map<String, RepairJob> activeJobs = new ConcurrentHashMap<String, RepairJob>();
+
+        private final SimpleCondition completed = new SimpleCondition();
+        public final Condition differencingDone = new SimpleCondition();
+
+        public RepairSession(TreeRequest req, String tablename, String... cfnames)
+        {
+            this(req.sessionid, req.range, tablename, cfnames);
+            AntiEntropyService.instance.sessions.put(getName(), this);
+        }
+
+        public RepairSession(Range range, String tablename, String... cfnames)
+        {
+            this("manual-repair-" + UUID.randomUUID(), range, tablename, cfnames);
+        }
+
+        private RepairSession(String id, Range range, String tablename, String[] cfnames)
+        {
+            this.sessionName = id;
+            this.tablename = tablename;
+            this.cfnames = cfnames;
+            assert cfnames.length > 0 : "Repairing no column families seems pointless, doesn't it";
+            this.range = range;
+            this.endpoints = AntiEntropyService.getNeighbors(tablename, range);
+        }
+
+        public String getName()
+        {
+            return sessionName;
+        }
+
+        RepairFuture getFuture()
+        {
+            return new RepairFuture(this);
+        }
+
+        // we don't care about the return value but care about it throwing exception
+        public void runMayThrow() throws Exception
+        {
+            if (endpoints.isEmpty())
+            {
+                differencingDone.signalAll();
+                logger.info("No neighbors to repair with for " + tablename + " on " + range + ": " + getName() + " completed.");
+                return;
+            }
+
+            // Checking all nodes are live
+            for (InetAddress endpoint : endpoints)
+            {
+                if (!FailureDetector.instance.isAlive(endpoint))
+                {
+                    differencingDone.signalAll();
+                    logger.info("Could not proceed on repair because a neighbor (" + endpoint + ") is dead: " + getName() + " failed.");
+                    return;
+                }
+            }
+
+            AntiEntropyService.instance.sessions.put(getName(), this);
+            Gossiper.instance.register(this);
+            FailureDetector.instance.registerFailureDetectionEventListener(this);
+            try
+            {
+                // Create and queue a RepairJob for each column family
+                for (String cfname : cfnames)
+                {
+                    RepairJob job = new RepairJob(cfname);
+                    jobs.offer(job);
+                    activeJobs.put(cfname, job);
+                }
+
+                jobs.peek().sendTreeRequests();
+
+                // block whatever thread started this session until all requests have been returned:
+                // if this thread dies, the session will still complete in the background
+                completed.await();
+                if (exception == null)
+                {
+                    logger.info(String.format("Repair session %s (on cfs %s, range %s) completed successfully", getName(), cfnames, range));
+                }
+                else
+                {
+                    logger.error(String.format("Repair session %s (on cfs %s, range %s) failed with the following error", getName(), cfnames, range), exception);
+                    throw exception;
+                }
+            }
+            catch (InterruptedException e)
+            {
+                throw new RuntimeException("Interrupted while waiting for repair: repair will continue in the background.");
+            }
+            finally
+            {
+                FailureDetector.instance.unregisterFailureDetectionEventListener(this);
+                Gossiper.instance.unregister(this);
+                AntiEntropyService.instance.sessions.remove(getName());
+            }
+        }
+
+        void completed(InetAddress remote, String cfname)
+        {
+            logger.debug("Repair completed for {} on {}", remote, cfname);
+            RepairJob job = activeJobs.get(cfname);
+            if (job.completedSynchronizationJob(remote))
+            {
+                activeJobs.remove(cfname);
+                if (activeJobs.isEmpty())
+                    completed.signalAll();
+            }
+        }
+
+        void failedNode(InetAddress remote)
+        {
+            String errorMsg = String.format("Problem during repair session %s, endpoint %s died", sessionName, remote);
+            logger.error(errorMsg);
+            exception = new IOException(errorMsg);
+            // If a node failed, we stop everything (though there could still be some activity in the background)
+            jobs.clear();
+            activeJobs.clear();
+            differencingDone.signalAll();
+            completed.signalAll();
+        }
+
+        public void onJoin(InetAddress endpoint, EndpointState epState) {}
+        public void onChange(InetAddress endpoint, ApplicationState state, VersionedValue value) {}
+        public void onAlive(InetAddress endpoint, EndpointState state) {}
+        public void onDead(InetAddress endpoint, EndpointState state) {}
+
+        public void onRemove(InetAddress endpoint)
+        {
+            convict(endpoint, Double.MAX_VALUE);
+        }
+
+        public void onRestart(InetAddress endpoint, EndpointState epState)
+        {
+            convict(endpoint, Double.MAX_VALUE);
+        }
+
+        public void convict(InetAddress endpoint, double phi)
+        {
+            if (!endpoints.contains(endpoint))
+                return;
+
+            // We want a higher confidence in the failure detection than usual because failing a repair wrongly has a high cost.
+            if (phi < 2 * DatabaseDescriptor.getPhiConvictThreshold())
+                return;
+
+            // Though unlikely, it is possible to arrive here multiple time and we
+            // want to avoid print an error message twice
+            if (!isFailed.compareAndSet(false, true))
+                return;
+
+            failedNode(endpoint);
+        }
+
+        class RepairJob
+        {
+            private final String cfname;
+            private final Set<InetAddress> requestedEndpoints = new HashSet<InetAddress>();
+            private final Map<InetAddress, MerkleTree> trees = new HashMap<InetAddress, MerkleTree>();
+            private final Set<InetAddress> syncJobs = new HashSet<InetAddress>();
+
+            public RepairJob(String cfname)
+            {
+                this.cfname = cfname;
+            }
+
+            /**
+             * Send merkle tree request to every involved neighbor.
+             */
+            public void sendTreeRequests()
+            {
+                requestedEndpoints.addAll(endpoints);
+                requestedEndpoints.add(FBUtilities.getLocalAddress());
+
+                // send requests to all nodes
+                for (InetAddress endpoint : requestedEndpoints)
+                    AntiEntropyService.instance.request(getName(), endpoint, range, tablename, cfname);
+            }
+
+            /**
+             * Add a new received tree and return the number of remaining tree to
+             * be received for the job to be complete.
+             */
+            public synchronized int addTree(TreeRequest request, MerkleTree tree)
+            {
+                assert request.cf.right.equals(cfname);
+                trees.put(request.endpoint, tree);
+                requestedEndpoints.remove(request.endpoint);
+                return requestedEndpoints.size();
+            }
+
+            /**
+             * Submit differencers for running.
+             * All tree *must* have been received before this is called.
+             */
+            public void submitDifferencers()
+            {
+                assert requestedEndpoints.size() == 0;
+
+                // Right now, we only difference local host against each other. CASSANDRA-2610 will fix that.
+                // In the meantime ugly special casing will work good enough.
+                MerkleTree localTree = trees.get(FBUtilities.getLocalAddress());
+                assert localTree != null;
+                for (Map.Entry<InetAddress, MerkleTree> entry : trees.entrySet())
+                {
+                    if (entry.getKey().equals(FBUtilities.getLocalAddress()))
+                        continue;
+
+                    Differencer differencer = new Differencer(cfname, entry.getKey(), entry.getValue(), localTree);
+                    syncJobs.add(entry.getKey());
+                    logger.debug("Queueing comparison " + differencer);
+                    StageManager.getStage(Stage.ANTI_ENTROPY).execute(differencer);
+                }
+                trees.clear(); // allows gc to do its thing
+            }
+
+            synchronized boolean completedSynchronizationJob(InetAddress remote)
+            {
+                syncJobs.remove(remote);
+                return syncJobs.isEmpty();
+            }
+        }
+
+        /**
+         * Runs on the node that initiated a request to compare two trees, and launch repairs for disagreeing ranges.
+         */
+        class Differencer implements Runnable
+        {
+            public final String cfname;
+            public final InetAddress remote;
+            public final MerkleTree ltree;
+            public final MerkleTree rtree;
+            public List<Range> differences;
+
+            Differencer(String cfname, InetAddress remote, MerkleTree ltree, MerkleTree rtree)
+            {
+                this.cfname = cfname;
+                this.remote = remote;
+                this.ltree = ltree;
+                this.rtree = rtree;
+                this.differences = new ArrayList<Range>();
+            }
+
+            /**
+             * Compares our trees, and triggers repairs for any ranges that mismatch.
+             */
+            public void run()
+            {
+                InetAddress local = FBUtilities.getLocalAddress();
+
+                // restore partitioners (in case we were serialized)
+                if (ltree.partitioner() == null)
+                    ltree.partitioner(StorageService.getPartitioner());
+                if (rtree.partitioner() == null)
+                    rtree.partitioner(StorageService.getPartitioner());
+
+                // compare trees, and collect differences
+                differences.addAll(MerkleTree.difference(ltree, rtree));
+
+                // choose a repair method based on the significance of the difference
+                String format = "Endpoints " + local + " and " + remote + " %s for " + cfname + " on " + range;
+                if (differences.isEmpty())
+                {
+                    logger.info(String.format(format, "are consistent"));
+                    completed(remote, cfname);
+                    return;
+                }
+
+                // non-0 difference: perform streaming repair
+                logger.info(String.format(format, "have " + differences.size() + " range(s) out of sync"));
+                try
+                {
+                    performStreamingRepair();
+                }
+                catch(IOException e)
+                {
+                    throw new RuntimeException(e);
+                }
+            }
+
+            /**
+             * Starts sending/receiving our list of differences to/from the remote endpoint: creates a callback
+             * that will be called out of band once the streams complete.
+             */
+            void performStreamingRepair() throws IOException
+            {
+                logger.info("Performing streaming repair of " + differences.size() + " ranges with " + remote + " for " + range);
+                ColumnFamilyStore cfstore = Table.open(tablename).getColumnFamilyStore(cfname);
+                try
+                {
+                    Collection<SSTableReader> sstables = cfstore.getSSTables();
+                    Callback callback = new Callback();
+                    // send ranges to the remote node
+                    StreamOutSession outsession = StreamOutSession.create(tablename, remote, callback);
+                    StreamOut.transferSSTables(outsession, sstables, differences, OperationType.AES);
+                    // request ranges from the remote node
+                    StreamIn.requestRanges(remote, tablename, differences, callback, OperationType.AES);
+                }
+                catch(Exception e)
+                {
+                    throw new IOException("Streaming repair failed.", e);
+                }
+            }
+
+            public String toString()
+            {
+                return "#<Differencer " + remote + "/" + range + ">";
+            }
+
+            /**
+             * When a repair is necessary, this callback is created to wait for the inbound
+             * and outbound streams to complete.
+             */
+            class Callback extends WrappedRunnable
+            {
+                // we expect one callback for the receive, and one for the send
+                private final AtomicInteger outstanding = new AtomicInteger(2);
+
+                protected void runMayThrow() throws Exception
+                {
+                    if (outstanding.decrementAndGet() > 0)
+                        // waiting on more calls
+                        return;
+
+                    // all calls finished successfully
+                    completed(remote, cfname);
+                    logger.info(String.format("Finished streaming repair with %s for %s", remote, range));
+                }
+            }
+        }
     }
 
-    @Override
-    public AtomicReaderContext[] leaves() {
-      return leaves;
+    public static class RepairFuture extends FutureTask
+    {
+        public final RepairSession session;
+
+        RepairFuture(RepairSession session)
+        {
+            super(session, null);
+            this.session = session;
+        }
     }
-    
-    
-    @Override
-    public ReaderContext[] children() {
-      return children;
-    }
-  }
-  
-  /**
-   * {@link ReaderContext} for atomic {@link IndexReader} instances
-   * @lucene.experimental
-   */
-  public static final class AtomicReaderContext extends ReaderContext {
-    /** The readers ord in the top-level's leaves array */
-    public final int ord;
-    /** The readers absolute doc base */
-    public final int docBase;
-    /**
-     * Creates a new {@link AtomicReaderContext} 
-     */    
-    public AtomicReaderContext(ReaderContext parent, IndexReader reader,
-        int ord, int docBase, int leafOrd, int leafDocBase) {
-      super(parent, reader, true, ord, docBase);
-      assert reader.getSequentialSubReaders() == null : "Atomic readers must not have subreaders";
-      this.ord = leafOrd;
-      this.docBase = leafDocBase;
-    }
-    
-    /**
-     * Creates a new {@link AtomicReaderContext} for a atomic reader without an immediate
-     * parent.
-     */
-    public AtomicReaderContext(IndexReader atomicReader) {
-      this(null, atomicReader, 0, 0, 0, 0);
-    }
-  }
 }

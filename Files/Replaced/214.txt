@@ -1,6 +1,8 @@
-assertEquals("size", 3, getTestVector().getNumNonZeroElements());
+Directory rd = FSDirectory.getDirectory(indexDir, null, false);
 
-/*
+package org.apache.lucene.index;
+
+/**
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -17,74 +19,269 @@ assertEquals("size", 3, getTestVector().getNumNonZeroElements());
  * limitations under the License.
  */
 
-package org.apache.mahout.math;
+import org.apache.lucene.util.LuceneTestCase;
+import org.apache.lucene.analysis.Analyzer;
+import org.apache.lucene.analysis.SimpleAnalyzer;
+import org.apache.lucene.analysis.standard.StandardAnalyzer;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.Field;
+import org.apache.lucene.document.Field.Index;
+import org.apache.lucene.document.Field.Store;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.FSDirectory;
+import org.apache.lucene.store.RAMDirectory;
 
-import org.apache.mahout.math.function.Functions;
-import org.junit.Test;
+import java.io.File;
+import java.io.IOException;
+import java.util.EmptyStackException;
+import java.util.Random;
+import java.util.Stack;
 
+/**
+ * Tests for the "IndexModifier" class, including accesses from two threads at the
+ * same time.
+ * 
+ * @author Daniel Naber
+ * @deprecated
+ */
+public class TestIndexModifier extends LuceneTestCase {
 
-public class WeightedVectorTest extends AbstractVectorTest {
-  @Test
-  public void testLength() {
-    Vector v = new DenseVector(new double[]{0.9921337470551008, 1.0031004325833064, 0.9963963182745947});
-    Centroid c = new Centroid(3, new DenseVector(v), 2);
-    assertEquals(c.getVector().getLengthSquared(), c.getLengthSquared(), 1.0e-17);
-    // previously, this wouldn't clear the cached squared length value correctly which would cause bad distances
-    c.set(0, -1);
-    System.out.printf("c = %.9f\nv = %.9f\n", c.getLengthSquared(), c.getVector().getLengthSquared());
-    assertEquals(c.getVector().getLengthSquared(), c.getLengthSquared(), 1.0e-17);
+  private int docCount = 0;
+  
+  private final Term allDocTerm = new Term("all", "x");
+
+  public void testIndex() throws IOException {
+    Directory ramDir = new RAMDirectory();
+    IndexModifier i = new IndexModifier(ramDir, new StandardAnalyzer(), true);
+    i.addDocument(getDoc());
+    assertEquals(1, i.docCount());
+    i.flush();
+    i.addDocument(getDoc(), new SimpleAnalyzer());
+    assertEquals(2, i.docCount());
+    i.optimize();
+    assertEquals(2, i.docCount());
+    i.flush();
+    i.deleteDocument(0);
+    assertEquals(1, i.docCount());
+    i.flush();
+    assertEquals(1, i.docCount());
+    i.addDocument(getDoc());
+    i.addDocument(getDoc());
+    i.flush();
+    // depend on merge policy - assertEquals(3, i.docCount());
+    i.deleteDocuments(allDocTerm);
+    assertEquals(0, i.docCount());
+    i.optimize();
+    assertEquals(0, i.docCount());
+    
+    //  Lucene defaults:
+    assertNull(i.getInfoStream());
+    assertTrue(i.getUseCompoundFile());
+    assertEquals(IndexWriter.DISABLE_AUTO_FLUSH, i.getMaxBufferedDocs());
+    assertEquals(10000, i.getMaxFieldLength());
+    assertEquals(10, i.getMergeFactor());
+    // test setting properties:
+    i.setMaxBufferedDocs(100);
+    i.setMergeFactor(25);
+    i.setMaxFieldLength(250000);
+    i.addDocument(getDoc());
+    i.setUseCompoundFile(false);
+    i.flush();
+    assertEquals(100, i.getMaxBufferedDocs());
+    assertEquals(25, i.getMergeFactor());
+    assertEquals(250000, i.getMaxFieldLength());
+    assertFalse(i.getUseCompoundFile());
+
+    // test setting properties when internally the reader is opened:
+    i.deleteDocuments(allDocTerm);
+    i.setMaxBufferedDocs(100);
+    i.setMergeFactor(25);
+    i.setMaxFieldLength(250000);
+    i.addDocument(getDoc());
+    i.setUseCompoundFile(false);
+    i.optimize();
+    assertEquals(100, i.getMaxBufferedDocs());
+    assertEquals(25, i.getMergeFactor());
+    assertEquals(250000, i.getMaxFieldLength());
+    assertFalse(i.getUseCompoundFile());
+
+    i.close();
+    try {
+      i.docCount();
+      fail();
+    } catch (IllegalStateException e) {
+      // expected exception
+    }
   }
 
-  @Override
-  public Vector vectorToTest(int size) {
-    return new WeightedVector(new DenseVector(size), 4.52, 345);
+  public void testExtendedIndex() throws IOException {
+    Directory ramDir = new RAMDirectory();
+    PowerIndex powerIndex = new PowerIndex(ramDir, new StandardAnalyzer(), true);
+    powerIndex.addDocument(getDoc());
+    powerIndex.addDocument(getDoc());
+    powerIndex.addDocument(getDoc());
+    powerIndex.addDocument(getDoc());
+    powerIndex.addDocument(getDoc());
+    powerIndex.flush();
+    assertEquals(5, powerIndex.docFreq(allDocTerm));
+    powerIndex.close();
+  }
+  
+  private Document getDoc() {
+    Document doc = new Document();
+    doc.add(new Field("body", new Integer(docCount).toString(), Field.Store.YES, Field.Index.UN_TOKENIZED));
+    doc.add(new Field("all", "x", Field.Store.YES, Field.Index.UN_TOKENIZED));
+    docCount++;
+    return doc;
+  }
+  
+  public void testIndexWithThreads() throws IOException {
+    testIndexInternal(0);
+    testIndexInternal(10);
+    testIndexInternal(50);
+  }
+  
+  private void testIndexInternal(int maxWait) throws IOException {
+    final boolean create = true;
+    //Directory rd = new RAMDirectory();
+    // work on disk to make sure potential lock problems are tested:
+    String tempDir = System.getProperty("java.io.tmpdir");
+    if (tempDir == null)
+      throw new IOException("java.io.tmpdir undefined, cannot run test");
+    File indexDir = new File(tempDir, "lucenetestindex");
+    Directory rd = FSDirectory.getDirectory(indexDir);
+    IndexThread.id = 0;
+    IndexThread.idStack.clear();
+    IndexModifier index = new IndexModifier(rd, new StandardAnalyzer(), create);
+    IndexThread thread1 = new IndexThread(index, maxWait, 1);
+    thread1.start();
+    IndexThread thread2 = new IndexThread(index, maxWait, 2);
+    thread2.start();
+    while(thread1.isAlive() || thread2.isAlive()) {
+      try {
+        Thread.sleep(100);
+      } catch (InterruptedException e) {
+        throw new RuntimeException(e);
+      }
+    }
+    index.optimize();
+    int added = thread1.added + thread2.added;
+    int deleted = thread1.deleted + thread2.deleted;
+    assertEquals(added-deleted, index.docCount());
+    index.close();
+    
+    try {
+      index.close();
+      fail();
+    } catch(IllegalStateException e) {
+      // expected exception
+    }
+    rmDir(indexDir);
+  }
+  
+  private void rmDir(File dir) {
+    File[] files = dir.listFiles();
+    for (int i = 0; i < files.length; i++) {
+      files[i].delete();
+    }
+    dir.delete();
+  }
+  
+  private class PowerIndex extends IndexModifier {
+    public PowerIndex(Directory dir, Analyzer analyzer, boolean create) throws IOException {
+      super(dir, analyzer, create);
+    }
+    public int docFreq(Term term) throws IOException {
+      synchronized(directory) {
+        assureOpen();
+        createIndexReader();
+        return indexReader.docFreq(term);
+      }
+    }
+  }
+  
+}
+
+class IndexThread extends Thread {
+
+  private final static int ITERATIONS = 500;       // iterations of thread test
+
+  static int id = 0;
+  static Stack idStack = new Stack();
+
+  int added = 0;
+  int deleted = 0;
+
+  private int maxWait = 10;
+  private IndexModifier index;
+  private int threadNumber;
+  private Random random;
+  
+  IndexThread(IndexModifier index, int maxWait, int threadNumber) {
+    this.index = index;
+    this.maxWait = maxWait;
+    this.threadNumber = threadNumber;
+    // TODO: test case is not reproducible despite pseudo-random numbers:
+    random = new Random(101+threadNumber);        // constant seed for better reproducability
+  }
+  
+  public void run() {
+    try {
+      for(int i = 0; i < ITERATIONS; i++) {
+        int rand = random.nextInt(101);
+        if (rand < 5) {
+          index.optimize();
+        } else if (rand < 60) {
+          Document doc = getDocument();
+          index.addDocument(doc);
+          idStack.push(doc.get("id"));
+          added++;
+        } else {
+          // we just delete the last document added and remove it
+          // from the id stack so that it won't be removed twice:
+          String delId = null;
+          try {
+            delId = (String)idStack.pop();
+          } catch (EmptyStackException e) {
+            continue;
+          }
+          Term delTerm = new Term("id", new Integer(delId).toString());
+          int delCount = index.deleteDocuments(delTerm);
+          if (delCount != 1) {
+            throw new RuntimeException("Internal error: " + threadNumber + " deleted " + delCount + 
+                " documents, term=" + delTerm);
+          }
+          deleted++;
+        }
+        if (maxWait > 0) {
+          try {
+            rand = random.nextInt(maxWait);
+            //System.out.println("waiting " + rand + "ms");
+            Thread.sleep(rand);
+          } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+          }
+        }
+      }
+    } catch (IOException e) {
+      throw new RuntimeException(e);
+    }
   }
 
-  @Test
-  public void testOrdering() {
-    WeightedVector v1 = new WeightedVector(new DenseVector(new double[]{1, 2, 3}), 5.41, 31);
-    WeightedVector v2 = new WeightedVector(new DenseVector(new double[]{1, 2, 3}), 5.00, 31);
-    WeightedVector v3 = new WeightedVector(new DenseVector(new double[]{1, 3, 3}), 5.00, 31);
-    WeightedVector v4 = (WeightedVector) v1.clone();
-    WeightedVectorComparator comparator = new WeightedVectorComparator();
-
-    assertTrue(comparator.compare(v1, v2) > 0);
-    assertTrue(comparator.compare(v3, v1) < 0);
-    assertTrue(comparator.compare(v3, v2) > 0);
-    assertEquals(0, comparator.compare(v4, v1));
-    assertEquals(0, comparator.compare(v1, v1));
+  private Document getDocument() {
+    Document doc = new Document();
+    synchronized (getClass()) {
+      doc.add(new Field("id", new Integer(id).toString(), Field.Store.YES,
+          Field.Index.UN_TOKENIZED));
+      id++;
+    }
+    // add random stuff:
+    doc.add(new Field("content", new Integer(random.nextInt(1000)).toString(), Field.Store.YES,
+        Field.Index.TOKENIZED));
+    doc.add(new Field("content", new Integer(random.nextInt(1000)).toString(), Field.Store.YES,
+        Field.Index.TOKENIZED));
+    doc.add(new Field("all", "x", Field.Store.YES, Field.Index.TOKENIZED));
+    return doc;
   }
-
-  @Test
-  public void testProjection() {
-    Vector v1 = new DenseVector(10).assign(Functions.random());
-    WeightedVector v2 = new WeightedVector(v1, v1, 31);
-    assertEquals(v1.dot(v1), v2.getWeight(), 1.0e-13);
-    assertEquals(31, v2.getIndex());
-
-    Matrix y = new DenseMatrix(10, 4).assign(Functions.random());
-    Matrix q = new QRDecomposition(y.viewPart(0, 10, 0, 3)).getQ();
-
-    Vector nullSpace = y.viewColumn(3).minus(q.times(q.transpose().times(y.viewColumn(3))));
-
-    WeightedVector v3 = new WeightedVector(q.viewColumn(0).plus(q.viewColumn(1)), nullSpace, 1);
-    assertEquals(0, v3.getWeight(), 1.0e-13);
-
-    Vector qx = q.viewColumn(0).plus(q.viewColumn(1)).normalize();
-    WeightedVector v4 = new WeightedVector(qx, q.viewColumn(0), 2);
-    assertEquals(Math.sqrt(0.5), v4.getWeight(), 1.0e-13);
-
-    WeightedVector v5 = WeightedVector.project(q.viewColumn(0), qx);
-    assertEquals(Math.sqrt(0.5), v5.getWeight(), 1.0e-13);
-  }
-
-  @Override
-  public void testSize() {
-    assertEquals("size", 3, getTestVector().getNumNondefaultElements());
-  }
-
-  @Override
-  Vector generateTestVector(int cardinality) {
-    return new WeightedVector(new DenseVector(cardinality), 3.14, 53);
-  }
+  
 }

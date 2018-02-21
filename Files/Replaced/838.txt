@@ -1,4 +1,6 @@
-Path input = new Path(this.getClass().getResource("/wdbc/").getPath());
+final LineFileDocs docs = new LineFileDocs(random, defaultCodecSupportsDocValues());
+
+package org.apache.lucene.index;
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -17,53 +19,88 @@ Path input = new Path(this.getClass().getResource("/wdbc/").getPath());
  * limitations under the License.
  */
 
-package org.apache.mahout.ga.watchmaker.cd.hadoop;
+import java.io.IOException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
-import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.fs.Path;
-import org.apache.mahout.common.MahoutTestCase;
-import org.apache.mahout.ga.watchmaker.cd.CDFitness;
-import org.apache.mahout.ga.watchmaker.cd.Rule;
-import org.apache.mahout.ga.watchmaker.cd.utils.RandomRule;
-import org.apache.mahout.ga.watchmaker.cd.utils.RandomRuleResults;
-import org.apache.mahout.common.RandomUtils;
+import org.apache.lucene.analysis.MockAnalyzer;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.util.LineFileDocs;
+import org.apache.lucene.util.LuceneTestCase;
+import org.apache.lucene.util._TestUtil;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Random;
+public class TestForceMergeForever extends LuceneTestCase {
 
-public class CDMahoutEvaluatorTest extends MahoutTestCase {
+  // Just counts how many merges are done
+  private static class MyIndexWriter extends IndexWriter {
 
-  public void testEvaluate() throws Exception {
-    int nbrules = 100;
-    Random rng = RandomUtils.getRandom();
-    int target = 1;
+    AtomicInteger mergeCount = new AtomicInteger();
+    private boolean first;
 
-    // random rules
-    List<Rule> rules = new ArrayList<Rule>();
-    for (int index = 0; index < nbrules; index++) {
-      rules.add(new RandomRule(index, target, rng));
+    public MyIndexWriter(Directory dir, IndexWriterConfig conf) throws Exception {
+      super(dir, conf);
     }
 
-    // dataset
-    // This is sensitive to the working directory where the test is run:
-    Path input = new Path("target/test-classes/wdbc");
-    CDMahoutEvaluator.initializeDataSet(input);
-
-    // evaluate the rules
-    List<CDFitness> results = new ArrayList<CDFitness>();
-    Path output = getTestTempDirPath("output");
-    FileSystem fs = output.getFileSystem(new Configuration());
-    fs.delete(output, true); // It's unhappy if this directory exists
-    CDMahoutEvaluator.evaluate(rules, target, input, output, results);
-
-    // check the results
-    for (int index = 0; index < nbrules; index++) {
-      assertEquals("rule " + index, RandomRuleResults.getResult(index),
-          results.get(index));
+    @Override
+    public void merge(MergePolicy.OneMerge merge) throws CorruptIndexException, IOException {
+      if (merge.maxNumSegments != -1 && (first || merge.segments.size() == 1)) {
+        first = false;
+        if (VERBOSE) {
+          System.out.println("TEST: maxNumSegments merge");
+        }
+        mergeCount.incrementAndGet();
+      }
+      super.merge(merge);
     }
-
   }
 
+  public void test() throws Exception {
+    final Directory d = newDirectory();
+    final MyIndexWriter w = new MyIndexWriter(d, newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random)));
+
+    // Try to make an index that requires merging:
+    w.getConfig().setMaxBufferedDocs(_TestUtil.nextInt(random, 2, 11));
+    final int numStartDocs = atLeast(20);
+    final LineFileDocs docs = new LineFileDocs(random);
+    for(int docIDX=0;docIDX<numStartDocs;docIDX++) {
+      w.addDocument(docs.nextDoc());
+    }
+    MergePolicy mp = w.getConfig().getMergePolicy();
+    final int mergeAtOnce = 1+w.segmentInfos.size();
+    if (mp instanceof TieredMergePolicy) {
+      ((TieredMergePolicy) mp).setMaxMergeAtOnce(mergeAtOnce);
+    } else if (mp instanceof LogMergePolicy) {
+      ((LogMergePolicy) mp).setMergeFactor(mergeAtOnce);
+    } else {
+      // skip test
+      w.close();
+      d.close();
+      return;
+    }
+
+    final AtomicBoolean doStop = new AtomicBoolean();
+    w.getConfig().setMaxBufferedDocs(2);
+    Thread t = new Thread() {
+      @Override
+      public void run() {
+        try {
+          while (!doStop.get()) {
+            w.updateDocument(new Term("docid", "" + random.nextInt(numStartDocs)),
+                             docs.nextDoc());
+            // Force deletes to apply
+            w.getReader().close();
+          }
+        } catch (Throwable t) {
+          throw new RuntimeException(t);
+        }
+      }
+      };
+    t.start();
+    w.forceMerge(1);
+    doStop.set(true);
+    t.join();
+    assertTrue("merge count is " + w.mergeCount.get(), w.mergeCount.get() <= 1);
+    w.close();
+    d.close();
+  }
 }

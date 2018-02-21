@@ -1,6 +1,8 @@
-parser.setHelpOption(helpOpt);
+this.likelyExpired = true;
 
-/**
+package org.apache.solr.common.cloud;
+
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -17,221 +19,223 @@ parser.setHelpOption(helpOpt);
  * limitations under the License.
  */
 
-package org.apache.mahout.text;
+import java.util.Timer;
+import java.util.TimerTask;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeoutException;
 
-import org.apache.commons.cli2.CommandLine;
-import org.apache.commons.cli2.Group;
-import org.apache.commons.cli2.Option;
-import org.apache.commons.cli2.OptionException;
-import org.apache.commons.cli2.builder.ArgumentBuilder;
-import org.apache.commons.cli2.builder.DefaultOptionBuilder;
-import org.apache.commons.cli2.builder.GroupBuilder;
-import org.apache.commons.cli2.commandline.Parser;
-import org.apache.hadoop.fs.Path;
-import org.apache.lucene.analysis.Analyzer;
-import org.apache.mahout.common.CommandLineUtil;
-import org.apache.mahout.common.HadoopUtil;
-import org.apache.mahout.utils.nlp.collocations.llr.LLRReducer;
-import org.apache.mahout.utils.vectors.common.PartialVectorMerger;
-import org.apache.mahout.utils.vectors.text.DictionaryVectorizer;
-import org.apache.mahout.utils.vectors.text.DocumentProcessor;
-import org.apache.mahout.utils.vectors.tfidf.TFIDFConverter;
+import org.apache.solr.common.SolrException;
+import org.apache.zookeeper.WatchedEvent;
+import org.apache.zookeeper.Watcher;
+import org.apache.zookeeper.Watcher.Event.KeeperState;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-/**
- * Converts a given set of sequence files into SparseVectors
- */
-public final class SparseVectorsFromSequenceFiles {
+public class ConnectionManager implements Watcher {
+  protected static final Logger log = LoggerFactory
+      .getLogger(ConnectionManager.class);
+
+  private final String name;
+  private CountDownLatch clientConnected;
+  private KeeperState state;
+  private boolean connected;
+  private boolean likelyExpired = true;
+
+  private final ZkClientConnectionStrategy connectionStrategy;
+
+  private final String zkServerAddress;
+
+  private final SolrZkClient client;
+
+  private final OnReconnect onReconnect;
+  private final BeforeReconnect beforeReconnect;
+
+  private volatile boolean isClosed = false;
   
-  private static final Logger log = LoggerFactory.getLogger(SparseVectorsFromSequenceFiles.class);
-  
-  private SparseVectorsFromSequenceFiles() {
+  private volatile Timer disconnectedTimer;
+
+  public ConnectionManager(String name, SolrZkClient client, String zkServerAddress, ZkClientConnectionStrategy strat, OnReconnect onConnect, BeforeReconnect beforeReconnect) {
+    this.name = name;
+    this.client = client;
+    this.connectionStrategy = strat;
+    this.zkServerAddress = zkServerAddress;
+    this.onReconnect = onConnect;
+    this.beforeReconnect = beforeReconnect;
+    reset();
+  }
+
+  private synchronized void reset() {
+    clientConnected = new CountDownLatch(1);
+    state = KeeperState.Disconnected;
+    disconnected();
   }
   
-  public static void main(String[] args) throws Exception {
-    DefaultOptionBuilder obuilder = new DefaultOptionBuilder();
-    ArgumentBuilder abuilder = new ArgumentBuilder();
-    GroupBuilder gbuilder = new GroupBuilder();
+  private synchronized void connected() {
+    connected = true;
+    if (disconnectedTimer != null) {
+      disconnectedTimer.cancel();
+      disconnectedTimer = null;
+    }
+    likelyExpired = false;
+  }
+
+  private synchronized void disconnected() {
+    if (disconnectedTimer != null) {
+      disconnectedTimer.cancel();
+      disconnectedTimer = null;
+    }
     
-    Option inputDirOpt = obuilder.withLongName("input").withRequired(true).withArgument(
-      abuilder.withName("input").withMinimum(1).withMaximum(1).create()).withDescription(
-      "input dir containing the documents in sequence file format").withShortName("i").create();
-    
-    Option outputDirOpt = obuilder.withLongName("output").withRequired(true).withArgument(
-      abuilder.withName("output").withMinimum(1).withMaximum(1).create()).withDescription(
-      "The output directory").withShortName("o").create();
-    Option minSupportOpt = obuilder.withLongName("minSupport").withArgument(
-      abuilder.withName("minSupport").withMinimum(1).withMaximum(1).create()).withDescription(
-      "(Optional) Minimum Support. Default Value: 2").withShortName("s").create();
-    
-    Option analyzerNameOpt = obuilder.withLongName("analyzerName").withArgument(
-      abuilder.withName("analyzerName").withMinimum(1).withMaximum(1).create()).withDescription(
-      "The class name of the analyzer").withShortName("a").create();
-    
-    Option chunkSizeOpt = obuilder.withLongName("chunkSize").withArgument(
-      abuilder.withName("chunkSize").withMinimum(1).withMaximum(1).create()).withDescription(
-      "The chunkSize in MegaBytes. 100-10000 MB").withShortName("chunk").create();
-    
-    Option weightOpt = obuilder.withLongName("weight").withRequired(false).withArgument(
-      abuilder.withName("weight").withMinimum(1).withMaximum(1).create()).withDescription(
-      "The kind of weight to use. Currently TF or TFIDF").withShortName("wt").create();
-    
-    Option minDFOpt = obuilder.withLongName("minDF").withRequired(false).withArgument(
-      abuilder.withName("minDF").withMinimum(1).withMaximum(1).create()).withDescription(
-      "The minimum document frequency.  Default is 1").withShortName("md").create();
-    
-    Option maxDFPercentOpt = obuilder.withLongName("maxDFPercent").withRequired(false).withArgument(
-      abuilder.withName("maxDFPercent").withMinimum(1).withMaximum(1).create()).withDescription(
-      "The max percentage of docs for the DF.  Can be used to remove really high frequency terms."
-          + " Expressed as an integer between 0 and 100. Default is 99.").withShortName("x").create();
-    
-    Option minLLROpt = obuilder.withLongName("minLLR").withRequired(false).withArgument(
-      abuilder.withName("minLLR").withMinimum(1).withMaximum(1).create()).withDescription(
-      "(Optional)The minimum Log Likelihood Ratio(Float)  Default is " + LLRReducer.DEFAULT_MIN_LLR)
-        .withShortName("ml").create();
-    
-    Option numReduceTasksOpt = obuilder.withLongName("numReducers").withArgument(
-      abuilder.withName("numReducers").withMinimum(1).withMaximum(1).create()).withDescription(
-      "(Optional) Number of reduce tasks. Default Value: 1").withShortName("nr").create();
-    
-    Option powerOpt = obuilder.withLongName("norm").withRequired(false).withArgument(
-      abuilder.withName("norm").withMinimum(1).withMaximum(1).create()).withDescription(
-      "The norm to use, expressed as either a float or \"INF\" if you want to use the Infinite norm.  "
-          + "Must be greater or equal to 0.  The default is not to normalize").withShortName("n").create();
-    Option maxNGramSizeOpt = obuilder.withLongName("maxNGramSize").withRequired(false).withArgument(
-      abuilder.withName("ngramSize").withMinimum(1).withMaximum(1).create())
-        .withDescription(
-          "(Optional) The maximum size of ngrams to create"
-              + " (2 = bigrams, 3 = trigrams, etc) Default Value:1").withShortName("ng").create();
-    Option sequentialAccessVectorOpt = obuilder.withLongName("sequentialAccessVector").withRequired(false)
-        .withDescription(
-          "(Optional) Whether output vectors should be SequentialAccessVectors. If set true else false")
-        .withShortName("seq").create();
-    
-    Option overwriteOutput = obuilder.withLongName("overwrite").withRequired(false).withDescription(
-      "If set, overwrite the output directory").withShortName("ow").create();
-    Option helpOpt = obuilder.withLongName("help").withDescription("Print out help").withShortName("h")
-        .create();
-    
-    Group group = gbuilder.withName("Options").withOption(minSupportOpt).withOption(analyzerNameOpt)
-        .withOption(chunkSizeOpt).withOption(outputDirOpt).withOption(inputDirOpt).withOption(minDFOpt)
-        .withOption(maxDFPercentOpt).withOption(weightOpt).withOption(powerOpt).withOption(minLLROpt)
-        .withOption(numReduceTasksOpt).withOption(maxNGramSizeOpt).withOption(overwriteOutput).withOption(
-          helpOpt).withOption(sequentialAccessVectorOpt).create();
-    try {
-      Parser parser = new Parser();
-      parser.setGroup(group);
-      CommandLine cmdLine = parser.parse(args);
+    disconnectedTimer = new Timer();
+    disconnectedTimer.schedule(new TimerTask() {
       
-      if (cmdLine.hasOption(helpOpt)) {
-        CommandLineUtil.printHelp(group);
-        return;
-      }
-      
-      Path inputDir = new Path((String) cmdLine.getValue(inputDirOpt));
-      Path outputDir = new Path((String) cmdLine.getValue(outputDirOpt));
-      
-      int chunkSize = 100;
-      if (cmdLine.hasOption(chunkSizeOpt)) {
-        chunkSize = Integer.parseInt((String) cmdLine.getValue(chunkSizeOpt));
-      }
-      int minSupport = 2;
-      if (cmdLine.hasOption(minSupportOpt)) {
-        String minSupportString = (String) cmdLine.getValue(minSupportOpt);
-        minSupport = Integer.parseInt(minSupportString);
-      }
-      
-      int maxNGramSize = 1;
-      
-      if (cmdLine.hasOption(maxNGramSizeOpt)) {
-        try {
-          maxNGramSize = Integer.parseInt(cmdLine.getValue(maxNGramSizeOpt).toString());
-        } catch (NumberFormatException ex) {
-          log.warn("Could not parse ngram size option");
+      @Override
+      public void run() {
+        synchronized (ConnectionManager.this) {
+          likelyExpired = true;
         }
       }
-      log.info("Maximum n-gram size is: {}", maxNGramSize);
       
-      if (cmdLine.hasOption(overwriteOutput)) {
-        HadoopUtil.overwriteOutput(outputDir);
+    }, (long) (client.getZkClientTimeout() * 0.90));
+    connected = false;
+  }
+
+  @Override
+  public synchronized void process(WatchedEvent event) {
+    if (log.isInfoEnabled()) {
+      log.info("Watcher " + this + " name:" + name + " got event " + event
+          + " path:" + event.getPath() + " type:" + event.getType());
+    }
+    
+    if (isClosed) {
+      log.info("Client->ZooKeeper status change trigger but we are already closed");
+      return;
+    }
+
+    state = event.getState();
+    if (state == KeeperState.SyncConnected) {
+      connected();
+      clientConnected.countDown();
+      connectionStrategy.connected();
+    } else if (state == KeeperState.Expired) {
+      disconnected();
+      log.info("Our previous ZooKeeper session was expired. Attempting to reconnect to recover relationship with ZooKeeper...");
+      if (beforeReconnect != null) {
+        beforeReconnect.command();
       }
-      
-      float minLLRValue = LLRReducer.DEFAULT_MIN_LLR;
-      if (cmdLine.hasOption(minLLROpt)) {
-        minLLRValue = Float.parseFloat(cmdLine.getValue(minLLROpt).toString());
+      try {
+        connectionStrategy.reconnect(zkServerAddress, client.getZkClientTimeout(), this,
+            new ZkClientConnectionStrategy.ZkUpdate() {
+              @Override
+              public void update(SolrZooKeeper keeper) {
+                try {
+                  waitForConnected(Long.MAX_VALUE);
+                } catch (Exception e1) {
+                  closeKeeper(keeper);
+                  throw new RuntimeException(e1);
+                }
+                
+                log.info("Connection with ZooKeeper reestablished.");
+                try {
+                  client.updateKeeper(keeper);
+                } catch (InterruptedException e) {
+                  closeKeeper(keeper);
+                  Thread.currentThread().interrupt();
+                  // we must have been asked to stop
+                  throw new RuntimeException(e);
+                } catch (Throwable t) {
+                  closeKeeper(keeper);
+                  throw new RuntimeException(t);
+                }
+                
+                if (onReconnect != null) {
+                  onReconnect.command();
+                }
+                
+                connected();
+                
+              }
+            });
+      } catch (Exception e) {
+        SolrException.log(log, "", e);
       }
-      log.info("Minimum LLR value: {}", minLLRValue);
-      
-      int reduceTasks = 1;
-      if (cmdLine.hasOption(numReduceTasksOpt)) {
-        reduceTasks = Integer.parseInt(cmdLine.getValue(numReduceTasksOpt).toString());
-      }
-      log.info("Number of reduce tasks: {}", reduceTasks);
-      
-      Class<? extends Analyzer> analyzerClass = DefaultAnalyzer.class;
-      if (cmdLine.hasOption(analyzerNameOpt)) {
-        String className = cmdLine.getValue(analyzerNameOpt).toString();
-        analyzerClass = Class.forName(className).asSubclass(Analyzer.class);
-        // try instantiating it, b/c there isn't any point in setting it if
-        // you can't instantiate it
-        analyzerClass.newInstance();
-      }
-      
-      boolean processIdf;
-      
-      if (cmdLine.hasOption(weightOpt)) {
-        String wString = cmdLine.getValue(weightOpt).toString();
-        if ("tf".equalsIgnoreCase(wString)) {
-          processIdf = false;
-        } else if ("tfidf".equalsIgnoreCase(wString)) {
-          processIdf = true;
-        } else {
-          throw new OptionException(weightOpt);
-        }
-      } else {
-        processIdf = true;
-      }
-      
-      int minDf = 1;
-      if (cmdLine.hasOption(minDFOpt)) {
-        minDf = Integer.parseInt(cmdLine.getValue(minDFOpt).toString());
-      }
-      int maxDFPercent = 99;
-      if (cmdLine.hasOption(maxDFPercentOpt)) {
-        maxDFPercent = Integer.parseInt(cmdLine.getValue(maxDFPercentOpt).toString());
-      }
-      
-      float norm = PartialVectorMerger.NO_NORMALIZING;
-      if (cmdLine.hasOption(powerOpt)) {
-        String power = cmdLine.getValue(powerOpt).toString();
-        if ("INF".equals(power)) {
-          norm = Float.POSITIVE_INFINITY;
-        } else {
-          norm = Float.parseFloat(power);
-        }
-      }
-      HadoopUtil.overwriteOutput(outputDir);
-      Path tokenizedPath = new Path(outputDir, DocumentProcessor.TOKENIZED_DOCUMENT_OUTPUT_FOLDER);
-      DocumentProcessor.tokenizeDocuments(inputDir, analyzerClass, tokenizedPath);
-      
-      boolean sequentialAccessOutput = false;
-      if (cmdLine.hasOption(sequentialAccessVectorOpt)) {
-        sequentialAccessOutput = true;
-      }
-      
-      DictionaryVectorizer.createTermFrequencyVectors(tokenizedPath, outputDir, minSupport, maxNGramSize,
-        minLLRValue, reduceTasks, chunkSize, sequentialAccessOutput);
-      if (processIdf) {
-        TFIDFConverter.processTfIdf(
-          new Path(outputDir, DictionaryVectorizer.DOCUMENT_VECTOR_OUTPUT_FOLDER),
-          outputDir, chunkSize, minDf, maxDFPercent, norm,
-          sequentialAccessOutput, reduceTasks);
-      }
-    } catch (OptionException e) {
-      log.error("Exception", e);
-      CommandLineUtil.printHelp(group);
+      log.info("Connected:" + connected);
+    } else if (state == KeeperState.Disconnected) {
+      log.info("zkClient has disconnected");
+      disconnected();
+      connectionStrategy.disconnected();
+    } else {
+      disconnected();
+    }
+    notifyAll();
+  }
+
+  public synchronized boolean isConnected() {
+    return !isClosed && connected;
+  }
+  
+  // we use a volatile rather than sync
+  // to avoid deadlock on shutdown
+  public void close() {
+    this.isClosed = true;
+    if (this.disconnectedTimer != null) {
+      this.disconnectedTimer.cancel();
+      this.disconnectedTimer = null;
     }
   }
+
+  public synchronized KeeperState state() {
+    return state;
+  }
   
+  public synchronized boolean isLikelyExpired() {
+    return likelyExpired;
+  }
+
+  public synchronized void waitForConnected(long waitForConnection)
+      throws TimeoutException {
+    log.info("Waiting for client to connect to ZooKeeper");
+    long expire = System.currentTimeMillis() + waitForConnection;
+    long left = 1;
+    while (!connected && left > 0) {
+      if (isClosed) {
+        break;
+      }
+      try {
+        wait(500);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new RuntimeException(e);
+      }
+      left = expire - System.currentTimeMillis();
+    }
+    if (!connected) {
+      throw new TimeoutException("Could not connect to ZooKeeper " + zkServerAddress + " within " + waitForConnection + " ms");
+    }
+    log.info("Client is connected to ZooKeeper");
+  }
+
+  public synchronized void waitForDisconnected(long timeout)
+      throws InterruptedException, TimeoutException {
+    long expire = System.currentTimeMillis() + timeout;
+    long left = timeout;
+    while (connected && left > 0) {
+      wait(left);
+      left = expire - System.currentTimeMillis();
+    }
+    if (connected) {
+      throw new TimeoutException("Did not disconnect");
+    }
+  }
+
+  private void closeKeeper(SolrZooKeeper keeper) {
+    try {
+      keeper.close();
+    } catch (InterruptedException e) {
+      // Restore the interrupted status
+      Thread.currentThread().interrupt();
+      log.error("", e);
+      throw new ZooKeeperException(SolrException.ErrorCode.SERVER_ERROR,
+          "", e);
+    }
+  }
 }

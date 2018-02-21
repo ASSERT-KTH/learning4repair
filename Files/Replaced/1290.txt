@@ -1,12 +1,13 @@
-transactions.add(Arrays.asList("D", "D", "", "D", "D"));
+logger.info("Listening for thrift clients...");
 
 /**
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -17,122 +18,208 @@ transactions.add(Arrays.asList("D", "D", "", "D", "D"));
  * limitations under the License.
  */
 
-package org.apache.mahout.fpm.pfpgrowth;
+package org.apache.cassandra.thrift;
 
-import java.io.File;
-import java.io.Writer;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.List;
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.util.UUID;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
-import com.google.common.base.Charsets;
-import com.google.common.collect.Lists;
-import com.google.common.io.Closeables;
-import com.google.common.io.Files;
-import org.apache.hadoop.conf.Configuration;
-import org.apache.mahout.common.MahoutTestCase;
-import org.apache.mahout.common.Pair;
-import org.apache.mahout.common.Parameters;
-import org.apache.mahout.fpm.pfpgrowth.convertors.string.TopKStringPatterns;
-import org.junit.Test;
+import org.apache.cassandra.config.ConfigurationException;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.CompactionManager;
+import org.apache.cassandra.db.SystemTable;
+import org.apache.cassandra.db.Table;
+import org.apache.cassandra.db.commitlog.CommitLog;
+import org.apache.cassandra.db.migration.Migration;
+import org.apache.cassandra.service.MigrationManager;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.Mx4jTool;
+import org.apache.thrift.TProcessorFactory;
+import org.apache.thrift.protocol.TBinaryProtocol;
+import org.apache.thrift.protocol.TProtocolFactory;
+import org.apache.thrift.server.TServer;
+import org.apache.thrift.transport.TFramedTransport;
+import org.apache.thrift.transport.TServerSocket;
+import org.apache.thrift.transport.TTransportException;
+import org.apache.thrift.transport.TTransportFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public final class PFPGrowthTest2 extends MahoutTestCase {
-  
-  private static final Logger log = LoggerFactory.getLogger(PFPGrowthTest.class);
-  
-  private final Parameters params = new Parameters();
+/**
+ * This class supports two methods for creating a Cassandra node daemon, 
+ * invoking the class's main method, and using the jsvc wrapper from 
+ * commons-daemon, (for more information on using this class with the 
+ * jsvc wrapper, see the 
+ * <a href="http://commons.apache.org/daemon/jsvc.html">Commons Daemon</a>
+ * documentation).
+ */
 
-  @Override
-  public void setUp() throws Exception {
-    super.setUp();
-    params.set(PFPGrowth.MIN_SUPPORT, "3");
-    params.set(PFPGrowth.MAX_HEAPSIZE, "4");
-    params.set(PFPGrowth.NUM_GROUPS, "2");
-    params.set(PFPGrowth.ENCODING, "UTF-8");
-    params.set(PFPGrowth.USE_FPG2, "true");
-    File inputDir = getTestTempDir("transactions");
-    File outputDir = getTestTempDir("frequentpatterns");
-    File input = new File(inputDir, "test.txt");
-    params.set(PFPGrowth.INPUT, input.getAbsolutePath());
-    params.set(PFPGrowth.OUTPUT, outputDir.getAbsolutePath());
-    Writer writer = Files.newWriter(input, Charsets.UTF_8);
-    try {
-      Collection<List<String>> transactions = Lists.newArrayList();
-      transactions.add(Arrays.asList("E", "A", "D", "B"));
-      transactions.add(Arrays.asList("D", "A", "C", "E", "B"));
-      transactions.add(Arrays.asList("C", "A", "B", "E"));
-      transactions.add(Arrays.asList("B", "A", "D"));
-      transactions.add(Arrays.asList("D"));
-      transactions.add(Arrays.asList("D", "B"));
-      transactions.add(Arrays.asList("A", "D", "E"));
-      transactions.add(Arrays.asList("B", "C"));
-      for (List<String> transaction : transactions) {
-        String sep = "";
-        for (String item : transaction) {
-          writer.write(sep + item);
-          sep = ",";
+public class CassandraDaemon extends org.apache.cassandra.service.AbstractCassandraDaemon
+{
+    private static Logger logger = LoggerFactory.getLogger(CassandraDaemon.class);
+    private TServer serverEngine;
+
+    protected void setup() throws IOException
+    {
+        int listenPort = DatabaseDescriptor.getRpcPort();
+        InetAddress listenAddr = DatabaseDescriptor.getRpcAddress();
+        
+        /* 
+         * If ThriftAddress was left completely unconfigured, then assume
+         * the same default as ListenAddress
+         */
+        if (listenAddr == null)
+            listenAddr = FBUtilities.getLocalAddress();
+        
+        Thread.setDefaultUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler()
+        {
+            public void uncaughtException(Thread t, Throwable e)
+            {
+                logger.error("Uncaught exception in thread " + t, e);
+                if (e instanceof OutOfMemoryError)
+                {
+                    System.exit(100);
+                }
+            }
+        });
+        
+        // check the system table for mismatched partitioner.
+        try
+        {
+            SystemTable.checkHealth();
         }
-        writer.write("\n");
-      }
-    } finally {
-      Closeables.closeQuietly(writer);
+        catch (ConfigurationException e)
+        {
+            logger.error("Fatal exception during initialization", e);
+            System.exit(100);
+        }
+
+        try
+        {
+            DatabaseDescriptor.loadSchemas();
+        }
+        catch (IOException e)
+        {
+            logger.error("Fatal exception during initialization", e);
+            System.exit(100);
+        }
+        
+        // initialize keyspaces
+        for (String table : DatabaseDescriptor.getTables())
+        {
+            if (logger.isDebugEnabled())
+                logger.debug("opening keyspace " + table);
+            Table.open(table);
+        }
+
+        // replay the log if necessary and check for compaction candidates
+        CommitLog.recover();
+        CompactionManager.instance.checkAllColumnFamilies();
+        
+        // check to see if CL.recovery modified the lastMigrationId. if it did, we need to re apply migrations. this isn't
+        // the same as merely reloading the schema (which wouldn't perform file deletion after a DROP). The solution
+        // is to read those migrations from disk and apply them.
+        UUID currentMigration = DatabaseDescriptor.getDefsVersion();
+        UUID lastMigration = Migration.getLastMigrationId();
+        if ((lastMigration != null) && (lastMigration.timestamp() > currentMigration.timestamp()))
+        {
+            MigrationManager.applyMigrations(currentMigration, lastMigration);
+        }
+        
+        // start server internals
+        StorageService.instance.initServer();
+        
+        // now we start listening for clients
+        final CassandraServer cassandraServer = new CassandraServer();
+        Cassandra.Processor processor = new Cassandra.Processor(cassandraServer);
+
+        // Transport
+        TServerSocket tServerSocket = null;
+        
+        try
+        {
+            tServerSocket = new TServerSocket(new InetSocketAddress(listenAddr, listenPort));
+        } catch (TTransportException e)
+        {
+            throw new IOException(String.format(
+                    "Unable to create thrift socket to %s:%s", listenAddr,
+                    listenPort), e);
+        }
+        
+        logger.info(String.format("Binding thrift service to %s:%s", listenAddr, listenPort));
+
+        // Protocol factory
+        TProtocolFactory tProtocolFactory = new TBinaryProtocol.Factory();
+        
+        // Transport factory
+        TTransportFactory inTransportFactory, outTransportFactory;
+        if (DatabaseDescriptor.isThriftFramed())
+        {
+            inTransportFactory = new TFramedTransport.Factory();
+            outTransportFactory = new TFramedTransport.Factory();
+            
+        }
+        else
+        {
+            inTransportFactory = new TTransportFactory();
+            outTransportFactory = new TTransportFactory();
+        }
+
+
+        // ThreadPool Server
+        CustomTThreadPoolServer.Options options = new CustomTThreadPoolServer.Options();
+        options.minWorkerThreads = 64;
+
+        SynchronousQueue<Runnable> executorQueue = new SynchronousQueue<Runnable>();
+
+        ExecutorService executorService = new ThreadPoolExecutor(options.minWorkerThreads,
+                                                                 options.maxWorkerThreads,
+                                                                 60,
+                                                                 TimeUnit.SECONDS,
+                                                                 executorQueue)
+        {
+            @Override
+            protected void afterExecute(Runnable r, Throwable t)
+            {
+                super.afterExecute(r, t);
+                cassandraServer.logout();
+            }
+        };
+        serverEngine = new CustomTThreadPoolServer(new TProcessorFactory(processor),
+                                             tServerSocket,
+                                             inTransportFactory,
+                                             outTransportFactory,
+                                             tProtocolFactory,
+                                             tProtocolFactory,
+                                             options,
+                                             executorService);
+    }
+
+    /** hook for JSVC */
+    public void start()
+    {
+        logger.info("Cassandra starting up...");
+        Mx4jTool.maybeLoad();
+        serverEngine.serve();
+    }
+
+    /** hook for JSVC */
+    public void stop()
+    {
+        // this doesn't entirely shut down Cassandra, just the Thrift server.
+        // jsvc takes care of taking the rest down
+        logger.info("Cassandra shutting down...");
+        serverEngine.stop();
     }
     
-  }
-
-  /**
-   * Test Parallel FPGrowth on small example data using top-level
-   * runPFPGrowth() method
-   */ 
-  @Test
-  public void testStartParallelFPGrowth() throws Exception {
-    PFPGrowth.runPFPGrowth(params);
-
-    List<Pair<String,TopKStringPatterns>> frequentPatterns = PFPGrowth.readFrequentPattern(params);
-
-    assertEquals("[(A,([A],5), ([D, A],4), ([B, A],4), ([A, E],4)), "
-                 + "(B,([B],6), ([B, D],4), ([B, A],4), ([B, D, A],3)), " 
-                 + "(C,([B, C],3)), "
-                 + "(D,([D],6), ([D, A],4), ([B, D],4), ([D, A, E],3)), "
-                 + "(E,([A, E],4), ([D, A, E],3), ([B, A, E],3))]", frequentPatterns.toString());                                                                 
-  }
-
-  /**
-   * Test Parallel FPG on small example data, running various stages
-   * individually
-   */ 
-  @Test
-  public void testStartParallelFPGrowthInSteps() throws Exception {
-    Configuration conf = new Configuration();
-    log.info("Starting Parallel Counting Test: {}", params.get(PFPGrowth.MAX_HEAPSIZE));
-    PFPGrowth.startParallelCounting(params, conf);
-    log.info("Reading fList Test: {}", params.get(PFPGrowth.MAX_HEAPSIZE));
-    List<Pair<String,Long>> fList = PFPGrowth.readFList(params);
-    log.info("{}", fList);
-    assertEquals("[(B,6), (D,6), (A,5), (E,4), (C,3)]", fList.toString());
- 
-    PFPGrowth.saveFList(fList, params, conf);
-    int numGroups = params.getInt(PFPGrowth.NUM_GROUPS, 
-                                  PFPGrowth.NUM_GROUPS_DEFAULT);
-    int maxPerGroup = fList.size() / numGroups;
-    if (fList.size() % numGroups != 0) {
-      maxPerGroup++;
+    public static void main(String[] args)
+    {
+        new CassandraDaemon().activate();
     }
-    params.set(PFPGrowth.MAX_PER_GROUP, Integer.toString(maxPerGroup));
-
-    log.info("Starting Parallel FPGrowth Test: {}", params.get(PFPGrowth.MAX_HEAPSIZE));
-    PFPGrowth.startParallelFPGrowth(params, conf);
-    log.info("Starting Pattern Aggregation Test: {}", params.get(PFPGrowth.MAX_HEAPSIZE));
-    PFPGrowth.startAggregating(params, conf);
-
-    List<Pair<String,TopKStringPatterns>> frequentPatterns = PFPGrowth.readFrequentPattern(params);
-
-    assertEquals("[(A,([A],5), ([D, A],4), ([B, A],4), ([A, E],4)), "
-                 + "(B,([B],6), ([B, D],4), ([B, A],4), ([B, D, A],3)), " 
-                 + "(C,([B, C],3)), "
-                 + "(D,([D],6), ([D, A],4), ([B, D],4), ([D, A, E],3)), "
-                 + "(E,([A, E],4), ([D, A, E],3), ([B, A, E],3))]", frequentPatterns.toString());                                                                 
-  }
 }

@@ -1,12 +1,14 @@
-/*
+package org.apache.lucene.index;
+
+/**
  * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
+ * contributor license agreements. See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
  * The ASF licenses this file to You under the Apache License, Version 2.0
  * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * the License. You may obtain a copy of the License at
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -14,202 +16,466 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.aries.transaction;
 
-import java.io.File;
-import java.util.ArrayList;
-import java.util.Dictionary;
-import java.util.List;
-import java.util.Properties;
-import javax.transaction.TransactionManager;
-import javax.transaction.TransactionSynchronizationRegistry;
-import javax.transaction.UserTransaction;
-import javax.transaction.xa.XAException;
+import static org.apache.lucene.util.ByteBlockPool.BYTE_BLOCK_MASK;
+import static org.apache.lucene.util.ByteBlockPool.BYTE_BLOCK_SIZE;
 
-import org.apache.aries.util.AriesFrameworkUtil;
-import org.apache.geronimo.transaction.log.HOWLLog;
-import org.apache.geronimo.transaction.log.UnrecoverableLog;
-import org.apache.geronimo.transaction.manager.GeronimoTransactionManager;
-import org.apache.geronimo.transaction.manager.RecoverableTransactionManager;
-import org.apache.geronimo.transaction.manager.TransactionLog;
-import org.apache.geronimo.transaction.manager.XidFactory;
-import org.apache.geronimo.transaction.manager.XidFactoryImpl;
-import org.osgi.framework.BundleContext;
-import org.osgi.framework.ServiceRegistration;
-import org.osgi.service.cm.ConfigurationException;
+import java.io.IOException;
+import java.io.PrintStream;
+import java.text.NumberFormat;
+import java.util.concurrent.atomic.AtomicLong;
 
-/**
- */
-public class TransactionManagerService {
+import org.apache.lucene.analysis.Analyzer;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.index.DocumentsWriterDeleteQueue.DeleteSlice;
+import org.apache.lucene.search.SimilarityProvider;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.util.BitVector;
+import org.apache.lucene.util.ByteBlockPool.Allocator;
+import org.apache.lucene.util.RamUsageEstimator;
 
-    public static final String TRANSACTION_TIMEOUT = "aries.transaction.timeout";
-    public static final String RECOVERABLE = "aries.transaction.recoverable";
-    public static final String TMID = "aries.transaction.tmid";
-    public static final String HOWL_BUFFER_CLASS_NAME = "aries.transaction.howl.bufferClassName";
-    public static final String HOWL_BUFFER_SIZE = "aries.transaction.howl.bufferSize";
-    public static final String HOWL_CHECKSUM_ENABLED = "aries.transaction.howl.checksumEnabled";
-    public static final String HOWL_ADLER32_CHECKSUM = "aries.transaction.howl.adler32Checksum";
-    public static final String HOWL_FLUSH_SLEEP_TIME = "aries.transaction.howl.flushSleepTime";
-    public static final String HOWL_LOG_FILE_EXT = "aries.transaction.howl.logFileExt";
-    public static final String HOWL_LOG_FILE_NAME = "aries.transaction.howl.logFileName";
-    public static final String HOWL_MAX_BLOCKS_PER_FILE = "aries.transaction.howl.maxBlocksPerFile";
-    public static final String HOWL_MAX_LOG_FILES = "aries.transaction.howl.maxLogFiles";
-    public static final String HOWL_MAX_BUFFERS = "aries.transaction.howl.maxBuffers";
-    public static final String HOWL_MIN_BUFFERS = "aries.transaction.howl.minBuffers";
-    public static final String HOWL_THREADS_WAITING_FORCE_THRESHOLD = "aries.transaction.howl.threadsWaitingForceThreshold";
-    public static final String HOWL_LOG_FILE_DIR = "aries.transaction.howl.logFileDir";
+public class DocumentsWriterPerThread {
 
-    public static final int DEFAULT_TRANSACTION_TIMEOUT = 600; // 600 seconds -> 10 minutes
-    public static final boolean DEFAULT_RECOVERABLE = false;   // not recoverable by default
+  /**
+   * The IndexingChain must define the {@link #getChain(DocumentsWriter)} method
+   * which returns the DocConsumer that the DocumentsWriter calls to process the
+   * documents.
+   */
+  abstract static class IndexingChain {
+    abstract DocConsumer getChain(DocumentsWriterPerThread documentsWriterPerThread);
+  }
 
-    private static final String PLATFORM_TRANSACTION_MANAGER_CLASS = "org.springframework.transaction.PlatformTransactionManager";
 
-    private final String pid;
-    private final Dictionary properties;
-    private final BundleContext bundleContext;
-    private boolean useSpring;
-    private GeronimoTransactionManager transactionManager;
-    private TransactionLog transactionLog;
-    private ServiceRegistration serviceRegistration;
+  static final IndexingChain defaultIndexingChain = new IndexingChain() {
 
-    public TransactionManagerService(String pid, Dictionary properties, BundleContext bundleContext) throws ConfigurationException {
-        this.pid = pid;
-        this.properties = properties;
-        this.bundleContext = bundleContext;
-        // Transaction timeout
-        int transactionTimeout = getInt(TRANSACTION_TIMEOUT, DEFAULT_TRANSACTION_TIMEOUT);
-        if (transactionTimeout <= 0) {
-            throw new ConfigurationException(TRANSACTION_TIMEOUT, NLS.MESSAGES.getMessage("tx.timeout.greaterthan.zero"));
-        }
+    @Override
+    DocConsumer getChain(DocumentsWriterPerThread documentsWriterPerThread) {
+      /*
+      This is the current indexing chain:
 
-        final String tmid = getString(TMID, pid);
-        // the max length of the factory should be 64
-        XidFactory xidFactory = new XidFactoryImpl(tmid.substring(0, Math.min(tmid.length(), 64)).getBytes());
-        // Transaction log
-        if (getBool(RECOVERABLE, DEFAULT_RECOVERABLE)) {
-            String bufferClassName = getString(HOWL_BUFFER_CLASS_NAME, "org.objectweb.howl.log.BlockLogBuffer");
-            int bufferSizeKBytes = getInt(HOWL_BUFFER_SIZE, 32);
-            if (bufferSizeKBytes < 1 || bufferSizeKBytes > 32) {
-                throw new ConfigurationException(HOWL_BUFFER_SIZE, NLS.MESSAGES.getMessage("buffer.size.between.one.and.thirtytwo"));
-            }
-            boolean checksumEnabled = getBool(HOWL_CHECKSUM_ENABLED, true);
-            boolean adler32Checksum = getBool(HOWL_ADLER32_CHECKSUM, true);
-            int flushSleepTimeMilliseconds = getInt(HOWL_FLUSH_SLEEP_TIME, 50);
-            String logFileExt = getString(HOWL_LOG_FILE_EXT, "log");
-            String logFileName = getString(HOWL_LOG_FILE_NAME, "transaction");
-            int maxBlocksPerFile = getInt(HOWL_MAX_BLOCKS_PER_FILE, -1);
-            int maxLogFiles = getInt(HOWL_MAX_LOG_FILES, 2);
-            int minBuffers = getInt(HOWL_MIN_BUFFERS, 4);
-            if (minBuffers < 0) {
-                throw new ConfigurationException(HOWL_MIN_BUFFERS, NLS.MESSAGES.getMessage("min.buffers.greaterthan.zero"));
-            }
-            int maxBuffers = getInt(HOWL_MAX_BUFFERS, 0);
-            if (maxBuffers > 0 && minBuffers < maxBuffers) {
-                throw new ConfigurationException(HOWL_MAX_BUFFERS, NLS.MESSAGES.getMessage("max.buffers.greaterthan.min.buffers"));
-            }
-            int threadsWaitingForceThreshold = getInt(HOWL_THREADS_WAITING_FORCE_THRESHOLD, -1);
-            String logFileDir = getString(HOWL_LOG_FILE_DIR, null);
-            if (logFileDir == null || logFileDir.length() == 0 || !new File(logFileDir).isAbsolute()) {
-                throw new ConfigurationException(HOWL_LOG_FILE_DIR, NLS.MESSAGES.getMessage("log.file.dir"));
-            }
-            try {
-                transactionLog = new HOWLLog(bufferClassName,
-                                             bufferSizeKBytes,
-                                             checksumEnabled,
-                                             adler32Checksum,
-                                             flushSleepTimeMilliseconds,
-                                             logFileDir,
-                                             logFileExt,
-                                             logFileName,
-                                             maxBlocksPerFile,
-                                             maxBuffers,
-                                             maxLogFiles,
-                                             minBuffers,
-                                             threadsWaitingForceThreshold,
-                                             xidFactory,
-                                             null);
-                ((HOWLLog) transactionLog).doStart();
-            } catch (Exception e) {
-                // This should not really happen as we've checked properties earlier
-                throw new ConfigurationException(null, null, e);
-            }
-        } else {
-            transactionLog =  new UnrecoverableLog();
-        }
-        // Create transaction manager
-        try {
-            try {
-                transactionManager = new SpringTransactionManagerCreator().create(transactionTimeout, xidFactory, transactionLog);
-                useSpring = true;
-            } catch (NoClassDefFoundError e) {
-                transactionManager = new GeronimoTransactionManager(transactionTimeout, xidFactory, transactionLog);
-            }
-        } catch (XAException e) {
-            throw new RuntimeException(NLS.MESSAGES.getMessage("tx.recovery.error"), e);
-        }
+      DocConsumer / DocConsumerPerThread
+        --> code: DocFieldProcessor / DocFieldProcessorPerThread
+          --> DocFieldConsumer / DocFieldConsumerPerThread / DocFieldConsumerPerField
+            --> code: DocFieldConsumers / DocFieldConsumersPerThread / DocFieldConsumersPerField
+              --> code: DocInverter / DocInverterPerThread / DocInverterPerField
+                --> InvertedDocConsumer / InvertedDocConsumerPerThread / InvertedDocConsumerPerField
+                  --> code: TermsHash / TermsHashPerThread / TermsHashPerField
+                    --> TermsHashConsumer / TermsHashConsumerPerThread / TermsHashConsumerPerField
+                      --> code: FreqProxTermsWriter / FreqProxTermsWriterPerThread / FreqProxTermsWriterPerField
+                      --> code: TermVectorsTermsWriter / TermVectorsTermsWriterPerThread / TermVectorsTermsWriterPerField
+                --> InvertedDocEndConsumer / InvertedDocConsumerPerThread / InvertedDocConsumerPerField
+                  --> code: NormsWriter / NormsWriterPerThread / NormsWriterPerField
+              --> code: StoredFieldsWriter / StoredFieldsWriterPerThread / StoredFieldsWriterPerField
+    */
+
+    // Build up indexing chain:
+
+      final TermsHashConsumer termVectorsWriter = new TermVectorsTermsWriter(documentsWriterPerThread);
+      final TermsHashConsumer freqProxWriter = new FreqProxTermsWriter();
+
+      final InvertedDocConsumer  termsHash = new TermsHash(documentsWriterPerThread, freqProxWriter, true,
+                                                           new TermsHash(documentsWriterPerThread, termVectorsWriter, false, null));
+      final NormsWriter normsWriter = new NormsWriter();
+      final DocInverter docInverter = new DocInverter(documentsWriterPerThread.docState, termsHash, normsWriter);
+      return new DocFieldProcessor(documentsWriterPerThread, docInverter);
+    }
+  };
+
+  static class DocState {
+    final DocumentsWriterPerThread docWriter;
+    Analyzer analyzer;
+    PrintStream infoStream;
+    SimilarityProvider similarityProvider;
+    int docID;
+    Document doc;
+    String maxTermPrefix;
+
+    DocState(DocumentsWriterPerThread docWriter) {
+      this.docWriter = docWriter;
     }
 
-    public void start() throws Exception {
-        List<String> clazzes = new ArrayList<String>();
-        clazzes.add(TransactionManager.class.getName());
-        clazzes.add(TransactionSynchronizationRegistry.class.getName());
-        clazzes.add(UserTransaction.class.getName());
-        clazzes.add(RecoverableTransactionManager.class.getName());
-        if (useSpring) {
-            clazzes.add(PLATFORM_TRANSACTION_MANAGER_CLASS);
-        }
-        serviceRegistration = bundleContext.registerService(clazzes.toArray(new String[clazzes.size()]), transactionManager, new Properties());
+    // Only called by asserts
+    public boolean testPoint(String name) {
+      return docWriter.writer.testPoint(name);
     }
 
-    public void close() throws Exception {
-        AriesFrameworkUtil.safeUnregisterService(serviceRegistration);
+    public void clear() {
+      // don't hold onto doc nor analyzer, in case it is
+      // largish:
+      doc = null;
+      analyzer = null;
+  }
+  }
+
+  static class FlushedSegment {
+    final SegmentInfo segmentInfo;
+    final BufferedDeletes segmentDeletes;
+    final BitVector deletedDocuments;
+
+    private FlushedSegment(SegmentInfo segmentInfo,
+        BufferedDeletes segmentDeletes, BitVector deletedDocuments) {
+      this.segmentInfo = segmentInfo;
+      this.segmentDeletes = segmentDeletes;
+      this.deletedDocuments = deletedDocuments;
+    }
+  }
+
+  /** Called if we hit an exception at a bad time (when
+   *  updating the index files) and must discard all
+   *  currently buffered docs.  This resets our state,
+   *  discarding any docs added since last flush. */
+  void abort() throws IOException {
+    hasAborted = aborting = true;
+    try {
+      if (infoStream != null) {
+        message("docWriter: now abort");
+      }
+      try {
+        consumer.abort();
+      } catch (Throwable t) {
+      }
+
+      pendingDeletes.clear();
+      deleteSlice = deleteQueue.newSlice();
+      // Reset all postings data
+      doAfterFlush();
+
+    } finally {
+      aborting = false;
+      if (infoStream != null) {
+        message("docWriter: done abort");
+      }
+    }
+  }
+
+  final DocumentsWriter parent;
+  final IndexWriter writer;
+  final Directory directory;
+  final DocState docState;
+  final DocConsumer consumer;
+  final AtomicLong bytesUsed;
+  
+  SegmentWriteState flushState;
+  //Deletes for our still-in-RAM (to be flushed next) segment
+  BufferedDeletes pendingDeletes;  
+  String segment;     // Current segment we are working on
+  boolean aborting = false;   // True if an abort is pending
+  boolean hasAborted = false; // True if the last exception throws by #updateDocument was aborting
+
+  private FieldInfos fieldInfos;
+  private final PrintStream infoStream;
+  private int numDocsInRAM;
+  private int flushedDocCount;
+  DocumentsWriterDeleteQueue deleteQueue;
+  DeleteSlice deleteSlice;
+  
+  public DocumentsWriterPerThread(Directory directory, DocumentsWriter parent,
+      FieldInfos fieldInfos, IndexingChain indexingChain) {
+    this.directory = directory;
+    this.parent = parent;
+    this.fieldInfos = fieldInfos;
+    this.writer = parent.indexWriter;
+    this.infoStream = parent.indexWriter.getInfoStream();
+    this.docState = new DocState(this);
+    this.docState.similarityProvider = parent.indexWriter.getConfig()
+        .getSimilarityProvider();
+
+    consumer = indexingChain.getChain(this);
+    bytesUsed = new AtomicLong(0);
+    pendingDeletes = new BufferedDeletes(false);
+    initialize();
+  }
+  
+  public DocumentsWriterPerThread(DocumentsWriterPerThread other, FieldInfos fieldInfos) {
+    this(other.directory, other.parent, fieldInfos, other.parent.chain);
+  }
+  
+  void initialize() {
+    deleteQueue = parent.deleteQueue;
+    assert numDocsInRAM == 0 : "num docs " + numDocsInRAM;
+    pendingDeletes.clear();
+    deleteSlice = null;
       
-        if (transactionLog instanceof HOWLLog) {
-            ((HOWLLog) transactionLog).doStop();
-        }
+  }
+
+  void setAborting() {
+    aborting = true;
+  }
+  
+  boolean checkAndResetHasAborted() {
+    final boolean retval = hasAborted;
+    hasAborted = false;
+    return retval;
+  }
+
+  public void updateDocument(Document doc, Analyzer analyzer, Term delTerm) throws IOException {
+    assert writer.testPoint("DocumentsWriterPerThread addDocument start");
+    assert deleteQueue != null;
+    docState.doc = doc;
+    docState.analyzer = analyzer;
+    docState.docID = numDocsInRAM;
+    if (segment == null) {
+      // this call is synchronized on IndexWriter.segmentInfos
+      segment = writer.newSegmentName();
+      assert numDocsInRAM == 0;
     }
 
-    private String getString(String property, String dflt) throws ConfigurationException {
-        String value = (String) properties.get(property);
-        if (value != null) {
-            return value;
+    boolean success = false;
+    try {
+      try {
+        consumer.processDocument(fieldInfos);
+      } finally {
+        docState.clear();
+      }
+      success = true;
+    } finally {
+      if (!success) {
+        if (!aborting) {
+          // mark document as deleted
+          deleteDocID(docState.docID);
+          numDocsInRAM++;
+        } else {
+          abort();
         }
-        return dflt;
+      }
     }
-
-    private int getInt(String property, int dflt) throws ConfigurationException {
-        String value = (String) properties.get(property);
-        if (value != null) {
-            try {
-                return Integer.parseInt(value);
-            } catch (Exception e) {
-                throw new ConfigurationException(property, NLS.MESSAGES.getMessage("prop.value.not.int", property, value), e);
-            }
-        }
-        return dflt;
+    success = false;
+    try {
+      consumer.finishDocument();
+      success = true;
+    } finally {
+      if (!success) {
+        abort();
+      }
     }
-
-    private boolean getBool(String property, boolean dflt) throws ConfigurationException {
-        String value = (String) properties.get(property);
-        if (value != null) {
-            try {
-                return Boolean.parseBoolean(value);
-            } catch (Exception e) {
-                throw new ConfigurationException(property, NLS.MESSAGES.getMessage("prop.value.not.boolean", property, value), e);
-            }
-        }
-        return dflt;
-    }
-
-    /**
-     * We use an inner static class to decouple this class from the spring-tx classes
-     * in order to not have NoClassDefFoundError if those are not present.
+    finishDocument(delTerm);
+  }
+  
+  private void finishDocument(Term delTerm) throws IOException {
+    /*
+     * here we actually finish the document in two steps 1. push the delete into
+     * the queue and update our slice. 2. increment the DWPT private document
+     * id.
+     * 
+     * the updated slice we get from 1. holds all the deletes that have occurred
+     * since we updated the slice the last time.
      */
-    public static class SpringTransactionManagerCreator {
-
-        public GeronimoTransactionManager create(int defaultTransactionTimeoutSeconds, XidFactory xidFactory, TransactionLog transactionLog) throws XAException {
-            return new GeronimoPlatformTransactionManager(defaultTransactionTimeoutSeconds, xidFactory, transactionLog);
-        }
-
+    if (deleteSlice == null) {
+      deleteSlice = deleteQueue.newSlice();
+      if (delTerm != null) {
+        deleteQueue.add(delTerm, deleteSlice);
+        deleteSlice.reset();
+      }
+      
+    } else {
+      if (delTerm != null) {
+        deleteQueue.add(delTerm, deleteSlice);
+        assert deleteSlice.isTailItem(delTerm) : "expected the delete term as the tail item";
+        deleteSlice.apply(pendingDeletes, numDocsInRAM);
+      } else if (deleteQueue.updateSlice(deleteSlice)) {
+        deleteSlice.apply(pendingDeletes, numDocsInRAM);
+      }
     }
+    ++numDocsInRAM;
+  }
+
+  // Buffer a specific docID for deletion.  Currently only
+  // used when we hit a exception when adding a document
+  void deleteDocID(int docIDUpto) {
+    pendingDeletes.addDocID(docIDUpto);
+    // NOTE: we do not trigger flush here.  This is
+    // potentially a RAM leak, if you have an app that tries
+    // to add docs but every single doc always hits a
+    // non-aborting exception.  Allowing a flush here gets
+    // very messy because we are only invoked when handling
+    // exceptions so to do this properly, while handling an
+    // exception we'd have to go off and flush new deletes
+    // which is risky (likely would hit some other
+    // confounding exception).
+  }
+
+  /**
+   * Returns the number of delete terms in this {@link DocumentsWriterPerThread}
+   */
+  public int numDeleteTerms() {
+    // public for FlushPolicy
+    return pendingDeletes.numTermDeletes.get();
+  }
+
+  /**
+   * Returns the number of RAM resident documents in this {@link DocumentsWriterPerThread}
+   */
+  public int getNumDocsInRAM() {
+    // public for FlushPolicy
+    return numDocsInRAM;
+  }
+
+  SegmentCodecs getCodec() {
+    return flushState.segmentCodecs;
+  }
+
+  /** Reset after a flush */
+  private void doAfterFlush() throws IOException {
+    segment = null;
+    consumer.doAfterFlush();
+    fieldInfos = new FieldInfos(fieldInfos);
+    parent.subtractFlushedNumDocs(numDocsInRAM);
+    numDocsInRAM = 0;
+  }
+  
+  FrozenBufferedDeletes prepareFlush() {
+    assert numDocsInRAM > 0;
+    final FrozenBufferedDeletes globalDeletes = deleteQueue.freezeGlobalBuffer(deleteSlice);
+    // apply all deletes before we flush and release the delete slice
+    deleteSlice.apply(pendingDeletes, numDocsInRAM);
+    deleteSlice = null;
+    return globalDeletes;
+  }
+
+  /** Flush all pending docs to a new segment */
+  FlushedSegment flush() throws IOException {
+    assert numDocsInRAM > 0;
+    flushState = new SegmentWriteState(infoStream, directory, segment, fieldInfos,
+        numDocsInRAM, writer.getConfig().getTermIndexInterval(),
+        fieldInfos.buildSegmentCodecs(true), pendingDeletes);
+
+    // Apply delete-by-docID now (delete-byDocID only
+    // happens when an exception is hit processing that
+    // doc, eg if analyzer has some problem w/ the text):
+    if (pendingDeletes.docIDs.size() > 0) {
+      flushState.deletedDocs = new BitVector(numDocsInRAM);
+      for(int delDocID : pendingDeletes.docIDs) {
+        flushState.deletedDocs.set(delDocID);
+      }
+      pendingDeletes.bytesUsed.addAndGet(-pendingDeletes.docIDs.size() * BufferedDeletes.BYTES_PER_DEL_DOCID);
+      pendingDeletes.docIDs.clear();
+    }
+
+    if (infoStream != null) {
+      message("flush postings as segment " + flushState.segmentName + " numDocs=" + numDocsInRAM);
+    }
+
+    if (aborting) {
+      if (infoStream != null) {
+        message("flush: skip because aborting is set");
+      }
+      return null;
+    }
+
+    boolean success = false;
+
+    try {
+
+      SegmentInfo newSegment = new SegmentInfo(segment, flushState.numDocs, directory, false, fieldInfos.hasProx(), flushState.segmentCodecs, false, fieldInfos);
+      consumer.flush(flushState);
+      pendingDeletes.terms.clear();
+      newSegment.setHasVectors(flushState.hasVectors);
+
+      if (infoStream != null) {
+        message("new segment has " + (flushState.deletedDocs == null ? 0 : flushState.deletedDocs.count()) + " deleted docs");
+        message("new segment has " + (flushState.hasVectors ? "vectors" : "no vectors"));
+        message("flushedFiles=" + newSegment.files());
+        message("flushed codecs=" + newSegment.getSegmentCodecs());
+      }
+      flushedDocCount += flushState.numDocs;
+
+      final BufferedDeletes segmentDeletes;
+      if (pendingDeletes.queries.isEmpty()) {
+        pendingDeletes.clear();
+        segmentDeletes = null;
+      } else {
+        segmentDeletes = pendingDeletes;
+        pendingDeletes = new BufferedDeletes(false);
+      }
+
+      doAfterFlush();
+
+      success = true;
+
+      return new FlushedSegment(newSegment, segmentDeletes, flushState.deletedDocs);
+    } finally {
+      if (!success) {
+        if (segment != null) {
+          synchronized(parent.indexWriter) {
+            parent.indexWriter.deleter.refresh(segment);
+          }
+        }
+        abort();
+      }
+    }
+  }
+
+  /** Get current segment name we are writing. */
+  String getSegment() {
+    return segment;
+  }
+
+  long bytesUsed() {
+    return bytesUsed.get() + pendingDeletes.bytesUsed.get();
+  }
+
+  FieldInfos getFieldInfos() {
+    return fieldInfos;
+  }
+
+  void message(String message) {
+    writer.message("DW: " + message);
+  }
+
+  NumberFormat nf = NumberFormat.getInstance();
+
+  /* Initial chunks size of the shared byte[] blocks used to
+     store postings data */
+  final static int BYTE_BLOCK_NOT_MASK = ~BYTE_BLOCK_MASK;
+
+  /* if you increase this, you must fix field cache impl for
+   * getTerms/getTermsIndex requires <= 32768 */
+  final static int MAX_TERM_LENGTH_UTF8 = BYTE_BLOCK_SIZE-2;
+
+  /* Initial chunks size of the shared int[] blocks used to
+     store postings data */
+  final static int INT_BLOCK_SHIFT = 13;
+  final static int INT_BLOCK_SIZE = 1 << INT_BLOCK_SHIFT;
+  final static int INT_BLOCK_MASK = INT_BLOCK_SIZE - 1;
+
+  /* Allocate another int[] from the shared pool */
+  int[] getIntBlock() {
+    int[] b = new int[INT_BLOCK_SIZE];
+    bytesUsed.addAndGet(INT_BLOCK_SIZE*RamUsageEstimator.NUM_BYTES_INT);
+    return b;
+  }
+  
+  void recycleIntBlocks(int[][] blocks, int offset, int length) {
+    bytesUsed.addAndGet(-(length *(INT_BLOCK_SIZE*RamUsageEstimator.NUM_BYTES_INT)));
+  }
+
+  final Allocator byteBlockAllocator = new DirectTrackingAllocator();
+    
+    
+ private class DirectTrackingAllocator extends Allocator {
+    public DirectTrackingAllocator() {
+      this(BYTE_BLOCK_SIZE);
+    }
+
+    public DirectTrackingAllocator(int blockSize) {
+      super(blockSize);
+    }
+
+    public byte[] getByteBlock() {
+      bytesUsed.addAndGet(blockSize);
+      return new byte[blockSize];
+    }
+    @Override
+    public void recycleByteBlocks(byte[][] blocks, int start, int end) {
+      bytesUsed.addAndGet(-((end-start)* blockSize));
+      for (int i = start; i < end; i++) {
+        blocks[i] = null;
+      }
+    }
+    
+  };
+
+  String toMB(long v) {
+    return nf.format(v/1024./1024.);
+  }
 }

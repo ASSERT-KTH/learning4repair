@@ -1,219 +1,520 @@
-assert index >= 0 && index < size();
+splitQRYDTA = null;
 
-package org.apache.lucene.util.packed;
+/*
 
-/**
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+   Derby - Class org.apache.derby.impl.drda.DRDAResultSet
+
+   Copyright 2003, 2004 The Apache Software Foundation or its licensors, as applicable.
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+
  */
 
-import org.apache.lucene.store.DataInput;
-import org.apache.lucene.util.RamUsageEstimator;
+package org.apache.derby.impl.drda;
 
-import java.io.IOException;
-import java.util.Arrays;
+import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
+import java.sql.SQLException;
+import java.sql.Types;
+import java.util.ArrayList;
+
+import org.apache.derby.impl.jdbc.EmbedResultSet;
 
 /**
- * Space optimized random access capable array of values with a fixed number of
- * bits. For 32 bits/value and less, performance on 32 bit machines is not
- * optimal. Consider using {@link Packed32} for such a setup.
- * </p><p>
- * The implementation strives to avoid conditionals and expensive operations,
- * sacrificing code clarity to achieve better performance.
- */
+	DRDAResultSet holds result set information
+*/
+class DRDAResultSet
+{
 
-class Packed64 extends PackedInts.ReaderImpl implements PackedInts.Mutable {
-  static final int BLOCK_SIZE = 64; // 32 = int, 64 = long
-  static final int BLOCK_BITS = 6; // The #bits representing BLOCK_SIZE
-  static final int MOD_MASK = BLOCK_SIZE - 1; // x % BLOCK_SIZE
+	// resultSet states are NOT_OPENED and SUSPENDED
+	protected static final int NOT_OPENED = 1;
+	protected static final int SUSPENDED = 2;
+	public static final int QRYCLSIMP_DEFAULT = CodePoint.QRYCLSIMP_NO;  
+	
+	boolean explicitlyClosed = false;
 
-  private static final int ENTRY_SIZE = BLOCK_SIZE + 1;
-  private static final int FAC_BITPOS = 3;
+	int state;
+	protected boolean hasdata = true;
+	protected int[] rsLens;				// result length for each column
+	private int[] rsDRDATypes;			// DRDA Types of the result set columns
+	private int[] rsPrecision;         // result precision for Decimal types
+	private int[] rsScale;              // result sale for Decimal types
 
-  /*
-   * In order to make an efficient value-getter, conditionals should be
-   * avoided. A value can be positioned inside of a block, requiring shifting
-   * left or right or it can span two blocks, requiring a left-shift on the
-   * first block and a right-shift on the right block.
-   * </p><p>
-   * By always shifting the first block both left and right, we get exactly
-   * the right bits. By always shifting the second block right and applying
-   * a mask, we get the right bits there. After that, we | the two bitsets.
-  */
-  private static final int[][] SHIFTS =
-          new int[ENTRY_SIZE][ENTRY_SIZE * FAC_BITPOS];
-          //new int[BLOCK_SIZE+1][BLOCK_SIZE][BLOCK_SIZE+1];
-  private static final long[][] MASKS = new long[ENTRY_SIZE][ENTRY_SIZE];
+	protected int [] outovr_drdaType;	// Output override DRDA type and length
 
-  static { // Generate shifts
-      for (int elementBits = 1 ; elementBits <= BLOCK_SIZE ; elementBits++) {
-          for (int bitPos = 0 ; bitPos < BLOCK_SIZE ; bitPos++) {
-              int[] currentShifts = SHIFTS[elementBits];
-              int base = bitPos * FAC_BITPOS;
-              currentShifts[base    ] = bitPos;
-              currentShifts[base + 1] = BLOCK_SIZE - elementBits;
-              if (bitPos <= BLOCK_SIZE - elementBits) { // Single block
-                  currentShifts[base + 2] = 0;
-                  MASKS[elementBits][bitPos] = 0;
-              } else { // Two blocks
-                  int rBits = elementBits - (BLOCK_SIZE - bitPos);
-                  currentShifts[base + 2] = BLOCK_SIZE - rBits;
-                  MASKS[elementBits][bitPos] = ~(~0L << rBits);
-              }
-          }
-      }
-  }
+	protected int withHoldCursor;			// hold cursor after commit attribute
+	protected int scrollType = ResultSet.TYPE_FORWARD_ONLY;			// Sensitive or Insensitive scroll attribute
+	protected int concurType;			// Concurency type
+	protected long rowCount;			// Number of rows we have processed
+	private ResultSet rs;              // Current ResultSet
 
-  /*
-   * The setter requires more masking than the getter.
-  */
-  private static final long[][] WRITE_MASKS =
-          new long[ENTRY_SIZE][ENTRY_SIZE * FAC_BITPOS];
-  static {
-      for (int elementBits = 1 ; elementBits <= BLOCK_SIZE ; elementBits++) {
-          long elementPosMask = ~(~0L << elementBits);
-          int[] currentShifts = SHIFTS[elementBits];
-          long[] currentMasks = WRITE_MASKS[elementBits];
-          for (int bitPos = 0 ; bitPos < BLOCK_SIZE ; bitPos++) {
-              int base = bitPos * FAC_BITPOS;
-              currentMasks[base  ] =~((elementPosMask
-                                 << currentShifts[base + 1])
-                                >>> currentShifts[base]);
-              if (bitPos <= BLOCK_SIZE - elementBits) { // Second block not used
-                currentMasks[base+1] = ~0; // Keep all bits
-                currentMasks[base+2] = 0;  // Or with 0
-              } else {
-                currentMasks[base+1] = ~(elementPosMask
-                                         << currentShifts[base + 2]);
-                currentMasks[base+2] = currentShifts[base + 2] == 0 ? 0 : ~0;
-              }
-          }
-      }
-  }
+	protected int blksize;				// Query block size
+	protected int maxblkext;			// Maximum number of extra blocks
+	protected int outovropt;			// Output Override option
+	protected int qryclsimp;			// Implicit Query Close Setting
+	protected boolean qryrelscr;		// Query relative scrolling
+	protected long qryrownbr;			// Query row number
+	protected boolean qryrfrtbl;		// Query refresh answer set table
+	protected int qryscrorn;			// Query scroll orientation
+	protected boolean qryrowsns;		// Query row sensitivity
+	protected boolean qryblkrst;		// Query block reset
+	protected boolean qryrtndta;		// Query returns data
+	protected int qryrowset;			// Query row set
+	private   int qryprctyp;			// Protocol type
+	private   boolean gotPrctyp;		// save the result, for performance
+	protected int rtnextdta;			// Return of EXTDTA option
+	protected int nbrrow;			   // number of fetch or insert rows
+	protected byte [] rslsetflg;		// Result Set Flags
 
-  /* The bits */
-  private long[] blocks;
+	private ArrayList  extDtaObjects;  // Arraylist of Blobs and Clobs 
+	                                   // Return Values to 
+		                               // send with extdta objects.
+	
+	private ArrayList rsExtPositions;
 
-  // Cached calculations
-  private int maxPos;      // blocks.length * BLOCK_SIZE / elementBits - 1
-  private int[] shifts;    // The shifts for the current elementBits
-  private long[] readMasks;
-  private long[] writeMasks;
+	protected ConsistencyToken pkgcnstkn; // Unique consistency token for ResultSet 0
 
-  /**
-   * Creates an array with the internal structures adjusted for the given
-   * limits and initialized to 0.
-   * @param valueCount   the number of elements.
-   * @param bitsPerValue the number of bits available for any given value.
-   */
-  public Packed64(int valueCount, int bitsPerValue) {
-    // TODO: Test for edge-cases (2^31 values, 63 bitsPerValue)
-    // +2 due to the avoid-conditionals-trick. The last entry is always 0
-    this(new long[(int)((long)valueCount * bitsPerValue / BLOCK_SIZE + 2)],
-            valueCount, bitsPerValue);
-  }
+	// splitQRYDTA is normally null. If it is non-null, it means that
+	// the last QRYDTA response which was sent for this statement was
+	// split according to the LMTBLKPRC protocol, and this array contains
+	// the bytes that didn't fit. These bytes should be the first bytes
+	// emitted in the next QRYDTA response to a CNTQRY request.
+	private byte []splitQRYDTA;
+
+	protected DRDAResultSet()
+	{
+		state = NOT_OPENED;
+		// Initialize qryclsimp to NO. Only result sets requested by
+		// an OPNQRY command should be implicitly closed. OPNQRY will
+		// set qryclsimp later in setOPNQRYOptions().
+		qryclsimp = CodePoint.QRYCLSIMP_NO;
+	}
+
+	/**
+ 	 * Set result set and initialize type array.
+	 *
+	 * @param value
+	 * 
+	 */
+
+	protected void setResultSet(ResultSet value) throws SQLException
+	{
+		int numCols;
+		rs = value;
+		gotPrctyp = false;
+		if (value != null)
+		{
+		    numCols= rs.getMetaData().getColumnCount();
+			rsDRDATypes = new int[numCols];
+		}
+		explicitlyClosed = false;
+	}
 
 
-  /**
-   * Creates an array backed by the given blocks.
-   * </p><p>
-   * Note: The blocks are used directly, so changes to the given block will
-   * affect the Packed32-structure.
-   * @param blocks   used as the internal backing array. Not that the last
-   *                 element cannot be addressed directly.
-   * @param valueCount the number of values.
-   * @param bitsPerValue the number of bits available for any given value.
-   */
-  public Packed64(long[] blocks, int valueCount, int bitsPerValue) {
-    super(valueCount, bitsPerValue);
-    this.blocks = blocks;
-    updateCached();
-  }
+	/**
+	 * set consistency token for this resultSet
+	 *
+	 */
+	protected void setPkgcnstkn(ConsistencyToken pkgcnstkn)
+	{
+		this.pkgcnstkn = pkgcnstkn;
+	}
 
-  /**
-   * Creates an array with content retrieved from the given DataInput.
-   * @param in       a DataInput, positioned at the start of Packed64-content.
-   * @param valueCount  the number of elements.
-   * @param bitsPerValue the number of bits available for any given value.
-   * @throws java.io.IOException if the values for the backing array could not
-   *                             be retrieved.
-   */
-  public Packed64(DataInput in, int valueCount, int bitsPerValue)
-                                                            throws IOException {
-    super(valueCount, bitsPerValue);
-    int size = size(valueCount, bitsPerValue);
-    blocks = new long[size+1]; // +1 due to non-conditional tricks
-    // TODO: find a faster way to bulk-read longs...
-    for(int i=0;i<size;i++) {
-      blocks[i] = in.readLong();
-    }
-    updateCached();
-  }
 
-  private static int size(int valueCount, int bitsPerValue) {
-    final long totBitCount = (long) valueCount * bitsPerValue;
-    return (int)(totBitCount/64 + ((totBitCount % 64 == 0 ) ? 0:1));
-  }
+	/**
+	 * 
+	 *  @return the underlying java.sql.ResultSet
+	 */
+	protected ResultSet getResultSet()
+	{
+		return rs;
+	}
 
-  private void updateCached() {
-    readMasks = MASKS[bitsPerValue];
-    shifts = SHIFTS[bitsPerValue];
-    writeMasks = WRITE_MASKS[bitsPerValue];
-    maxPos = (int)((((long)blocks.length) * BLOCK_SIZE / bitsPerValue) - 2);
-  }
+	public void setSplitQRYDTA(byte []data)
+	{
+		splitQRYDTA = data;
+	}
+	public byte[]getSplitQRYDTA()
+	{
+		return splitQRYDTA;
+	}
 
-  /**
-   * @param index the position of the value.
-   * @return the value at the given index.
-   */
-  public long get(final int index) {
-    final long majorBitPos = (long)index * bitsPerValue;
-    final int elementPos = (int)(majorBitPos >>> BLOCK_BITS); // / BLOCK_SIZE
-    final int bitPos =     (int)(majorBitPos & MOD_MASK); // % BLOCK_SIZE);
+	/** 
+	 * Set ResultSet DRDA DataTypes
+	 * @param value drdaTypes for columns.
+	 **/
+	protected void setRsDRDATypes(int [] value)
+	{
+		rsDRDATypes = value;
 
-    final int base = bitPos * FAC_BITPOS;
-    assert elementPos < blocks.length : "elementPos: " + elementPos + "; blocks.len: " + blocks.length;
-    return ((blocks[elementPos] << shifts[base]) >>> shifts[base+1]) |
-            ((blocks[elementPos+1] >>> shifts[base+2]) & readMasks[bitPos]);
-  }
+	}
 
-  public void set(final int index, final long value) {
-    final long majorBitPos = (long)index * bitsPerValue;
-    final int elementPos = (int)(majorBitPos >>> BLOCK_BITS); // / BLOCK_SIZE
-    final int bitPos =     (int)(majorBitPos & MOD_MASK); // % BLOCK_SIZE);
-    final int base = bitPos * FAC_BITPOS;
+	/**
+	 *@return ResultSet DRDA DataTypes
+	 **/
 
-    blocks[elementPos  ] = (blocks[elementPos  ] & writeMasks[base])
-                           | (value << shifts[base + 1] >>> shifts[base]);
-    blocks[elementPos+1] = (blocks[elementPos+1] & writeMasks[base+1])
-                           | ((value << shifts[base + 2]) & writeMasks[base+2]);
-  }
+	protected int[] getRsDRDATypes()
+	{
+		// use the given override if it is present
+		if (outovr_drdaType != null)
+			return outovr_drdaType;
+		return rsDRDATypes;
+	}
 
-  @Override
-  public String toString() {
-    return "Packed64(bitsPerValue=" + bitsPerValue + ", size="
-            + size() + ", maxPos=" + maxPos
-            + ", elements.length=" + blocks.length + ")";
-  }
+	/**
+	 * set resultset/out parameter precision
+	 *
+	 * @param index - starting with 1
+	 * @param precision
+	 */
+	protected void setRsPrecision(int index, int precision)
+	{
+		if (rsPrecision == null)
+			rsPrecision = new int[rsDRDATypes.length];
+		rsPrecision[index -1] = precision;
+	}
 
-  public long ramBytesUsed() {
-    return RamUsageEstimator.NUM_BYTES_ARRAY_HEADER
-            + blocks.length * RamUsageEstimator.NUM_BYTES_LONG;
-  }
+	/**
+	 * get resultset /out paramter precision
+	 * @param index -starting with 1
+	 * @return precision of column
+	 */
+	protected int getRsPrecision(int index)
+	{
+		if (rsPrecision == null)
+			return 0;
+		return rsPrecision[index-1];
+	}
 
-  public void clear() {
-    Arrays.fill(blocks, 0L);
-  }
+	/**
+	 * set resultset/out parameter scale
+	 *
+	 * @param index - starting with 1
+	 * @param scale
+	 */
+	protected void setRsScale(int index, int scale)
+	{
+		if (rsScale == null)
+			rsScale = new int[rsDRDATypes.length];
+		rsScale[index-1] = scale;
+	}
+
+	/**
+	 * get resultset /out paramter scale
+	 * @param index -starting with 1
+	 * @return scale of column
+	 */
+	protected int  getRsScale(int index)
+	{
+		if (rsScale == null)
+			return 0;
+		
+		return rsScale[index -1];
+	}
+	
+	
+	/**
+	 * set resultset/out parameter DRDAType
+	 *
+	 * @param index - starting with 1
+	 * @param type
+	 */
+	protected  void setRsDRDAType(int index, int type)
+	{
+		rsDRDATypes[index -1] =  type;
+		
+	}
+	
+	/**
+	 * get  resultset/out parameter DRDAType
+	 *
+	 * @param index - starting with 1
+	 * @return  DRDA Type of column
+	 */
+	protected int getRsDRDAType(int index)
+	{
+		return rsDRDATypes[index -1];
+	}
+	
+
+	/**
+	 * set resultset DRDA Len
+	 *
+	 * @param index - starting with 1
+	 * @param value
+	 */
+	protected  void setRsLen(int index, int value)
+	{
+		if (rsLens == null)
+			rsLens = new int[rsDRDATypes.length];
+		rsLens[index -1] = value;
+		
+	}
+	
+	/**
+	 * get  resultset  DRDALen
+	 * @param index - starting with 1
+	 * @return  length of column value
+	 */
+	protected int getRsLen(int index)
+	{
+		return rsLens[index -1];
+	}
+	
+
+	/**
+	 * Add extDtaObject
+	 * @param o - object to  add
+	 */
+	protected void  addExtDtaObject (Object o, int jdbcIndex )
+	{
+		if (extDtaObjects == null)
+			extDtaObjects = new java.util.ArrayList();
+		extDtaObjects.add (o);
+
+		if (rsExtPositions == null)
+			rsExtPositions = new java.util.ArrayList();
+		
+		// need to record the 0 based position so subtract 1
+		rsExtPositions.add (new Integer(jdbcIndex -1 ));
+
+	}
+
+
+	/**
+	 * Clear externalized lob objects in current result set
+	 */
+	protected void  clearExtDtaObjects ()
+	{
+		if (extDtaObjects != null)
+			extDtaObjects.clear();
+		if (rsExtPositions != null)
+			rsExtPositions.clear();
+		
+	}
+	
+	/*
+	 * Is lob object nullable
+	 * @param index - offset starting with 0
+	 * @return true if object is nullable
+	 */
+	protected boolean isExtDtaValueNullable(int index)
+	{
+		if ((rsExtPositions == null) || 
+			rsExtPositions.get(index) == null)
+			return false;
+		
+
+		int colnum = ((Integer) rsExtPositions.get(index)).intValue();
+		
+		if (FdocaConstants.isNullable((getRsDRDATypes())[colnum]))
+			return true;
+		else 
+			return false;
+	}
+	
+
+	/**
+	 * Get the extData Objects
+	 *
+	 *  @return ArrayList with extdta
+	 */
+	protected ArrayList getExtDtaObjects()
+	{
+		return extDtaObjects;
+	}
+
+	/**
+	 * Set the extData Objects
+	 */
+	protected void  setExtDtaObjects(ArrayList a)
+	{
+		extDtaObjects =a;
+	}
+	
+	
+	/** Clean up statements and resultSet
+	 * 
+	 */
+	protected void close()  throws SQLException
+	{
+		if (rs != null)
+			rs.close();
+		rs = null;
+		gotPrctyp = false;
+		outovr_drdaType = null;
+		scrollType = ResultSet.TYPE_FORWARD_ONLY;	
+		concurType = 0;
+		rowCount = 0;
+		rsLens = null;
+		rsDRDATypes = null;
+		rsPrecision = null;
+		rsScale = null;
+		extDtaObjects = null;
+		rsExtPositions = null;
+		state=NOT_OPENED;
+		hasdata = true;
+	}
+
+
+	/**
+	 * Explicitly close the result set by CLSQRY
+	 * needed to check for double close.
+	 */
+	protected void CLSQRY()
+	{
+		explicitlyClosed = true;
+	}
+
+	/* 
+	 * @return whether CLSQRY has been called on the
+	 *         current result set.
+	 */
+	protected boolean wasExplicitlyClosed()
+	{
+		return explicitlyClosed;
+	}
+
+
+	/****
+	 * Check to see if the result set for this statement
+	 * has at least one column that is BLOB/CLOB.
+	 * @return True if the result has at least one blob/clob
+	 *  column; false otherwise.
+	 ****/
+ 
+	private boolean hasLobColumns()	throws SQLException
+	{
+		ResultSetMetaData rsmd = rs.getMetaData();
+		int ncols = rsmd.getColumnCount();
+		for (int i = 1; i <= ncols; i++)
+		{
+			int type = rsmd.getColumnType(i);
+			if (type == Types.BLOB || type == Types.CLOB)
+				return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Get the cursor name for the ResultSet
+	 */
+	public String getResultSetCursorName() throws SQLException
+	{
+
+		if (rs != null)
+			return rs.getCursorName();
+		else 
+			return null;
+	}
+
+	protected int getQryprctyp()
+		throws SQLException
+	{
+		if (!gotPrctyp && qryprctyp == CodePoint.LMTBLKPRC)
+		{
+			gotPrctyp = true;
+			if (rs == null || ((EmbedResultSet) rs).isForUpdate() ||
+				/* for now we are not supporting LOB under LMTBLKPRC.  drda spec only
+				 * disallows LOB under LMTBLKPRC if OUTOVR is also for ANY CNTQRY reply.
+				 * To support LOB, QRYDTA protocols for LOB will need to be changed.
+				 */
+				hasLobColumns())
+			{
+				qryprctyp = CodePoint.FIXROWPRC;
+			}
+		}
+		return qryprctyp;
+	}
+
+	protected void setQryprctyp(int qryprctyp)
+	{
+		this.qryprctyp = qryprctyp;
+	}
+
+	/**
+	 * is ResultSet closed
+	 * @return whether the resultSet  is closed
+	 */
+	protected boolean isClosed()
+	{
+		return (state == NOT_OPENED);
+	}
+
+	/**
+	 * Set state to SUSPENDED (result set is opened)
+	 */
+	protected void suspend()
+	{
+		state = SUSPENDED;
+	}
+
+
+	protected String toDebugString(String indent)
+	{
+		String s = indent + "***** DRDASResultSet toDebugString ******\n";
+		s += indent + "State:" + getStateString(state)+ "\n";
+		s += indent + "pkgcnstkn: {" + pkgcnstkn + "}\n"; 
+		s += indent + "cursor Name: ";
+		String cursorName = null;
+		try {
+			if (rs != null)
+				cursorName = rs.getCursorName();
+		}
+		catch (SQLException se )
+		{
+			cursorName = "invalid rs";
+		}
+		s += indent + cursorName + "\n";
+		   
+		return s;
+	}
+
+
+	private String getStateString( int i )
+	{
+		switch (i)
+		{
+			case NOT_OPENED:
+				return "NOT_OPENED";
+			case SUSPENDED:
+				return "SUSPENDED";
+			default:
+				return "UNKNOWN_STATE";
+		}
+
+	}
+	
+	/**
+	 * Sets the OPNQRYOptions. For more information on the meaning of these
+	 * values consult the DRDA Technical Standard document. 
+	 * 
+	 * @param blksize Query block Size
+	 * @param qryblkctl Use to set the query protocol type
+	 * @param maxblkext Maximum number of extra blocks
+	 * @param outovropt Output override option
+	 * @param qryrowset Query row set
+	 * @param qryclsimpl Implicit query close setting
+	 */
+	protected void setOPNQRYOptions(int blksize, int qryblkctl,
+			int maxblkext, int outovropt,int qryrowset,int qryclsimpl)
+	{
+		this.blksize = blksize;
+		setQryprctyp(qryblkctl);
+		this.maxblkext = maxblkext;
+		this.outovropt = outovropt;
+		this.qryrowset = qryrowset;
+		this.qryclsimp = (qryclsimpl == CodePoint.QRYCLSIMP_SERVER_CHOICE)
+			? DRDAResultSet.QRYCLSIMP_DEFAULT : qryclsimpl;
+	}
 }

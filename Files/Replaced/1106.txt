@@ -1,82 +1,136 @@
-return result;
+if (rows.size() > 1 || shouldPurge || !rows.get(0).sstable.descriptor.isLatestVersion)
 
-/**
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+package org.apache.cassandra.io;
+/*
+ * 
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ * 
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ * 
  */
 
-package org.apache.mahout.classifier.naivebayes;
 
-import java.util.Iterator;
+import java.io.DataOutput;
+import java.io.IOError;
+import java.io.IOException;
+import java.security.MessageDigest;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 
-import org.apache.mahout.classifier.AbstractVectorClassifier;
-import org.apache.mahout.math.Vector;
-import org.apache.mahout.math.Vector.Element;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-/** Class implementing the Naive Bayes Classifier Algorithm */
-public abstract class AbstractNaiveBayesClassifier extends AbstractVectorClassifier {
+import org.apache.cassandra.db.ColumnFamily;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.io.sstable.SSTable;
+import org.apache.cassandra.io.sstable.SSTableIdentityIterator;
+import org.apache.cassandra.io.util.DataOutputBuffer;
 
-  private final NaiveBayesModel model;
-  
-  protected AbstractNaiveBayesClassifier(NaiveBayesModel model) {
-    this.model = model;
-  }
+/**
+ * PrecompactedRow merges its rows in its constructor in memory.
+ */
+public class PrecompactedRow extends AbstractCompactedRow
+{
+    private static Logger logger = LoggerFactory.getLogger(PrecompactedRow.class);
 
-  protected NaiveBayesModel getModel() {
-    return model;
-  }
-  
-  protected abstract double getScoreForLabelFeature(int label, int feature);
+    private final DataOutputBuffer buffer;
+    private int columnCount = 0;
 
-  protected double getScoreForLabelInstance(int label, Vector instance) {
-    double result = 0.0;
-    Iterator<Element> elements = instance.iterateNonZero();
-    while (elements.hasNext()) {
-      Element e = elements.next();
-      result += e.get() * getScoreForLabelFeature(label, e.index());
+    public PrecompactedRow(DecoratedKey key, DataOutputBuffer buffer)
+    {
+        super(key);
+        this.buffer = buffer;
     }
-    return -result;
-  }
-  
-  @Override
-  public int numCategories() {
-    return model.numLabels();
-  }
 
-  @Override
-  public Vector classifyFull(Vector instance) {
-    Vector score = model.createScoringVector();
-    for (int label = 0; label < model.numLabels(); label++) {
-      score.set(label, getScoreForLabelInstance(label, instance));
+    public PrecompactedRow(ColumnFamilyStore cfStore, List<SSTableIdentityIterator> rows, boolean major, int gcBefore)
+    {
+        super(rows.get(0).getKey());
+        buffer = new DataOutputBuffer();
+
+        Set<SSTable> sstables = new HashSet<SSTable>();
+        for (SSTableIdentityIterator row : rows)
+        {
+            sstables.add(row.sstable);
+        }
+        boolean shouldPurge = major || !cfStore.isKeyInRemainingSSTables(key, sstables);
+
+        if (rows.size() > 1 || shouldPurge)
+        {
+            ColumnFamily cf = null;
+            for (SSTableIdentityIterator row : rows)
+            {
+                ColumnFamily thisCF;
+                try
+                {
+                    thisCF = row.getColumnFamilyWithColumns();
+                }
+                catch (IOException e)
+                {
+                    logger.error("Skipping row " + key + " in " + row.getPath(), e);
+                    continue;
+                }
+                if (cf == null)
+                {
+                    cf = thisCF;
+                }
+                else
+                {
+                    cf.addAll(thisCF);
+                }
+            }
+            ColumnFamily cfPurged = shouldPurge ? ColumnFamilyStore.removeDeleted(cf, gcBefore) : cf;
+            if (cfPurged == null)
+                return;
+            columnCount = ColumnFamily.serializer().serializeWithIndexes(cfPurged, buffer);
+        }
+        else
+        {
+            assert rows.size() == 1;
+            try
+            {
+                rows.get(0).echoData(buffer);
+                columnCount = rows.get(0).columnCount;
+            }
+            catch (IOException e)
+            {
+                throw new IOError(e);
+            }
+        }
     }
-    return score;
-  }
-  
-  @Override
-  public Vector classifyFull(Vector r, Vector instance) {
-    r = classifyFull(instance);
-    return r;
-  }
 
-  @Override
-  public double classifyScalar(Vector instance) {
-    throw new UnsupportedOperationException("Not supported in Naive Bayes");
-  }
-  
-  @Override
-  public Vector classify(Vector instance) {
-    throw new UnsupportedOperationException("probabilites not supported in Naive Bayes");
-  }
+    public void write(DataOutput out) throws IOException
+    {
+        out.writeLong(buffer.getLength());
+        out.write(buffer.getData(), 0, buffer.getLength());
+    }
+
+    public void update(MessageDigest digest)
+    {
+        digest.update(buffer.getData(), 0, buffer.getLength());
+    }
+
+    public boolean isEmpty()
+    {
+        return buffer.getLength() == 0;
+    }
+
+    public int columnCount()
+    {
+        return columnCount;
+    }
 }

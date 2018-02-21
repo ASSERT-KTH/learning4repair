@@ -1,12 +1,13 @@
-parser.setHelpOption(helpOpt);
+logger_.debug("reporting as failed " + ep);
 
 /**
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -17,198 +18,324 @@ parser.setHelpOption(helpOpt);
  * limitations under the License.
  */
 
-package org.apache.mahout.text;
+package org.apache.cassandra.gms;
 
-import java.io.Closeable;
-import java.io.File;
-import java.io.FileFilter;
-import java.io.FileNotFoundException;
-import java.io.IOException;
-import java.nio.charset.Charset;
+import java.io.FileOutputStream;
+import java.lang.management.ManagementFactory;
+import java.net.UnknownHostException;
+import java.util.*;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+import javax.management.MBeanServer;
+import javax.management.ObjectName;
 
-import org.apache.commons.cli2.CommandLine;
-import org.apache.commons.cli2.Group;
-import org.apache.commons.cli2.Option;
-import org.apache.commons.cli2.OptionException;
-import org.apache.commons.cli2.builder.ArgumentBuilder;
-import org.apache.commons.cli2.builder.DefaultOptionBuilder;
-import org.apache.commons.cli2.builder.GroupBuilder;
-import org.apache.commons.cli2.commandline.Parser;
-import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.io.SequenceFile;
-import org.apache.hadoop.io.Text;
-import org.apache.mahout.common.CommandLineUtil;
-import org.apache.mahout.common.FileLineIterable;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.commons.lang.StringUtils;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.net.EndPoint;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.LogUtil;
+import org.apache.log4j.Logger;
 
 /**
- * Converts a directory of text documents into SequenceFiles of Specified chunkSize. This class takes in a
- * parent directory containing sub folders of text documents and recursively reads the files and creates the
- * {@link SequenceFile}s of docid => content. The docid is set as the relative path of the document from the
- * parent directory prepended with a specified prefix. You can also specify the input encoding of the text
- * files. The content of the output SequenceFiles are encoded as UTF-8 text.
+ * This FailureDetector is an implementation of the paper titled
+ * "The Phi Accrual Failure Detector" by Hayashibara. 
+ * Check the paper and the <i>IFailureDetector</i> interface for details.
  * 
- * 
+ * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
  */
-public final class SequenceFilesFromDirectory {
-  
-  private static final Logger log = LoggerFactory.getLogger(SequenceFilesFromDirectory.class);
-  
-  private static ChunkedWriter createNewChunkedWriter(int chunkSizeInMB, String outputDir) throws IOException {
-    return new ChunkedWriter(chunkSizeInMB, outputDir);
-  }
-  
-  public void createSequenceFiles(File parentDir,
-                                  String outputDir,
-                                  String prefix,
-                                  int chunkSizeInMB,
-                                  Charset charset) throws IOException {
-    ChunkedWriter writer = createNewChunkedWriter(chunkSizeInMB, outputDir);
-    parentDir.listFiles(new PrefixAdditionFilter(prefix, writer, charset));
-    writer.close();
-  }
-  
-  public static class ChunkedWriter implements Closeable {
-    private final int maxChunkSizeInBytes;
-    private final String outputDir;
-    private SequenceFile.Writer writer;
-    private int currentChunkID;
-    private int currentChunkSize;
-    private final Configuration conf = new Configuration();
-    private final FileSystem fs;
+public class FailureDetector implements IFailureDetector, FailureDetectorMBean
+{
+    private static Logger logger_ = Logger.getLogger(FailureDetector.class);
+    private static final int sampleSize_ = 1000;
+    private static final int phiSuspectThreshold_ = 5;
+    private static final int phiConvictThreshold_ = 8;
+    /* The Failure Detector has to have been up for atleast 1 min. */
+    private static final long uptimeThreshold_ = 60000;
+    private static IFailureDetector failureDetector_;
+    /* Used to lock the factory for creation of FailureDetector instance */
+    private static Lock createLock_ = new ReentrantLock();
+    /* The time when the module was instantiated. */
+    private static long creationTime_;
     
-    public ChunkedWriter(int chunkSizeInMB, String outputDir) throws IOException {
-      if (chunkSizeInMB > 1984) {
-        chunkSizeInMB = 1984;
-      }
-      maxChunkSizeInBytes = chunkSizeInMB * 1024 * 1024;
-      this.outputDir = outputDir;
-      fs = FileSystem.get(conf);
-      currentChunkID = 0;
-      writer = new SequenceFile.Writer(fs, conf, getPath(currentChunkID), Text.class, Text.class);
+    public static IFailureDetector instance()
+    {        
+        if ( failureDetector_ == null )
+        {
+            FailureDetector.createLock_.lock();
+            try
+            {
+                if ( failureDetector_ == null )
+                {
+                    failureDetector_ = new FailureDetector();
+                }
+            }
+            finally
+            {
+                createLock_.unlock();
+            }
+        }        
+        return failureDetector_;
     }
     
-    private Path getPath(int chunkID) {
-      return new Path(outputDir + "/chunk-" + chunkID);
-    }
+    private Map<EndPoint, ArrivalWindow> arrivalSamples_ = new Hashtable<EndPoint, ArrivalWindow>();
+    private List<IFailureDetectionEventListener> fdEvntListeners_ = new ArrayList<IFailureDetectionEventListener>();
     
-    public void write(String key, String value) throws IOException {
-      if (currentChunkSize > maxChunkSizeInBytes) {
-        writer.close();
-        writer = new SequenceFile.Writer(fs, conf, getPath(currentChunkID++), Text.class, Text.class);
-        currentChunkSize = 0;
-        
-      }
-      
-      Text keyT = new Text(key);
-      Text valueT = new Text(value);
-      currentChunkSize += keyT.getBytes().length + valueT.getBytes().length; // Overhead
-      writer.append(keyT, valueT);
-    }
-    
-    @Override
-    public void close() throws IOException {
-      writer.close();
-    }
-  }
-  
-  public class PrefixAdditionFilter implements FileFilter {
-    private final String prefix;
-    private final ChunkedWriter writer;
-    private final Charset charset;
-    
-    public PrefixAdditionFilter(String prefix, ChunkedWriter writer, Charset charset) {
-      this.prefix = prefix;
-      this.writer = writer;
-      this.charset = charset;
-    }
-    
-    @Override
-    public boolean accept(File current) {
-      if (current.isDirectory()) {
-        current.listFiles(new PrefixAdditionFilter(prefix + File.separator + current.getName(), writer,
-            charset));
-      } else {
-        try {
-          StringBuilder file = new StringBuilder();
-          for (String aFit : new FileLineIterable(current, charset, false)) {
-            file.append(aFit).append('\n');
-          }
-          writer.write(prefix + File.separator + current.getName(), file.toString());
-          
-        } catch (FileNotFoundException e) {
-          // Skip file.
-        } catch (IOException e) {
-          // TODO: report exceptions and continue;
-          throw new IllegalStateException(e);
+    public FailureDetector()
+    {
+        creationTime_ = System.currentTimeMillis();
+        // Register this instance with JMX
+        try
+        {
+            MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+            mbs.registerMBean(this, new ObjectName("org.apache.cassandra.gms:type=FailureDetector"));
         }
-      }
-      return false;
+        catch (Exception e)
+        {
+            logger_.error(LogUtil.throwableToString(e));
+        }
     }
     
-  }
-  
-  public static void main(String[] args) throws Exception {
-    DefaultOptionBuilder obuilder = new DefaultOptionBuilder();
-    ArgumentBuilder abuilder = new ArgumentBuilder();
-    GroupBuilder gbuilder = new GroupBuilder();
-    
-    Option parentOpt = obuilder.withLongName("input").withRequired(true).withArgument(
-      abuilder.withName("input").withMinimum(1).withMaximum(1).create()).withDescription(
-      "The input dir containing the documents").withShortName("i").create();
-    
-    Option outputDirOpt = obuilder.withLongName("output").withRequired(true).withArgument(
-      abuilder.withName("output").withMinimum(1).withMaximum(1).create()).withDescription(
-      "The output directory").withShortName("o").create();
-    
-    Option chunkSizeOpt = obuilder.withLongName("chunkSize").withArgument(
-      abuilder.withName("chunkSize").withMinimum(1).withMaximum(1).create()).withDescription(
-      "The chunkSize in MegaBytes. Defaults to 64").withShortName("chunk").create();
-    
-    Option keyPrefixOpt = obuilder.withLongName("keyPrefix").withArgument(
-      abuilder.withName("keyPrefix").withMinimum(1).withMaximum(1).create()).withDescription(
-      "The prefix to be prepended to the key").withShortName("prefix").create();
-    
-    Option charsetOpt = obuilder.withLongName("charset").withRequired(true).withArgument(
-      abuilder.withName("charset").withMinimum(1).withMaximum(1).create()).withDescription(
-      "The name of the character encoding of the input files").withShortName("c").create();
-    
-    Option helpOpt = obuilder.withLongName("help").withDescription("Print out help").withShortName("h")
-        .create();
-    
-    Group group = gbuilder.withName("Options").withOption(keyPrefixOpt).withOption(chunkSizeOpt).withOption(
-      charsetOpt).withOption(outputDirOpt).withOption(helpOpt).withOption(parentOpt).create();
-    
-    try {
-      Parser parser = new Parser();
-      parser.setGroup(group);
-      CommandLine cmdLine = parser.parse(args);
-      if (cmdLine.hasOption(helpOpt)) {
-        CommandLineUtil.printHelp(group);
-        return;
-      }
-      File parentDir = new File((String) cmdLine.getValue(parentOpt));
-      String outputDir = (String) cmdLine.getValue(outputDirOpt);
-      
-      int chunkSize = 64;
-      if (cmdLine.hasOption(chunkSizeOpt)) {
-        chunkSize = Integer.parseInt((String) cmdLine.getValue(chunkSizeOpt));
-      }
-      
-      String prefix = "";
-      if (cmdLine.hasOption(keyPrefixOpt)) {
-        prefix = (String) cmdLine.getValue(keyPrefixOpt);
-      }
-      Charset charset = Charset.forName((String) cmdLine.getValue(charsetOpt));
-      SequenceFilesFromDirectory dir = new SequenceFilesFromDirectory();
-      
-      dir.createSequenceFiles(parentDir, outputDir, prefix, chunkSize, charset);
-    } catch (OptionException e) {
-      log.error("Exception", e);
-      CommandLineUtil.printHelp(group);
+    /**
+     * Dump the inter arrival times for examination if necessary.
+     */
+    public void dumpInterArrivalTimes()
+    {
+        try
+        {
+            FileOutputStream fos = new FileOutputStream("/var/tmp/output-" + System.currentTimeMillis() + ".dat", true);
+            fos.write(toString().getBytes());
+            fos.close();
+        }
+        catch(Throwable th)
+        {
+            logger_.warn(LogUtil.throwableToString(th));
+        }
     }
-  }
+    
+    /**
+     * We dump the arrival window for any endpoint only if the 
+     * local Failure Detector module has been up for more than a 
+     * minute.
+     * 
+     * @param ep for which the arrival window needs to be dumped.
+     */
+    private void dumpInterArrivalTimes(EndPoint ep)
+    {
+        long now = System.currentTimeMillis();
+        if ( (now - FailureDetector.creationTime_) <= FailureDetector.uptimeThreshold_ )
+            return;
+        try
+        {
+            FileOutputStream fos = new FileOutputStream("/var/tmp/output-" + System.currentTimeMillis() + "-" + ep + ".dat", true);
+            ArrivalWindow hWnd = arrivalSamples_.get(ep);
+            fos.write(hWnd.toString().getBytes());
+            fos.close();
+        }
+        catch(Throwable th)
+        {
+            logger_.warn(LogUtil.throwableToString(th));
+        }
+    }
+    
+    public boolean isAlive(EndPoint ep)
+    {
+        try
+        {
+            /* If the endpoint in question is the local endpoint return true. */
+            String localHost = FBUtilities.getHostAddress();
+            if ( localHost.equals( ep.getHost() ) )
+                    return true;
+        }
+        catch( UnknownHostException ex )
+        {
+            logger_.info( LogUtil.throwableToString(ex) );
+        }
+    	/* Incoming port is assumed to be the Storage port. We need to change it to the control port */
+    	EndPoint ep2 = new EndPoint(ep.getHost(), DatabaseDescriptor.getControlPort());        
+        EndPointState epState = Gossiper.instance().getEndPointStateForEndPoint(ep2);
+        return epState.isAlive();
+    }
+    
+    public void report(EndPoint ep)
+    {
+        long now = System.currentTimeMillis();
+        ArrivalWindow hbWnd = arrivalSamples_.get(ep);
+        if ( hbWnd == null )
+        {
+            hbWnd = new ArrivalWindow(sampleSize_);
+            arrivalSamples_.put(ep, hbWnd);
+        }
+        hbWnd.add(now);  
+    }
+    
+    public void intepret(EndPoint ep)
+    {
+        ArrivalWindow hbWnd = arrivalSamples_.get(ep);
+        if ( hbWnd == null )
+        {            
+            return;
+        }
+        long now = System.currentTimeMillis();
+        /* We need this so that we do not suspect a convict. */
+        boolean isConvicted = false;
+        double phi = hbWnd.phi(now);
+        logger_.trace("PHI for " + ep + " : " + phi);
+        
+        /*
+        if ( phi > phiConvictThreshold_ )
+        {            
+            isConvicted = true;     
+            for ( IFailureDetectionEventListener listener : fdEvntListeners_ )
+            {
+                listener.convict(ep);                
+            }
+        }
+        */
+        if ( !isConvicted && phi > phiSuspectThreshold_ )
+        {     
+            for ( IFailureDetectionEventListener listener : fdEvntListeners_ )
+            {
+                listener.suspect(ep);
+            }
+        }        
+    }
+    
+    public void registerFailureDetectionEventListener(IFailureDetectionEventListener listener)
+    {
+        fdEvntListeners_.add(listener);
+    }
+    
+    public void unregisterFailureDetectionEventListener(IFailureDetectionEventListener listener)
+    {
+        fdEvntListeners_.remove(listener);
+    }
+    
+    public String toString()
+    {
+        StringBuilder sb = new StringBuilder();
+        Set<EndPoint> eps = arrivalSamples_.keySet();
+        
+        sb.append("-----------------------------------------------------------------------");
+        for ( EndPoint ep : eps )
+        {
+            ArrivalWindow hWnd = arrivalSamples_.get(ep);
+            sb.append(ep + " : ");
+            sb.append(hWnd.toString());
+            sb.append( System.getProperty("line.separator") );
+        }
+        sb.append("-----------------------------------------------------------------------");
+        return sb.toString();
+    }
+    
+    public static void main(String[] args) throws Throwable
+    {           
+    }
+}
+
+class ArrivalWindow
+{
+    private static Logger logger_ = Logger.getLogger(ArrivalWindow.class);
+    private double tLast_ = 0L;
+    private Deque<Double> arrivalIntervals_;
+    private int size_;
+    
+    ArrivalWindow(int size)
+    {
+        size_ = size;
+        arrivalIntervals_ = new ArrayDeque<Double>(size);
+    }
+    
+    synchronized void add(double value)
+    {
+        if ( arrivalIntervals_.size() == size_ )
+        {                          
+            arrivalIntervals_.remove();            
+        }
+        
+        double interArrivalTime;
+        if ( tLast_ > 0L )
+        {                        
+            interArrivalTime = (value - tLast_);            
+        }
+        else
+        {
+            interArrivalTime = Gossiper.intervalInMillis_ / 2;
+        }
+        tLast_ = value;            
+        arrivalIntervals_.add(interArrivalTime);        
+    }
+    
+    synchronized double sum()
+    {
+        double sum = 0d;
+        for (Double interval : arrivalIntervals_)
+        {
+            sum += interval;
+        }
+        return sum;
+    }
+    
+    synchronized double sumOfDeviations()
+    {
+        double sumOfDeviations = 0d;
+        double mean = mean();
+
+        for (Double interval : arrivalIntervals_)
+        {
+            double v = interval - mean;
+            sumOfDeviations += v * v;
+        }
+
+        return sumOfDeviations;
+    }
+    
+    synchronized double mean()
+    {
+        return sum()/arrivalIntervals_.size();
+    }
+    
+    synchronized double variance()
+    {                
+        return sumOfDeviations() / (arrivalIntervals_.size());        
+    }
+    
+    double deviation()
+    {        
+        return Math.sqrt(variance());
+    }
+    
+    void clear()
+    {
+        arrivalIntervals_.clear();
+    }
+    
+    double p(double t)
+    {
+        // Stat stat = new Stat();
+        double mean = mean();        
+        double deviation = deviation();   
+        /* Exponential CDF = 1 -e^-lambda*x */
+        double exponent = (-1)*(t)/mean;
+        return 1 - ( 1 - Math.pow(Math.E, exponent) );
+        // return stat.gaussianCDF(mean, deviation, t, Double.POSITIVE_INFINITY);             
+    }
+    
+    double phi(long tnow)
+    {            
+        int size = arrivalIntervals_.size();
+        double log = 0d;
+        if ( size > 0 )
+        {
+            double t = tnow - tLast_;                
+            double probability = p(t);       
+            log = (-1) * Math.log10( probability );                                 
+        }
+        return log;           
+    } 
+    
+    public String toString()
+    {
+        return StringUtils.join(arrivalIntervals_, " ");
+    }
 }
