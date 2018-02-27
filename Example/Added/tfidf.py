@@ -22,7 +22,7 @@ def main():
                 if(freq == 0):
                     weight_insert.append(1)
                 else:
-                    weight_insert.append(math.log(len(lines)/freq))
+                    weight_insert.append(math.log(len(lines)/(freq*1.0)))
             weight_insert = normalize(weight_insert)
 
             max = 0
