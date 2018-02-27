@@ -4,7 +4,7 @@ def editDistance(s1,s2):
     return edit_distance.SequenceMatcher(a=s1, b=s2).distance()
 
 def main():
-    path = "../../Files/Replaced/"
+    path = "../../Files/Added/"
     for i in range (1,100):
         filename=path+str(i)+".txt"
         with open(filename, 'r') as file:

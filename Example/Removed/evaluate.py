@@ -19,7 +19,7 @@ def main():
             solution = open(path_solutions+filename, "r")
 
             file_length = len(file.readlines())
-            if(int(line) < 1 or int(line) > file_length+1):
+            if(int(line) < 1 or int(line) > file_length):
                 raise LineOutOfRangeException("Line number out of range. Expected: 1<={line}<=" + str(file_length) + ", found: " + line)
 
             solution_line = solution.readline()

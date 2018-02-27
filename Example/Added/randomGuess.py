@@ -2,7 +2,7 @@ import os,glob,random
 
 def randomLineOfFile(file):
     total = len(file.readlines()) - 2
-    return random.randint(0,total+1)
+    return random.randint(0,total)
 
 def guess():
     path = "../../Files/Added"
