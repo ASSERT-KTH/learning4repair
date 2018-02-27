@@ -1,4 +1,4 @@
-public ConstantScorer(DocIdSetIterator docIdSetIterator, Weight w, float theScore) {
+public float score() {
 
 package org.apache.lucene.search;
 
@@ -19,265 +19,302 @@ package org.apache.lucene.search;
  * limitations under the License.
  */
 
-import org.apache.lucene.index.AtomicReaderContext;
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.Term;
-import org.apache.lucene.util.Bits;
-import org.apache.lucene.util.ToStringUtils;
-
 import java.io.IOException;
-import java.util.Set;
+import java.util.Arrays;
 
-/**
- * A query that wraps another query or a filter and simply returns a constant score equal to the
- * query boost for every document that matches the filter or query.
- * For queries it therefore simply strips of all scores and returns a constant one.
- */
-public class ConstantScoreQuery extends Query {
-  protected final Filter filter;
-  protected final Query query;
+import org.apache.lucene.index.*;
+import org.apache.lucene.search.similarities.Similarity;
 
-  /** Strips off scores from the passed in Query. The hits will get a constant score
-   * dependent on the boost factor of this query. */
-  public ConstantScoreQuery(Query query) {
-    if (query == null)
-      throw new NullPointerException("Query may not be null");
-    this.filter = null;
-    this.query = query;
+final class ExactPhraseScorer extends Scorer {
+  private final int endMinus1;
+
+  private final static int CHUNK = 4096;
+
+  private int gen;
+  private final int[] counts = new int[CHUNK];
+  private final int[] gens = new int[CHUNK];
+
+  boolean noDocs;
+
+  private final static class ChunkState {
+    final DocsAndPositionsEnum posEnum;
+    final int offset;
+    final boolean useAdvance;
+    int posUpto;
+    int posLimit;
+    int pos;
+    int lastPos;
+
+    public ChunkState(DocsAndPositionsEnum posEnum, int offset, boolean useAdvance) {
+      this.posEnum = posEnum;
+      this.offset = offset;
+      this.useAdvance = useAdvance;
+    }
   }
 
-  /** Wraps a Filter as a Query. The hits will get a constant score
-   * dependent on the boost factor of this query.
-   * If you simply want to strip off scores from a Query, no longer use
-   * {@code new ConstantScoreQuery(new QueryWrapperFilter(query))}, instead
-   * use {@link #ConstantScoreQuery(Query)}!
-   */
-  public ConstantScoreQuery(Filter filter) {
-    if (filter == null)
-      throw new NullPointerException("Filter may not be null");
-    this.filter = filter;
-    this.query = null;
-  }
+  private final ChunkState[] chunkStates;
 
-  /** Returns the encapsulated filter, returns {@code null} if a query is wrapped. */
-  public Filter getFilter() {
-    return filter;
-  }
+  private int docID = -1;
+  private int freq;
 
-  /** Returns the encapsulated query, returns {@code null} if a filter is wrapped. */
-  public Query getQuery() {
-    return query;
-  }
+  private final Similarity.ExactSimScorer docScorer;
+  
+  ExactPhraseScorer(Weight weight, PhraseQuery.PostingsAndFreq[] postings,
+                    Similarity.ExactSimScorer docScorer) throws IOException {
+    super(weight);
+    this.docScorer = docScorer;
 
-  @Override
-  public Query rewrite(IndexReader reader) throws IOException {
-    if (query != null) {
-      Query rewritten = query.rewrite(reader);
-      if (rewritten != query) {
-        rewritten = new ConstantScoreQuery(rewritten);
-        rewritten.setBoost(this.getBoost());
-        return rewritten;
+    chunkStates = new ChunkState[postings.length];
+
+    endMinus1 = postings.length-1;
+
+    for(int i=0;i<postings.length;i++) {
+
+      // Coarse optimization: advance(target) is fairly
+      // costly, so, if the relative freq of the 2nd
+      // rarest term is not that much (> 1/5th) rarer than
+      // the first term, then we just use .nextDoc() when
+      // ANDing.  This buys ~15% gain for phrases where
+      // freq of rarest 2 terms is close:
+      final boolean useAdvance = postings[i].docFreq > 5*postings[0].docFreq;
+      chunkStates[i] = new ChunkState(postings[i].postings, -postings[i].position, useAdvance);
+      if (i > 0 && postings[i].postings.nextDoc() == DocIdSetIterator.NO_MORE_DOCS) {
+        noDocs = true;
+        return;
       }
     }
-    return this;
   }
 
   @Override
-  public void extractTerms(Set<Term> terms) {
-    // TODO: OK to not add any terms when wrapped a filter
-    // and used with MultiSearcher, but may not be OK for
-    // highlighting.
-    // If a query was wrapped, we delegate to query.
-    if (query != null)
-      query.extractTerms(terms);
-  }
+  public int nextDoc() throws IOException {
+    while(true) {
 
-  protected class ConstantWeight extends Weight {
-    private final Weight innerWeight;
-    private float queryNorm;
-    private float queryWeight;
-    
-    public ConstantWeight(IndexSearcher searcher) throws IOException {
-      this.innerWeight = (query == null) ? null : query.createWeight(searcher);
-    }
+      // first (rarest) term
+      final int doc = chunkStates[0].posEnum.nextDoc();
+      if (doc == DocIdSetIterator.NO_MORE_DOCS) {
+        docID = doc;
+        return doc;
+      }
 
-    @Override
-    public Query getQuery() {
-      return ConstantScoreQuery.this;
-    }
-
-    @Override
-    public float getValueForNormalization() throws IOException {
-      // we calculate sumOfSquaredWeights of the inner weight, but ignore it (just to initialize everything)
-      if (innerWeight != null) innerWeight.getValueForNormalization();
-      queryWeight = getBoost();
-      return queryWeight * queryWeight;
-    }
-
-    @Override
-    public void normalize(float norm, float topLevelBoost) {
-      this.queryNorm = norm * topLevelBoost;
-      queryWeight *= this.queryNorm;
-      // we normalize the inner weight, but ignore it (just to initialize everything)
-      if (innerWeight != null) innerWeight.normalize(norm, topLevelBoost);
-    }
-
-    @Override
-    public Scorer scorer(AtomicReaderContext context, boolean scoreDocsInOrder,
-        boolean topScorer, final Bits acceptDocs) throws IOException {
-      final DocIdSetIterator disi;
-      if (filter != null) {
-        assert query == null;
-        final DocIdSet dis = filter.getDocIdSet(context, acceptDocs);
-        if (dis == null) {
-          return null;
+      // not-first terms
+      int i = 1;
+      while(i < chunkStates.length) {
+        final ChunkState cs = chunkStates[i];
+        int doc2 = cs.posEnum.docID();
+        if (cs.useAdvance) {
+          if (doc2 < doc) {
+            doc2 = cs.posEnum.advance(doc);
+          }
+        } else {
+          int iter = 0;
+          while(doc2 < doc) {
+            // safety net -- fallback to .advance if we've
+            // done too many .nextDocs
+            if (++iter == 50) {
+              doc2 = cs.posEnum.advance(doc);
+              break;
+            } else {
+              doc2 = cs.posEnum.nextDoc();
+            }
+          }
         }
-        disi = dis.iterator();
-      } else {
-        assert query != null && innerWeight != null;
-        disi = innerWeight.scorer(context, scoreDocsInOrder, topScorer, acceptDocs);
+        if (doc2 > doc) {
+          break;
+        }
+        i++;
       }
 
-      if (disi == null) {
-        return null;
-      }
-      return new ConstantScorer(disi, this, queryWeight);
-    }
-    
-    @Override
-    public boolean scoresDocsOutOfOrder() {
-      return (innerWeight != null) ? innerWeight.scoresDocsOutOfOrder() : false;
-    }
+      if (i == chunkStates.length) {
+        // this doc has all the terms -- now test whether
+        // phrase occurs
+        docID = doc;
 
-    @Override
-    public Explanation explain(AtomicReaderContext context, int doc) throws IOException {
-      final Scorer cs = scorer(context, true, false, context.reader().getLiveDocs());
-      final boolean exists = (cs != null && cs.advance(doc) == doc);
-
-      final ComplexExplanation result = new ComplexExplanation();
-      if (exists) {
-        result.setDescription(ConstantScoreQuery.this.toString() + ", product of:");
-        result.setValue(queryWeight);
-        result.setMatch(Boolean.TRUE);
-        result.addDetail(new Explanation(getBoost(), "boost"));
-        result.addDetail(new Explanation(queryNorm, "queryNorm"));
-      } else {
-        result.setDescription(ConstantScoreQuery.this.toString() + " doesn't match id " + doc);
-        result.setValue(0);
-        result.setMatch(Boolean.FALSE);
-      }
-      return result;
-    }
-  }
-
-  protected class ConstantScorer extends Scorer {
-    final DocIdSetIterator docIdSetIterator;
-    final float theScore;
-
-    public ConstantScorer(DocIdSetIterator docIdSetIterator, Weight w, float theScore) throws IOException {
-      super(w);
-      this.theScore = theScore;
-      this.docIdSetIterator = docIdSetIterator;
-    }
-
-    @Override
-    public int nextDoc() throws IOException {
-      return docIdSetIterator.nextDoc();
-    }
-    
-    @Override
-    public int docID() {
-      return docIdSetIterator.docID();
-    }
-
-    @Override
-    public float score() throws IOException {
-      return theScore;
-    }
-
-    @Override
-    public int advance(int target) throws IOException {
-      return docIdSetIterator.advance(target);
-    }
-    
-    private Collector wrapCollector(final Collector collector) {
-      return new Collector() {
-        @Override
-        public void setScorer(Scorer scorer) throws IOException {
-          // we must wrap again here, but using the scorer passed in as parameter:
-          collector.setScorer(new ConstantScorer(scorer, ConstantScorer.this.weight, ConstantScorer.this.theScore));
+        freq = phraseFreq();
+        if (freq != 0) {
+          return docID;
         }
-        
-        @Override
-        public void collect(int doc) throws IOException {
-          collector.collect(doc);
-        }
-        
-        @Override
-        public void setNextReader(AtomicReaderContext context) throws IOException {
-          collector.setNextReader(context);
-        }
-        
-        @Override
-        public boolean acceptsDocsOutOfOrder() {
-          return collector.acceptsDocsOutOfOrder();
-        }
-      };
-    }
-
-    // this optimization allows out of order scoring as top scorer!
-    @Override
-    public void score(Collector collector) throws IOException {
-      if (docIdSetIterator instanceof Scorer) {
-        ((Scorer) docIdSetIterator).score(wrapCollector(collector));
-      } else {
-        super.score(collector);
-      }
-    }
-
-    // this optimization allows out of order scoring as top scorer,
-    @Override
-    public boolean score(Collector collector, int max, int firstDocID) throws IOException {
-      if (docIdSetIterator instanceof Scorer) {
-        return ((Scorer) docIdSetIterator).score(wrapCollector(collector), max, firstDocID);
-      } else {
-        return super.score(collector, max, firstDocID);
       }
     }
   }
 
   @Override
-  public Weight createWeight(IndexSearcher searcher) throws IOException {
-    return new ConstantScoreQuery.ConstantWeight(searcher);
-  }
+  public int advance(int target) throws IOException {
 
-  @Override
-  public String toString(String field) {
-    return new StringBuilder("ConstantScore(")
-      .append((query == null) ? filter.toString() : query.toString(field))
-      .append(')')
-      .append(ToStringUtils.boost(getBoost()))
-      .toString();
-  }
-
-  @Override
-  public boolean equals(Object o) {
-    if (this == o) return true;
-    if (!super.equals(o))
-      return false;
-    if (o instanceof ConstantScoreQuery) {
-      final ConstantScoreQuery other = (ConstantScoreQuery) o;
-      return 
-        ((this.filter == null) ? other.filter == null : this.filter.equals(other.filter)) &&
-        ((this.query == null) ? other.query == null : this.query.equals(other.query));
+    // first term
+    int doc = chunkStates[0].posEnum.advance(target);
+    if (doc == DocIdSetIterator.NO_MORE_DOCS) {
+      docID = DocIdSetIterator.NO_MORE_DOCS;
+      return doc;
     }
-    return false;
+
+    while(true) {
+      
+      // not-first terms
+      int i = 1;
+      while(i < chunkStates.length) {
+        int doc2 = chunkStates[i].posEnum.docID();
+        if (doc2 < doc) {
+          doc2 = chunkStates[i].posEnum.advance(doc);
+        }
+        if (doc2 > doc) {
+          break;
+        }
+        i++;
+      }
+
+      if (i == chunkStates.length) {
+        // this doc has all the terms -- now test whether
+        // phrase occurs
+        docID = doc;
+        freq = phraseFreq();
+        if (freq != 0) {
+          return docID;
+        }
+      }
+
+      doc = chunkStates[0].posEnum.nextDoc();
+      if (doc == DocIdSetIterator.NO_MORE_DOCS) {
+        docID = doc;
+        return doc;
+      }
+    }
   }
 
   @Override
-  public int hashCode() {
-    return 31 * super.hashCode() +
-      ((query == null) ? filter : query).hashCode();
+  public String toString() {
+    return "ExactPhraseScorer(" + weight + ")";
   }
 
+  @Override
+  public float freq() {
+    return freq;
+  }
+
+  @Override
+  public int docID() {
+    return docID;
+  }
+
+  @Override
+  public float score() throws IOException {
+    return docScorer.score(docID, freq);
+  }
+
+  private int phraseFreq() throws IOException {
+
+    freq = 0;
+
+    // init chunks
+    for(int i=0;i<chunkStates.length;i++) {
+      final ChunkState cs = chunkStates[i];
+      cs.posLimit = cs.posEnum.freq();
+      cs.pos = cs.offset + cs.posEnum.nextPosition();
+      cs.posUpto = 1;
+      cs.lastPos = -1;
+    }
+
+    int chunkStart = 0;
+    int chunkEnd = CHUNK;
+
+    // process chunk by chunk
+    boolean end = false;
+
+    // TODO: we could fold in chunkStart into offset and
+    // save one subtract per pos incr
+
+    while(!end) {
+
+      gen++;
+
+      if (gen == 0) {
+        // wraparound
+        Arrays.fill(gens, 0);
+        gen++;
+      }
+
+      // first term
+      {
+        final ChunkState cs = chunkStates[0];
+        while(cs.pos < chunkEnd) {
+          if (cs.pos > cs.lastPos) {
+            cs.lastPos = cs.pos;
+            final int posIndex = cs.pos - chunkStart;
+            counts[posIndex] = 1;
+            assert gens[posIndex] != gen;
+            gens[posIndex] = gen;
+          }
+
+          if (cs.posUpto == cs.posLimit) {
+            end = true;
+            break;
+          }
+          cs.posUpto++;
+          cs.pos = cs.offset + cs.posEnum.nextPosition();
+        }
+      }
+
+      // middle terms
+      boolean any = true;
+      for(int t=1;t<endMinus1;t++) {
+        final ChunkState cs = chunkStates[t];
+        any = false;
+        while(cs.pos < chunkEnd) {
+          if (cs.pos > cs.lastPos) {
+            cs.lastPos = cs.pos;
+            final int posIndex = cs.pos - chunkStart;
+            if (posIndex >= 0 && gens[posIndex] == gen && counts[posIndex] == t) {
+              // viable
+              counts[posIndex]++;
+              any = true;
+            }
+          }
+
+          if (cs.posUpto == cs.posLimit) {
+            end = true;
+            break;
+          }
+          cs.posUpto++;
+          cs.pos = cs.offset + cs.posEnum.nextPosition();
+        }
+
+        if (!any) {
+          break;
+        }
+      }
+
+      if (!any) {
+        // petered out for this chunk
+        chunkStart += CHUNK;
+        chunkEnd += CHUNK;
+        continue;
+      }
+
+      // last term
+
+      {
+        final ChunkState cs = chunkStates[endMinus1];
+        while(cs.pos < chunkEnd) {
+          if (cs.pos > cs.lastPos) {
+            cs.lastPos = cs.pos;
+            final int posIndex = cs.pos - chunkStart;
+            if (posIndex >= 0 && gens[posIndex] == gen && counts[posIndex] == endMinus1) {
+              freq++;
+            }
+          }
+
+          if (cs.posUpto == cs.posLimit) {
+            end = true;
+            break;
+          }
+          cs.posUpto++;
+          cs.pos = cs.offset + cs.posEnum.nextPosition();
+        }
+      }
+
+      chunkStart += CHUNK;
+      chunkEnd += CHUNK;
+    }
+
+    return freq;
+  }
 }

@@ -1,6 +1,7 @@
-props.put("multiValued", "false");
+assert !omitTF || !currentFieldStoresPayloads;
 
-package org.apache.solr.schema;
+package org.apache.lucene.index.codecs.sep;
+
 /**
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
@@ -18,106 +19,191 @@ package org.apache.solr.schema;
  * limitations under the License.
  */
 
-import org.apache.solr.common.SolrException;
-import org.apache.solr.common.params.MapSolrParams;
-import org.apache.solr.common.params.SolrParams;
-import org.apache.solr.search.QParser;
-import org.apache.lucene.search.Query;
+import java.io.IOException;
+import java.util.Arrays;
 
-import java.util.HashMap;
-import java.util.Map;
-
+import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.index.codecs.MultiLevelSkipListReader;
 
 /**
- * An abstract base class for FieldTypes that delegate work to another {@link org.apache.solr.schema.FieldType}.
- * The sub type can be obtained by either specifying the subFieldType attribute or the subFieldSuffix.  In the former
- * case, a new dynamic field will be injected into the schema automatically with the name of {@link #POLY_FIELD_SEPARATOR}.
- * In the latter case, it will use an existing dynamic field definition to get the type.  See the example schema and the
- * use of the {@link org.apache.solr.schema.PointType} for more details.
+ * Implements the skip list reader for the default posting list format
+ * that stores positions and payloads.
  *
- **/
-public abstract class AbstractSubTypeFieldType extends FieldType implements SchemaAware {
-  protected FieldType subType;
-  public static final String SUB_FIELD_SUFFIX = "subFieldSuffix";
-  public static final String SUB_FIELD_TYPE = "subFieldType";
-  protected String suffix;
-  protected int dynFieldProps;
-  protected String[] suffixes;
-  protected IndexSchema schema;   // needed for retrieving SchemaFields
+ * @lucene.experimental
+ */
 
-  public FieldType getSubType() {
-    return subType;
-  }
+// TODO: rewrite this as recursive classes?
+class SepSkipListReader extends MultiLevelSkipListReader {
+  private boolean currentFieldStoresPayloads;
+  private IntIndexInput.Index freqIndex[];
+  private IntIndexInput.Index docIndex[];
+  private IntIndexInput.Index posIndex[];
+  private long payloadPointer[];
+  private int payloadLength[];
 
-  @Override
-  protected void init(IndexSchema schema, Map<String, String> args) {
-    this.schema = schema;
-    //it's not a first class citizen for the IndexSchema
-    SolrParams p = new MapSolrParams(args);
-    String subFT = p.get(SUB_FIELD_TYPE);
-    String subSuffix = p.get(SUB_FIELD_SUFFIX);
-    if (subFT != null) {
-      args.remove(SUB_FIELD_TYPE);
-      subType = schema.getFieldTypeByName(subFT.trim());
-      suffix = POLY_FIELD_SEPARATOR + subType.typeName;
-    } else if (subSuffix != null) {
-      args.remove(SUB_FIELD_SUFFIX);
-      suffix = subSuffix;
+  private final IntIndexInput.Index lastFreqIndex;
+  private final IntIndexInput.Index lastDocIndex;
+  // TODO: -- make private again
+  final IntIndexInput.Index lastPosIndex;
+  
+  private long lastPayloadPointer;
+  private int lastPayloadLength;
+                           
+  SepSkipListReader(IndexInput skipStream,
+                    IntIndexInput freqIn,
+                    IntIndexInput docIn,
+                    IntIndexInput posIn,
+                    int maxSkipLevels,
+                    int skipInterval)
+    throws IOException {
+    super(skipStream, maxSkipLevels, skipInterval);
+    if (freqIn != null) {
+      freqIndex = new IntIndexInput.Index[maxSkipLevels];
+    }
+    docIndex = new IntIndexInput.Index[maxSkipLevels];
+    if (posIn != null) {
+      posIndex = new IntIndexInput.Index[maxNumberOfSkipLevels];
+    }
+    for(int i=0;i<maxSkipLevels;i++) {
+      if (freqIn != null) {
+        freqIndex[i] = freqIn.index();
+      }
+      docIndex[i] = docIn.index();
+      if (posIn != null) {
+        posIndex[i] = posIn.index();
+      }
+    }
+    payloadPointer = new long[maxSkipLevels];
+    payloadLength = new int[maxSkipLevels];
+
+    if (freqIn != null) {
+      lastFreqIndex = freqIn.index();
     } else {
-      throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, "The field type: " + typeName
-              + " must specify the " +
-              SUB_FIELD_TYPE + " attribute or the " + SUB_FIELD_SUFFIX + " attribute.");
+      lastFreqIndex = null;
     }
-
-  }
-
-  /**
-   * Helper method for creating a dynamic field SchemaField prototype.  Returns a {@link SchemaField} with
-   * the {@link FieldType} given and a name of "*" + {@link FieldType#POLY_FIELD_SEPARATOR} + {@link FieldType#typeName}
-   * and props of indexed=true, stored=false.
-   *
-   * @param schema the IndexSchema
-   * @param type   The {@link FieldType} of the prototype.
-   * @return The {@link SchemaField}
-   */
-
-  static SchemaField registerPolyFieldDynamicPrototype(IndexSchema schema, FieldType type) {
-    String name = "*" + FieldType.POLY_FIELD_SEPARATOR + type.typeName;
-    Map<String, String> props = new HashMap<String, String>();
-    //Just set these, delegate everything else to the field type
-    props.put("indexed", "true");
-    props.put("stored", "false");
-    int p = SchemaField.calcProps(name, type, props);
-    SchemaField proto = SchemaField.create(name,
-            type, p, null);
-    schema.registerDynamicField(proto);
-    return proto;
-  }
-
-  public void inform(IndexSchema schema) {
-    //Can't do this until here b/c the Dynamic Fields are not initialized until here.
-    if (subType != null) {
-      SchemaField proto = registerPolyFieldDynamicPrototype(schema, subType);
-      dynFieldProps = proto.getProperties();
+    lastDocIndex = docIn.index();
+    if (posIn != null) {
+      lastPosIndex = posIn.index();
+    } else {
+      lastPosIndex = null;
     }
   }
+  
+  boolean omitTF;
 
-  /**
-   * Throws UnsupportedOperationException()
-   */
+  void setOmitTF(boolean v) {
+    omitTF = v;
+  }
+
+  void init(long skipPointer,
+            IntIndexInput.Index docBaseIndex,
+            IntIndexInput.Index freqBaseIndex,
+            IntIndexInput.Index posBaseIndex,
+            long payloadBasePointer,
+            int df,
+            boolean storesPayloads) {
+
+    super.init(skipPointer, df);
+    this.currentFieldStoresPayloads = storesPayloads;
+
+    lastPayloadPointer = payloadBasePointer;
+
+    for(int i=0;i<maxNumberOfSkipLevels;i++) {
+      docIndex[i].set(docBaseIndex);
+      if (freqIndex != null) {
+        freqIndex[i].set(freqBaseIndex);
+      }
+      if (posBaseIndex != null) {
+        posIndex[i].set(posBaseIndex);
+      }
+    }
+    Arrays.fill(payloadPointer, payloadBasePointer);
+    Arrays.fill(payloadLength, 0);
+  }
+
+  long getPayloadPointer() {
+    return lastPayloadPointer;
+  }
+  
+  /** Returns the payload length of the payload stored just before 
+   * the doc to which the last call of {@link MultiLevelSkipListReader#skipTo(int)} 
+   * has skipped.  */
+  int getPayloadLength() {
+    return lastPayloadLength;
+  }
+  
   @Override
-  public Query getFieldQuery(QParser parser, SchemaField field, String externalVal) {
-    throw new UnsupportedOperationException();
+  protected void seekChild(int level) throws IOException {
+    super.seekChild(level);
+    payloadPointer[level] = lastPayloadPointer;
+    payloadLength[level] = lastPayloadLength;
   }
+  
+  @Override
+  protected void setLastSkipData(int level) {
+    super.setLastSkipData(level);
 
-  protected void createSuffixCache(int size) {
-    suffixes = new String[size];
-    for (int i=0; i<size; i++) {
-      suffixes[i] = "_" + i + suffix;
+    lastPayloadPointer = payloadPointer[level];
+    lastPayloadLength = payloadLength[level];
+    if (freqIndex != null) {
+      lastFreqIndex.set(freqIndex[level]);
+    }
+    lastDocIndex.set(docIndex[level]);
+    if (lastPosIndex != null) {
+      lastPosIndex.set(posIndex[level]);
+    }
+
+    if (level > 0) {
+      if (freqIndex != null) {
+        freqIndex[level-1].set(freqIndex[level]);
+      }
+      docIndex[level-1].set(docIndex[level]);
+      if (posIndex != null) {
+        posIndex[level-1].set(posIndex[level]);
+      }
     }
   }
 
-  protected SchemaField subField(SchemaField base, int i) {
-    return schema.getField(base.getName() + suffixes[i]);
+  IntIndexInput.Index getFreqIndex() {
+    return lastFreqIndex;
+  }
+
+  IntIndexInput.Index getPosIndex() {
+    return lastPosIndex;
+  }
+
+  IntIndexInput.Index getDocIndex() {
+    return lastDocIndex;
+  }
+
+  @Override
+  protected int readSkipData(int level, IndexInput skipStream) throws IOException {
+    int delta;
+    if (currentFieldStoresPayloads) {
+      // the current field stores payloads.
+      // if the doc delta is odd then we have
+      // to read the current payload length
+      // because it differs from the length of the
+      // previous payload
+      delta = skipStream.readVInt();
+      if ((delta & 1) != 0) {
+        payloadLength[level] = skipStream.readVInt();
+      }
+      delta >>>= 1;
+    } else {
+      delta = skipStream.readVInt();
+    }
+    if (!omitTF) {
+      freqIndex[level].read(skipStream, false);
+    }
+    docIndex[level].read(skipStream, false);
+    if (!omitTF) {
+      posIndex[level].read(skipStream, false);
+      if (currentFieldStoresPayloads) {
+        payloadPointer[level] += skipStream.readVInt();
+      }
+    }
+    
+    return delta;
   }
 }

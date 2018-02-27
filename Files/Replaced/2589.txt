@@ -1,8 +1,7 @@
-public abstract void files(Directory dir, SegmentInfo segmentInfo, String segmentSuffix, Set<String> files) throws IOException;
+String errString = "Not Found";
 
-package org.apache.lucene.index.codecs;
-
-/**
+package org.apache.solr.schema;
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -19,68 +18,125 @@ package org.apache.lucene.index.codecs;
  * limitations under the License.
  */
 
+import org.apache.commons.io.IOUtils;
+import org.apache.solr.client.solrj.ResponseParser;
+import org.apache.solr.client.solrj.SolrServer;
+import org.apache.solr.client.solrj.SolrServerException;
+import org.apache.solr.client.solrj.impl.HttpSolrServer;
+import org.apache.solr.client.solrj.request.QueryRequest;
+import org.apache.solr.cloud.AbstractFullDistribZkTestBase;
+import org.apache.solr.common.SolrException;
+import org.apache.solr.common.params.CoreAdminParams;
+import org.apache.solr.common.params.ModifiableSolrParams;
+import org.apache.solr.common.util.NamedList;
+import org.junit.BeforeClass;
+
 import java.io.IOException;
-import java.util.Set;
+import java.io.InputStream;
+import java.io.Reader;
+import java.util.regex.Pattern;
 
-import org.apache.lucene.index.SegmentInfo;
-import org.apache.lucene.index.SegmentWriteState;
-import org.apache.lucene.index.SegmentReadState;
-import org.apache.lucene.util.NamedSPILoader;
+public class TestCloudManagedSchema extends AbstractFullDistribZkTestBase {
 
-import org.apache.lucene.store.Directory;
+  public TestCloudManagedSchema() {
+    super();
+  }
 
-/** @lucene.experimental */
-public abstract class PostingsFormat implements NamedSPILoader.NamedSPI {
-
-  private static final NamedSPILoader<PostingsFormat> loader =
-    new NamedSPILoader<PostingsFormat>(PostingsFormat.class);
-
-  public static final PostingsFormat[] EMPTY = new PostingsFormat[0];
-  /** Unique name that's used to retrieve this format when
-   *  reading the index.
-   */
-  private final String name;
-  
-  protected PostingsFormat(String name) {
-    this.name = name;
+  @BeforeClass
+  public static void initSysProperties() {
+    System.setProperty("managed.schema.mutable", "false");
+    System.setProperty("enable.update.log", "true");
   }
 
   @Override
-  public String getName() {
-    return name;
+  protected String getCloudSolrConfig() {
+    return "solrconfig-managed-schema.xml";
   }
-  
-  /** Writes a new segment */
-  public abstract FieldsConsumer fieldsConsumer(SegmentWriteState state) throws IOException;
-
-  /** Reads a segment.  NOTE: by the time this call
-   *  returns, it must hold open any files it will need to
-   *  use; else, those files may be deleted. */
-  public abstract FieldsProducer fieldsProducer(SegmentReadState state) throws IOException;
-
-  /**
-   * Gathers files associated with this segment
-   * 
-   * @param dir the {@link Directory} this segment was written to
-   * @param segmentInfo the {@link SegmentInfo} for this segment 
-   * @param id the codec id within this segment
-   * @param files the of files to add the codec files to.
-   */
-  public abstract void files(Directory dir, SegmentInfo segmentInfo, int id, Set<String> files) throws IOException;
-
+      
   @Override
-  public String toString() {
-    return "PostingsFormat(name=" + name + ")";
+  public void doTest() throws Exception {
+    ModifiableSolrParams params = new ModifiableSolrParams();
+    params.set(CoreAdminParams.ACTION, CoreAdminParams.CoreAdminAction.STATUS.toString());
+    QueryRequest request = new QueryRequest(params);
+    request.setPath("/admin/cores");
+    int which = r.nextInt(clients.size());
+    HttpSolrServer client = (HttpSolrServer)clients.get(which);
+    String previousBaseURL = client.getBaseURL();
+    // Strip /collection1 step from baseURL - requests fail otherwise
+    client.setBaseURL(previousBaseURL.substring(0, previousBaseURL.lastIndexOf("/")));
+    NamedList namedListResponse = client.request(request);
+    client.setBaseURL(previousBaseURL); // Restore baseURL 
+    NamedList status = (NamedList)namedListResponse.get("status");
+    NamedList collectionStatus = (NamedList)status.get("collection1");
+    String collectionSchema = (String)collectionStatus.get(CoreAdminParams.SCHEMA);
+    // Make sure the upgrade to managed schema happened
+    assertEquals("Schema resource name differs from expected name", "managed-schema", collectionSchema);
+    
+    // Make sure "DO NOT EDIT" is in the content of the managed schema
+    String fileContent = getFileContentFromZooKeeper("managed-schema");
+    assertTrue("Managed schema is missing", fileContent.contains("DO NOT EDIT"));
+    
+    // Make sure the original non-managed schema is no longer in ZooKeeper
+    assertFileNotInZooKeeper("schema.xml");
+
+    // Make sure the renamed non-managed schema is present in ZooKeeper
+    fileContent = getFileContentFromZooKeeper("schema.xml.bak");
+    assertTrue("schema file doesn't contain '<schema'", fileContent.contains("<schema"));
   }
   
-  /** looks up a format by name */
-  public static PostingsFormat forName(String name) {
-    return loader.lookup(name);
+  private String getFileContentFromZooKeeper(String fileName) throws IOException, SolrServerException {
+    QueryRequest request = new QueryRequest(params("file", fileName));
+    request.setPath("/admin/file");
+    RawResponseParser responseParser = new RawResponseParser();
+    request.setResponseParser(responseParser);
+    int which = r.nextInt(clients.size());
+    // For some reason, /admin/file requests work without stripping the /collection1 step from the URL
+    // (unlike /admin/cores requests - see above)
+    SolrServer client = clients.get(which);
+    client.request(request);
+    return responseParser.getRawFileContent();   
   }
   
-  /** returns a list of all available format names */
-  public static Set<String> availablePostingsFormats() {
-    return loader.availableServices();
+  private class RawResponseParser extends ResponseParser {
+    // Stolen from ShowFileRequestHandlerTest
+    private String rawFileContent = null;
+    String getRawFileContent() { return rawFileContent; }
+    @Override
+    public String getWriterType() {
+      return "mock";//unfortunately this gets put onto params wt=mock but it apparently has no effect
+    }
+    @Override
+    public NamedList<Object> processResponse(InputStream body, String encoding) {
+      try {
+        rawFileContent = IOUtils.toString(body, encoding);
+      } catch (Exception e) {
+        throw new RuntimeException(e);
+      }
+      return null;
+    }
+    @Override
+    public NamedList<Object> processResponse(Reader reader) {
+      throw new UnsupportedOperationException("TODO unimplemented");//TODO
+    }
   }
-  
+
+  protected final void assertFileNotInZooKeeper(String fileName) throws Exception {
+    // Stolen from AbstractBadConfigTestBase
+    String errString = "returned non ok status:404, message:Not Found";
+    ignoreException(Pattern.quote(errString));
+    String rawContent = null;
+    try {
+      rawContent = getFileContentFromZooKeeper(fileName);
+    } catch (Exception e) {
+      // short circuit out if we found what we expected
+      if (-1 != e.getMessage().indexOf(errString)) return;
+      // otherwise, rethrow it, possibly completely unrelated
+      throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, 
+                              "Unexpected error, expected error matching: " + errString, e);
+    } finally {
+      resetExceptionIgnores();
+    }
+    fail("File '" + fileName + "' was unexpectedly found in ZooKeeper.  Content starts with '" 
+        + rawContent.substring(0, 100) + " [...]'");
+  }
 }

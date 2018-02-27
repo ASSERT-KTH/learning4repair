@@ -1,13 +1,12 @@
-public static class BloomSpecification {
+final String errPrefix = VERSION_FIELD + " field must exist in schema, using indexed=\"true\" stored=\"true\" and multiValued=\"false\"";
 
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,116 +17,198 @@ public static class BloomSpecification {
  * limitations under the License.
  */
 
-package org.apache.cassandra.utils;
+package org.apache.solr.update;
 
-/**
- * The following calculations are taken from:
- * http://www.cs.wisc.edu/~cao/papers/summary-cache/node8.html
- * "Bloom Filters - the math"
- *
- * This class's static methods are meant to facilitate the use of the Bloom
- * Filter class by helping to choose correct values of 'bits per element' and
- * 'number of hash functions, k'.
- */
-public class BloomCalculations {
+import java.io.IOException;
+import java.util.Map;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
-    private static final int maxBuckets = 15;
-    private static final int minBuckets = 2;
-    private static final int minK = 1;
-    private static final int maxK = 8;
-    private static final int[] optKPerBuckets =
-            new int[]{1, // dummy K for 0 buckets per element
-                      1, // dummy K for 1 buckets per element
-                      1, 2, 3, 3, 4, 5, 5, 6, 7, 8, 8, 8, 8, 8};
+import org.apache.lucene.queries.function.FunctionValues;
+import org.apache.lucene.queries.function.ValueSource;
+import org.apache.lucene.util.BitUtil;
+import org.apache.lucene.util.BytesRef;
+import org.apache.solr.common.SolrException;
+import org.apache.solr.schema.IndexSchema;
+import org.apache.solr.schema.SchemaField;
+import org.apache.solr.search.SolrIndexSearcher;
+import org.apache.solr.util.RefCounted;
 
-    /**
-     * In the following table, the row 'i' shows false positive rates if i buckets
-     * per element are used.  Column 'j' shows false positive rates if j hash
-     * functions are used.  The first row is 'i=0', the first column is 'j=0'.
-     * Each cell (i,j) the false positive rate determined by using i buckets per
-     * element and j hash functions.
-     */
-    static final double[][] probs = new double[][]{
-        {1.0}, // dummy row representing 0 buckets per element
-        {1.0, 1.0}, // dummy row representing 1 buckets per element
-        {1.0, 0.393,  0.400},
-        {1.0, 0.283,  0.237,  0.253},
-        {1.0, 0.221,  0.155,  0.147,   0.160},
-        {1.0, 0.181,  0.109,  0.092,   0.092,   0.101}, // 5
-        {1.0, 0.154,  0.0804, 0.0609,  0.0561,  0.0578,  0.0638},
-        {1.0, 0.133,  0.0618, 0.0423,  0.0359,  0.0347,  0.0364},
-        {1.0, 0.118,  0.0489, 0.0306,  0.024,   0.0217,  0.0216,  0.0229},
-        {1.0, 0.105,  0.0397, 0.0228,  0.0166,  0.0141,  0.0133,  0.0135,  0.0145}, // 9
-        {1.0, 0.0952, 0.0329, 0.0174,  0.0118,  0.00943, 0.00844, 0.00819, 0.00846},
-        {1.0, 0.0869, 0.0276, 0.0136,  0.00864, 0.0065,  0.00552, 0.00513, 0.00509},
-        {1.0, 0.08,   0.0236, 0.0108,  0.00646, 0.00459, 0.00371, 0.00329, 0.00314},
-        {1.0, 0.074,  0.0203, 0.00875, 0.00492, 0.00332, 0.00255, 0.00217, 0.00199},
-        {1.0, 0.0689, 0.0177, 0.00718, 0.00381, 0.00244, 0.00179, 0.00146, 0.00129},
-        {1.0, 0.0645, 0.0156, 0.00596, 0.003,   0.00183, 0.00128, 0.001,   0.000852} // 15
-    };  // the first column is a dummy column representing K=0.
+public class VersionInfo {
+  public static final String VERSION_FIELD="_version_";
 
-    /**
-     * Given the number of buckets that can be used per element, return the optimal
-     * number of hash functions in order to minimize the false positive rate.
-     *
-     * @param bucketsPerElement
-     * @return The number of hash functions that minimize the false positive rate.
-     */
-    public static int computeBestK(int bucketsPerElement){
-        assert bucketsPerElement >= 0;
-        if(bucketsPerElement >= optKPerBuckets.length)
-            return optKPerBuckets[optKPerBuckets.length-1];
-        return optKPerBuckets[bucketsPerElement];
+  private final UpdateLog ulog;
+  private final VersionBucket[] buckets;
+  private SchemaField versionField;
+  private SchemaField idField;
+  final ReadWriteLock lock = new ReentrantReadWriteLock(true);
+
+  /**
+   * Gets and returns the {@link #VERSION_FIELD} from the specified 
+   * schema, after verifying that it is indexed, stored, and single-valued.  
+   * If any of these pre-conditions are not met, it throws a SolrException 
+   * with a user suitable message indicating the problem.
+   */
+  public static SchemaField getAndCheckVersionField(IndexSchema schema) 
+    throws SolrException {
+    final String errPrefix = VERSION_FIELD + "field must exist in schema, using indexed=\"true\" stored=\"true\" and multiValued=\"false\"";
+    SchemaField sf = schema.getFieldOrNull(VERSION_FIELD);
+
+    if (null == sf) {
+      throw new SolrException
+        (SolrException.ErrorCode.SERVER_ERROR, 
+         errPrefix + " (" + VERSION_FIELD + " does not exist)");
     }
-
-    /**
-     * A wrapper class that holds two key parameters for a Bloom Filter: the
-     * number of hash functions used, and the number of buckets per element used.
-     */
-    public static final class BloomSpecification {
-        final int K; // number of hash functions.
-        final int bucketsPerElement;
-
-        public BloomSpecification(int k, int bucketsPerElement) {
-            K = k;
-            this.bucketsPerElement = bucketsPerElement;
-        }
+    if ( !sf.indexed() ) {
+      throw new SolrException
+        (SolrException.ErrorCode.SERVER_ERROR, 
+         errPrefix + " (" + VERSION_FIELD + " is not indexed");
     }
-
-    /**
-     * Given a maximum tolerable false positive probability, compute a Bloom
-     * specification which will give less than the specified false positive rate,
-     * but minimize the number of buckets per element and the number of hash
-     * functions used.  Because bandwidth (and therefore total bitvector size)
-     * is considered more expensive than computing power, preference is given
-     * to minimizing buckets per element rather than number of hash functions.
-     *
-     * @param maxFalsePosProb The maximum tolerable false positive rate.
-     * @return A Bloom Specification which would result in a false positive rate
-     * less than specified by the function call.
-     */
-    public static BloomSpecification computeBucketsAndK(double maxFalsePosProb){
-        // Handle the trivial cases
-        if(maxFalsePosProb >= probs[minBuckets][minK]) {
-            return new BloomSpecification(2, optKPerBuckets[2]);
-        }
-        if(maxFalsePosProb < probs[maxBuckets][maxK]) {
-            return new BloomSpecification(maxK, maxBuckets);
-        }
-
-        // First find the minimal required number of buckets:
-        int bucketsPerElement = 2;
-        int K = optKPerBuckets[2];
-        while(probs[bucketsPerElement][K] > maxFalsePosProb){
-            bucketsPerElement++;
-            K = optKPerBuckets[bucketsPerElement];
-        }
-        // Now that the number of buckets is sufficient, see if we can relax K
-        // without losing too much precision.
-        while(probs[bucketsPerElement][K - 1] <= maxFalsePosProb){
-            K--;
-        }
-
-        return new BloomSpecification(K, bucketsPerElement);
+    if ( !sf.stored() ) {
+      throw new SolrException
+        (SolrException.ErrorCode.SERVER_ERROR, 
+         errPrefix + " (" + VERSION_FIELD + " is not stored");
     }
+    if ( sf.multiValued() ) {
+      throw new SolrException
+        (SolrException.ErrorCode.SERVER_ERROR, 
+         errPrefix + " (" + VERSION_FIELD + " is multiValued");
+    }
+    
+    return sf;
+  }
+
+  public VersionInfo(UpdateLog ulog, int nBuckets) {
+    this.ulog = ulog;
+    IndexSchema schema = ulog.uhandler.core.getLatestSchema(); 
+    versionField = getAndCheckVersionField(schema);
+    idField = schema.getUniqueKeyField();
+    buckets = new VersionBucket[ BitUtil.nextHighestPowerOfTwo(nBuckets) ];
+    for (int i=0; i<buckets.length; i++) {
+      buckets[i] = new VersionBucket();
+    }
+  }
+
+  public void reload() {
+
+  }
+
+  public SchemaField getVersionField() {
+    return versionField;
+  }
+
+  public void lockForUpdate() {
+    lock.readLock().lock();
+  }
+
+  public void unlockForUpdate() {
+    lock.readLock().unlock();
+  }
+
+  public void blockUpdates() {
+    lock.writeLock().lock();
+  }
+
+  public void unblockUpdates() {
+    lock.writeLock().unlock();
+  }
+
+  /***
+  // todo: initialize... use current time to start?
+  // a clock that increments by 1 for every operation makes it easier to detect missing
+  // messages, but raises other issues:
+  // - need to initialize to largest thing in index or tlog
+  // - when becoming leader, need to make sure it's greater than
+  // - using to detect missing messages means we need to keep track per-leader, or make
+  //   sure a new leader starts off with 1 greater than the last leader.
+  private final AtomicLong clock = new AtomicLong();
+
+  public long getNewClock() {
+    return clock.incrementAndGet();
+  }
+
+  // Named *old* to prevent accidental calling getClock and expecting a new updated clock.
+  public long getOldClock() {
+    return clock.get();
+  }
+  ***/
+
+  /** We are currently using this time-based clock to avoid going back in time on a
+   * server restart (i.e. we don't want version numbers to start at 1 again).
+   */
+
+  // Time-based lamport clock.  Good for introducing some reality into clocks (to the degree
+  // that times are somewhat synchronized in the cluster).
+  // Good if we want to relax some constraints to scale down to where only one node may be
+  // up at a time.  Possibly harder to detect missing messages (because versions are not contiguous.
+  long vclock;
+  long time;
+  private final Object clockSync = new Object();
+
+
+  public long getNewClock() {
+    synchronized (clockSync) {
+      time = System.currentTimeMillis();
+      long result = time << 20;
+      if (result <= vclock) {
+        result = vclock + 1;
+      }
+      vclock = result;
+      return vclock;
+    }
+  }
+
+  public long getOldClock() {
+    synchronized (clockSync) {
+      return vclock;
+    }
+  }
+
+  public void updateClock(long clock) {
+    synchronized (clockSync) {
+      vclock = Math.max(vclock, clock);
+    }
+  }
+
+
+  public VersionBucket bucket(int hash) {
+    // If this is a user provided hash, it may be poor in the right-hand bits.
+    // Make sure high bits are moved down, since only the low bits will matter.
+    // int h = hash + (hash >>> 8) + (hash >>> 16) + (hash >>> 24);
+    // Assume good hash codes for now.
+
+    int slot = hash & (buckets.length-1);
+    return buckets[slot];
+  }
+
+  public Long lookupVersion(BytesRef idBytes) {
+    return ulog.lookupVersion(idBytes);
+  }
+
+  public Long getVersionFromIndex(BytesRef idBytes) {
+    // TODO: we could cache much of this and invalidate during a commit.
+    // TODO: most DocValues classes are threadsafe - expose which.
+
+    RefCounted<SolrIndexSearcher> newestSearcher = ulog.uhandler.core.getRealtimeSearcher();
+    try {
+      SolrIndexSearcher searcher = newestSearcher.get();
+      long lookup = searcher.lookupId(idBytes);
+      if (lookup < 0) return null;
+
+      ValueSource vs = versionField.getType().getValueSource(versionField, null);
+      Map context = ValueSource.newContext(searcher);
+      vs.createWeight(context, searcher);
+      FunctionValues fv = vs.getValues(context, searcher.getTopReaderContext().leaves().get((int)(lookup>>32)));
+      long ver = fv.longVal((int)lookup);
+      return ver;
+
+    } catch (IOException e) {
+      throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, "Error reading version from index", e);
+    } finally {
+      if (newestSearcher != null) {
+        newestSearcher.decref();
+      }
+    }
+  }
+
 }

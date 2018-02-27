@@ -1,8 +1,6 @@
 @Override
 
-// This file has been automatically generated, DO NOT EDIT
-
-package org.apache.lucene.util.packed;
+package org.apache.lucene.util;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -21,108 +19,127 @@ package org.apache.lucene.util.packed;
  * limitations under the License.
  */
 
-import org.apache.lucene.store.DataInput;
-import org.apache.lucene.util.RamUsageEstimator;
+import java.io.Closeable;
+import java.lang.ref.WeakReference;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.WeakHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
-import java.io.IOException;
-import java.util.Arrays;
-
-/**
- * Packs integers into 3 shorts (48 bits per value).
+/** Java's builtin ThreadLocal has a serious flaw:
+ *  it can take an arbitrarily long amount of time to
+ *  dereference the things you had stored in it, even once the
+ *  ThreadLocal instance itself is no longer referenced.
+ *  This is because there is single, master map stored for
+ *  each thread, which all ThreadLocals share, and that
+ *  master map only periodically purges "stale" entries.
+ *
+ *  While not technically a memory leak, because eventually
+ *  the memory will be reclaimed, it can take a long time
+ *  and you can easily hit OutOfMemoryError because from the
+ *  GC's standpoint the stale entries are not reclaimable.
+ * 
+ *  This class works around that, by only enrolling
+ *  WeakReference values into the ThreadLocal, and
+ *  separately holding a hard reference to each stored
+ *  value.  When you call {@link #close}, these hard
+ *  references are cleared and then GC is freely able to
+ *  reclaim space by objects stored in it.
+ *
+ *  We can not rely on {@link ThreadLocal#remove()} as it
+ *  only removes the value for the caller thread, whereas
+ *  {@link #close} takes care of all
+ *  threads.  You should not call {@link #close} until all
+ *  threads are done using the instance.
+ *
  * @lucene.internal
  */
-final class Packed16ThreeBlocks extends PackedInts.MutableImpl {
-  final short[] blocks;
 
-  public static final int MAX_SIZE = Integer.MAX_VALUE / 3;
+public class CloseableThreadLocal<T> implements Closeable {
 
-  Packed16ThreeBlocks(int valueCount) {
-    super(valueCount, 48);
-    if (valueCount > MAX_SIZE) {
-      throw new ArrayIndexOutOfBoundsException("MAX_SIZE exceeded");
-    }
-    blocks = new short[valueCount * 3];
+  private ThreadLocal<WeakReference<T>> t = new ThreadLocal<WeakReference<T>>();
+
+  // Use a WeakHashMap so that if a Thread exits and is
+  // GC'able, its entry may be removed:
+  private Map<Thread,T> hardRefs = new WeakHashMap<Thread,T>();
+  
+  // Increase this to decrease frequency of purging in get:
+  private static int PURGE_MULTIPLIER = 20;
+
+  // On each get or set we decrement this; when it hits 0 we
+  // purge.  After purge, we set this to
+  // PURGE_MULTIPLIER * stillAliveCount.  This keeps
+  // amortized cost of purging linear.
+  private final AtomicInteger countUntilPurge = new AtomicInteger(PURGE_MULTIPLIER);
+
+  protected T initialValue() {
+    return null;
   }
-
-  Packed16ThreeBlocks(int packedIntsVersion, DataInput in, int valueCount) throws IOException {
-    this(valueCount);
-    for (int i = 0; i < 3 * valueCount; ++i) {
-      blocks[i] = in.readShort();
-    }
-    // because packed ints have not always been byte-aligned
-    final int remaining = (int) (PackedInts.Format.PACKED.byteCount(packedIntsVersion, valueCount, 48) - 3L * valueCount * 2);
-    for (int i = 0; i < remaining; ++i) {
-       in.readByte();
-    }
-  }
-
-  @Override
-  public long get(int index) {
-    final int o = index * 3;
-    return (blocks[o] & 0xFFFFL) << 32 | (blocks[o+1] & 0xFFFFL) << 16 | (blocks[o+2] & 0xFFFFL);
-  }
-
-  @Override
-  public int get(int index, long[] arr, int off, int len) {
-    assert len > 0 : "len must be > 0 (got " + len + ")";
-    assert index >= 0 && index < valueCount;
-    assert off + len <= arr.length;
-
-    final int gets = Math.min(valueCount - index, len);
-    for (int i = index * 3, end = (index + gets) * 3; i < end; i+=3) {
-      arr[off++] = (blocks[i] & 0xFFFFL) << 32 | (blocks[i+1] & 0xFFFFL) << 16 | (blocks[i+2] & 0xFFFFL);
-    }
-    return gets;
-  }
-
-  @Override
-  public void set(int index, long value) {
-    final int o = index * 3;
-    blocks[o] = (short) (value >>> 32);
-    blocks[o+1] = (short) (value >>> 16);
-    blocks[o+2] = (short) value;
-  }
-
-  @Override
-  public int set(int index, long[] arr, int off, int len) {
-    assert len > 0 : "len must be > 0 (got " + len + ")";
-    assert index >= 0 && index < valueCount;
-    assert off + len <= arr.length;
-
-    final int sets = Math.min(valueCount - index, len);
-    for (int i = off, o = index * 3, end = off + sets; i < end; ++i) {
-      final long value = arr[i];
-      blocks[o++] = (short) (value >>> 32);
-      blocks[o++] = (short) (value >>> 16);
-      blocks[o++] = (short) value;
-    }
-    return sets;
-  }
-
-  @Override
-  public void fill(int fromIndex, int toIndex, long val) {
-    final short block1 = (short) (val >>> 32);
-    final short block2 = (short) (val >>> 16);
-    final short block3 = (short) val;
-    for (int i = fromIndex * 3, end = toIndex * 3; i < end; i += 3) {
-      blocks[i] = block1;
-      blocks[i+1] = block2;
-      blocks[i+2] = block3;
+  
+  public T get() {
+    WeakReference<T> weakRef = t.get();
+    if (weakRef == null) {
+      T iv = initialValue();
+      if (iv != null) {
+        set(iv);
+        return iv;
+      } else {
+        return null;
+      }
+    } else {
+      maybePurge();
+      return weakRef.get();
     }
   }
 
-  @Override
-  public void clear() {
-    Arrays.fill(blocks, (short) 0);
+  public void set(T object) {
+
+    t.set(new WeakReference<T>(object));
+
+    synchronized(hardRefs) {
+      hardRefs.put(Thread.currentThread(), object);
+      maybePurge();
+    }
   }
 
-  public long ramBytesUsed() {
-    return RamUsageEstimator.sizeOf(blocks);
+  private void maybePurge() {
+    if (countUntilPurge.getAndDecrement() == 0) {
+      purge();
+    }
   }
 
-  @Override
-  public String toString() {
-    return getClass().getSimpleName() + "(bitsPerValue=" + bitsPerValue
-        + ", size=" + size() + ", elements.length=" + blocks.length + ")";
+  // Purge dead threads
+  private void purge() {
+    synchronized(hardRefs) {
+      int stillAliveCount = 0;
+      for (Iterator<Thread> it = hardRefs.keySet().iterator(); it.hasNext();) {
+        final Thread t = it.next();
+        if (!t.isAlive()) {
+          it.remove();
+        } else {
+          stillAliveCount++;
+        }
+      }
+      int nextCount = (1+stillAliveCount) * PURGE_MULTIPLIER;
+      if (nextCount <= 0) {
+        // defensive: int overflow!
+        nextCount = 1000000;
+      }
+      
+      countUntilPurge.set(nextCount);
+    }
+  }
+
+  public void close() {
+    // Clear the hard refs; then, the only remaining refs to
+    // all values we were storing are weak (unless somewhere
+    // else is still using them) and so GC may reclaim them:
+    hardRefs = null;
+    // Take care of the current thread right now; others will be
+    // taken care of via the WeakReferences.
+    if (t != null) {
+      t.remove();
+    }
+    t = null;
   }
 }

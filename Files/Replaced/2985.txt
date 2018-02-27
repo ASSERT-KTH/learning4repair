@@ -1,6 +1,4 @@
-DocsEnum docsEnum = MultiFields.getTermDocsEnum(topLevelReader, MultiFields.getLiveDocs(topLevelReader), "id", new BytesRef(otherSideDoc.id), 0);
-
-package org.apache.lucene.search.join;
+0);
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,738 +17,697 @@ package org.apache.lucene.search.join;
  * limitations under the License.
  */
 
-import org.apache.lucene.analysis.MockAnalyzer;
-import org.apache.lucene.analysis.MockTokenizer;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.Field;
-import org.apache.lucene.document.TextField;
-import org.apache.lucene.index.AtomicReaderContext;
-import org.apache.lucene.index.DocTermOrds;
-import org.apache.lucene.index.DocsEnum;
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.MultiFields;
-import org.apache.lucene.index.RandomIndexWriter;
-import org.apache.lucene.index.Term;
-import org.apache.lucene.index.TermsEnum;
-import org.apache.lucene.search.Collector;
-import org.apache.lucene.search.DocIdSetIterator;
-import org.apache.lucene.search.Explanation;
-import org.apache.lucene.search.FieldCache;
-import org.apache.lucene.search.IndexSearcher;
-import org.apache.lucene.search.MatchAllDocsQuery;
-import org.apache.lucene.search.Query;
-import org.apache.lucene.search.ScoreDoc;
-import org.apache.lucene.search.Scorer;
-import org.apache.lucene.search.TermQuery;
-import org.apache.lucene.search.TopDocs;
-import org.apache.lucene.search.TopScoreDocCollector;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.FixedBitSet;
-import org.apache.lucene.util.LuceneTestCase;
-import org.apache.lucene.util._TestUtil;
-import org.apache.lucene.util.LuceneTestCase.Slow;
-import org.junit.Test;
+package org.apache.solr.handler.admin;
 
 import java.io.IOException;
+import java.net.MalformedURLException;
+import java.net.URL;
 import java.util.*;
 
-@Slow
-public class TestJoinUtil extends LuceneTestCase {
+import org.apache.lucene.analysis.Analyzer;
+import org.apache.lucene.analysis.util.CharFilterFactory;
+import org.apache.lucene.analysis.util.TokenFilterFactory;
+import org.apache.lucene.analysis.util.TokenizerFactory;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.Field;
+import org.apache.lucene.index.*;
+import org.apache.lucene.index.FieldInfo.IndexOptions;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.CharsRef;
+import org.apache.lucene.util.PriorityQueue;
+import org.apache.lucene.util.UnicodeUtil;
+import org.apache.solr.analysis.TokenizerChain;
+import org.apache.solr.common.SolrException;
+import org.apache.solr.common.SolrException.ErrorCode;
+import org.apache.solr.common.luke.FieldFlag;
+import org.apache.solr.common.params.CommonParams;
+import org.apache.solr.common.params.SolrParams;
+import org.apache.solr.common.util.Base64;
+import org.apache.solr.common.util.NamedList;
+import org.apache.solr.common.util.SimpleOrderedMap;
+import org.apache.solr.handler.RequestHandlerBase;
+import org.apache.solr.request.SolrQueryRequest;
+import org.apache.solr.response.SolrQueryResponse;
+import org.apache.solr.schema.FieldType;
+import org.apache.solr.update.SolrIndexWriter;
+import org.apache.solr.schema.IndexSchema;
+import org.apache.solr.schema.SchemaField;
+import org.apache.solr.search.SolrIndexSearcher;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-  public void testSimple() throws Exception {
-    final String idField = "id";
-    final String toField = "productId";
+import static org.apache.lucene.index.FieldInfo.IndexOptions.DOCS_AND_FREQS;
+import static org.apache.lucene.index.FieldInfo.IndexOptions.DOCS_ONLY;
 
-    Directory dir = newDirectory();
-    RandomIndexWriter w = new RandomIndexWriter(
-        random(),
-        dir,
-        newIndexWriterConfig(TEST_VERSION_CURRENT,
-            new MockAnalyzer(random())).setMergePolicy(newLogMergePolicy()));
+/**
+ * This handler exposes the internal lucene index.  It is inspired by and 
+ * modeled on Luke, the Lucene Index Browser by Andrzej Bialecki.
+ *   http://www.getopt.org/luke/
+ *
+ * For more documentation see:
+ *  http://wiki.apache.org/solr/LukeRequestHandler
+ *
+ * @since solr 1.2
+ */
+public class LukeRequestHandler extends RequestHandlerBase
+{
+  private static Logger log = LoggerFactory.getLogger(LukeRequestHandler.class);
 
-    // 0
-    Document doc = new Document();
-    doc.add(new TextField("description", "random text", Field.Store.NO));
-    doc.add(new TextField("name", "name1", Field.Store.NO));
-    doc.add(new TextField(idField, "1", Field.Store.NO));
-    w.addDocument(doc);
+  public static final String NUMTERMS = "numTerms";
+  public static final String DOC_ID = "docId";
+  public static final String ID = "id";
+  public static final int DEFAULT_COUNT = 10;
 
-    // 1
-    doc = new Document();
-    doc.add(new TextField("price", "10.0", Field.Store.NO));
-    doc.add(new TextField(idField, "2", Field.Store.NO));
-    doc.add(new TextField(toField, "1", Field.Store.NO));
-    w.addDocument(doc);
+  static final int HIST_ARRAY_SIZE = 33;
 
-    // 2
-    doc = new Document();
-    doc.add(new TextField("price", "20.0", Field.Store.NO));
-    doc.add(new TextField(idField, "3", Field.Store.NO));
-    doc.add(new TextField(toField, "1", Field.Store.NO));
-    w.addDocument(doc);
+  private static enum ShowStyle {
+    ALL,
+    DOC,
+    SCHEMA,
+    INDEX;
 
-    // 3
-    doc = new Document();
-    doc.add(new TextField("description", "more random text", Field.Store.NO));
-    doc.add(new TextField("name", "name2", Field.Store.NO));
-    doc.add(new TextField(idField, "4", Field.Store.NO));
-    w.addDocument(doc);
-    w.commit();
-
-    // 4
-    doc = new Document();
-    doc.add(new TextField("price", "10.0", Field.Store.NO));
-    doc.add(new TextField(idField, "5", Field.Store.NO));
-    doc.add(new TextField(toField, "4", Field.Store.NO));
-    w.addDocument(doc);
-
-    // 5
-    doc = new Document();
-    doc.add(new TextField("price", "20.0", Field.Store.NO));
-    doc.add(new TextField(idField, "6", Field.Store.NO));
-    doc.add(new TextField(toField, "4", Field.Store.NO));
-    w.addDocument(doc);
-
-    IndexSearcher indexSearcher = new IndexSearcher(w.getReader());
-    w.close();
-
-    // Search for product
-    Query joinQuery =
-        JoinUtil.createJoinQuery(idField, false, toField, new TermQuery(new Term("name", "name2")), indexSearcher, ScoreMode.None);
-
-    TopDocs result = indexSearcher.search(joinQuery, 10);
-    assertEquals(2, result.totalHits);
-    assertEquals(4, result.scoreDocs[0].doc);
-    assertEquals(5, result.scoreDocs[1].doc);
-
-    joinQuery = JoinUtil.createJoinQuery(idField, false, toField, new TermQuery(new Term("name", "name1")), indexSearcher, ScoreMode.None);
-    result = indexSearcher.search(joinQuery, 10);
-    assertEquals(2, result.totalHits);
-    assertEquals(1, result.scoreDocs[0].doc);
-    assertEquals(2, result.scoreDocs[1].doc);
-
-    // Search for offer
-    joinQuery = JoinUtil.createJoinQuery(toField, false, idField, new TermQuery(new Term("id", "5")), indexSearcher, ScoreMode.None);
-    result = indexSearcher.search(joinQuery, 10);
-    assertEquals(1, result.totalHits);
-    assertEquals(3, result.scoreDocs[0].doc);
-
-    indexSearcher.getIndexReader().close();
-    dir.close();
-  }
-
-  public void testSimpleWithScoring() throws Exception {
-    final String idField = "id";
-    final String toField = "movieId";
-
-    Directory dir = newDirectory();
-    RandomIndexWriter w = new RandomIndexWriter(
-        random(),
-        dir,
-        newIndexWriterConfig(TEST_VERSION_CURRENT,
-            new MockAnalyzer(random())).setMergePolicy(newLogMergePolicy()));
-
-    // 0
-    Document doc = new Document();
-    doc.add(new TextField("description", "A random movie", Field.Store.NO));
-    doc.add(new TextField("name", "Movie 1", Field.Store.NO));
-    doc.add(new TextField(idField, "1", Field.Store.NO));
-    w.addDocument(doc);
-
-    // 1
-    doc = new Document();
-    doc.add(new TextField("subtitle", "The first subtitle of this movie", Field.Store.NO));
-    doc.add(new TextField(idField, "2", Field.Store.NO));
-    doc.add(new TextField(toField, "1", Field.Store.NO));
-    w.addDocument(doc);
-
-    // 2
-    doc = new Document();
-    doc.add(new TextField("subtitle", "random subtitle; random event movie", Field.Store.NO));
-    doc.add(new TextField(idField, "3", Field.Store.NO));
-    doc.add(new TextField(toField, "1", Field.Store.NO));
-    w.addDocument(doc);
-
-    // 3
-    doc = new Document();
-    doc.add(new TextField("description", "A second random movie", Field.Store.NO));
-    doc.add(new TextField("name", "Movie 2", Field.Store.NO));
-    doc.add(new TextField(idField, "4", Field.Store.NO));
-    w.addDocument(doc);
-    w.commit();
-
-    // 4
-    doc = new Document();
-    doc.add(new TextField("subtitle", "a very random event happened during christmas night", Field.Store.NO));
-    doc.add(new TextField(idField, "5", Field.Store.NO));
-    doc.add(new TextField(toField, "4", Field.Store.NO));
-    w.addDocument(doc);
-
-    // 5
-    doc = new Document();
-    doc.add(new TextField("subtitle", "movie end movie test 123 test 123 random", Field.Store.NO));
-    doc.add(new TextField(idField, "6", Field.Store.NO));
-    doc.add(new TextField(toField, "4", Field.Store.NO));
-    w.addDocument(doc);
-
-    IndexSearcher indexSearcher = new IndexSearcher(w.getReader());
-    w.close();
-
-    // Search for movie via subtitle
-    Query joinQuery =
-        JoinUtil.createJoinQuery(toField, false, idField, new TermQuery(new Term("subtitle", "random")), indexSearcher, ScoreMode.Max);
-    TopDocs result = indexSearcher.search(joinQuery, 10);
-    assertEquals(2, result.totalHits);
-    assertEquals(0, result.scoreDocs[0].doc);
-    assertEquals(3, result.scoreDocs[1].doc);
-
-    // Score mode max.
-    joinQuery = JoinUtil.createJoinQuery(toField, false, idField, new TermQuery(new Term("subtitle", "movie")), indexSearcher, ScoreMode.Max);
-    result = indexSearcher.search(joinQuery, 10);
-    assertEquals(2, result.totalHits);
-    assertEquals(3, result.scoreDocs[0].doc);
-    assertEquals(0, result.scoreDocs[1].doc);
-
-    // Score mode total
-    joinQuery = JoinUtil.createJoinQuery(toField, false, idField, new TermQuery(new Term("subtitle", "movie")), indexSearcher, ScoreMode.Total);
-    result = indexSearcher.search(joinQuery, 10);
-    assertEquals(2, result.totalHits);
-    assertEquals(0, result.scoreDocs[0].doc);
-    assertEquals(3, result.scoreDocs[1].doc);
-
-    //Score mode avg
-    joinQuery = JoinUtil.createJoinQuery(toField, false, idField, new TermQuery(new Term("subtitle", "movie")), indexSearcher, ScoreMode.Avg);
-    result = indexSearcher.search(joinQuery, 10);
-    assertEquals(2, result.totalHits);
-    assertEquals(3, result.scoreDocs[0].doc);
-    assertEquals(0, result.scoreDocs[1].doc);
-
-    indexSearcher.getIndexReader().close();
-    dir.close();
-  }
-
-  @Test
-  public void testSingleValueRandomJoin() throws Exception {
-    int maxIndexIter = _TestUtil.nextInt(random(), 6, 12);
-    int maxSearchIter = _TestUtil.nextInt(random(), 13, 26);
-    executeRandomJoin(false, maxIndexIter, maxSearchIter, _TestUtil.nextInt(random(), 87, 764));
-  }
-
-  @Test
-  // This test really takes more time, that is why the number of iterations are smaller.
-  public void testMultiValueRandomJoin() throws Exception {
-    int maxIndexIter = _TestUtil.nextInt(random(), 3, 6);
-    int maxSearchIter = _TestUtil.nextInt(random(), 6, 12);
-    executeRandomJoin(true, maxIndexIter, maxSearchIter, _TestUtil.nextInt(random(), 11, 57));
-  }
-
-  private void executeRandomJoin(boolean multipleValuesPerDocument, int maxIndexIter, int maxSearchIter, int numberOfDocumentsToIndex) throws Exception {
-    for (int indexIter = 1; indexIter <= maxIndexIter; indexIter++) {
-      if (VERBOSE) {
-        System.out.println("indexIter=" + indexIter);
-      }
-      Directory dir = newDirectory();
-      RandomIndexWriter w = new RandomIndexWriter(
-          random(),
-          dir,
-          newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random(), MockTokenizer.KEYWORD, false)).setMergePolicy(newLogMergePolicy())
-      );
-      IndexIterationContext context = createContext(numberOfDocumentsToIndex, w, multipleValuesPerDocument);
-
-      IndexReader topLevelReader = w.getReader();
-      w.close();
-      for (int searchIter = 1; searchIter <= maxSearchIter; searchIter++) {
-        if (VERBOSE) {
-          System.out.println("searchIter=" + searchIter);
-        }
-        IndexSearcher indexSearcher = newSearcher(topLevelReader);
-
-        int r = random().nextInt(context.randomUniqueValues.length);
-        boolean from = context.randomFrom[r];
-        String randomValue = context.randomUniqueValues[r];
-        FixedBitSet expectedResult = createExpectedResult(randomValue, from, indexSearcher.getIndexReader(), context);
-
-        final Query actualQuery = new TermQuery(new Term("value", randomValue));
-        if (VERBOSE) {
-          System.out.println("actualQuery=" + actualQuery);
-        }
-        final ScoreMode scoreMode = ScoreMode.values()[random().nextInt(ScoreMode.values().length)];
-        if (VERBOSE) {
-          System.out.println("scoreMode=" + scoreMode);
-        }
-
-        final Query joinQuery;
-        if (from) {
-          joinQuery = JoinUtil.createJoinQuery("from", multipleValuesPerDocument, "to", actualQuery, indexSearcher, scoreMode);
-        } else {
-          joinQuery = JoinUtil.createJoinQuery("to", multipleValuesPerDocument, "from", actualQuery, indexSearcher, scoreMode);
-        }
-        if (VERBOSE) {
-          System.out.println("joinQuery=" + joinQuery);
-        }
-
-        // Need to know all documents that have matches. TopDocs doesn't give me that and then I'd be also testing TopDocsCollector...
-        final FixedBitSet actualResult = new FixedBitSet(indexSearcher.getIndexReader().maxDoc());
-        final TopScoreDocCollector topScoreDocCollector = TopScoreDocCollector.create(10, false);
-        indexSearcher.search(joinQuery, new Collector() {
-
-          int docBase;
-
-          public void collect(int doc) throws IOException {
-            actualResult.set(doc + docBase);
-            topScoreDocCollector.collect(doc);
-          }
-
-          public void setNextReader(AtomicReaderContext context) {
-            docBase = context.docBase;
-            topScoreDocCollector.setNextReader(context);
-          }
-
-          public void setScorer(Scorer scorer) throws IOException {
-            topScoreDocCollector.setScorer(scorer);
-          }
-
-          public boolean acceptsDocsOutOfOrder() {
-            return topScoreDocCollector.acceptsDocsOutOfOrder();
-          }
-        });
-        // Asserting bit set...
-        if (VERBOSE) {
-          System.out.println("expected cardinality:" + expectedResult.cardinality());
-          DocIdSetIterator iterator = expectedResult.iterator();
-          for (int doc = iterator.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = iterator.nextDoc()) {
-            System.out.println(String.format(Locale.ROOT, "Expected doc[%d] with id value %s", doc, indexSearcher.doc(doc).get("id")));
-          }
-          System.out.println("actual cardinality:" + actualResult.cardinality());
-          iterator = actualResult.iterator();
-          for (int doc = iterator.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = iterator.nextDoc()) {
-            System.out.println(String.format(Locale.ROOT, "Actual doc[%d] with id value %s", doc, indexSearcher.doc(doc).get("id")));
-          }
-        }
-        assertEquals(expectedResult, actualResult);
-
-        // Asserting TopDocs...
-        TopDocs expectedTopDocs = createExpectedTopDocs(randomValue, from, scoreMode, context);
-        TopDocs actualTopDocs = topScoreDocCollector.topDocs();
-        assertEquals(expectedTopDocs.totalHits, actualTopDocs.totalHits);
-        assertEquals(expectedTopDocs.scoreDocs.length, actualTopDocs.scoreDocs.length);
-        if (scoreMode == ScoreMode.None) {
-          continue;
-        }
-
-        assertEquals(expectedTopDocs.getMaxScore(), actualTopDocs.getMaxScore(), 0.0f);
-        for (int i = 0; i < expectedTopDocs.scoreDocs.length; i++) {
-          if (VERBOSE) {
-            System.out.printf("Expected doc: %d | Actual doc: %d\n", expectedTopDocs.scoreDocs[i].doc, actualTopDocs.scoreDocs[i].doc);
-            System.out.printf("Expected score: %f | Actual score: %f\n", expectedTopDocs.scoreDocs[i].score, actualTopDocs.scoreDocs[i].score);
-          }
-          assertEquals(expectedTopDocs.scoreDocs[i].doc, actualTopDocs.scoreDocs[i].doc);
-          assertEquals(expectedTopDocs.scoreDocs[i].score, actualTopDocs.scoreDocs[i].score, 0.0f);
-          Explanation explanation = indexSearcher.explain(joinQuery, expectedTopDocs.scoreDocs[i].doc);
-          assertEquals(expectedTopDocs.scoreDocs[i].score, explanation.getValue(), 0.0f);
-        }
-      }
-      topLevelReader.close();
-      dir.close();
+    public static ShowStyle get(String v) {
+      if(v==null) return null;
+      if("schema".equalsIgnoreCase(v)) return SCHEMA;
+      if("index".equalsIgnoreCase(v))  return INDEX;
+      if("doc".equalsIgnoreCase(v))    return DOC;
+      if("all".equalsIgnoreCase(v))    return ALL;
+      throw new SolrException(ErrorCode.BAD_REQUEST, "Unknown Show Style: "+v);
     }
-  }
+  };
 
-  private IndexIterationContext createContext(int nDocs, RandomIndexWriter writer, boolean multipleValuesPerDocument) throws IOException {
-    return createContext(nDocs, writer, writer, multipleValuesPerDocument);
-  }
 
-  private IndexIterationContext createContext(int nDocs, RandomIndexWriter fromWriter, RandomIndexWriter toWriter, boolean multipleValuesPerDocument) throws IOException {
-    IndexIterationContext context = new IndexIterationContext();
-    int numRandomValues = nDocs / 2;
-    context.randomUniqueValues = new String[numRandomValues];
-    Set<String> trackSet = new HashSet<String>();
-    context.randomFrom = new boolean[numRandomValues];
-    for (int i = 0; i < numRandomValues; i++) {
-      String uniqueRandomValue;
-      do {
-        uniqueRandomValue = _TestUtil.randomRealisticUnicodeString(random());
-//        uniqueRandomValue = _TestUtil.randomSimpleString(random);
-      } while ("".equals(uniqueRandomValue) || trackSet.contains(uniqueRandomValue));
-      // Generate unique values and empty strings aren't allowed.
-      trackSet.add(uniqueRandomValue);
-      context.randomFrom[i] = random().nextBoolean();
-      context.randomUniqueValues[i] = uniqueRandomValue;
+  @Override
+  public void handleRequestBody(SolrQueryRequest req, SolrQueryResponse rsp) throws Exception
+  {
+    IndexSchema schema = req.getSchema();
+    SolrIndexSearcher searcher = req.getSearcher();
+    DirectoryReader reader = searcher.getIndexReader();
+    SolrParams params = req.getParams();
+    ShowStyle style = ShowStyle.get(params.get("show"));
+
+    // If no doc is given, show all fields and top terms
+
+    rsp.add("index", getIndexInfo(reader));
+
+    if(ShowStyle.INDEX==style) {
+      return; // that's all we need
     }
 
-    RandomDoc[] docs = new RandomDoc[nDocs];
-    for (int i = 0; i < nDocs; i++) {
-      String id = Integer.toString(i);
-      int randomI = random().nextInt(context.randomUniqueValues.length);
-      String value = context.randomUniqueValues[randomI];
-      Document document = new Document();
-      document.add(newTextField(random(), "id", id, Field.Store.NO));
-      document.add(newTextField(random(), "value", value, Field.Store.NO));
 
-      boolean from = context.randomFrom[randomI];
-      int numberOfLinkValues = multipleValuesPerDocument ? 2 + random().nextInt(10) : 1;
-      docs[i] = new RandomDoc(id, numberOfLinkValues, value, from);
-      for (int j = 0; j < numberOfLinkValues; j++) {
-        String linkValue = context.randomUniqueValues[random().nextInt(context.randomUniqueValues.length)];
-        docs[i].linkValues.add(linkValue);
-        if (from) {
-          if (!context.fromDocuments.containsKey(linkValue)) {
-            context.fromDocuments.put(linkValue, new ArrayList<RandomDoc>());
-          }
-          if (!context.randomValueFromDocs.containsKey(value)) {
-            context.randomValueFromDocs.put(value, new ArrayList<RandomDoc>());
-          }
-
-          context.fromDocuments.get(linkValue).add(docs[i]);
-          context.randomValueFromDocs.get(value).add(docs[i]);
-          document.add(newTextField(random(), "from", linkValue, Field.Store.NO));
-        } else {
-          if (!context.toDocuments.containsKey(linkValue)) {
-            context.toDocuments.put(linkValue, new ArrayList<RandomDoc>());
-          }
-          if (!context.randomValueToDocs.containsKey(value)) {
-            context.randomValueToDocs.put(value, new ArrayList<RandomDoc>());
-          }
-
-          context.toDocuments.get(linkValue).add(docs[i]);
-          context.randomValueToDocs.get(value).add(docs[i]);
-          document.add(newTextField(random(), "to", linkValue, Field.Store.NO));
-        }
-      }
-
-      final RandomIndexWriter w;
-      if (from) {
-        w = fromWriter;
-      } else {
-        w = toWriter;
-      }
-
-      w.addDocument(document);
-      if (random().nextInt(10) == 4) {
-        w.commit();
-      }
-      if (VERBOSE) {
-        System.out.println("Added document[" + docs[i].id + "]: " + document);
+    Integer docId = params.getInt( DOC_ID );
+    if( docId == null && params.get( ID ) != null ) {
+      // Look for something with a given solr ID
+      SchemaField uniqueKey = schema.getUniqueKeyField();
+      String v = uniqueKey.getType().toInternal( params.get(ID) );
+      Term t = new Term( uniqueKey.getName(), v );
+      docId = searcher.getFirstMatch( t );
+      if( docId < 0 ) {
+        throw new SolrException( SolrException.ErrorCode.NOT_FOUND, "Can't find document: "+params.get( ID ) );
       }
     }
 
-    // Pre-compute all possible hits for all unique random values. On top of this also compute all possible score for
-    // any ScoreMode.
-    IndexSearcher fromSearcher = newSearcher(fromWriter.getReader());
-    IndexSearcher toSearcher = newSearcher(toWriter.getReader());
-    for (int i = 0; i < context.randomUniqueValues.length; i++) {
-      String uniqueRandomValue = context.randomUniqueValues[i];
-      final String fromField;
-      final String toField;
-      final Map<String, Map<Integer, JoinScore>> queryVals;
-      if (context.randomFrom[i]) {
-        fromField = "from";
-        toField = "to";
-        queryVals = context.fromHitsToJoinScore;
-      } else {
-        fromField = "to";
-        toField = "from";
-        queryVals = context.toHitsToJoinScore;
+    // Read the document from the index
+    if( docId != null ) {
+      if( style != null && style != ShowStyle.DOC ) {
+        throw new SolrException(ErrorCode.BAD_REQUEST, "missing doc param for doc style");
       }
-      final Map<BytesRef, JoinScore> joinValueToJoinScores = new HashMap<BytesRef, JoinScore>();
-      if (multipleValuesPerDocument) {
-        fromSearcher.search(new TermQuery(new Term("value", uniqueRandomValue)), new Collector() {
+      Document doc = null;
+      try {
+        doc = reader.document( docId );
+      }
+      catch( Exception ex ) {}
+      if( doc == null ) {
+        throw new SolrException( SolrException.ErrorCode.NOT_FOUND, "Can't find document: "+docId );
+      }
 
-          private Scorer scorer;
-          private DocTermOrds docTermOrds;
-          private TermsEnum docTermsEnum;
-          private DocTermOrds.TermOrdsIterator reuse;
+      SimpleOrderedMap<Object> info = getDocumentFieldsInfo( doc, docId, reader, schema );
 
-          public void collect(int doc) throws IOException {
-            if (docTermOrds.isEmpty()) {
-              return;
+      SimpleOrderedMap<Object> docinfo = new SimpleOrderedMap<Object>();
+      docinfo.add( "docId", docId );
+      docinfo.add( "lucene", info );
+      docinfo.add( "solr", doc );
+      rsp.add( "doc", docinfo );
+    }
+    else if ( ShowStyle.SCHEMA == style ) {
+      rsp.add( "schema", getSchemaInfo( req.getSchema() ) );
+    }
+    else {
+      rsp.add( "fields", getIndexedFieldsInfo(req) ) ;
+    }
+
+    // Add some generally helpful information
+    NamedList<Object> info = new SimpleOrderedMap<Object>();
+    info.add( "key", getFieldFlagsKey() );
+    info.add( "NOTE", "Document Frequency (df) is not updated when a document is marked for deletion.  df values include deleted documents." );
+    rsp.add( "info", info );
+    rsp.setHttpCaching(false);
+  }
+
+
+
+  /**
+   * @return a string representing a IndexableField's flags.  
+   */
+  private static String getFieldFlags( IndexableField f )
+  {
+    IndexOptions opts = (f == null) ? null : f.fieldType().indexOptions();
+
+    StringBuilder flags = new StringBuilder();
+
+    flags.append( (f != null && f.fieldType().indexed())                     ? FieldFlag.INDEXED.getAbbreviation() : '-' );
+    flags.append( (f != null && f.fieldType().tokenized())                   ? FieldFlag.TOKENIZED.getAbbreviation() : '-' );
+    flags.append( (f != null && f.fieldType().stored())                      ? FieldFlag.STORED.getAbbreviation() : '-' );
+    flags.append( (false)                                          ? FieldFlag.MULTI_VALUED.getAbbreviation() : '-' ); // SchemaField Specific
+    flags.append( (f != null && f.fieldType().storeTermVectors())            ? FieldFlag.TERM_VECTOR_STORED.getAbbreviation() : '-' );
+    flags.append( (f != null && f.fieldType().storeTermVectorOffsets())   ? FieldFlag.TERM_VECTOR_OFFSET.getAbbreviation() : '-' );
+    flags.append( (f != null && f.fieldType().storeTermVectorPositions()) ? FieldFlag.TERM_VECTOR_POSITION.getAbbreviation() : '-' );
+    flags.append( (f != null && f.fieldType().omitNorms())                  ? FieldFlag.OMIT_NORMS.getAbbreviation() : '-' );
+
+    flags.append( (f != null && DOCS_ONLY == opts ) ?
+        FieldFlag.OMIT_TF.getAbbreviation() : '-' );
+
+    flags.append((f != null && DOCS_AND_FREQS == opts) ?
+        FieldFlag.OMIT_POSITIONS.getAbbreviation() : '-');
+
+    flags.append( (f != null && f.getClass().getSimpleName().equals("LazyField")) ? FieldFlag.LAZY.getAbbreviation() : '-' );
+    flags.append( (f != null && f.binaryValue()!=null)                      ? FieldFlag.BINARY.getAbbreviation() : '-' );
+    flags.append( (false)                                          ? FieldFlag.SORT_MISSING_FIRST.getAbbreviation() : '-' ); // SchemaField Specific
+    flags.append( (false)                                          ? FieldFlag.SORT_MISSING_LAST.getAbbreviation() : '-' ); // SchemaField Specific
+    return flags.toString();
+  }
+
+  /**
+   * @return a string representing a SchemaField's flags.  
+   */
+  private static String getFieldFlags( SchemaField f )
+  {
+    FieldType t = (f==null) ? null : f.getType();
+
+    // see: http://www.nabble.com/schema-field-properties-tf3437753.html#a9585549
+    boolean lazy = false; // "lazy" is purely a property of reading fields
+    boolean binary = false; // Currently not possible
+
+    StringBuilder flags = new StringBuilder();
+    flags.append( (f != null && f.indexed())             ? FieldFlag.INDEXED.getAbbreviation() : '-' );
+    flags.append( (t != null && t.isTokenized())         ? FieldFlag.TOKENIZED.getAbbreviation() : '-' );
+    flags.append( (f != null && f.stored())              ? FieldFlag.STORED.getAbbreviation() : '-' );
+    flags.append( (f != null && f.multiValued())         ? FieldFlag.MULTI_VALUED.getAbbreviation() : '-' );
+    flags.append( (f != null && f.storeTermVector() )    ? FieldFlag.TERM_VECTOR_STORED.getAbbreviation() : '-' );
+    flags.append( (f != null && f.storeTermOffsets() )   ? FieldFlag.TERM_VECTOR_OFFSET.getAbbreviation() : '-' );
+    flags.append( (f != null && f.storeTermPositions() ) ? FieldFlag.TERM_VECTOR_POSITION.getAbbreviation() : '-' );
+    flags.append( (f != null && f.omitNorms())           ? FieldFlag.OMIT_NORMS.getAbbreviation() : '-' );
+    flags.append( (f != null &&
+        f.omitTermFreqAndPositions() )        ? FieldFlag.OMIT_TF.getAbbreviation() : '-' );
+    flags.append( (f != null && f.omitPositions() )      ? FieldFlag.OMIT_POSITIONS.getAbbreviation() : '-' );
+    flags.append( (lazy)                                 ? FieldFlag.LAZY.getAbbreviation() : '-' );
+    flags.append( (binary)                               ? FieldFlag.BINARY.getAbbreviation() : '-' );
+    flags.append( (f != null && f.sortMissingFirst() )   ? FieldFlag.SORT_MISSING_FIRST.getAbbreviation() : '-' );
+    flags.append( (f != null && f.sortMissingLast() )    ? FieldFlag.SORT_MISSING_LAST.getAbbreviation() : '-' );
+    return flags.toString();
+  }
+
+  /**
+   * @return a key to what each character means
+   */
+  public static SimpleOrderedMap<String> getFieldFlagsKey() {
+    SimpleOrderedMap<String> key = new SimpleOrderedMap<String>();
+    for (FieldFlag f : FieldFlag.values()) {
+      key.add(String.valueOf(f.getAbbreviation()), f.getDisplay() );
+    }
+    return key;
+  }
+
+  private static SimpleOrderedMap<Object> getDocumentFieldsInfo( Document doc, int docId, IndexReader reader,
+                                                                 IndexSchema schema ) throws IOException
+  {
+    final CharsRef spare = new CharsRef();
+    SimpleOrderedMap<Object> finfo = new SimpleOrderedMap<Object>();
+    for( Object o : doc.getFields() ) {
+      Field field = (Field)o;
+      SimpleOrderedMap<Object> f = new SimpleOrderedMap<Object>();
+
+      SchemaField sfield = schema.getFieldOrNull( field.name() );
+      FieldType ftype = (sfield==null)?null:sfield.getType();
+
+      f.add( "type", (ftype==null)?null:ftype.getTypeName() );
+      f.add( "schema", getFieldFlags( sfield ) );
+      f.add( "flags", getFieldFlags( field ) );
+
+      Term t = new Term(field.name(), ftype!=null ? ftype.storedToIndexed(field) : field.stringValue());
+
+      f.add( "value", (ftype==null)?null:ftype.toExternal( field ) );
+
+      // TODO: this really should be "stored"
+      f.add( "internal", field.stringValue() );  // may be a binary number
+
+      BytesRef bytes = field.binaryValue();
+      if (bytes != null) {
+        f.add( "binary", Base64.byteArrayToBase64(bytes.bytes, bytes.offset, bytes.length));
+      }
+      f.add( "boost", field.boost() );
+      f.add( "docFreq", t.text()==null ? 0 : reader.docFreq( t ) ); // this can be 0 for non-indexed fields
+
+      // If we have a term vector, return that
+      if( field.fieldType().storeTermVectors() ) {
+        try {
+          Terms v = reader.getTermVector( docId, field.name() );
+          if( v != null ) {
+            SimpleOrderedMap<Integer> tfv = new SimpleOrderedMap<Integer>();
+            final TermsEnum termsEnum = v.iterator(null);
+            BytesRef text;
+            while((text = termsEnum.next()) != null) {
+              final int freq = (int) termsEnum.totalTermFreq();
+              UnicodeUtil.UTF8toUTF16(text, spare);
+              tfv.add(spare.toString(), freq);
             }
-
-            reuse = docTermOrds.lookup(doc, reuse);
-            int[] buffer = new int[5];
-
-            int chunk;
-            do {
-              chunk = reuse.read(buffer);
-              if (chunk == 0) {
-                return;
-              }
-
-              for (int idx = 0; idx < chunk; idx++) {
-                int key = buffer[idx];
-                docTermsEnum.seekExact((long) key);
-                BytesRef joinValue = docTermsEnum.term();
-                if (joinValue == null) {
-                  continue;
-                }
-
-                JoinScore joinScore = joinValueToJoinScores.get(joinValue);
-                if (joinScore == null) {
-                  joinValueToJoinScores.put(BytesRef.deepCopyOf(joinValue), joinScore = new JoinScore());
-                }
-                joinScore.addScore(scorer.score());
-              }
-            } while (chunk >= buffer.length);
+            f.add( "termVector", tfv );
           }
-
-          public void setNextReader(AtomicReaderContext context) throws IOException {
-            docTermOrds = FieldCache.DEFAULT.getDocTermOrds(context.reader(), fromField);
-            docTermsEnum = docTermOrds.getOrdTermsEnum(context.reader());
-            reuse = null;
-          }
-
-          public void setScorer(Scorer scorer) {
-            this.scorer = scorer;
-          }
-
-          public boolean acceptsDocsOutOfOrder() {
-            return false;
-          }
-        });
-      } else {
-        fromSearcher.search(new TermQuery(new Term("value", uniqueRandomValue)), new Collector() {
-
-          private Scorer scorer;
-          private FieldCache.DocTerms terms;
-          private final BytesRef spare = new BytesRef();
-
-          public void collect(int doc) throws IOException {
-            BytesRef joinValue = terms.getTerm(doc, spare);
-            if (joinValue == null) {
-              return;
-            }
-
-            JoinScore joinScore = joinValueToJoinScores.get(joinValue);
-            if (joinScore == null) {
-              joinValueToJoinScores.put(BytesRef.deepCopyOf(joinValue), joinScore = new JoinScore());
-            }
-            joinScore.addScore(scorer.score());
-          }
-
-          public void setNextReader(AtomicReaderContext context) throws IOException {
-            terms = FieldCache.DEFAULT.getTerms(context.reader(), fromField);
-          }
-
-          public void setScorer(Scorer scorer) {
-            this.scorer = scorer;
-          }
-
-          public boolean acceptsDocsOutOfOrder() {
-            return false;
-          }
-        });
+        }
+        catch( Exception ex ) {
+          log.warn( "error writing term vector", ex );
+        }
       }
 
-      final Map<Integer, JoinScore> docToJoinScore = new HashMap<Integer, JoinScore>();
-      if (multipleValuesPerDocument) {
-        toSearcher.search(new MatchAllDocsQuery(), new Collector() {
-
-          private DocTermOrds docTermOrds;
-          private TermsEnum docTermsEnum;
-          private DocTermOrds.TermOrdsIterator reuse;
-          private int docBase;
-
-          public void collect(int doc) throws IOException {
-            if (docTermOrds.isEmpty()) {
-              return;
-            }
-
-            reuse = docTermOrds.lookup(doc, reuse);
-            int[] buffer = new int[5];
-
-            int chunk;
-            do {
-              chunk = reuse.read(buffer);
-              if (chunk == 0) {
-                return;
-              }
-
-              for (int idx = 0; idx < chunk; idx++) {
-                int key = buffer[idx];
-                docTermsEnum.seekExact((long) key);
-                JoinScore joinScore = joinValueToJoinScores.get(docTermsEnum.term());
-                if (joinScore == null) {
-                  continue;
-                }
-                Integer basedDoc = docBase + doc;
-                // First encountered join value determines the score.
-                // Something to keep in mind for many-to-many relations.
-                if (!docToJoinScore.containsKey(basedDoc)) {
-                  docToJoinScore.put(basedDoc, joinScore);
-                }
-              }
-            } while (chunk >= buffer.length);
-          }
-
-          public void setNextReader(AtomicReaderContext context) throws IOException {
-            docBase = context.docBase;
-            docTermOrds = FieldCache.DEFAULT.getDocTermOrds(context.reader(), toField);
-            docTermsEnum = docTermOrds.getOrdTermsEnum(context.reader());
-            reuse = null;
-          }
-
-          public boolean acceptsDocsOutOfOrder() {return false;}
-          public void setScorer(Scorer scorer) {}
-        });
-      } else {
-        toSearcher.search(new MatchAllDocsQuery(), new Collector() {
-
-          private FieldCache.DocTerms terms;
-          private int docBase;
-          private final BytesRef spare = new BytesRef();
-
-          public void collect(int doc) {
-            JoinScore joinScore = joinValueToJoinScores.get(terms.getTerm(doc, spare));
-            if (joinScore == null) {
-              return;
-            }
-            docToJoinScore.put(docBase + doc, joinScore);
-          }
-
-          public void setNextReader(AtomicReaderContext context) throws IOException {
-            terms = FieldCache.DEFAULT.getTerms(context.reader(), toField);
-            docBase = context.docBase;
-          }
-
-          public boolean acceptsDocsOutOfOrder() {return false;}
-          public void setScorer(Scorer scorer) {}
-        });
-      }
-      queryVals.put(uniqueRandomValue, docToJoinScore);
+      finfo.add( field.name(), f );
     }
-
-    fromSearcher.getIndexReader().close();
-    toSearcher.getIndexReader().close();
-
-    return context;
+    return finfo;
   }
 
-  private TopDocs createExpectedTopDocs(String queryValue,
-                                        final boolean from,
-                                        final ScoreMode scoreMode,
-                                        IndexIterationContext context) {
+  private static SimpleOrderedMap<Object> getIndexedFieldsInfo(SolrQueryRequest req)
+      throws Exception {
 
-    Map<Integer, JoinScore> hitsToJoinScores;
-    if (from) {
-      hitsToJoinScores = context.fromHitsToJoinScore.get(queryValue);
-    } else {
-      hitsToJoinScores = context.toHitsToJoinScore.get(queryValue);
+    SolrIndexSearcher searcher = req.getSearcher();
+    SolrParams params = req.getParams();
+
+    Set<String> fields = null;
+    String fl = params.get(CommonParams.FL);
+    if (fl != null) {
+      fields = new TreeSet<String>(Arrays.asList(fl.split( "[,\\s]+" )));
     }
-    List<Map.Entry<Integer,JoinScore>> hits = new ArrayList<Map.Entry<Integer, JoinScore>>(hitsToJoinScores.entrySet());
-    Collections.sort(hits, new Comparator<Map.Entry<Integer, JoinScore>>() {
 
-      public int compare(Map.Entry<Integer, JoinScore> hit1, Map.Entry<Integer, JoinScore> hit2) {
-        float score1 = hit1.getValue().score(scoreMode);
-        float score2 = hit2.getValue().score(scoreMode);
+    AtomicReader reader = searcher.getAtomicReader();
+    IndexSchema schema = searcher.getSchema();
 
-        int cmp = Float.compare(score2, score1);
-        if (cmp != 0) {
-          return cmp;
-        }
-        return hit1.getKey() - hit2.getKey();
+    // Don't be tempted to put this in the loop below, the whole point here is to alphabetize the fields!
+    Set<String> fieldNames = new TreeSet<String>();
+    for(FieldInfo fieldInfo : reader.getFieldInfos()) {
+      fieldNames.add(fieldInfo.name);
+    }
+
+    // Walk the term enum and keep a priority queue for each map in our set
+    SimpleOrderedMap<Object> finfo = new SimpleOrderedMap<Object>();
+
+    for (String fieldName : fieldNames) {
+      if (fields != null && ! fields.contains(fieldName) && ! fields.contains("*")) {
+        continue; //we're not interested in this field Still an issue here
       }
 
-    });
-    ScoreDoc[] scoreDocs = new ScoreDoc[Math.min(10, hits.size())];
-    for (int i = 0; i < scoreDocs.length; i++) {
-      Map.Entry<Integer,JoinScore> hit = hits.get(i);
-      scoreDocs[i] = new ScoreDoc(hit.getKey(), hit.getValue().score(scoreMode));
+      SimpleOrderedMap<Object> fieldMap = new SimpleOrderedMap<Object>();
+
+      SchemaField sfield = schema.getFieldOrNull( fieldName );
+      FieldType ftype = (sfield==null)?null:sfield.getType();
+
+      fieldMap.add( "type", (ftype==null)?null:ftype.getTypeName() );
+      fieldMap.add("schema", getFieldFlags(sfield));
+      if (sfield != null && schema.isDynamicField(sfield.getName()) && schema.getDynamicPattern(sfield.getName()) != null) {
+        fieldMap.add("dynamicBase", schema.getDynamicPattern(sfield.getName()));
+      }
+      Terms terms = reader.fields().terms(fieldName);
+      if (terms == null) { // Not indexed, so we need to report what we can (it made it through the fl param if specified)
+        finfo.add( fieldName, fieldMap );
+        continue;
+      }
+
+      if(sfield != null && sfield.indexed() ) {
+        // In the pre-4.0 days, this did a veeeery expensive range query. But we can be much faster now,
+        // so just do this all the time.
+        Document doc = getFirstLiveDoc(reader, fieldName, terms);
+
+
+        if( doc != null ) {
+          // Found a document with this field
+          try {
+            IndexableField fld = doc.getField( fieldName );
+            if( fld != null ) {
+              fieldMap.add("index", getFieldFlags(fld));
+            }
+            else {
+              // it is a non-stored field...
+              fieldMap.add("index", "(unstored field)");
+            }
+          }
+          catch( Exception ex ) {
+            log.warn( "error reading field: "+fieldName );
+          }
+        }
+        fieldMap.add("docs", terms.getDocCount());
+
+      }
+      if (fields != null && (fields.contains(fieldName) || fields.contains("*"))) {
+        getDetailedFieldInfo(req, fieldName, fieldMap);
+      }
+      // Add the field
+      finfo.add( fieldName, fieldMap );
     }
-    return new TopDocs(hits.size(), scoreDocs, hits.isEmpty() ? Float.NaN : hits.get(0).getValue().score(scoreMode));
+    return finfo;
   }
 
-  private FixedBitSet createExpectedResult(String queryValue, boolean from, IndexReader topLevelReader, IndexIterationContext context) throws IOException {
-    final Map<String, List<RandomDoc>> randomValueDocs;
-    final Map<String, List<RandomDoc>> linkValueDocuments;
-    if (from) {
-      randomValueDocs = context.randomValueFromDocs;
-      linkValueDocuments = context.toDocuments;
-    } else {
-      randomValueDocs = context.randomValueToDocs;
-      linkValueDocuments = context.fromDocuments;
-    }
-
-    FixedBitSet expectedResult = new FixedBitSet(topLevelReader.maxDoc());
-    List<RandomDoc> matchingDocs = randomValueDocs.get(queryValue);
-    if (matchingDocs == null) {
-      return new FixedBitSet(topLevelReader.maxDoc());
-    }
-
-    for (RandomDoc matchingDoc : matchingDocs) {
-      for (String linkValue : matchingDoc.linkValues) {
-        List<RandomDoc> otherMatchingDocs = linkValueDocuments.get(linkValue);
-        if (otherMatchingDocs == null) {
-          continue;
-        }
-
-        for (RandomDoc otherSideDoc : otherMatchingDocs) {
-          DocsEnum docsEnum = MultiFields.getTermDocsEnum(topLevelReader, MultiFields.getLiveDocs(topLevelReader), "id", new BytesRef(otherSideDoc.id), false);
-          assert docsEnum != null;
-          int doc = docsEnum.nextDoc();
-          expectedResult.set(doc);
+  // Just get a document with the term in it, the first one will do!
+  // Is there a better way to do this? Shouldn't actually be very costly
+  // to do it this way.
+  private static Document getFirstLiveDoc(AtomicReader reader, String fieldName, Terms terms) throws IOException {
+    DocsEnum docsEnum = null;
+    TermsEnum termsEnum = terms.iterator(null);
+    BytesRef text;
+    // Deal with the chance that the first bunch of terms are in deleted documents. Is there a better way?
+    for (int idx = 0; idx < 1000 && docsEnum == null; ++idx) {
+      text = termsEnum.next();
+      if (text == null) { // Ran off the end of the terms enum without finding any live docs with that field in them.
+        return null;
+      }
+      Term term = new Term(fieldName, text);
+      docsEnum = reader.termDocsEnum(reader.getLiveDocs(),
+          term.field(),
+          new BytesRef(term.text()),
+          false);
+      if (docsEnum != null) {
+        int docId;
+        if ((docId = docsEnum.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+          return reader.document(docId);
         }
       }
     }
-    return expectedResult;
+    return null;
   }
 
-  private static class IndexIterationContext {
-
-    String[] randomUniqueValues;
-    boolean[] randomFrom;
-    Map<String, List<RandomDoc>> fromDocuments = new HashMap<String, List<RandomDoc>>();
-    Map<String, List<RandomDoc>> toDocuments = new HashMap<String, List<RandomDoc>>();
-    Map<String, List<RandomDoc>> randomValueFromDocs = new HashMap<String, List<RandomDoc>>();
-    Map<String, List<RandomDoc>> randomValueToDocs = new HashMap<String, List<RandomDoc>>();
-
-    Map<String, Map<Integer, JoinScore>> fromHitsToJoinScore = new HashMap<String, Map<Integer, JoinScore>>();
-    Map<String, Map<Integer, JoinScore>> toHitsToJoinScore = new HashMap<String, Map<Integer, JoinScore>>();
-
-  }
-
-  private static class RandomDoc {
-
-    final String id;
-    final List<String> linkValues;
-    final String value;
-    final boolean from;
-
-    private RandomDoc(String id, int numberOfLinkValues, String value, boolean from) {
-      this.id = id;
-      this.from = from;
-      linkValues = new ArrayList<String>(numberOfLinkValues);
-      this.value = value;
+  /**
+   * Return info from the index
+   */
+  private static SimpleOrderedMap<Object> getSchemaInfo( IndexSchema schema ) {
+    Map<String, List<String>> typeusemap = new TreeMap<String, List<String>>();
+    Map<String, Object> fields = new TreeMap<String, Object>();
+    SchemaField uniqueField = schema.getUniqueKeyField();
+    for( SchemaField f : schema.getFields().values() ) {
+      populateFieldInfo(schema, typeusemap, fields, uniqueField, f);
     }
+
+    Map<String, Object> dynamicFields = new TreeMap<String, Object>();
+    for (SchemaField f : schema.getDynamicFieldPrototypes()) {
+      populateFieldInfo(schema, typeusemap, dynamicFields, uniqueField, f);
+    }
+    SimpleOrderedMap<Object> types = new SimpleOrderedMap<Object>();
+    Map<String, FieldType> sortedTypes = new TreeMap<String, FieldType>(schema.getFieldTypes());
+    for( FieldType ft : sortedTypes.values() ) {
+      SimpleOrderedMap<Object> field = new SimpleOrderedMap<Object>();
+      field.add("fields", typeusemap.get( ft.getTypeName() ) );
+      field.add("tokenized", ft.isTokenized() );
+      field.add("className", ft.getClass().getName());
+      field.add("indexAnalyzer", getAnalyzerInfo(ft.getAnalyzer()));
+      field.add("queryAnalyzer", getAnalyzerInfo(ft.getQueryAnalyzer()));
+      types.add( ft.getTypeName(), field );
+    }
+
+    // Must go through this to maintain binary compatbility. Putting a TreeMap into a resp leads to casting errors
+    SimpleOrderedMap<Object> finfo = new SimpleOrderedMap<Object>();
+
+    SimpleOrderedMap<Object> fieldsSimple = new SimpleOrderedMap<Object>();
+    for (Map.Entry<String, Object> ent : fields.entrySet()) {
+      fieldsSimple.add(ent.getKey(), ent.getValue());
+    }
+    finfo.add("fields", fieldsSimple);
+
+    SimpleOrderedMap<Object> dynamicSimple = new SimpleOrderedMap<Object>();
+    for (Map.Entry<String, Object> ent : dynamicFields.entrySet()) {
+      dynamicSimple.add(ent.getKey(), ent.getValue());
+    }
+    finfo.add("dynamicFields", dynamicSimple);
+
+    finfo.add("uniqueKeyField",
+        null == uniqueField ? null : uniqueField.getName());
+    finfo.add("defaultSearchField", schema.getDefaultSearchFieldName());
+    finfo.add("types", types);
+    return finfo;
   }
 
-  private static class JoinScore {
 
-    float maxScore;
-    float total;
-    int count;
+  private static SimpleOrderedMap<Object> getAnalyzerInfo(Analyzer analyzer) {
+    SimpleOrderedMap<Object> aninfo = new SimpleOrderedMap<Object>();
+    aninfo.add("className", analyzer.getClass().getName());
+    if (analyzer instanceof TokenizerChain) {
 
-    void addScore(float score) {
-      total += score;
-      if (score > maxScore) {
-        maxScore = score;
+      TokenizerChain tchain = (TokenizerChain)analyzer;
+
+      CharFilterFactory[] cfiltfacs = tchain.getCharFilterFactories();
+      SimpleOrderedMap<Map<String, Object>> cfilters = new SimpleOrderedMap<Map<String, Object>>();
+      for (CharFilterFactory cfiltfac : cfiltfacs) {
+        Map<String, Object> tok = new HashMap<String, Object>();
+        String className = cfiltfac.getClass().getName();
+        tok.put("className", className);
+        tok.put("args", cfiltfac.getArgs());
+        cfilters.add(className.substring(className.lastIndexOf('.')+1), tok);
       }
-      count++;
-    }
-
-    float score(ScoreMode mode) {
-      switch (mode) {
-        case None:
-          return 1.0f;
-        case Total:
-          return total;
-        case Avg:
-          return total / count;
-        case Max:
-          return maxScore;
+      if (cfilters.size() > 0) {
+        aninfo.add("charFilters", cfilters);
       }
-      throw new IllegalArgumentException("Unsupported ScoreMode: " + mode);
-    }
 
+      SimpleOrderedMap<Object> tokenizer = new SimpleOrderedMap<Object>();
+      TokenizerFactory tfac = tchain.getTokenizerFactory();
+      tokenizer.add("className", tfac.getClass().getName());
+      tokenizer.add("args", tfac.getArgs());
+      aninfo.add("tokenizer", tokenizer);
+
+      TokenFilterFactory[] filtfacs = tchain.getTokenFilterFactories();
+      SimpleOrderedMap<Map<String, Object>> filters = new SimpleOrderedMap<Map<String, Object>>();
+      for (TokenFilterFactory filtfac : filtfacs) {
+        Map<String, Object> tok = new HashMap<String, Object>();
+        String className = filtfac.getClass().getName();
+        tok.put("className", className);
+        tok.put("args", filtfac.getArgs());
+        filters.add(className.substring(className.lastIndexOf('.')+1), tok);
+      }
+      if (filters.size() > 0) {
+        aninfo.add("filters", filters);
+      }
+    }
+    return aninfo;
   }
 
+  private static void populateFieldInfo(IndexSchema schema,
+                                        Map<String, List<String>> typeusemap, Map<String, Object> fields,
+                                        SchemaField uniqueField, SchemaField f) {
+    FieldType ft = f.getType();
+    SimpleOrderedMap<Object> field = new SimpleOrderedMap<Object>();
+    field.add( "type", ft.getTypeName() );
+    field.add( "flags", getFieldFlags(f) );
+    if( f.isRequired() ) {
+      field.add( "required", f.isRequired() );
+    }
+    if( f.getDefaultValue() != null ) {
+      field.add( "default", f.getDefaultValue() );
+    }
+    if (f == uniqueField){
+      field.add("uniqueKey", true);
+    }
+    if (ft.getAnalyzer().getPositionIncrementGap(f.getName()) != 0) {
+      field.add("positionIncrementGap", ft.getAnalyzer().getPositionIncrementGap(f.getName()));
+    }
+    field.add("copyDests", schema.getCopyFieldsList(f.getName()));
+    field.add("copySources", schema.getCopySources(f.getName()));
+
+
+    fields.put( f.getName(), field );
+
+    List<String> v = typeusemap.get( ft.getTypeName() );
+    if( v == null ) {
+      v = new ArrayList<String>();
+    }
+    v.add( f.getName() );
+    typeusemap.put( ft.getTypeName(), v );
+  }
+
+  /**
+   * @deprecated use {@link #getIndexInfo(DirectoryReader)} since you now have to explicitly pass the "fl" prameter
+   * and this was always called with "false" anyway from CoreAdminHandler
+   */
+  public static SimpleOrderedMap<Object> getIndexInfo(DirectoryReader reader, boolean detail) throws IOException {
+    return getIndexInfo(reader);
+  }
+  // This method just gets the top-most level of information. This was conflated with getting detailed info
+  // for *all* the fields, called from CoreAdminHandler etc.
+
+  public static SimpleOrderedMap<Object> getIndexInfo(DirectoryReader reader) throws IOException {
+    Directory dir = reader.directory();
+    SimpleOrderedMap<Object> indexInfo = new SimpleOrderedMap<Object>();
+
+    indexInfo.add("numDocs", reader.numDocs());
+    indexInfo.add("maxDoc", reader.maxDoc());
+
+    indexInfo.add("version", reader.getVersion());  // TODO? Is this different then: IndexReader.getCurrentVersion( dir )?
+    indexInfo.add("segmentCount", reader.getTopReaderContext().leaves().size());
+    indexInfo.add("current", reader.isCurrent() );
+    indexInfo.add("hasDeletions", reader.hasDeletions() );
+    indexInfo.add("directory", dir );
+    indexInfo.add("userData", reader.getIndexCommit().getUserData());
+    String s = reader.getIndexCommit().getUserData().get(SolrIndexWriter.COMMIT_TIME_MSEC_KEY);
+    if (s != null) {
+      indexInfo.add("lastModified", new Date(Long.parseLong(s)));
+    }
+    return indexInfo;
+  }
+
+  // Get terribly detailed information about a particular field. This is a very expensive call, use it with caution
+  // especially on large indexes!
+  @SuppressWarnings("unchecked")
+  private static void getDetailedFieldInfo(SolrQueryRequest req, String field, SimpleOrderedMap<Object> fieldMap)
+      throws IOException {
+
+    SolrParams params = req.getParams();
+    int numTerms = params.getInt( NUMTERMS, DEFAULT_COUNT );
+
+    TopTermQueue tiq = new TopTermQueue(numTerms + 1);  // Something to collect the top N terms in.
+
+    final CharsRef spare = new CharsRef();
+
+    Fields fields = MultiFields.getFields(req.getSearcher().getIndexReader());
+
+    if (fields == null) { // No indexed fields
+      return;
+    }
+
+    Terms terms = fields.terms(field);
+    if (terms == null) {  // No terms in the field.
+      return;
+    }
+    TermsEnum termsEnum = terms.iterator(null);
+    BytesRef text;
+    int[] buckets = new int[HIST_ARRAY_SIZE];
+    while ((text = termsEnum.next()) != null) {
+      int freq = termsEnum.docFreq();  // This calculation seems odd, but it gives the same results as it used to.
+      int slot = 32 - Integer.numberOfLeadingZeros(Math.max(0, freq - 1));
+      buckets[slot] = buckets[slot] + 1;
+      if (freq > tiq.minFreq) {
+        UnicodeUtil.UTF8toUTF16(text, spare);
+        String t = spare.toString();
+        tiq.distinctTerms = new Long(terms.size()).intValue();
+
+        tiq.add(new TopTermQueue.TermInfo(new Term(field, t), termsEnum.docFreq()));
+        if (tiq.size() > numTerms) { // if tiq full
+          tiq.pop(); // remove lowest in tiq
+          tiq.minFreq = tiq.getTopTermInfo().docFreq;
+        }
+      }
+    }
+    tiq.histogram.add(buckets);
+    fieldMap.add("distinct", tiq.distinctTerms);
+
+    // Include top terms
+    fieldMap.add("topTerms", tiq.toNamedList(req.getSearcher().getSchema()));
+
+    // Add a histogram
+    fieldMap.add("histogram", tiq.histogram.toNamedList());
+  }
+  //////////////////////// SolrInfoMBeans methods //////////////////////
+
+  @Override
+  public String getDescription() {
+    return "Lucene Index Browser.  Inspired and modeled after Luke: http://www.getopt.org/luke/";
+  }
+
+  @Override
+  public String getSource() {
+    return "$URL$";
+  }
+
+  @Override
+  public URL[] getDocs() {
+    try {
+      return new URL[] { new URL("http://wiki.apache.org/solr/LukeRequestHandler") };
+    }
+    catch( MalformedURLException ex ) { return null; }
+  }
+
+  ///////////////////////////////////////////////////////////////////////////////////////
+
+  static class TermHistogram
+  {
+    int _maxBucket = -1;
+    int _buckets[] = new int[HIST_ARRAY_SIZE];
+    public void add(int[] buckets) {
+      for (int idx = 0; idx < buckets.length; ++idx) {
+        if (buckets[idx] != 0) _maxBucket = idx;
+      }
+      for (int idx = 0; idx <= _maxBucket; ++idx) {
+        _buckets[idx] = buckets[idx];
+      }
+    }
+    // TODO? should this be a list or a map?
+    public NamedList<Integer> toNamedList()
+    {
+      NamedList<Integer> nl = new NamedList<Integer>();
+      for( int bucket = 0; bucket <= _maxBucket; bucket++ ) {
+        nl.add( ""+ (1 << bucket), _buckets[bucket] );
+      }
+      return nl;
+    }
+  }
+  /**
+   * Private internal class that counts up frequent terms
+   */
+  private static class TopTermQueue extends PriorityQueue
+  {
+    static class TermInfo {
+      TermInfo(Term t, int df) {
+        term = t;
+        docFreq = df;
+      }
+      int docFreq;
+      Term term;
+    }
+
+    public int minFreq = 0;
+    public int distinctTerms = 0;
+    public TermHistogram histogram;
+
+
+    TopTermQueue(int size) {
+      super(size);
+      histogram = new TermHistogram();
+    }
+
+    @Override
+    protected final boolean lessThan(Object a, Object b) {
+      TermInfo termInfoA = (TermInfo)a;
+      TermInfo termInfoB = (TermInfo)b;
+      return termInfoA.docFreq < termInfoB.docFreq;
+    }
+
+    /**
+     * This is a destructive call... the queue is empty at the end
+     */
+    public NamedList<Integer> toNamedList( IndexSchema schema )
+    {
+      // reverse the list..
+      List<TermInfo> aslist = new LinkedList<TermInfo>();
+      while( size() > 0 ) {
+        aslist.add( 0, (TermInfo)pop() );
+      }
+
+      NamedList<Integer> list = new NamedList<Integer>();
+      for (TermInfo i : aslist) {
+        String txt = i.term.text();
+        SchemaField ft = schema.getFieldOrNull( i.term.field() );
+        if( ft != null ) {
+          txt = ft.getType().indexedToReadable( txt );
+        }
+        list.add( txt, i.docFreq );
+      }
+      return list;
+    }
+    public TermInfo getTopTermInfo() {
+      return (TermInfo)top();
+    }
+  }
 }

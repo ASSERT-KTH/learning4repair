@@ -1,426 +1,310 @@
-package org.apache.lucene.index;
+/*
 
-/**
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+   Derby - Class org.apache.derby.tools.PlanExporter
+
+   Licensed to the Apache Software Foundation (ASF) under one or more
+   contributor license agreements.  See the NOTICE file distributed with
+   this work for additional information regarding copyright ownership.
+   The ASF licenses this file to You under the Apache License, Version 2.0
+   (the "License"); you may not use this file except in compliance with
+   the License.  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+
  */
 
-import java.io.IOException;
-import java.io.PrintStream;
-import java.util.List;
-import java.util.ArrayList;
-import java.util.Date;
-import java.util.Comparator;
-import java.util.Collections;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
+package org.apache.derby.tools;
 
-import org.apache.lucene.search.DocIdSet;
-import org.apache.lucene.search.DocIdSetIterator;
-import org.apache.lucene.search.Query;
-import org.apache.lucene.search.QueryWrapperFilter;
-import org.apache.lucene.util.BytesRef;
+import java.io.File;
+import java.security.AccessController;
+import org.apache.derby.impl.tools.planexporter.AccessDatabase;
+import org.apache.derby.impl.tools.planexporter.CreateHTMLFile;
+import org.apache.derby.impl.tools.planexporter.CreateXMLFile;
 
-/* Tracks the stream of {@link BuffereDeletes}.
- * When DocumensWriter flushes, its buffered
- * deletes are appended to this stream.  We later
- * apply these deletes (resolve them to the actual
- * docIDs, per segment) when a merge is started
- * (only to the to-be-merged segments).  We
- * also apply to all segments when NRT reader is pulled,
- * commit/close is called, or when too many deletes are
- * buffered and must be flushed (by RAM usage or by count).
- *
- * Each packet is assigned a generation, and each flushed or
- * merged segment is also assigned a generation, so we can
- * track which BufferedDeletes packets to apply to any given
- * segment. */
+/**
+ * This class is the main entry point to the tool Graphical Query Explainer.
+ */
+public class PlanExporter {
 
-class BufferedDeletesStream {
+    private static String dbURL = null; //connection URL
+    private static String xslStyleSheetName ="resources/vanilla_html.xsl";//default xsl
+    private static final int XML=1;
+    private static final int HTML=2;
+    private static final int XSL=3;
 
-  // TODO: maybe linked list?
-  private final List<FrozenBufferedDeletes> deletes = new ArrayList<FrozenBufferedDeletes>();
+    /**
+     * @param args
+     * 1) database URL eg: jdbc:derby:myDB ---------
+     * 2) database schema -----------------------------
+     * 3) statement ID (36 characters) ----------------
+     * and user specified arguments.
+     */
+    public static void main(String[] args) {
 
-  // Starts at 1 so that SegmentInfos that have never had
-  // deletes applied (whose bufferedDelGen defaults to 0)
-  // will be correct:
-  private long nextGen = 1;
+        try{
+            if(args.length>4 && args.length<10 ){
+                dbURL = args[0];
 
-  // used only by assert
-  private Term lastDeleteTerm;
-  
-  private PrintStream infoStream;
-  private final AtomicLong bytesUsed = new AtomicLong();
-  private final AtomicInteger numTerms = new AtomicInteger();
-  private final int messageID;
+                AccessDatabase access = new AccessDatabase(dbURL, args[1], args[2]);
+                access.createConnection();
+                
+                if(access.verifySchemaExistance()){
+                
+                	if(access.initializeDataArray()){
+                		access.createXMLFragment();
+                		access.markTheDepth();
+                		String stmt=access.statement();
+                		String time=access.time();
+                		access.closeConnection();
 
-  public BufferedDeletesStream(int messageID) {
-    this.messageID = messageID;
-  }
-
-  private synchronized void message(String message) {
-    if (infoStream != null) {
-      infoStream.println("BD " + messageID + " [" + new Date() + "; " + Thread.currentThread().getName() + "]: " + message);
-    }
-  }
-  
-  public synchronized void setInfoStream(PrintStream infoStream) {
-    this.infoStream = infoStream;
-  }
-
-  // Appends a new packet of buffered deletes to the stream,
-  // setting its generation:
-  public synchronized void push(FrozenBufferedDeletes packet) {
-    assert packet.any();
-    assert checkDeleteStats();    
-    assert packet.gen < nextGen;
-    deletes.add(packet);
-    numTerms.addAndGet(packet.numTermDeletes);
-    bytesUsed.addAndGet(packet.bytesUsed);
-    if (infoStream != null) {
-      message("push deletes " + packet + " delGen=" + packet.gen + " packetCount=" + deletes.size());
-    }
-    assert checkDeleteStats();    
-  }
-    
-  public synchronized void clear() {
-    deletes.clear();
-    nextGen = 1;
-    numTerms.set(0);
-    bytesUsed.set(0);
-  }
-
-  public boolean any() {
-    return bytesUsed.get() != 0;
-  }
-
-  public int numTerms() {
-    return numTerms.get();
-  }
-
-  public long bytesUsed() {
-    return bytesUsed.get();
-  }
-
-  public static class ApplyDeletesResult {
-    // True if any actual deletes took place:
-    public final boolean anyDeletes;
-
-    // Current gen, for the merged segment:
-    public final long gen;
-
-    // If non-null, contains segments that are 100% deleted
-    public final List<SegmentInfo> allDeleted;
-
-    ApplyDeletesResult(boolean anyDeletes, long gen, List<SegmentInfo> allDeleted) {
-      this.anyDeletes = anyDeletes;
-      this.gen = gen;
-      this.allDeleted = allDeleted;
-    }
-  }
-
-  // Sorts SegmentInfos from smallest to biggest bufferedDelGen:
-  private static final Comparator<SegmentInfo> sortByDelGen = new Comparator<SegmentInfo>() {
-    // @Override -- not until Java 1.6
-    public int compare(SegmentInfo si1, SegmentInfo si2) {
-      final long cmp = si1.getBufferedDeletesGen() - si2.getBufferedDeletesGen();
-      if (cmp > 0) {
-        return 1;
-      } else if (cmp < 0) {
-        return -1;
-      } else {
-        return 0;
-      }
-    }
-  };
-
-  /** Resolves the buffered deleted Term/Query/docIDs, into
-   *  actual deleted docIDs in the deletedDocs BitVector for
-   *  each SegmentReader. */
-  public synchronized ApplyDeletesResult applyDeletes(IndexWriter.ReaderPool readerPool, List<SegmentInfo> infos) throws IOException {
-    final long t0 = System.currentTimeMillis();
-
-    if (infos.size() == 0) {
-      return new ApplyDeletesResult(false, nextGen++, null);
-    }
-
-    assert checkDeleteStats();
-
-    if (!any()) {
-      message("applyDeletes: no deletes; skipping");
-      return new ApplyDeletesResult(false, nextGen++, null);
-    }
-
-    if (infoStream != null) {
-      message("applyDeletes: infos=" + infos + " packetCount=" + deletes.size());
-    }
-
-    List<SegmentInfo> infos2 = new ArrayList<SegmentInfo>();
-    infos2.addAll(infos);
-    Collections.sort(infos2, sortByDelGen);
-
-    CoalescedDeletes coalescedDeletes = null;
-    boolean anyNewDeletes = false;
-
-    int infosIDX = infos2.size()-1;
-    int delIDX = deletes.size()-1;
-
-    List<SegmentInfo> allDeleted = null;
-
-    while (infosIDX >= 0) {
-      //System.out.println("BD: cycle delIDX=" + delIDX + " infoIDX=" + infosIDX);
-
-      final FrozenBufferedDeletes packet = delIDX >= 0 ? deletes.get(delIDX) : null;
-      final SegmentInfo info = infos2.get(infosIDX);
-      final long segGen = info.getBufferedDeletesGen();
-
-      if (packet != null && segGen < packet.gen) {
-        //System.out.println("  coalesce");
-        if (coalescedDeletes == null) {
-          coalescedDeletes = new CoalescedDeletes();
-        }
-        coalescedDeletes.update(packet);
-        delIDX--;
-      } else if (packet != null && segGen == packet.gen) {
-        //System.out.println("  eq");
-
-        // Lock order: IW -> BD -> RP
-        assert readerPool.infoIsLive(info);
-        SegmentReader reader = readerPool.get(info, false);
-        int delCount = 0;
-        final boolean segAllDeletes;
-        try {
-          if (coalescedDeletes != null) {
-            //System.out.println("    del coalesced");
-            delCount += applyTermDeletes(coalescedDeletes.termsIterable(), reader);
-            delCount += applyQueryDeletes(coalescedDeletes.queriesIterable(), reader);
-          }
-          //System.out.println("    del exact");
-          // Don't delete by Term here; DocumentsWriter
-          // already did that on flush:
-          delCount += applyQueryDeletes(packet.queriesIterable(), reader);
-          segAllDeletes = reader.numDocs() == 0;
-        } finally {
-          readerPool.release(reader);
-        }
-        anyNewDeletes |= delCount > 0;
-
-        if (segAllDeletes) {
-          if (allDeleted == null) {
-            allDeleted = new ArrayList<SegmentInfo>();
-          }
-          allDeleted.add(info);
-        }
-
-        if (infoStream != null) {
-          message("seg=" + info + " segGen=" + segGen + " segDeletes=[" + packet + "]; coalesced deletes=[" + (coalescedDeletes == null ? "null" : coalescedDeletes) + "] delCount=" + delCount + (segAllDeletes ? " 100% deleted" : ""));
-        }
-
-        if (coalescedDeletes == null) {
-          coalescedDeletes = new CoalescedDeletes();
-        }
-        coalescedDeletes.update(packet);
-        delIDX--;
-        infosIDX--;
-        info.setBufferedDeletesGen(nextGen);
-
-      } else {
-        //System.out.println("  gt");
-
-        if (coalescedDeletes != null) {
-          // Lock order: IW -> BD -> RP
-          assert readerPool.infoIsLive(info);
-          SegmentReader reader = readerPool.get(info, false);
-          int delCount = 0;
-          final boolean segAllDeletes;
-          try {
-            delCount += applyTermDeletes(coalescedDeletes.termsIterable(), reader);
-            delCount += applyQueryDeletes(coalescedDeletes.queriesIterable(), reader);
-            segAllDeletes = reader.numDocs() == 0;
-          } finally {
-            readerPool.release(reader);
-          }
-          anyNewDeletes |= delCount > 0;
-
-          if (segAllDeletes) {
-            if (allDeleted == null) {
-              allDeleted = new ArrayList<SegmentInfo>();
+                		//advanced XSL feature
+                		//possible occurrences are
+                		//-adv -xml {path} -xsl {path} or
+                		//-adv -xsl {path} -xml {path}
+                		if(args.length==8 &&
+                				args[3].equalsIgnoreCase("-adv")){
+                			int opt1=selectArg(args[4]);
+                			int opt2=selectArg(args[6]);
+                			if(opt1==1 && opt2==3){
+                				if(args[7].toUpperCase().endsWith(".XSL"))
+                					generateXML(access,args[5],stmt,time,args[7]);
+                				else
+                					generateXML(access,args[5],stmt,time,args[7]+".xsl");
+                			}
+                			else if(opt1==3 && opt2==1){
+                				if(args[5].toUpperCase().endsWith(".XSL"))
+                					generateXML(access,args[7],stmt,time,args[5]);
+                				else
+                					generateXML(access,args[7],stmt,time,args[5]+".xsl");
+                			}
+                			else
+                				printHelp();
+                		}
+                		//possible occurrences are -xml {path} or -html {path}
+                		else if(args.length==5){
+                			int opt=selectArg(args[3]);
+                			if(opt==0 || opt==3)
+                				printHelp();
+                			else if(opt==1)
+                				generateXML(access,args[4],stmt,time,null);
+                			else{
+                				generateXML(access,"temp.xml",stmt,time,null);
+                				generateHTML("temp.xml",args[4],xslStyleSheetName,true);
+                				deleteFile("temp.xml");
+                			}
+                		}
+                		//possible occurrences are
+                		//-xml {path} and -html {path}
+                		//-html {path} and -xml {path}
+                		//-html {path} and -xsl {path}
+                		//-xsl {path} and -html {path}
+                		else if(args.length==7){
+                			int opt1=selectArg(args[3]);
+                			int opt2=selectArg(args[5]);
+                			if(opt1==0 || opt2==0)
+                				printHelp();
+                			else if(opt1==1 && opt2==2){
+                				generateXML(access,args[4],stmt,time,null);
+                				generateHTML(args[4],args[6],xslStyleSheetName,true);
+                			}
+                			else if(opt1==2 && opt2==1){
+                				generateXML(access,args[6],stmt,time,null);
+                				generateHTML(args[6],args[4],xslStyleSheetName,true);
+                			}
+                			else if(opt1==2 && opt2==3){
+                				generateXML(access,"temp.xml",stmt,time,null);
+                				generateHTML("temp.xml",args[4],args[6],false);
+                				deleteFile("temp.xml");
+                			}
+                			else if(opt1==3 && opt2==2){
+                				generateXML(access,"temp.xml",stmt,time,null);
+                				generateHTML("temp.xml",args[6],args[4],false);
+                				deleteFile("temp.xml");
+                			}
+                			else
+                				printHelp();
+                		}
+                		//possible occurrences are
+                		//-xml {path} and -html {path} and -xsl {path}
+                		//-html {path} and -xsl {path} and -xml {path}
+                		//-xsl {path} and -xml {path} and -html {path}
+                		//-xml {path} and -xsl {path} and -html {path}
+                		//-html {path} and -xml {path} and -xsl {path}
+                		//-xsl {path} and -html {path} and -xml {path}
+                		else if(args.length==9){
+                			int opt1=selectArg(args[3]);
+                			int opt2=selectArg(args[5]);
+                			int opt3=selectArg(args[7]);
+                			if(opt1==0 || opt2==0 || opt3==0)
+                				printHelp();
+                			else if(opt1==1 && opt2==2 && opt3==3){
+                				generateXML(access,args[4],stmt,time,null);
+                				generateHTML(args[4],args[6],args[8],false);
+                			}
+                			else if(opt1==2 && opt2==3 && opt3==1){
+                				generateXML(access,args[8],stmt,time,null);
+                				generateHTML(args[8],args[4],args[6],false);
+                			}
+                			else if(opt1==3 && opt2==1 && opt3==2){
+                				generateXML(access,args[6],stmt,time,null);
+                				generateHTML(args[6],args[8],args[4],false);
+                			}
+                			else if(opt1==1 && opt2==3 && opt3==2){
+                				generateXML(access,args[4],stmt,time,null);
+                				generateHTML(args[4],args[8],args[6],false);
+                			}
+                			else if(opt1==2 && opt2==1 && opt3==3){
+                				generateXML(access,args[6],stmt,time,null);
+                				generateHTML(args[6],args[4],args[8],false);
+                			}
+                			else if(opt1==3 && opt2==2 && opt3==1){
+                				generateXML(access,args[8],stmt,time,null);
+                				generateHTML(args[8],args[6],args[4],false);
+                			}
+                			else
+                				printHelp();
+                		}
+                		else
+                			printHelp();
+                	}
+                	else{
+                		System.out.println(
+                				"====================================================\n" +
+                				"--- An Error Occured: No Statistics has Captured ---\n" +
+                				"-- Possible reasons:                              --\n" +
+                				"-- 1) The statement executed is a DDL statement.  --\n" +
+                				"-- Statistics will not capture for DDL statements --\n" +
+                				"-- by the Derby.                                  --\n" +
+                				"-- 2) The statement ID entered is incorrect.      --\n" +
+                				"-- 3) Schema specified does not exist.            --\n" +
+                				"====================================================\n"
+                		);
+                	}
+                }
+                else{
+                	System.out.println(
+            				"====================================================\n" +
+            				"---              An Error Occured:               ---\n" +
+            				"-------   Specified Schema does not exist.   -------\n" +
+            				"======================================================");
+                }
             }
-            allDeleted.add(info);
-          }
+            else
+                printHelp();
 
-          if (infoStream != null) {
-            message("seg=" + info + " segGen=" + segGen + " coalesced deletes=[" + (coalescedDeletes == null ? "null" : coalescedDeletes) + "] delCount=" + delCount + (segAllDeletes ? " 100% deleted" : ""));
-          }
+        }catch(Exception ex){
+            ex.printStackTrace();
         }
-        info.setBufferedDeletesGen(nextGen);
-
-        infosIDX--;
-      }
     }
 
-    assert checkDeleteStats();
-    if (infoStream != null) {
-      message("applyDeletes took " + (System.currentTimeMillis()-t0) + " msec");
-    }
-    // assert infos != segmentInfos || !any() : "infos=" + infos + " segmentInfos=" + segmentInfos + " any=" + any;
-    
-    return new ApplyDeletesResult(anyNewDeletes, nextGen++, allDeleted);
-  }
-
-  public synchronized long getNextGen() {
-    return nextGen++;
-  }
-
-  // Lock order IW -> BD
-  /* Removes any BufferedDeletes that we no longer need to
-   * store because all segments in the index have had the
-   * deletes applied. */
-  public synchronized void prune(SegmentInfos segmentInfos) {
-    assert checkDeleteStats();
-    long minGen = Long.MAX_VALUE;
-    for(SegmentInfo info : segmentInfos) {
-      minGen = Math.min(info.getBufferedDeletesGen(), minGen);
+    /**
+     * Reading the user's option
+     * @param arg user's option
+     * @return the argument type
+     */
+    private static int selectArg(String arg){
+        if(arg.equalsIgnoreCase("-xml"))
+            return XML;
+        else if(arg.equalsIgnoreCase("-html"))
+            return HTML;
+        else if(arg.equalsIgnoreCase("-xsl"))
+            return XSL;
+        else
+            return 0;
     }
 
-    if (infoStream != null) {
-      message("prune sis=" + segmentInfos + " minGen=" + minGen + " packetCount=" + deletes.size());
-    }
+    /**
+     *
+     * @param access instance of AccessDatabase class
+     * @param arg path of XML
+     * @param stmt statement executed
+     * @param time time which the statement was executed
+     * @param xsl name of the style sheet
+     * @throws Exception
+     */
+    private static void generateXML(AccessDatabase access,
+            String arg, String stmt, String time, String xsl) throws Exception{
+        CreateXMLFile xmlFile = new CreateXMLFile(access);
 
-    final int limit = deletes.size();
-    for(int delIDX=0;delIDX<limit;delIDX++) {
-      if (deletes.get(delIDX).gen >= minGen) {
-        prune(delIDX);
-        assert checkDeleteStats();
-        return;
-      }
-    }
-
-    // All deletes pruned
-    prune(limit);
-    assert !any();
-    assert checkDeleteStats();
-  }
-
-  private synchronized void prune(int count) {
-    if (count > 0) {
-      if (infoStream != null) {
-        message("pruneDeletes: prune " + count + " packets; " + (deletes.size() - count) + " packets remain");
-      }
-      for(int delIDX=0;delIDX<count;delIDX++) {
-        final FrozenBufferedDeletes packet = deletes.get(delIDX);
-        numTerms.addAndGet(-packet.numTermDeletes);
-        assert numTerms.get() >= 0;
-        bytesUsed.addAndGet(-packet.bytesUsed);
-        assert bytesUsed.get() >= 0;
-      }
-      deletes.subList(0, count).clear();
-    }
-  }
-
-  // Delete by Term
-  private synchronized long applyTermDeletes(Iterable<Term> termsIter, SegmentReader reader) throws IOException {
-    long delCount = 0;
-        
-    assert checkDeleteTerm(null);
-    
-    final TermDocs docs = reader.termDocs();
-
-    for (Term term : termsIter) {
-        
-      // Since we visit terms sorted, we gain performance
-      // by re-using the same TermsEnum and seeking only
-      // forwards
-      assert checkDeleteTerm(term);
-      docs.seek(term);
-          
-      while (docs.next()) {
-        final int docID = docs.doc();
-        reader.deleteDocument(docID);
-        // TODO: we could/should change
-        // reader.deleteDocument to return boolean
-        // true if it did in fact delete, because here
-        // we could be deleting an already-deleted doc
-        // which makes this an upper bound:
-        delCount++;
-      }
-    }
-
-    return delCount;
-  }
-
-  public static class QueryAndLimit {
-    public final Query query;
-    public final int limit;
-    public QueryAndLimit(Query query, int limit) {
-      this.query = query;       
-      this.limit = limit;
-    }
-  }
-
-  // Delete by query
-  private synchronized long applyQueryDeletes(Iterable<QueryAndLimit> queriesIter, SegmentReader reader) throws IOException {
-    long delCount = 0;
-
-    for (QueryAndLimit ent : queriesIter) {
-      Query query = ent.query;
-      int limit = ent.limit;
-      final DocIdSet docs = new QueryWrapperFilter(query).getDocIdSet(reader);
-      if (docs != null) {
-        final DocIdSetIterator it = docs.iterator();
-        if (it != null) {
-          while(true)  {
-            int doc = it.nextDoc();
-            if (doc >= limit)
-              break;
-
-            reader.deleteDocument(doc);
-            // TODO: we could/should change
-            // reader.deleteDocument to return boolean
-            // true if it did in fact delete, because here
-            // we could be deleting an already-deleted doc
-            // which makes this an upper bound:
-            delCount++;
-          }
+        if(arg.toUpperCase().endsWith(".XML")){
+            xmlFile.writeTheXMLFile(stmt, time,
+                    access.getData(),
+                    arg, xsl);
         }
-      }
+        else{
+            xmlFile.writeTheXMLFile(stmt, time,
+                    access.getData(),
+                    arg.concat(".xml"),
+                    xsl);
+        }
     }
 
-    return delCount;
-  }
+    /**
+     *
+     * @param arg path to xml
+     * @param path path of HTML
+     * @param style path to xsl
+     * @param def whether the default xsl or not
+     * @throws Exception
+     */
+    private static void generateHTML(String arg, String path,
+            String style, boolean def) throws Exception{
+        CreateHTMLFile htmlFile = new CreateHTMLFile();
 
-  // used only by assert
-  private boolean checkDeleteTerm(Term term) {
-    if (term != null) {
-      assert lastDeleteTerm == null || term.compareTo(lastDeleteTerm) > 0: "lastTerm=" + lastDeleteTerm + " vs term=" + term;
+        if(arg.toUpperCase().endsWith(".XML")){
+            htmlFile.getHTML(arg, style, path, def);
+        }
+        else{
+            htmlFile.getHTML(arg.concat(".xml"), style, path, def);
+        }
     }
-    // TODO: we re-use term now in our merged iterable, but we shouldn't clone, instead copy for this assert
-    lastDeleteTerm = term == null ? null : new Term(term.field(), term.text());
-    return true;
-  }
-  
-  // only for assert
-  private boolean checkDeleteStats() {
-    int numTerms2 = 0;
-    long bytesUsed2 = 0;
-    for(FrozenBufferedDeletes packet : deletes) {
-      numTerms2 += packet.numTermDeletes;
-      bytesUsed2 += packet.bytesUsed;
+
+    private static void printHelp(){
+        System.out.println
+        (
+                "================================================\n" +
+                "-------------- PlanExporter Tool ---------------\n" +
+                "--   You can pass 5 arguments (minimum), or   --\n" +
+                "--       7 arguments or 8 arguments or        --\n" +
+                "-----------  9 arguments (maximum)  ------------\n" +
+                "--         separated by a space.              --\n" +
+                "---------------Mandatory Arguments--------------\n" +
+                "1) database URL --------------------------------\n" +
+                "2) database schema -----------------------------\n" +
+                "3) statement ID (36 characters) ----------------\n" +
+                "---------------Optional Arguments---------------\n" +
+                "-----------Choose at least one option-----------\n" +
+                "a) -xml {pathToXML} or -html {pathToHTML} ------\n" +
+                "b) -xml {pathToXML} -html {pathToHTML} ---------\n" +
+                "c) -xsl {pathToXSL} -html {pathToHTML} ---------\n" +
+                "d) -xml {pathToXML} -xsl {pathToXSL} -----------\n" +
+                "      -html {pathToHTML} -----------------------\n" +
+                "e) -adv -xml {pathToXML} -xsl {pathToXSL} ------\n" +
+                "================================================\n"
+        );
     }
-    assert numTerms2 == numTerms.get(): "numTerms2=" + numTerms2 + " vs " + numTerms.get();
-    assert bytesUsed2 == bytesUsed.get(): "bytesUsed2=" + bytesUsed2 + " vs " + bytesUsed;
-    return true;
-  }
+
+    private static void deleteFile(final String fileName)
+    {
+        AccessController.doPrivileged
+        (new java.security.PrivilegedAction() {
+
+            public Object run() {
+                File delFile = new File(fileName);
+                if (!delFile.exists())
+                    return null;
+                delFile.delete();
+                return null;
+            }
+        }
+        );
+
+    }
+
 }

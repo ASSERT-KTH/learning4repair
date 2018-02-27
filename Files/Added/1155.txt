@@ -19,538 +19,316 @@ package org.apache.lucene.index;
  * limitations under the License.
  */
 
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.util.ThreadInterruptedException;
-import org.apache.lucene.util.CollectionUtil;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.SortedMap;
+import java.util.TreeMap;
 
-import java.io.IOException;
-import java.util.List;
-import java.util.ArrayList;
-import java.util.Comparator;
+import org.apache.lucene.index.FieldInfo.IndexOptions;
 
-/** A {@link MergeScheduler} that runs each merge using a
- *  separate thread.
- *
- *  <p>Specify the max number of threads that may run at
- *  once with {@link #setMaxThreadCount}.</p>
- *
- *  <p>Separately specify the maximum number of simultaneous
- *  merges with {@link #setMaxMergeCount}.  If the number of
- *  merges exceeds the max number of threads then the
- *  largest merges are paused until one of the smaller
- *  merges completes.</p>
- *
- *  <p>If more than {@link #getMaxMergeCount} merges are
- *  requested then this class will forcefully throttle the
- *  incoming threads by pausing until one more more merges
- *  complete.</p>
- */ 
-public class ConcurrentMergeScheduler extends MergeScheduler {
-
-  private int mergeThreadPriority = -1;
-
-  /** List of currently active {@link MergeThread}s. */
-  protected List<MergeThread> mergeThreads = new ArrayList<MergeThread>();
-
-  // Max number of merge threads allowed to be running at
-  // once.  When there are more merges then this, we
-  // forcefully pause the larger ones, letting the smaller
-  // ones run, up until maxMergeCount merges at which point
-  // we forcefully pause incoming threads (that presumably
-  // are the ones causing so much merging).  We dynamically
-  // default this from 1 to 3, depending on how many cores
-  // you have:
-  private int maxThreadCount = Math.max(1, Math.min(3, Runtime.getRuntime().availableProcessors()/2));
-
-  // Max number of merges we accept before forcefully
-  // throttling the incoming threads
-  private int maxMergeCount = maxThreadCount+2;
-
-  /** {@link Directory} that holds the index. */
-  protected Directory dir;
-
-  /** {@link IndexWriter} that owns this instance. */
-  protected IndexWriter writer;
-
-  /** How many {@link MergeThread}s have kicked off (this is use
-   *  to name them). */
-  protected int mergeThreadCount;
-
-  /** Sole constructor, with all settings set to default
-   *  values. */
-  public ConcurrentMergeScheduler() {
-  }
-
-  /** Sets the max # simultaneous merge threads that should
-   *  be running at once.  This must be <= {@link
-   *  #setMaxMergeCount}. */
-  public void setMaxThreadCount(int count) {
-    if (count < 1) {
-      throw new IllegalArgumentException("count should be at least 1");
-    }
-    if (count > maxMergeCount) {
-      throw new IllegalArgumentException("count should be <= maxMergeCount (= " + maxMergeCount + ")");
-    }
-    maxThreadCount = count;
-  }
-
-  /** Returns {@code maxThreadCount}.
-   *
-   * @see #setMaxThreadCount(int) */
-  public int getMaxThreadCount() {
-    return maxThreadCount;
-  }
-
-  /** Sets the max # simultaneous merges that are allowed.
-   *  If a merge is necessary yet we already have this many
-   *  threads running, the incoming thread (that is calling
-   *  add/updateDocument) will block until a merge thread
-   *  has completed.  Note that we will only run the
-   *  smallest {@link #setMaxThreadCount} merges at a time. */
-  public void setMaxMergeCount(int count) {
-    if (count < 1) {
-      throw new IllegalArgumentException("count should be at least 1");
-    }
-    if (count < maxThreadCount) {
-      throw new IllegalArgumentException("count should be >= maxThreadCount (= " + maxThreadCount + ")");
-    }
-    maxMergeCount = count;
-  }
-
-  /** See {@link #setMaxMergeCount}. */
-  public int getMaxMergeCount() {
-    return maxMergeCount;
-  }
-
-  /** Return the priority that merge threads run at.  By
-   *  default the priority is 1 plus the priority of (ie,
-   *  slightly higher priority than) the first thread that
-   *  calls merge. */
-  public synchronized int getMergeThreadPriority() {
-    initMergeThreadPriority();
-    return mergeThreadPriority;
-  }
-
-  /** Set the base priority that merge threads run at.
-   *  Note that CMS may increase priority of some merge
-   *  threads beyond this base priority.  It's best not to
-   *  set this any higher than
-   *  Thread.MAX_PRIORITY-maxThreadCount, so that CMS has
-   *  room to set relative priority among threads.  */
-  public synchronized void setMergeThreadPriority(int pri) {
-    if (pri > Thread.MAX_PRIORITY || pri < Thread.MIN_PRIORITY)
-      throw new IllegalArgumentException("priority must be in range " + Thread.MIN_PRIORITY + " .. " + Thread.MAX_PRIORITY + " inclusive");
-    mergeThreadPriority = pri;
-    updateMergeThreads();
-  }
-
-  /** Sorts {@link MergeThread}s; larger merges come first. */
-  protected static final Comparator<MergeThread> compareByMergeDocCount = new Comparator<MergeThread>() {
-    public int compare(MergeThread t1, MergeThread t2) {
-      final MergePolicy.OneMerge m1 = t1.getCurrentMerge();
-      final MergePolicy.OneMerge m2 = t2.getCurrentMerge();
-      
-      final int c1 = m1 == null ? Integer.MAX_VALUE : m1.totalDocCount;
-      final int c2 = m2 == null ? Integer.MAX_VALUE : m2.totalDocCount;
-
-      return c2 - c1;
-    }
-  };
-
+/** 
+ * Collection of {@link FieldInfo}s (accessible by number or by name).
+ *  @lucene.experimental
+ */
+public class FieldInfos implements Iterable<FieldInfo> {
+  private final boolean hasFreq;
+  private final boolean hasProx;
+  private final boolean hasPayloads;
+  private final boolean hasOffsets;
+  private final boolean hasVectors;
+  private final boolean hasNorms;
+  private final boolean hasDocValues;
+  
+  private final SortedMap<Integer,FieldInfo> byNumber = new TreeMap<Integer,FieldInfo>();
+  private final HashMap<String,FieldInfo> byName = new HashMap<String,FieldInfo>();
+  private final Collection<FieldInfo> values; // for an unmodifiable iterator
+  
   /**
-   * Called whenever the running merges have changed, to pause & unpause
-   * threads. This method sorts the merge threads by their merge size in
-   * descending order and then pauses/unpauses threads from first to last --
-   * that way, smaller merges are guaranteed to run before larger ones.
+   * Constructs a new FieldInfos from an array of FieldInfo objects
    */
-  protected synchronized void updateMergeThreads() {
-
-    // Only look at threads that are alive & not in the
-    // process of stopping (ie have an active merge):
-    final List<MergeThread> activeMerges = new ArrayList<MergeThread>();
-
-    int threadIdx = 0;
-    while (threadIdx < mergeThreads.size()) {
-      final MergeThread mergeThread = mergeThreads.get(threadIdx);
-      if (!mergeThread.isAlive()) {
-        // Prune any dead threads
-        mergeThreads.remove(threadIdx);
-        continue;
-      }
-      if (mergeThread.getCurrentMerge() != null) {
-        activeMerges.add(mergeThread);
-      }
-      threadIdx++;
-    }
-
-    // Sort the merge threads in descending order.
-    CollectionUtil.mergeSort(activeMerges, compareByMergeDocCount);
+  public FieldInfos(FieldInfo[] infos) {
+    boolean hasVectors = false;
+    boolean hasProx = false;
+    boolean hasPayloads = false;
+    boolean hasOffsets = false;
+    boolean hasFreq = false;
+    boolean hasNorms = false;
+    boolean hasDocValues = false;
     
-    int pri = mergeThreadPriority;
-    final int activeMergeCount = activeMerges.size();
-    for (threadIdx=0;threadIdx<activeMergeCount;threadIdx++) {
-      final MergeThread mergeThread = activeMerges.get(threadIdx);
-      final MergePolicy.OneMerge merge = mergeThread.getCurrentMerge();
-      if (merge == null) { 
-        continue;
+    for (FieldInfo info : infos) {
+      FieldInfo previous = byNumber.put(info.number, info);
+      if (previous != null) {
+        throw new IllegalArgumentException("duplicate field numbers: " + previous.name + " and " + info.name + " have: " + info.number);
       }
-
-      // pause the thread if maxThreadCount is smaller than the number of merge threads.
-      final boolean doPause = threadIdx < activeMergeCount - maxThreadCount;
-
-      if (verbose()) {
-        if (doPause != merge.getPause()) {
-          if (doPause) {
-            message("pause thread " + mergeThread.getName());
-          } else {
-            message("unpause thread " + mergeThread.getName());
-          }
-        }
+      previous = byName.put(info.name, info);
+      if (previous != null) {
+        throw new IllegalArgumentException("duplicate field names: " + previous.number + " and " + info.number + " have: " + info.name);
       }
-      if (doPause != merge.getPause()) {
-        merge.setPause(doPause);
-      }
-
-      if (!doPause) {
-        if (verbose()) {
-          message("set priority of merge thread " + mergeThread.getName() + " to " + pri);
-        }
-        mergeThread.setThreadPriority(pri);
-        pri = Math.min(Thread.MAX_PRIORITY, 1+pri);
-      }
+      
+      hasVectors |= info.hasVectors();
+      hasProx |= info.isIndexed() && info.getIndexOptions().compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) >= 0;
+      hasFreq |= info.isIndexed() && info.getIndexOptions() != IndexOptions.DOCS_ONLY;
+      hasOffsets |= info.isIndexed() && info.getIndexOptions().compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) >= 0;
+      hasNorms |= info.hasNorms();
+      hasDocValues |= info.hasDocValues();
+      hasPayloads |= info.hasPayloads();
     }
+    
+    this.hasVectors = hasVectors;
+    this.hasProx = hasProx;
+    this.hasPayloads = hasPayloads;
+    this.hasOffsets = hasOffsets;
+    this.hasFreq = hasFreq;
+    this.hasNorms = hasNorms;
+    this.hasDocValues = hasDocValues;
+    this.values = Collections.unmodifiableCollection(byNumber.values());
+  }
+  
+  /** Returns true if any fields have freqs */
+  public boolean hasFreq() {
+    return hasFreq;
+  }
+  
+  /** Returns true if any fields have positions */
+  public boolean hasProx() {
+    return hasProx;
   }
 
-  /**
-   * Returns true if verbosing is enabled. This method is usually used in
-   * conjunction with {@link #message(String)}, like that:
-   * 
-   * <pre class="prettyprint">
-   * if (verbose()) {
-   *   message(&quot;your message&quot;);
-   * }
-   * </pre>
-   */
-  protected boolean verbose() {
-    return writer != null && writer.infoStream.isEnabled("CMS");
+  /** Returns true if any fields have payloads */
+  public boolean hasPayloads() {
+    return hasPayloads;
+  }
+
+  /** Returns true if any fields have offsets */
+  public boolean hasOffsets() {
+    return hasOffsets;
+  }
+  
+  /** Returns true if any fields have vectors */
+  public boolean hasVectors() {
+    return hasVectors;
+  }
+  
+  /** Returns true if any fields have norms */
+  public boolean hasNorms() {
+    return hasNorms;
+  }
+  
+  /** Returns true if any fields have DocValues */
+  public boolean hasDocValues() {
+    return hasDocValues;
+  }
+  
+  /** Returns the number of fields */
+  public int size() {
+    assert byNumber.size() == byName.size();
+    return byNumber.size();
   }
   
   /**
-   * Outputs the given message - this method assumes {@link #verbose()} was
-   * called and returned true.
+   * Returns an iterator over all the fieldinfo objects present,
+   * ordered by ascending field number
    */
-  protected void message(String message) {
-    writer.infoStream.message("CMS", message);
+  // TODO: what happens if in fact a different order is used?
+  public Iterator<FieldInfo> iterator() {
+    return values.iterator();
   }
 
-  private synchronized void initMergeThreadPriority() {
-    if (mergeThreadPriority == -1) {
-      // Default to slightly higher priority than our
-      // calling thread
-      mergeThreadPriority = 1+Thread.currentThread().getPriority();
-      if (mergeThreadPriority > Thread.MAX_PRIORITY)
-        mergeThreadPriority = Thread.MAX_PRIORITY;
+  /**
+   * Return the fieldinfo object referenced by the field name
+   * @return the FieldInfo object or null when the given fieldName
+   * doesn't exist.
+   */  
+  public FieldInfo fieldInfo(String fieldName) {
+    return byName.get(fieldName);
+  }
+
+  /**
+   * Return the fieldinfo object referenced by the fieldNumber.
+   * @param fieldNumber field's number. if this is negative, this method
+   *        always returns null.
+   * @return the FieldInfo object or null when the given fieldNumber
+   * doesn't exist.
+   */  
+  // TODO: fix this negative behavior, this was something related to Lucene3x?
+  // if the field name is empty, i think it writes the fieldNumber as -1
+  public FieldInfo fieldInfo(int fieldNumber) {
+    return (fieldNumber >= 0) ? byNumber.get(fieldNumber) : null;
+  }
+  
+  static final class FieldNumbers {
+    
+    private final Map<Integer,String> numberToName;
+    private final Map<String,Integer> nameToNumber;
+    private int lowestUnassignedFieldNumber = -1;
+    
+    FieldNumbers() {
+      this.nameToNumber = new HashMap<String, Integer>();
+      this.numberToName = new HashMap<Integer, String>();
     }
-  }
+    
+    /**
+     * Returns the global field number for the given field name. If the name
+     * does not exist yet it tries to add it with the given preferred field
+     * number assigned if possible otherwise the first unassigned field number
+     * is used as the field number.
+     */
+    synchronized int addOrGet(String fieldName, int preferredFieldNumber) {
+      Integer fieldNumber = nameToNumber.get(fieldName);
+      if (fieldNumber == null) {
+        final Integer preferredBoxed = Integer.valueOf(preferredFieldNumber);
 
-  @Override
-  public void close() {
-    sync();
-  }
-
-  /** Wait for any running merge threads to finish. This call is not interruptible as used by {@link #close()}. */
-  public void sync() {
-    boolean interrupted = false;
-    try {
-      while (true) {
-        MergeThread toSync = null;
-        synchronized (this) {
-          for (MergeThread t : mergeThreads) {
-            if (t.isAlive()) {
-              toSync = t;
-              break;
-            }
-          }
-        }
-        if (toSync != null) {
-          try {
-            toSync.join();
-          } catch (InterruptedException ie) {
-            // ignore this Exception, we will retry until all threads are dead
-            interrupted = true;
-          }
+        if (preferredFieldNumber != -1 && !numberToName.containsKey(preferredBoxed)) {
+          // cool - we can use this number globally
+          fieldNumber = preferredBoxed;
         } else {
-          break;
+          // find a new FieldNumber
+          while (numberToName.containsKey(++lowestUnassignedFieldNumber)) {
+            // might not be up to date - lets do the work once needed
+          }
+          fieldNumber = lowestUnassignedFieldNumber;
         }
+        
+        numberToName.put(fieldNumber, fieldName);
+        nameToNumber.put(fieldName, fieldNumber);
       }
-    } finally {
-      // finally, restore interrupt status:
-      if (interrupted) Thread.currentThread().interrupt();
-    }
-  }
 
-  /**
-   * Returns the number of merge threads that are alive. Note that this number
-   * is &le; {@link #mergeThreads} size.
-   */
-  protected synchronized int mergeThreadCount() {
-    int count = 0;
-    for (MergeThread mt : mergeThreads) {
-      if (mt.isAlive() && mt.getCurrentMerge() != null) {
-        count++;
+      return fieldNumber.intValue();
+    }
+
+    /**
+     * Sets the given field number and name if not yet set. 
+     */
+    synchronized void setIfNotSet(int fieldNumber, String fieldName) {
+      final Integer boxedFieldNumber = Integer.valueOf(fieldNumber);
+      if (!numberToName.containsKey(boxedFieldNumber)
+          && !nameToNumber.containsKey(fieldName)) {
+        numberToName.put(boxedFieldNumber, fieldName);
+        nameToNumber.put(fieldName, boxedFieldNumber);
+      } else {
+        assert containsConsistent(boxedFieldNumber, fieldName);
       }
-    }
-    return count;
-  }
-
-  @Override
-  public synchronized void merge(IndexWriter writer) throws IOException {
-
-    assert !Thread.holdsLock(writer);
-
-    this.writer = writer;
-
-    initMergeThreadPriority();
-
-    dir = writer.getDirectory();
-
-    // First, quickly run through the newly proposed merges
-    // and add any orthogonal merges (ie a merge not
-    // involving segments already pending to be merged) to
-    // the queue.  If we are way behind on merging, many of
-    // these newly proposed merges will likely already be
-    // registered.
-
-    if (verbose()) {
-      message("now merge");
-      message("  index: " + writer.segString());
     }
     
-    // Iterate, pulling from the IndexWriter's queue of
-    // pending merges, until it's empty:
-    while (true) {
-
-      long startStallTime = 0;
-      while (writer.hasPendingMerges() && mergeThreadCount() >= maxMergeCount) {
-        // This means merging has fallen too far behind: we
-        // have already created maxMergeCount threads, and
-        // now there's at least one more merge pending.
-        // Note that only maxThreadCount of
-        // those created merge threads will actually be
-        // running; the rest will be paused (see
-        // updateMergeThreads).  We stall this producer
-        // thread to prevent creation of new segments,
-        // until merging has caught up:
-        startStallTime = System.currentTimeMillis();
-        if (verbose()) {
-          message("    too many merges; stalling...");
-        }
-        try {
-          wait();
-        } catch (InterruptedException ie) {
-          throw new ThreadInterruptedException(ie);
-        }
-      }
-
-      if (verbose()) {
-        if (startStallTime != 0) {
-          message("  stalled for " + (System.currentTimeMillis()-startStallTime) + " msec");
-        }
-      }
-
-      MergePolicy.OneMerge merge = writer.getNextMerge();
-      if (merge == null) {
-        if (verbose()) {
-          message("  no more merges pending; now return");
-        }
-        return;
-      }
-
-      boolean success = false;
-      try {
-        if (verbose()) {
-          message("  consider merge " + writer.segString(merge.segments));
-        }
-
-        // OK to spawn a new merge thread to handle this
-        // merge:
-        final MergeThread merger = getMergeThread(writer, merge);
-        mergeThreads.add(merger);
-        if (verbose()) {
-          message("    launch new thread [" + merger.getName() + "]");
-        }
-
-        merger.start();
-
-        // Must call this after starting the thread else
-        // the new thread is removed from mergeThreads
-        // (since it's not alive yet):
-        updateMergeThreads();
-
-        success = true;
-      } finally {
-        if (!success) {
-          writer.mergeFinish(merge);
-        }
-      }
+    // used by assert
+    synchronized boolean containsConsistent(Integer number, String name) {
+      return name.equals(numberToName.get(number))
+          && number.equals(nameToNumber.get(name));
     }
-  }
-
-  /** Does the actual merge, by calling {@link IndexWriter#merge} */
-  protected void doMerge(MergePolicy.OneMerge merge) throws IOException {
-    writer.merge(merge);
-  }
-
-  /** Create and return a new MergeThread */
-  protected synchronized MergeThread getMergeThread(IndexWriter writer, MergePolicy.OneMerge merge) throws IOException {
-    final MergeThread thread = new MergeThread(writer, merge);
-    thread.setThreadPriority(mergeThreadPriority);
-    thread.setDaemon(true);
-    thread.setName("Lucene Merge Thread #" + mergeThreadCount++);
-    return thread;
-  }
-
-  /** Runs a merge thread, which may run one or more merges
-   *  in sequence. */
-  protected class MergeThread extends Thread {
-
-    IndexWriter tWriter;
-    MergePolicy.OneMerge startMerge;
-    MergePolicy.OneMerge runningMerge;
-    private volatile boolean done;
-
-    /** Sole constructor. */
-    public MergeThread(IndexWriter writer, MergePolicy.OneMerge startMerge) {
-      this.tWriter = writer;
-      this.startMerge = startMerge;
-    }
-
-    /** Record the currently running merge. */
-    public synchronized void setRunningMerge(MergePolicy.OneMerge merge) {
-      runningMerge = merge;
-    }
-
-    /** Return the currently running merge. */
-    public synchronized MergePolicy.OneMerge getRunningMerge() {
-      return runningMerge;
-    }
-
-    /** Return the current merge, or null if this {@code
-     *  MergeThread} is done. */
-    public synchronized MergePolicy.OneMerge getCurrentMerge() {
-      if (done) {
-        return null;
-      } else if (runningMerge != null) {
-        return runningMerge;
-      } else {
-        return startMerge;
-      }
-    }
-
-    /** Set the priority of this thread. */
-    public void setThreadPriority(int pri) {
-      try {
-        setPriority(pri);
-      } catch (NullPointerException npe) {
-        // Strangely, Sun's JDK 1.5 on Linux sometimes
-        // throws NPE out of here...
-      } catch (SecurityException se) {
-        // Ignore this because we will still run fine with
-        // normal thread priority
-      }
-    }
-
-    @Override
-    public void run() {
-      
-      // First time through the while loop we do the merge
-      // that we were started with:
-      MergePolicy.OneMerge merge = this.startMerge;
-      
-      try {
-
-        if (verbose()) {
-          message("  merge thread: start");
-        }
-
-        while(true) {
-          setRunningMerge(merge);
-          doMerge(merge);
-
-          // Subsequent times through the loop we do any new
-          // merge that writer says is necessary:
-          merge = tWriter.getNextMerge();
-          if (merge != null) {
-            updateMergeThreads();
-            if (verbose()) {
-              message("  merge thread: do another merge " + tWriter.segString(merge.segments));
-            }
-          } else {
-            break;
-          }
-        }
-
-        if (verbose()) {
-          message("  merge thread: done");
-        }
-
-      } catch (Throwable exc) {
-
-        // Ignore the exception if it was due to abort:
-        if (!(exc instanceof MergePolicy.MergeAbortedException)) {
-          //System.out.println(Thread.currentThread().getName() + ": CMS: exc");
-          //exc.printStackTrace(System.out);
-          if (!suppressExceptions) {
-            // suppressExceptions is normally only set during
-            // testing.
-            handleMergeException(exc);
-          }
-        }
-      } finally {
-        done = true;
-        synchronized(ConcurrentMergeScheduler.this) {
-          updateMergeThreads();
-          ConcurrentMergeScheduler.this.notifyAll();
-        }
-      }
-    }
-  }
-
-  /** Called when an exception is hit in a background merge
-   *  thread */
-  protected void handleMergeException(Throwable exc) {
-    try {
-      // When an exception is hit during merge, IndexWriter
-      // removes any partial files and then allows another
-      // merge to run.  If whatever caused the error is not
-      // transient then the exception will keep happening,
-      // so, we sleep here to avoid saturating CPU in such
-      // cases:
-      Thread.sleep(250);
-    } catch (InterruptedException ie) {
-      throw new ThreadInterruptedException(ie);
-    }
-    throw new MergePolicy.MergeException(exc, dir);
-  }
-
-  private boolean suppressExceptions;
-
-  /** Used for testing */
-  void setSuppressExceptions() {
-    suppressExceptions = true;
-  }
-
-  /** Used for testing */
-  void clearSuppressExceptions() {
-    suppressExceptions = false;
   }
   
-  @Override
-  public String toString() {
-    StringBuilder sb = new StringBuilder(getClass().getSimpleName() + ": ");
-    sb.append("maxThreadCount=").append(maxThreadCount).append(", ");    
-    sb.append("maxMergeCount=").append(maxMergeCount).append(", ");    
-    sb.append("mergeThreadPriority=").append(mergeThreadPriority);
-    return sb.toString();
+  static final class Builder {
+    private final HashMap<String,FieldInfo> byName = new HashMap<String,FieldInfo>();
+    final FieldNumbers globalFieldNumbers;
+
+    Builder() {
+      this(new FieldNumbers());
+    }
+    
+    /**
+     * Creates a new instance with the given {@link FieldNumbers}. 
+     */
+    Builder(FieldNumbers globalFieldNumbers) {
+      assert globalFieldNumbers != null;
+      this.globalFieldNumbers = globalFieldNumbers;
+    }
+
+    public void add(FieldInfos other) {
+      for(FieldInfo fieldInfo : other){ 
+        add(fieldInfo);
+      }
+    }
+   
+    /**
+     * adds the given field to this FieldInfos name / number mapping. The given FI
+     * must be present in the global field number mapping before this method it
+     * called
+     */
+    private void putInternal(FieldInfo fi) {
+      assert !byName.containsKey(fi.name);
+      assert globalFieldNumbers.containsConsistent(Integer.valueOf(fi.number), fi.name);
+      byName.put(fi.name, fi);
+    }
+    
+    /** If the field is not yet known, adds it. If it is known, checks to make
+     *  sure that the isIndexed flag is the same as was given previously for this
+     *  field. If not - marks it as being indexed.  Same goes for the TermVector
+     * parameters.
+     *
+     * @param name The name of the field
+     * @param isIndexed true if the field is indexed
+     * @param storeTermVector true if the term vector should be stored
+     * @param omitNorms true if the norms for the indexed field should be omitted
+     * @param storePayloads true if payloads should be stored for this field
+     * @param indexOptions if term freqs should be omitted for this field
+     */
+    // TODO: fix testCodecs to do this another way, its the only user of this
+    FieldInfo addOrUpdate(String name, boolean isIndexed, boolean storeTermVector,
+                         boolean omitNorms, boolean storePayloads, IndexOptions indexOptions, DocValues.Type docValues, DocValues.Type normType) {
+      return addOrUpdateInternal(name, -1, isIndexed, storeTermVector, omitNorms, storePayloads, indexOptions, docValues, normType);
+    }
+
+    /** NOTE: this method does not carry over termVector
+     *  booleans nor docValuesType; the indexer chain
+     *  (TermVectorsConsumerPerField, DocFieldProcessor) must
+     *  set these fields when they succeed in consuming
+     *  the document */
+    public FieldInfo addOrUpdate(String name, IndexableFieldType fieldType) {
+      // TODO: really, indexer shouldn't even call this
+      // method (it's only called from DocFieldProcessor);
+      // rather, each component in the chain should update
+      // what it "owns".  EG fieldType.indexOptions() should
+      // be updated by maybe FreqProxTermsWriterPerField:
+      return addOrUpdateInternal(name, -1, fieldType.indexed(), false,
+                                 fieldType.omitNorms(), false,
+                                 fieldType.indexOptions(), null, null);
+    }
+
+    private FieldInfo addOrUpdateInternal(String name, int preferredFieldNumber, boolean isIndexed,
+        boolean storeTermVector,
+        boolean omitNorms, boolean storePayloads, IndexOptions indexOptions, DocValues.Type docValues, DocValues.Type normType) {
+      FieldInfo fi = fieldInfo(name);
+      if (fi == null) {
+        // get a global number for this field
+        final int fieldNumber = globalFieldNumbers.addOrGet(name, preferredFieldNumber);
+        fi = addInternal(name, fieldNumber, isIndexed, storeTermVector, omitNorms, storePayloads, indexOptions, docValues, normType);
+      } else {
+        fi.update(isIndexed, storeTermVector, omitNorms, storePayloads, indexOptions);
+        if (docValues != null) {
+          fi.setDocValuesType(docValues);
+        }
+        if (!fi.omitsNorms() && normType != null) {
+          fi.setNormValueType(normType);
+        }
+      }
+      return fi;
+    }
+    
+    public FieldInfo add(FieldInfo fi) {
+      // IMPORTANT - reuse the field number if possible for consistent field numbers across segments
+      return addOrUpdateInternal(fi.name, fi.number, fi.isIndexed(), fi.hasVectors(),
+                 fi.omitsNorms(), fi.hasPayloads(),
+                 fi.getIndexOptions(), fi.getDocValuesType(), fi.getNormType());
+    }
+    
+    private FieldInfo addInternal(String name, int fieldNumber, boolean isIndexed,
+                                  boolean storeTermVector, boolean omitNorms, boolean storePayloads,
+                                  IndexOptions indexOptions, DocValues.Type docValuesType, DocValues.Type normType) {
+      globalFieldNumbers.setIfNotSet(fieldNumber, name);
+      final FieldInfo fi = new FieldInfo(name, isIndexed, fieldNumber, storeTermVector, omitNorms, storePayloads, indexOptions, docValuesType, normType, null);
+      putInternal(fi);
+      return fi;
+    }
+
+    public FieldInfo fieldInfo(String fieldName) {
+      return byName.get(fieldName);
+    }
+    
+    final FieldInfos finish() {
+      return new FieldInfos(byName.values().toArray(new FieldInfo[byName.size()]));
+    }
   }
 }

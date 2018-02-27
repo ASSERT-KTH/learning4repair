@@ -18,273 +18,394 @@
  */
 package org.apache.solr.search;
 
-import org.apache.solr.SolrTestCaseJ4;
-import org.apache.solr.common.SolrInputDocument;
-import org.apache.solr.request.SolrQueryRequest;
-import org.apache.solr.response.ResultContext;
-import org.apache.solr.response.SolrQueryResponse;
-import org.junit.Before;
-import org.junit.BeforeClass;
-import org.junit.Test;
+import org.apache.lucene.util.LuceneTestCase;
+import org.apache.solr.common.util.NamedList;
+import org.apache.solr.util.ConcurrentLRUCache;
 
-import java.util.*;
+import java.io.IOException;
+import java.io.Serializable;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Random;
+import java.util.concurrent.atomic.AtomicInteger;
 
-public class TestRangeQuery extends SolrTestCaseJ4 {
 
-  @BeforeClass
-  public static void beforeClass() throws Exception {
-    initCore("solrconfig.xml", "schema11.xml");
-  }
-
-  @Override
-  @Before
-  public void setUp() throws Exception {
-    // if you override setUp or tearDown, you better call
-    // the super classes version
-    super.setUp();
-    clearIndex();
-    assertU(commit());
-  }
-
-  Random r = new Random(1);
-
-  void addInt(SolrInputDocument doc, int l, int u, String... fields) {
-    int v=0;
-    if (0==l && l==u) {
-      v=r.nextInt();
-    } else {
-      v=r.nextInt(u-l)+l;
+/**
+ * Test for FastLRUCache
+ *
+ *
+ * @see org.apache.solr.search.FastLRUCache
+ * @since solr 1.4
+ */
+public class TestFastLRUCache extends LuceneTestCase {
+  
+  public void testPercentageAutowarm() throws IOException {
+    FastLRUCache<Object, Object> fastCache = new FastLRUCache<Object, Object>();
+    Map<String, String> params = new HashMap<String, String>();
+    params.put("size", "100");
+    params.put("initialSize", "10");
+    params.put("autowarmCount", "100%");
+    CacheRegenerator cr = createCodeRegenerator();
+    Object o = fastCache.init(params, null, cr);
+    fastCache.setState(SolrCache.State.LIVE);
+    for (int i = 0; i < 101; i++) {
+      fastCache.put(i + 1, "" + (i + 1));
     }
-    for (String field : fields) {
-      doc.addField(field, v);
-    }
+    assertEquals("25", fastCache.get(25));
+    assertEquals(null, fastCache.get(110));
+    NamedList<Serializable> nl = fastCache.getStatistics();
+    assertEquals(2L, nl.get("lookups"));
+    assertEquals(1L, nl.get("hits"));
+    assertEquals(101L, nl.get("inserts"));
+    assertEquals(null, fastCache.get(1));  // first item put in should be the first out
+    FastLRUCache<Object, Object> fastCacheNew = new FastLRUCache<Object, Object>();
+    fastCacheNew.init(params, o, cr);
+    fastCacheNew.warm(null, fastCache);
+    fastCacheNew.setState(SolrCache.State.LIVE);
+    fastCache.close();
+    fastCacheNew.put(103, "103");
+    assertEquals("90", fastCacheNew.get(90));
+    assertEquals("50", fastCacheNew.get(50));
+    nl = fastCacheNew.getStatistics();
+    assertEquals(2L, nl.get("lookups"));
+    assertEquals(2L, nl.get("hits"));
+    assertEquals(1L, nl.get("inserts"));
+    assertEquals(0L, nl.get("evictions"));
+    assertEquals(5L, nl.get("cumulative_lookups"));
+    assertEquals(3L, nl.get("cumulative_hits"));
+    assertEquals(102L, nl.get("cumulative_inserts"));
+    fastCacheNew.close();
   }
-
-  interface DocProcessor {
-    public void process(SolrInputDocument doc);
+  
+  public void testPercentageAutowarmMultiple() throws IOException {
+    doTestPercentageAutowarm(100, 50, new int[]{51, 55, 60, 70, 80, 99, 100}, new int[]{1, 2, 3, 5, 10, 20, 30, 40, 50});
+    doTestPercentageAutowarm(100, 25, new int[]{76, 80, 99, 100}, new int[]{1, 2, 3, 5, 10, 20, 30, 40, 50, 51, 55, 60, 70});
+    doTestPercentageAutowarm(1000, 10, new int[]{901, 930, 950, 999, 1000}, new int[]{1, 5, 100, 200, 300, 400, 800, 899, 900});
+    doTestPercentageAutowarm(100, 200, new int[]{1, 10, 25, 51, 55, 60, 70, 80, 99, 100}, new int[]{200, 300});
+    doTestPercentageAutowarm(100, 0, new int[]{}, new int[]{1, 10, 25, 51, 55, 60, 70, 80, 99, 100, 200, 300});
   }
-
-  public void createIndex(int nDocs, DocProcessor proc) {
-    for (int i=0; i<nDocs; i++) {
-      SolrInputDocument doc = new SolrInputDocument();
-      doc.addField("id", ""+i);
-      proc.process(doc);
-      assertU(adoc(doc));
-    }
-  }
-
-  @Test
-  public void testRangeQueries() throws Exception {
-    // ensure that we aren't losing precision on any fields in addition to testing other non-numeric fields
-    // that aren't tested in testRandomRangeQueries()
-
-    int i=2000000000;
-    long l=500000000000000000L;
-    double d=0.3333333333333333;
-
-    // first 3 values will be indexed, the last two won't be
-    String[] ints = {""+(i-1), ""+(i), ""+(i+1),   ""+(i-2), ""+(i+2)};
-    String[] longs = {""+(l-1), ""+(l), ""+(l+1),  ""+(l-2), ""+(l+2)};
-    String[] doubles = {""+(d-1e-16), ""+(d), ""+(d+1e-16),   ""+(d-2e-16), ""+(d+2e-16)};
-    String[] strings = {"aaa","bbb","ccc",  "aa","cccc" };
-    String[] dates = {"0299-12-31T23:59:59.999Z","2000-01-01T00:00:00.000Z","2000-01-01T00:00:00.001Z",  "0299-12-31T23:59:59.998Z","2000-01-01T00:00:00.002Z" };
-
-    // fields that normal range queries should work on
-    Map<String,String[]> norm_fields = new HashMap<String,String[]>();
-    norm_fields.put("foo_i", ints);
-    norm_fields.put("foo_l", longs);
-    norm_fields.put("foo_d", doubles);
-
-    norm_fields.put("foo_ti", ints);
-    norm_fields.put("foo_tl", longs);
-    norm_fields.put("foo_td", doubles);
-    norm_fields.put("foo_tdt", dates);
-
-    norm_fields.put("foo_s", strings);
-    norm_fields.put("foo_dt", dates);
-
-
-    // fields that frange queries should work on
-    Map<String,String[]> frange_fields = new HashMap<String,String[]>();
-    frange_fields.put("foo_i", ints);
-    frange_fields.put("foo_l", longs);
-    frange_fields.put("foo_d", doubles);
-
-    frange_fields.put("foo_ti", ints);
-    frange_fields.put("foo_tl", longs);
-    frange_fields.put("foo_td", doubles);
-    frange_fields.put("foo_tdt", dates);
-
-    frange_fields.put("foo_pi", ints);
-    frange_fields.put("foo_pl", longs);
-    frange_fields.put("foo_pd", doubles);
-
-    frange_fields.put("foo_s", strings);
-    frange_fields.put("foo_dt", dates);
-
-    Map<String,String[]> all_fields = new HashMap<String,String[]>();
-    all_fields.putAll(norm_fields);
-    all_fields.putAll(frange_fields);
-
-    for (int j=0; j<ints.length-2; j++) {
-      List<String> fields = new ArrayList<String>();
-      fields.add("id");
-      fields.add(""+j);
-      for (Map.Entry<String,String[]> entry : all_fields.entrySet()) {
-        fields.add(entry.getKey());
-        fields.add(entry.getValue()[j]);
-      }
-      assertU(adoc(fields.toArray(new String[fields.size()])));
+  
+  private void doTestPercentageAutowarm(int limit, int percentage, int[] hits, int[]misses) {
+    FastLRUCache<Object, Object> fastCache = new FastLRUCache<Object, Object>();
+    Map<String, String> params = new HashMap<String, String>();
+    params.put("size", String.valueOf(limit));
+    params.put("initialSize", "10");
+    params.put("autowarmCount", percentage + "%");
+    CacheRegenerator cr = createCodeRegenerator();
+    Object o = fastCache.init(params, null, cr);
+    fastCache.setState(SolrCache.State.LIVE);
+    for (int i = 1; i <= limit; i++) {
+      fastCache.put(i, "" + i);//adds numbers from 1 to 100
     }
 
-    assertU(commit());
-
-    // simple test of a function rather than just the field
-    assertQ(req("{!frange l=0 u=2}id"), "*[count(//doc)=3]");
-    assertQ(req("{!frange l=0 u=2}product(id,2)"), "*[count(//doc)=2]");
-    assertQ(req("{!frange l=100 u=102}sum(id,100)"), "*[count(//doc)=3]");
-
-
-    for (Map.Entry<String,String[]> entry : norm_fields.entrySet()) {
-      String f = entry.getKey();
-      String[] v = entry.getValue();
-
-      assertQ(req(f + ":[* TO *]" ), "*[count(//doc)=3]");
-      assertQ(req(f + ":["+v[0]+" TO "+v[2]+"]"), "*[count(//doc)=3]");
-      assertQ(req(f + ":["+v[1]+" TO "+v[2]+"]"), "*[count(//doc)=2]");
-      assertQ(req(f + ":["+v[0]+" TO "+v[1]+"]"), "*[count(//doc)=2]");
-      assertQ(req(f + ":["+v[0]+" TO "+v[0]+"]"), "*[count(//doc)=1]");
-      assertQ(req(f + ":["+v[1]+" TO "+v[1]+"]"), "*[count(//doc)=1]");
-      assertQ(req(f + ":["+v[2]+" TO "+v[2]+"]"), "*[count(//doc)=1]");
-      assertQ(req(f + ":["+v[3]+" TO "+v[3]+"]"), "*[count(//doc)=0]");
-      assertQ(req(f + ":["+v[4]+" TO "+v[4]+"]"), "*[count(//doc)=0]");
-
-      assertQ(req(f + ":{"+v[0]+" TO "+v[2]+"}"), "*[count(//doc)=1]");
-      assertQ(req(f + ":{"+v[1]+" TO "+v[2]+"}"), "*[count(//doc)=0]");
-      assertQ(req(f + ":{"+v[0]+" TO "+v[1]+"}"), "*[count(//doc)=0]");
-      assertQ(req(f + ":{"+v[3]+" TO "+v[4]+"}"), "*[count(//doc)=3]");
+    FastLRUCache<Object, Object> fastCacheNew = new FastLRUCache<Object, Object>();
+    fastCacheNew.init(params, o, cr);
+    fastCacheNew.warm(null, fastCache);
+    fastCacheNew.setState(SolrCache.State.LIVE);
+    fastCache.close();
+      
+    for(int hit:hits) {
+      assertEquals("The value " + hit + " should be on new cache", String.valueOf(hit), fastCacheNew.get(hit));
     }
-
-    for (Map.Entry<String,String[]> entry : frange_fields.entrySet()) {
-      String f = entry.getKey();
-      String[] v = entry.getValue();
-
-      assertQ(req("{!frange}"+f ), "*[count(//doc)=3]");
-      assertQ(req("{!frange" + " l="+v[0]+"}"+f ), "*[count(//doc)=3]");
-      assertQ(req("{!frange" + " l="+v[1]+"}"+f ), "*[count(//doc)=2]");
-      assertQ(req("{!frange" + " l="+v[2]+"}"+f ), "*[count(//doc)=1]");
-      assertQ(req("{!frange" + " l="+v[3]+"}"+f ), "*[count(//doc)=3]");
-      assertQ(req("{!frange" + " l="+v[4]+"}"+f ), "*[count(//doc)=0]");
-
-      assertQ(req("{!frange" + " u="+v[0]+"}"+f ), "*[count(//doc)=1]");
-      assertQ(req("{!frange" + " u="+v[1]+"}"+f ), "*[count(//doc)=2]");
-      assertQ(req("{!frange" + " u="+v[2]+"}"+f ), "*[count(//doc)=3]");
-      assertQ(req("{!frange" + " u="+v[3]+"}"+f ), "*[count(//doc)=0]");
-      assertQ(req("{!frange" + " u="+v[4]+"}"+f ), "*[count(//doc)=3]");
-
-      assertQ(req("{!frange incl=false" + " l="+v[0]+"}"+f ), "*[count(//doc)=2]");
-      assertQ(req("{!frange incl=false" + " l="+v[1]+"}"+f ), "*[count(//doc)=1]");
-      assertQ(req("{!frange incl=false" + " l="+v[2]+"}"+f ), "*[count(//doc)=0]");
-      assertQ(req("{!frange incl=false" + " l="+v[3]+"}"+f ), "*[count(//doc)=3]");
-      assertQ(req("{!frange incl=false" + " l="+v[4]+"}"+f ), "*[count(//doc)=0]");
-
-      assertQ(req("{!frange incu=false" + " u="+v[0]+"}"+f ), "*[count(//doc)=0]");
-      assertQ(req("{!frange incu=false" + " u="+v[1]+"}"+f ), "*[count(//doc)=1]");
-      assertQ(req("{!frange incu=false" + " u="+v[2]+"}"+f ), "*[count(//doc)=2]");
-      assertQ(req("{!frange incu=false" + " u="+v[3]+"}"+f ), "*[count(//doc)=0]");
-      assertQ(req("{!frange incu=false" + " u="+v[4]+"}"+f ), "*[count(//doc)=3]");
-
-      assertQ(req("{!frange incl=true incu=true" + " l=" +v[0] +" u="+v[2]+"}"+f ), "*[count(//doc)=3]");
-      assertQ(req("{!frange incl=false incu=false" + " l=" +v[0] +" u="+v[2]+"}"+f ), "*[count(//doc)=1]");
-      assertQ(req("{!frange incl=false incu=false" + " l=" +v[3] +" u="+v[4]+"}"+f ), "*[count(//doc)=3]");
+      
+    for(int miss:misses) {
+      assertEquals("The value " + miss + " should NOT be on new cache", null, fastCacheNew.get(miss));
     }
+    NamedList<Serializable> nl = fastCacheNew.getStatistics();
+    assertEquals(Long.valueOf(hits.length + misses.length), nl.get("lookups"));
+    assertEquals(Long.valueOf(hits.length), nl.get("hits"));
+    fastCacheNew.close();
+  }
+  
+  public void testNoAutowarm() throws IOException {
+    FastLRUCache<Object, Object> fastCache = new FastLRUCache<Object, Object>();
+    Map<String, String> params = new HashMap<String, String>();
+    params.put("size", "100");
+    params.put("initialSize", "10");
+    CacheRegenerator cr = createCodeRegenerator();
+    Object o = fastCache.init(params, null, cr);
+    fastCache.setState(SolrCache.State.LIVE);
+    for (int i = 0; i < 101; i++) {
+      fastCache.put(i + 1, "" + (i + 1));
+    }
+    assertEquals("25", fastCache.get(25));
+    assertEquals(null, fastCache.get(110));
+    NamedList<Serializable> nl = fastCache.getStatistics();
+    assertEquals(2L, nl.get("lookups"));
+    assertEquals(1L, nl.get("hits"));
+    assertEquals(101L, nl.get("inserts"));
+    assertEquals(null, fastCache.get(1));  // first item put in should be the first out
+    FastLRUCache<Object, Object> fastCacheNew = new FastLRUCache<Object, Object>();
+    fastCacheNew.init(params, o, cr);
+    fastCacheNew.warm(null, fastCache);
+    fastCacheNew.setState(SolrCache.State.LIVE);
+    fastCache.close();
+    fastCacheNew.put(103, "103");
+    assertEquals(null, fastCacheNew.get(90));
+    assertEquals(null, fastCacheNew.get(50));
+    fastCacheNew.close();
+  }
+  
+  public void testFullAutowarm() throws IOException {
+    FastLRUCache<Object, Object> cache = new FastLRUCache<Object, Object>();
+    Map<Object, Object> params = new HashMap<Object, Object>();
+    params.put("size", "100");
+    params.put("initialSize", "10");
+    params.put("autowarmCount", "-1");
+    CacheRegenerator cr = createCodeRegenerator();
+    Object o = cache.init(params, null, cr);
+    cache.setState(SolrCache.State.LIVE);
+    for (int i = 0; i < 101; i++) {
+      cache.put(i + 1, "" + (i + 1));
+    }
+    assertEquals("25", cache.get(25));
+    assertEquals(null, cache.get(110));
 
+    assertEquals(null, cache.get(1));  // first item put in should be the first out
+
+
+    FastLRUCache<Object, Object> cacheNew = new FastLRUCache<Object, Object>();
+    cacheNew.init(params, o, cr);
+    cacheNew.warm(null, cache);
+    cacheNew.setState(SolrCache.State.LIVE);
+    cache.close();
+    cacheNew.put(103, "103");
+    assertEquals("90", cacheNew.get(90));
+    assertEquals("50", cacheNew.get(50));
+    assertEquals("103", cacheNew.get(103));
+    cacheNew.close();
   }
 
-  @Test
-  public void testRandomRangeQueries() throws Exception {
-    String handler="";
-    final String[] fields = {"foo_s","foo_i","foo_l","foo_f","foo_d"  // SortableIntField, etc
-            ,"foo_pi","foo_pl","foo_pf","foo_pd"                      // plain int  IntField, etc
-            ,"foo_ti","foo_tl","foo_tf","foo_td"                      // trie numer fields
-    };
-    final int l=5;
-    final int u=25;
-
-
-    createIndex(15, new DocProcessor() {
-      public void process(SolrInputDocument doc) {
-        addInt(doc, l,u, fields);
-      }
-    });
-    assertU(commit());
-    
-    // fields that a normal range query will work correctly on
-    String[] norm_fields = {
-            "foo_i","foo_l","foo_f","foo_d"
-            ,"foo_ti","foo_tl","foo_tf","foo_td"
-
-    };
-    
-    // fields that a value source range query should work on
-    String[] frange_fields = {"foo_i","foo_l","foo_f","foo_d",
-            "foo_pi","foo_pl","foo_pf","foo_pd"};
-
-    for (int i=0; i<1000; i++) {
-      int lower = l + r.nextInt(u-l+10)-5;
-      int upper = lower + r.nextInt(u+5-lower);
-      boolean lowerMissing = r.nextInt(10)==1;
-      boolean upperMissing = r.nextInt(10)==1;
-      boolean inclusive = lowerMissing || upperMissing || r.nextBoolean();
-
-      // lower=2; upper=2; inclusive=true;      
-      // inclusive=true; lowerMissing=true; upperMissing=true;    
-
-      List<String> qs = new ArrayList<String>();
-      for (String field : norm_fields) {
-        String q = field + ':' + (inclusive?'[':'{')
-                + (lowerMissing?"*":lower)
-                + " TO "
-                + (upperMissing?"*":upper)
-                + (inclusive?']':'}');
-        qs.add(q);
-      }
-      for (String field : frange_fields) {
-        String q = "{!frange v="+field
-                + (lowerMissing?"":(" l="+lower))
-                + (upperMissing?"":(" u="+upper))
-                + (inclusive?"":" incl=false")
-                + (inclusive?"":" incu=false")
-                + "}";
-        qs.add(q);
-      }
-
-      SolrQueryResponse last=null;
-      for (String q : qs) {
-        // System.out.println("QUERY="+q);
-        SolrQueryRequest req = req("q",q,"rows","1000");
-        SolrQueryResponse qr = h.queryAndResponse(handler, req);
-        if (last != null) {
-          // we only test if the same docs matched since some queries will include factors like idf, etc.
-          DocList rA = ((ResultContext)qr.getValues().get("response")).docs;
-          DocList rB = ((ResultContext)last.getValues().get("response")).docs;
-          sameDocs( rA, rB );
+  private CacheRegenerator createCodeRegenerator() {
+    CacheRegenerator cr = new CacheRegenerator() {
+        public boolean regenerateItem(SolrIndexSearcher newSearcher, SolrCache newCache,
+                                      SolrCache oldCache, Object oldKey, Object oldVal) {
+          newCache.put(oldKey, oldVal);
+          return true;
         }
-        req.close();
-        last = qr;
-      }
+      };
+    return cr;
+  }
+  
+  
+  
+  public void testSimple() throws IOException {
+    FastLRUCache sc = new FastLRUCache();
+    Map l = new HashMap();
+    l.put("size", "100");
+    l.put("initialSize", "10");
+    l.put("autowarmCount", "25");
+    CacheRegenerator cr = createCodeRegenerator();
+    Object o = sc.init(l, null, cr);
+    sc.setState(SolrCache.State.LIVE);
+    for (int i = 0; i < 101; i++) {
+      sc.put(i + 1, "" + (i + 1));
+    }
+    assertEquals("25", sc.get(25));
+    assertEquals(null, sc.get(110));
+    NamedList nl = sc.getStatistics();
+    assertEquals(2L, nl.get("lookups"));
+    assertEquals(1L, nl.get("hits"));
+    assertEquals(101L, nl.get("inserts"));
+
+    assertEquals(null, sc.get(1));  // first item put in should be the first out
+
+
+    FastLRUCache scNew = new FastLRUCache();
+    scNew.init(l, o, cr);
+    scNew.warm(null, sc);
+    scNew.setState(SolrCache.State.LIVE);
+    sc.close();
+    scNew.put(103, "103");
+    assertEquals("90", scNew.get(90));
+    assertEquals(null, scNew.get(50));
+    nl = scNew.getStatistics();
+    assertEquals(2L, nl.get("lookups"));
+    assertEquals(1L, nl.get("hits"));
+    assertEquals(1L, nl.get("inserts"));
+    assertEquals(0L, nl.get("evictions"));
+
+    assertEquals(5L, nl.get("cumulative_lookups"));
+    assertEquals(2L, nl.get("cumulative_hits"));
+    assertEquals(102L, nl.get("cumulative_inserts"));
+    scNew.close();
+  }
+
+  public void testOldestItems() {
+    ConcurrentLRUCache<Integer, String> cache = new ConcurrentLRUCache<Integer, String>(100, 90);
+    for (int i = 0; i < 50; i++) {
+      cache.put(i + 1, "" + (i + 1));
+    }
+    cache.get(1);
+    cache.get(3);
+    Map<Integer, String> m = cache.getOldestAccessedItems(5);
+    //7 6 5 4 2
+    assertNotNull(m.get(7));
+    assertNotNull(m.get(6));
+    assertNotNull(m.get(5));
+    assertNotNull(m.get(4));
+    assertNotNull(m.get(2));
+
+    m = cache.getOldestAccessedItems(0);
+    assertTrue(m.isEmpty());
+
+    //test this too
+    m = cache.getLatestAccessedItems(0);
+    assertTrue(m.isEmpty());
+
+    cache.destroy();
+  }
+
+  // enough randomness to exercise all of the different cache purging phases
+  public void testRandom() {
+    int sz = random().nextInt(100)+5;
+    int lowWaterMark = random().nextInt(sz-3)+1;
+    int keyrange = random().nextInt(sz*3)+1;
+    ConcurrentLRUCache<Integer, String> cache = new ConcurrentLRUCache<Integer, String>(sz, lowWaterMark);
+    for (int i=0; i<10000; i++) {
+      cache.put(random().nextInt(keyrange), "");
+      cache.get(random().nextInt(keyrange));
     }
   }
 
-  static boolean sameDocs(DocSet a, DocSet b) {
-    DocIterator i = a.iterator();
-    // System.out.println("SIZES="+a.size() + "," + b.size());
-    assertEquals(a.size(), b.size());
-    while (i.hasNext()) {
-      int doc = i.nextDoc();
-      assertTrue(b.exists(doc));
-      // System.out.println("MATCH! " + doc);
+  void doPerfTest(int iter, int cacheSize, int maxKey) {
+    long start = System.currentTimeMillis();
+
+    int lowerWaterMark = cacheSize;
+    int upperWaterMark = (int)(lowerWaterMark * 1.1);
+
+    Random r = random();
+    ConcurrentLRUCache cache = new ConcurrentLRUCache(upperWaterMark, lowerWaterMark, (upperWaterMark+lowerWaterMark)/2, upperWaterMark, false, false, null);
+    boolean getSize=false;
+    int minSize=0,maxSize=0;
+    for (int i=0; i<iter; i++) {
+      cache.put(r.nextInt(maxKey),"TheValue");
+      int sz = cache.size();
+      if (!getSize && sz >= cacheSize) {
+        getSize = true;
+        minSize = sz;
+      } else {
+        if (sz < minSize) minSize=sz;
+        else if (sz > maxSize) maxSize=sz;
+      }
     }
-    return true;
+    cache.destroy();
+
+    long end = System.currentTimeMillis();
+    System.out.println("time=" + (end-start) + ", minSize="+minSize+",maxSize="+maxSize);
   }
+
+  /***
+      public void testPerf() {
+      doPerfTest(1000000, 100000, 200000); // big cache, warmup
+      doPerfTest(2000000, 100000, 200000); // big cache
+      doPerfTest(2000000, 100000, 120000);  // smaller key space increases distance between oldest, newest and makes the first passes less effective.
+      doPerfTest(6000000, 1000, 2000);    // small cache, smaller hit rate
+      doPerfTest(6000000, 1000, 1200);    // small cache, bigger hit rate
+      }
+  ***/
+
+  // returns number of puts
+  int useCache(SolrCache sc, int numGets, int maxKey, int seed) {
+    int ret = 0;
+    Random r = new Random(seed);
+
+    // use like a cache... gets and a put if not found
+    for (int i=0; i<numGets; i++) {
+      Integer k = r.nextInt(maxKey);
+      Integer v = (Integer)sc.get(k);
+      if (v == null) {
+        sc.put(k, k);
+        ret++;
+      }
+    }
+
+    return ret;
+  }
+
+  void fillCache(SolrCache sc, int cacheSize, int maxKey) {
+    for (int i=0; i<cacheSize; i++) {
+      Integer kv = random().nextInt(maxKey);
+      sc.put(kv,kv);
+    }
+  }
+
+
+  void cachePerfTest(final SolrCache sc, final int nThreads, final int numGets, int cacheSize, final int maxKey) {
+    Map l = new HashMap();
+    l.put("size", ""+cacheSize);
+    l.put("initialSize", ""+cacheSize);
+
+    Object o = sc.init(l, null, null);
+    sc.setState(SolrCache.State.LIVE);
+
+    fillCache(sc, cacheSize, maxKey);
+
+    long start = System.currentTimeMillis();
+
+    Thread[] threads = new Thread[nThreads];
+    final AtomicInteger puts = new AtomicInteger(0);
+    for (int i=0; i<threads.length; i++) {
+      final int seed=random().nextInt();
+      threads[i] = new Thread() {
+          @Override
+          public void run() {
+            int ret = useCache(sc, numGets/nThreads, maxKey, seed);
+            puts.addAndGet(ret);
+          }
+        };
+    }
+
+    for (Thread thread : threads) {
+      try {
+        thread.start();
+      } catch (Exception e) {
+        e.printStackTrace();
+      }
+    }
+
+    for (Thread thread : threads) {
+      try {
+        thread.join();
+      } catch (Exception e) {
+        e.printStackTrace();
+      }
+    }
+
+    long end = System.currentTimeMillis();
+    System.out.println("time=" + (end-start) + " impl=" +sc.getClass().getSimpleName()
+                       +" nThreads= " + nThreads + " size="+cacheSize+" maxKey="+maxKey+" gets="+numGets
+                       +" hitRatio="+(1-(((double)puts.get())/numGets)));
+  }
+
+  void perfTestBoth(int nThreads, int numGets, int cacheSize, int maxKey) {
+    cachePerfTest(new LRUCache(), nThreads, numGets, cacheSize, maxKey);
+    cachePerfTest(new FastLRUCache(), nThreads, numGets, cacheSize, maxKey);
+  }
+
+  /***
+      public void testCachePerf() {
+      // warmup
+      perfTestBoth(2, 100000, 100000, 120000);
+      perfTestBoth(1, 2000000, 100000, 100000); // big cache, 100% hit ratio
+      perfTestBoth(2, 2000000, 100000, 100000); // big cache, 100% hit ratio
+      perfTestBoth(1, 2000000, 100000, 120000); // big cache, bigger hit ratio
+      perfTestBoth(2, 2000000, 100000, 120000); // big cache, bigger hit ratio
+      perfTestBoth(1, 2000000, 100000, 200000); // big cache, ~50% hit ratio
+      perfTestBoth(2, 2000000, 100000, 200000); // big cache, ~50% hit ratio
+      perfTestBoth(1, 2000000, 100000, 1000000); // big cache, ~10% hit ratio
+      perfTestBoth(2, 2000000, 100000, 1000000); // big cache, ~10% hit ratio
+
+      perfTestBoth(1, 2000000, 1000, 1000); // small cache, ~100% hit ratio
+      perfTestBoth(2, 2000000, 1000, 1000); // small cache, ~100% hit ratio
+      perfTestBoth(1, 2000000, 1000, 1200); // small cache, bigger hit ratio
+      perfTestBoth(2, 2000000, 1000, 1200); // small cache, bigger hit ratio
+      perfTestBoth(1, 2000000, 1000, 2000); // small cache, ~50% hit ratio
+      perfTestBoth(2, 2000000, 1000, 2000); // small cache, ~50% hit ratio
+      perfTestBoth(1, 2000000, 1000, 10000); // small cache, ~10% hit ratio
+      perfTestBoth(2, 2000000, 1000, 10000); // small cache, ~10% hit ratio
+      }
+  ***/
+
+
 }

@@ -1,6 +1,4 @@
-public Set<String> files() {
-
-package org.apache.lucene.index;
+public SnapShooter(SolrCore core, String location) {
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -18,285 +16,239 @@ package org.apache.lucene.index;
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+package org.apache.solr.handler;
 
-
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
 import java.io.IOException;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Set;
+import java.util.Date;
+import java.util.List;
+import java.util.Locale;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
-import org.apache.lucene.codecs.Codec;
-import org.apache.lucene.codecs.lucene3x.Lucene3xSegmentInfoFormat;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.TrackingDirectoryWrapper;
+import org.apache.commons.io.IOUtils;
+import org.apache.lucene.index.IndexCommit;
+import org.apache.lucene.store.Lock;
+import org.apache.lucene.store.SimpleFSLockFactory;
+import org.apache.solr.common.util.NamedList;
+import org.apache.solr.core.IndexDeletionPolicyWrapper;
+import org.apache.solr.core.SolrCore;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
- * Information about a segment such as it's name, directory, and files related
- * to the segment.
+ * <p/> Provides functionality equivalent to the snapshooter script </p>
  *
- * @lucene.experimental
+ *
+ * @since solr 1.4
  */
-public final class SegmentInfo {
+public class SnapShooter {
+  private static final Logger LOG = LoggerFactory.getLogger(SnapShooter.class.getName());
+  private String snapDir = null;
+  private SolrCore solrCore;
+  private SimpleFSLockFactory lockFactory;
   
-  // TODO: remove these from this class, for now this is the representation
-  public static final int NO = -1;          // e.g. no norms; no deletes;
-  public static final int YES = 1;          // e.g. have norms; have deletes;
-
-  public final String name;				  // unique name in dir
-  private int docCount;				  // number of docs in seg
-  public final Directory dir;				  // where segment resides
-
-  private boolean isCompoundFile;
-
-  private volatile long sizeInBytes = -1;         // total byte size of all files (computed on demand)
-
-  private Codec codec;
-
-  private Map<String,String> diagnostics;
+  public SnapShooter(SolrCore core, String location) throws IOException {
+    solrCore = core;
+    if (location == null) snapDir = core.getDataDir();
+    else  {
+      File base = new File(core.getCoreDescriptor().getInstanceDir());
+      snapDir = org.apache.solr.util.FileUtils.resolvePath(base, location).getAbsolutePath();
+      File dir = new File(snapDir);
+      if (!dir.exists())  dir.mkdirs();
+    }
+    lockFactory = new SimpleFSLockFactory(snapDir);
+  }
   
-  private Map<String,String> attributes;
-
-  // Tracks the Lucene version this segment was created with, since 3.1. Null
-  // indicates an older than 3.0 index, and it's used to detect a too old index.
-  // The format expected is "x.y" - "2.x" for pre-3.0 indexes (or null), and
-  // specific versions afterwards ("3.0", "3.1" etc.).
-  // see Constants.LUCENE_MAIN_VERSION.
-  private String version;
-
-  void setDiagnostics(Map<String, String> diagnostics) {
-    this.diagnostics = diagnostics;
+  void createSnapAsync(final IndexCommit indexCommit, final ReplicationHandler replicationHandler) {
+    createSnapAsync(indexCommit, Integer.MAX_VALUE, replicationHandler);
   }
 
-  public Map<String, String> getDiagnostics() {
-    return diagnostics;
-  }
+  void createSnapAsync(final IndexCommit indexCommit, final int numberToKeep, final ReplicationHandler replicationHandler) {
+    replicationHandler.core.getDeletionPolicy().saveCommitPoint(indexCommit.getGeneration());
 
-  /**
-   * Construct a new complete SegmentInfo instance from input.
-   * <p>Note: this is public only to allow access from
-   * the codecs package.</p>
-   */
-  public SegmentInfo(Directory dir, String version, String name, int docCount, 
-                     boolean isCompoundFile, Codec codec, Map<String,String> diagnostics, Map<String,String> attributes) {
-    assert !(dir instanceof TrackingDirectoryWrapper);
-    this.dir = dir;
-    this.version = version;
-    this.name = name;
-    this.docCount = docCount;
-    this.isCompoundFile = isCompoundFile;
-    this.codec = codec;
-    this.diagnostics = diagnostics;
-    this.attributes = attributes;
-  }
-
-  /**
-   * Returns total size in bytes of all of files used by
-   * this segment.  Note that this will not include any live
-   * docs for the segment; to include that use {@link
-   * SegmentInfoPerCommit#sizeInBytes()} instead.
-   */
-  public long sizeInBytes() throws IOException {
-    if (sizeInBytes == -1) {
-      long sum = 0;
-      for (final String fileName : files()) {
-        sum += dir.fileLength(fileName);
+    new Thread() {
+      @Override
+      public void run() {
+        createSnapshot(indexCommit, numberToKeep, replicationHandler);
       }
-      sizeInBytes = sum;
-    }
-    return sizeInBytes;
+    }.start();
   }
 
-  /**
-   * @deprecated separate norms are not supported in >= 4.0
-   */
-  @Deprecated
-  boolean hasSeparateNorms() {
-    return getAttribute(Lucene3xSegmentInfoFormat.NORMGEN_KEY) != null;
-  }
+  void createSnapshot(final IndexCommit indexCommit, int numberToKeep, ReplicationHandler replicationHandler) {
 
-  /**
-   * Mark whether this segment is stored as a compound file.
-   *
-   * @param isCompoundFile true if this is a compound file;
-   * else, false
-   */
-  void setUseCompoundFile(boolean isCompoundFile) {
-    this.isCompoundFile = isCompoundFile;
-  }
-  
-  /**
-   * Returns true if this segment is stored as a compound
-   * file; else, false.
-   */
-  public boolean getUseCompoundFile() {
-    return isCompoundFile;
-  }
+    NamedList<Object> details = new NamedList<Object>();
+    details.add("startTime", new Date().toString());
+    File snapShotDir = null;
+    String directoryName = null;
+    Lock lock = null;
+    try {
+      if(numberToKeep<Integer.MAX_VALUE) {
+        deleteOldBackups(numberToKeep);
+      }
+      SimpleDateFormat fmt = new SimpleDateFormat(DATE_FMT, Locale.US);
+      directoryName = "snapshot." + fmt.format(new Date());
+      lock = lockFactory.makeLock(directoryName + ".lock");
+      if (lock.isLocked()) return;
+      snapShotDir = new File(snapDir, directoryName);
+      if (!snapShotDir.mkdir()) {
+        LOG.warn("Unable to create snapshot directory: " + snapShotDir.getAbsolutePath());
+        return;
+      }
+      Collection<String> files = indexCommit.getFileNames();
+      FileCopier fileCopier = new FileCopier(solrCore.getDeletionPolicy(), indexCommit);
+      fileCopier.copyFiles(files, snapShotDir);
 
-  /** Can only be called once. */
-  public void setCodec(Codec codec) {
-    assert this.codec == null;
-    if (codec == null) {
-      throw new IllegalArgumentException("segmentCodecs must be non-null");
-    }
-    this.codec = codec;
-  }
-
-  public Codec getCodec() {
-    return codec;
-  }
-
-  public int getDocCount() {
-    if (this.docCount == -1) {
-      throw new IllegalStateException("docCount isn't set yet");
-    }
-    return docCount;
-  }
-
-  // NOTE: leave package private
-  void setDocCount(int docCount) {
-    if (this.docCount != -1) {
-      throw new IllegalStateException("docCount was already set");
-    }
-    this.docCount = docCount;
-  }
-
-  /*
-   * Return all files referenced by this SegmentInfo.  The
-   * returns List is a locally cached List so you should not
-   * modify it.
-   */
-
-  public Set<String> files() throws IOException {
-    if (setFiles == null) {
-      throw new IllegalStateException("files were not computed yet");
-    }
-    return Collections.unmodifiableSet(setFiles);
-  }
-
-  /** {@inheritDoc} */
-  @Override
-  public String toString() {
-    return toString(dir, 0);
-  }
-
-  /** Used for debugging.  Format may suddenly change.
-   *
-   *  <p>Current format looks like
-   *  <code>_a(3.1):c45/4</code>, which means the segment's
-   *  name is <code>_a</code>; it was created with Lucene 3.1 (or
-   *  '?' if it's unknown); it's using compound file
-   *  format (would be <code>C</code> if not compound); it
-   *  has 45 documents; it has 4 deletions (this part is
-   *  left off when there are no deletions).</p>
-   */
-  public String toString(Directory dir, int delCount) {
-
-    StringBuilder s = new StringBuilder();
-    s.append(name).append('(').append(version == null ? "?" : version).append(')').append(':');
-    char cfs = getUseCompoundFile() ? 'c' : 'C';
-    s.append(cfs);
-
-    if (this.dir != dir) {
-      s.append('x');
-    }
-    s.append(docCount);
-
-    if (delCount != 0) {
-      s.append('/').append(delCount);
-    }
-
-    // TODO: we could append toString of attributes() here?
-
-    return s.toString();
-  }
-
-  /** We consider another SegmentInfo instance equal if it
-   *  has the same dir and same name. */
-  @Override
-  public boolean equals(Object obj) {
-    if (this == obj) return true;
-    if (obj instanceof SegmentInfo) {
-      final SegmentInfo other = (SegmentInfo) obj;
-      return other.dir == dir && other.name.equals(name);
-    } else {
-      return false;
+      details.add("fileCount", files.size());
+      details.add("status", "success");
+      details.add("snapshotCompletedAt", new Date().toString());
+    } catch (Exception e) {
+      SnapPuller.delTree(snapShotDir);
+      LOG.error("Exception while creating snapshot", e);
+      details.add("snapShootException", e.getMessage());
+    } finally {
+      replicationHandler.core.getDeletionPolicy().releaseCommitPoint(indexCommit.getGeneration());
+      replicationHandler.snapShootDetails = details;
+      if (lock != null) {
+        try {
+          lock.release();
+        } catch (IOException e) {
+          LOG.error("Unable to release snapshoot lock: " + directoryName + ".lock");
+        }
+      }
     }
   }
-
-  @Override
-  public int hashCode() {
-    return dir.hashCode() + name.hashCode();
+  private void deleteOldBackups(int numberToKeep) {
+    File[] files = new File(snapDir).listFiles();
+    List<OldBackupDirectory> dirs = new ArrayList<OldBackupDirectory>();
+    for(File f : files) {
+      OldBackupDirectory obd = new OldBackupDirectory(f);
+      if(obd.dir != null) {
+        dirs.add(obd);
+      }
+    }
+    Collections.sort(dirs);
+    int i=1;
+    for(OldBackupDirectory dir : dirs) {
+      if( i++ > numberToKeep-1 ) {
+        SnapPuller.delTree(dir.dir);
+      }
+    }   
   }
-
-  /**
-   * Used by DefaultSegmentInfosReader to upgrade a 3.0 segment to record its
-   * version is "3.0". This method can be removed when we're not required to
-   * support 3x indexes anymore, e.g. in 5.0.
-   * <p>
-   * <b>NOTE:</b> this method is used for internal purposes only - you should
-   * not modify the version of a SegmentInfo, or it may result in unexpected
-   * exceptions thrown when you attempt to open the index.
-   *
-   * @lucene.internal
-   */
-  public void setVersion(String version) {
-    this.version = version;
-  }
-
-  /** Returns the version of the code which wrote the segment. */
-  public String getVersion() {
-    return version;
-  }
-
-  private Set<String> setFiles;
-
-  public void setFiles(Set<String> files) {
-    setFiles = files;
-    sizeInBytes = -1;
-  }
-
-  public void addFiles(Collection<String> files) {
-    setFiles.addAll(files);
-  }
-
-  public void addFile(String file) {
-    setFiles.add(file);
-  }
+  private class OldBackupDirectory implements Comparable<OldBackupDirectory>{
+    File dir;
+    Date timestamp;
+    final Pattern dirNamePattern = Pattern.compile("^snapshot[.](.*)$");
     
-  /**
-   * Get a codec attribute value, or null if it does not exist
-   */
-  public String getAttribute(String key) {
-    if (attributes == null) {
-      return null;
-    } else {
-      return attributes.get(key);
+    OldBackupDirectory(File dir) {
+      if(dir.isDirectory()) {
+        Matcher m = dirNamePattern.matcher(dir.getName());
+        if(m.find()) {
+          try {
+            this.dir = dir;
+            this.timestamp = new SimpleDateFormat(DATE_FMT).parse(m.group(1));
+          } catch(Exception e) {
+            this.dir = null;
+            this.timestamp = null;
+          }
+        }
+      }
+    }
+    public int compareTo(OldBackupDirectory that) {
+      return that.timestamp.compareTo(this.timestamp);
+    }
+  }
+
+  public static final String SNAP_DIR = "snapDir";
+  public static final String DATE_FMT = "yyyyMMddHHmmssSSS";
+  
+
+  private class FileCopier {
+    private static final int DEFAULT_BUFFER_SIZE = 32768;
+    private byte[] buffer = new byte[DEFAULT_BUFFER_SIZE];
+    private IndexCommit indexCommit;
+    private IndexDeletionPolicyWrapper delPolicy;
+
+    public FileCopier(IndexDeletionPolicyWrapper delPolicy, IndexCommit commit) {
+      this.delPolicy = delPolicy;
+      this.indexCommit = commit;
+    }
+    
+    public void copyFiles(Collection<String> files, File destDir) throws IOException {
+      for (String indexFile : files) {
+        File source = new File(solrCore.getIndexDir(), indexFile);
+        copyFile(source, new File(destDir, source.getName()), true);
+      }
+    }
+    
+    public void copyFile(File source, File destination, boolean preserveFileDate)
+      throws IOException {
+      // check source exists
+      if (!source.exists()) {
+        String message = "File " + source + " does not exist";
+        throw new FileNotFoundException(message);
+      }
+
+      // does destinations directory exist ?
+      if (destination.getParentFile() != null
+          && !destination.getParentFile().exists()) {
+        destination.getParentFile().mkdirs();
+      }
+
+      // make sure we can write to destination
+      if (destination.exists() && !destination.canWrite()) {
+        String message = "Unable to open file " + destination + " for writing.";
+        throw new IOException(message);
+      }
+
+      FileInputStream input = null;
+      FileOutputStream output = null;
+      try {
+        input = new FileInputStream(source);
+        output = new FileOutputStream(destination);
+ 
+        int count = 0;
+        int n = 0;
+        int rcnt = 0;
+        while (-1 != (n = input.read(buffer))) {
+          output.write(buffer, 0, n);
+          count += n;
+          rcnt++;
+          /***
+          // reserve every 4.6875 MB
+          if (rcnt == 150) {
+            rcnt = 0;
+            delPolicy.setReserveDuration(indexCommit.getVersion(), reserveTime);
+          }
+           ***/
+        }
+      } finally {
+        try {
+          IOUtils.closeQuietly(input);
+        } finally {
+          IOUtils.closeQuietly(output);
+        }
+      }
+
+      if (source.length() != destination.length()) {
+        String message = "Failed to copy full contents from " + source + " to "
+          + destination;
+        throw new IOException(message);
+      }
+
+      if (preserveFileDate) {
+        // file copy should preserve file date
+        destination.setLastModified(source.lastModified());
+      }
     }
   }
   
-  /**
-   * Puts a codec attribute value.
-   * <p>
-   * This is a key-value mapping for the field that the codec can use
-   * to store additional metadata, and will be available to the codec
-   * when reading the segment via {@link #getAttribute(String)}
-   * <p>
-   * If a value already exists for the field, it will be replaced with 
-   * the new value.
-   */
-  public String putAttribute(String key, String value) {
-    if (attributes == null) {
-      attributes = new HashMap<String,String>();
-    }
-    return attributes.put(key, value);
-  }
-  
-  /**
-   * @return internal codec attributes map. May be null if no mappings exist.
-   */
-  public Map<String,String> attributes() {
-    return attributes;
-  }
+
 }

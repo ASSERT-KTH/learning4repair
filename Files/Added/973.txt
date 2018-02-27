@@ -1,325 +1,448 @@
 @Override
 
-/*
- * Created on 28-Oct-2004
- */
-package org.apache.lucene.search.highlight;
+package org.apache.lucene.codecs.simpletext;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
+ * contributor license agreements. See the NOTICE file distributed with this
+ * work for additional information regarding copyright ownership. The ASF
+ * licenses this file to You under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * 
  * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
  */
+import static org.apache.lucene.codecs.simpletext.SimpleTextDocValuesConsumer.DOC;
+import static org.apache.lucene.codecs.simpletext.SimpleTextDocValuesConsumer.END;
+import static org.apache.lucene.codecs.simpletext.SimpleTextDocValuesConsumer.HEADER;
+import static org.apache.lucene.codecs.simpletext.SimpleTextDocValuesConsumer.VALUE;
+import static org.apache.lucene.codecs.simpletext.SimpleTextDocValuesConsumer.VALUE_SIZE;
 
+import java.io.Closeable;
 import java.io.IOException;
-import java.io.StringReader;
-import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
+import java.util.Map;
+import java.util.TreeMap;
 
-import org.apache.lucene.analysis.Analyzer;
-import org.apache.lucene.analysis.Token;
-import org.apache.lucene.analysis.TokenStream;
-import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
-import org.apache.lucene.analysis.tokenattributes.OffsetAttribute;
-import org.apache.lucene.analysis.tokenattributes.PositionIncrementAttribute;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.index.DocsAndPositionsEnum;
-import org.apache.lucene.index.Fields;
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.Terms;
-import org.apache.lucene.index.TermsEnum;
-import org.apache.lucene.search.DocIdSetIterator;
-import org.apache.lucene.util.ArrayUtil;
+import org.apache.lucene.codecs.DocValuesArraySource;
+import org.apache.lucene.codecs.PerDocProducerBase;
+import org.apache.lucene.index.DocValues;
+import org.apache.lucene.index.DocValues.SortedSource;
+import org.apache.lucene.index.DocValues.Source;
+import org.apache.lucene.index.DocValues.Type;
+import org.apache.lucene.index.IndexFileNames;
+import org.apache.lucene.index.SegmentReadState;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.IOContext;
+import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.BytesRefHash;
+import org.apache.lucene.util.IOUtils;
+import org.apache.lucene.util.StringHelper;
+import org.apache.lucene.util.packed.PackedInts.Reader;
 
 /**
- * Hides implementation issues associated with obtaining a TokenStream for use
- * with the higlighter - can obtain from TermFreqVectors with offsets and
- * (optionally) positions or from Analyzer class reparsing the stored content.
+ * Reads plain-text DocValues.
+ * <p>
+ * <b><font color="red">FOR RECREATIONAL USE ONLY</font></B>
+ * 
+ * @lucene.experimental
  */
-public class TokenSources {
-  /**
-   * A convenience method that tries to first get a TermPositionVector for the
-   * specified docId, then, falls back to using the passed in
-   * {@link org.apache.lucene.document.Document} to retrieve the TokenStream.
-   * This is useful when you already have the document, but would prefer to use
-   * the vector first.
-   * 
-   * @param reader The {@link org.apache.lucene.index.IndexReader} to use to try
-   *        and get the vector from
-   * @param docId The docId to retrieve.
-   * @param field The field to retrieve on the document
-   * @param doc The document to fall back on
-   * @param analyzer The analyzer to use for creating the TokenStream if the
-   *        vector doesn't exist
-   * @return The {@link org.apache.lucene.analysis.TokenStream} for the
-   *         {@link org.apache.lucene.index.IndexableField} on the
-   *         {@link org.apache.lucene.document.Document}
-   * @throws IOException if there was an error loading
-   */
-
-  public static TokenStream getAnyTokenStream(IndexReader reader, int docId,
-      String field, Document doc, Analyzer analyzer) throws IOException {
-    TokenStream ts = null;
-
-    Fields vectors = reader.getTermVectors(docId);
-    if (vectors != null) {
-      Terms vector = vectors.terms(field);
-      if (vector != null) {
-        ts = getTokenStream(vector);
-      }
-    }
-
-    // No token info stored so fall back to analyzing raw content
-    if (ts == null) {
-      ts = getTokenStream(doc, field, analyzer);
-    }
-    return ts;
-  }
+public class SimpleTextPerDocProducer extends PerDocProducerBase {
+  protected final TreeMap<String, DocValues> docValues;
+  private Comparator<BytesRef> comp;
+  private final String segmentSuffix;
 
   /**
-   * A convenience method that tries a number of approaches to getting a token
-   * stream. The cost of finding there are no termVectors in the index is
-   * minimal (1000 invocations still registers 0 ms). So this "lazy" (flexible?)
-   * approach to coding is probably acceptable
-   * 
-   * @return null if field not stored correctly
-   * @throws IOException If there is a low-level I/O error
+   * Creates a new {@link SimpleTextPerDocProducer} instance and loads all
+   * {@link DocValues} instances for this segment and codec.
    */
-  public static TokenStream getAnyTokenStream(IndexReader reader, int docId,
-      String field, Analyzer analyzer) throws IOException {
-    TokenStream ts = null;
-
-    Fields vectors = reader.getTermVectors(docId);
-    if (vectors != null) {
-      Terms vector = vectors.terms(field);
-      if (vector != null) {
-        ts = getTokenStream(vector);
-      }
+  public SimpleTextPerDocProducer(SegmentReadState state,
+      Comparator<BytesRef> comp, String segmentSuffix) throws IOException {
+    this.comp = comp;
+    this.segmentSuffix = segmentSuffix;
+    if (anyDocValuesFields(state.fieldInfos)) {
+      docValues = load(state.fieldInfos, state.segmentInfo.name,
+                       state.segmentInfo.getDocCount(), state.dir, state.context);
+    } else {
+      docValues = new TreeMap<String, DocValues>();
     }
-
-    // No token info stored so fall back to analyzing raw content
-    if (ts == null) {
-      ts = getTokenStream(reader, docId, field, analyzer);
-    }
-    return ts;
   }
 
-  public static TokenStream getTokenStream(Terms vector) throws IOException {
-    // assumes the worst and makes no assumptions about token position
-    // sequences.
-    return getTokenStream(vector, false);
+  @Override
+  protected Map<String, DocValues> docValues() {
+    return docValues;
   }
 
-  /**
-   * Low level api. Returns a token stream generated from a {@link Terms}. This
-   * can be used to feed the highlighter with a pre-parsed token
-   * stream.  The {@link Terms} must have offsets available.
-   * 
-   * In my tests the speeds to recreate 1000 token streams using this method
-   * are: - with TermVector offset only data stored - 420 milliseconds - with
-   * TermVector offset AND position data stored - 271 milliseconds (nb timings
-   * for TermVector with position data are based on a tokenizer with contiguous
-   * positions - no overlaps or gaps) The cost of not using TermPositionVector
-   * to store pre-parsed content and using an analyzer to re-parse the original
-   * content: - reanalyzing the original content - 980 milliseconds
-   * 
-   * The re-analyze timings will typically vary depending on - 1) The complexity
-   * of the analyzer code (timings above were using a
-   * stemmer/lowercaser/stopword combo) 2) The number of other fields (Lucene
-   * reads ALL fields off the disk when accessing just one document field - can
-   * cost dear!) 3) Use of compression on field storage - could be faster due to
-   * compression (less disk IO) or slower (more CPU burn) depending on the
-   * content.
-   * 
-   * @param tokenPositionsGuaranteedContiguous true if the token position
-   *        numbers have no overlaps or gaps. If looking to eek out the last
-   *        drops of performance, set to true. If in doubt, set to false.
-   *
-   * @throws IllegalArgumentException if no offsets are available
-   */
-  public static TokenStream getTokenStream(Terms tpv,
-      boolean tokenPositionsGuaranteedContiguous) 
-  throws IOException {
+  protected DocValues loadDocValues(int docCount, Directory dir, String id,
+      DocValues.Type type, IOContext context) throws IOException {
+    return new SimpleTextDocValues(dir, context, type, id, docCount, comp, segmentSuffix);
+  }
 
-    if (!tpv.hasOffsets()) {
-      throw new IllegalArgumentException("Cannot create TokenStream from Terms without offsets");
-    }
+  @Override
+  protected void closeInternal(Collection<? extends Closeable> closeables)
+      throws IOException {
+    IOUtils.close(closeables);
+  }
 
-    if (!tokenPositionsGuaranteedContiguous && tpv.hasPositions()) {
-      return new TokenStreamFromTermPositionVector(tpv);
-    }
+  private static class SimpleTextDocValues extends DocValues {
 
-    // an object used to iterate across an array of tokens
-    final class StoredTokenStream extends TokenStream {
-      Token tokens[];
+    private int docCount;
 
-      int currentToken = 0;
-
-      CharTermAttribute termAtt;
-
-      OffsetAttribute offsetAtt;
-
-      PositionIncrementAttribute posincAtt;
-
-      StoredTokenStream(Token tokens[]) {
-        this.tokens = tokens;
-        termAtt = addAttribute(CharTermAttribute.class);
-        offsetAtt = addAttribute(OffsetAttribute.class);
-        posincAtt = addAttribute(PositionIncrementAttribute.class);
-      }
-
-      @Override
-      public boolean incrementToken() {
-        if (currentToken >= tokens.length) {
-          return false;
-        }
-        Token token = tokens[currentToken++];
-        clearAttributes();
-        termAtt.setEmpty().append(token);
-        offsetAtt.setOffset(token.startOffset(), token.endOffset());
-        posincAtt
-            .setPositionIncrement(currentToken <= 1
-                || tokens[currentToken - 1].startOffset() > tokens[currentToken - 2]
-                    .startOffset() ? 1 : 0);
-        return true;
-      }
-    }
-    // code to reconstruct the original sequence of Tokens
-    TermsEnum termsEnum = tpv.iterator(null);
-    int totalTokens = 0;
-    while(termsEnum.next() != null) {
-      totalTokens += (int) termsEnum.totalTermFreq();
-    }
-    Token tokensInOriginalOrder[] = new Token[totalTokens];
-    ArrayList<Token> unsortedTokens = null;
-    termsEnum = tpv.iterator(null);
-    BytesRef text;
-    DocsAndPositionsEnum dpEnum = null;
-    while ((text = termsEnum.next()) != null) {
-
-      dpEnum = termsEnum.docsAndPositions(null, dpEnum);
-      if (dpEnum == null) {
-        throw new IllegalArgumentException(
-            "Required TermVector Offset information was not found");
-      }
-      final String term = text.utf8ToString();
-
-      dpEnum.nextDoc();
-      final int freq = dpEnum.freq();
-      for(int posUpto=0;posUpto<freq;posUpto++) {
-        final int pos = dpEnum.nextPosition();
-        if (dpEnum.startOffset() < 0) {
-          throw new IllegalArgumentException(
-              "Required TermVector Offset information was not found");
-        }
-        final Token token = new Token(term,
-                                      dpEnum.startOffset(),
-                                      dpEnum.endOffset());
-        if (tokenPositionsGuaranteedContiguous && pos != -1) {
-          // We have positions stored and a guarantee that the token position
-          // information is contiguous
-
-          // This may be fast BUT wont work if Tokenizers used which create >1
-          // token in same position or
-          // creates jumps in position numbers - this code would fail under those
-          // circumstances
-
-          // tokens stored with positions - can use this to index straight into
-          // sorted array
-          tokensInOriginalOrder[pos] = token;
+    @Override
+    public void close() throws IOException {
+      boolean success = false;
+      try {
+        super.close();
+        success = true;
+      } finally {
+        if (success) {
+          IOUtils.close(input);
         } else {
-          // tokens NOT stored with positions or not guaranteed contiguous - must
-          // add to list and sort later
-          if (unsortedTokens == null) {
-            unsortedTokens = new ArrayList<Token>();
-          }
-          unsortedTokens.add(token);
+          IOUtils.closeWhileHandlingException(input);
         }
       }
     }
 
-    // If the field has been stored without position data we must perform a sort
-    if (unsortedTokens != null) {
-      tokensInOriginalOrder = unsortedTokens.toArray(new Token[unsortedTokens
-          .size()]);
-      ArrayUtil.mergeSort(tokensInOriginalOrder, new Comparator<Token>() {
-        public int compare(Token t1, Token t2) {
-          if (t1.startOffset() == t2.startOffset()) return t1.endOffset()
-              - t2.endOffset();
-          else return t1.startOffset() - t2.startOffset();
+    private Type type;
+    private Comparator<BytesRef> comp;
+    private int valueSize;
+    private final IndexInput input;
+
+    public SimpleTextDocValues(Directory dir, IOContext ctx, Type type,
+        String id, int docCount, Comparator<BytesRef> comp, String segmentSuffix) throws IOException {
+      this.type = type;
+      this.docCount = docCount;
+      this.comp = comp;
+      final String fileName = IndexFileNames.segmentFileName(id, "", segmentSuffix);
+      boolean success = false;
+      IndexInput in = null;
+      try {
+        in = dir.openInput(fileName, ctx);
+        valueSize = readHeader(in);
+        success = true;
+      } finally {
+        if (!success) {
+          IOUtils.closeWhileHandlingException(in);
         }
-      });
-    }
-    return new StoredTokenStream(tokensInOriginalOrder);
-  }
+      }
+      input = in;
 
-  /**
-   * Returns a {@link TokenStream} with positions and offsets constructed from
-   * field termvectors.  If the field has no termvectors, or positions or offsets
-   * are not included in the termvector, return null.
-   * @param reader the {@link IndexReader} to retrieve term vectors from
-   * @param docId the document to retrieve termvectors for
-   * @param field the field to retrieve termvectors for
-   * @return a {@link TokenStream}, or null if positions and offsets are not available
-   * @throws IOException If there is a low-level I/O error
-   */
-  public static TokenStream getTokenStreamWithOffsets(IndexReader reader, int docId,
-                                                      String field) throws IOException {
-
-    Fields vectors = reader.getTermVectors(docId);
-    if (vectors == null) {
-      return null;
     }
 
-    Terms vector = vectors.terms(field);
-    if (vector == null) {
-      return null;
+    @Override
+    protected Source loadSource() throws IOException {
+      boolean success = false;
+      IndexInput in = input.clone();
+      try {
+        Source source = null;
+        switch (type) {
+        case BYTES_FIXED_DEREF:
+        case BYTES_FIXED_SORTED:
+        case BYTES_FIXED_STRAIGHT:
+        case BYTES_VAR_DEREF:
+        case BYTES_VAR_SORTED:
+        case BYTES_VAR_STRAIGHT:
+          source = read(in, new ValueReader(type, docCount, comp));
+          break;
+        case FIXED_INTS_16:
+        case FIXED_INTS_32:
+        case VAR_INTS:
+        case FIXED_INTS_64:
+        case FIXED_INTS_8:
+        case FLOAT_32:
+        case FLOAT_64:
+          source = read(in, new ValueReader(type, docCount, null));
+          break;
+        default:
+          throw new IllegalArgumentException("unknown type: " + type);
+        }
+        assert source != null;
+        success = true;
+        return source;
+      } finally {
+        if (!success) {
+          IOUtils.closeWhileHandlingException(in);
+        } else {
+          IOUtils.close(in);
+        }
+      }
     }
 
-    if (!vector.hasPositions() || !vector.hasOffsets()) {
-      return null;
+    private int readHeader(IndexInput in) throws IOException {
+      BytesRef scratch = new BytesRef();
+      SimpleTextUtil.readLine(in, scratch);
+      assert StringHelper.startsWith(scratch, HEADER);
+      SimpleTextUtil.readLine(in, scratch);
+      assert StringHelper.startsWith(scratch, VALUE_SIZE);
+      return Integer.parseInt(readString(scratch.offset + VALUE_SIZE.length,
+          scratch));
+    }
+
+    private Source read(IndexInput in, ValueReader reader) throws IOException {
+      BytesRef scratch = new BytesRef();
+      for (int i = 0; i < docCount; i++) {
+        SimpleTextUtil.readLine(in, scratch);
+
+        assert StringHelper.startsWith(scratch, DOC) : scratch.utf8ToString();
+        SimpleTextUtil.readLine(in, scratch);
+        assert StringHelper.startsWith(scratch, VALUE);
+        reader.fromString(i, scratch, scratch.offset + VALUE.length);
+      }
+      SimpleTextUtil.readLine(in, scratch);
+      assert scratch.equals(END);
+      return reader.getSource();
     }
     
-    return getTokenStream(vector);
-  }
-
-  // convenience method
-  public static TokenStream getTokenStream(IndexReader reader, int docId,
-      String field, Analyzer analyzer) throws IOException {
-    Document doc = reader.document(docId);
-    return getTokenStream(doc, field, analyzer);
-  }
-
-  public static TokenStream getTokenStream(Document doc, String field,
-      Analyzer analyzer) {
-    String contents = doc.get(field);
-    if (contents == null) {
-      throw new IllegalArgumentException("Field " + field
-          + " in document is not stored and cannot be analyzed");
+    @Override
+    public Source getDirectSource() throws IOException {
+      return this.getSource(); // don't cache twice
     }
-    return getTokenStream(field, contents, analyzer);
+
+    @Override
+    protected Source loadDirectSource() throws IOException {
+      return this.getSource();
+    }
+
+    @Override
+    public int getValueSize() {
+      return valueSize;
+    }
+
+    @Override
+    public Type getType() {
+      return type;
+    }
+
   }
 
-  // convenience method
-  public static TokenStream getTokenStream(String field, String contents,
-      Analyzer analyzer) {
-    try {
-      return analyzer.tokenStream(field, new StringReader(contents));
-    } catch (IOException ex) {
-      throw new RuntimeException(ex);
+  public static String readString(int offset, BytesRef scratch) {
+    return new String(scratch.bytes, scratch.offset + offset, scratch.length
+        - offset, IOUtils.CHARSET_UTF_8);
+  }
+
+  private static final class ValueReader {
+    private final Type type;
+    private byte[] bytes;
+    private short[] shorts;
+    private int[] ints;
+    private long[] longs;
+    private float[] floats;
+    private double[] doubles;
+    private Source source;
+    private BytesRefHash hash;
+    private BytesRef scratch;
+
+    public ValueReader(Type type, int maxDocs, Comparator<BytesRef> comp) {
+      super();
+      this.type = type;
+      Source docValuesArray = null;
+      switch (type) {
+      case FIXED_INTS_16:
+        shorts = new short[maxDocs];
+        docValuesArray = DocValuesArraySource.forType(type)
+            .newFromArray(shorts);
+        break;
+      case FIXED_INTS_32:
+        ints = new int[maxDocs];
+        docValuesArray = DocValuesArraySource.forType(type).newFromArray(ints);
+        break;
+      case FIXED_INTS_64:
+        longs = new long[maxDocs];
+        docValuesArray = DocValuesArraySource.forType(type)
+            .newFromArray(longs);
+        break;
+      case VAR_INTS:
+        longs = new long[maxDocs];
+        docValuesArray = new VarIntsArraySource(type, longs);
+        break;
+      case FIXED_INTS_8:
+        bytes = new byte[maxDocs];
+        docValuesArray = DocValuesArraySource.forType(type).newFromArray(bytes);
+        break;
+      case FLOAT_32:
+        floats = new float[maxDocs];
+        docValuesArray = DocValuesArraySource.forType(type)
+            .newFromArray(floats);
+        break;
+      case FLOAT_64:
+        doubles = new double[maxDocs];
+        docValuesArray = DocValuesArraySource.forType(type).newFromArray(
+            doubles);
+        break;
+      case BYTES_FIXED_DEREF:
+      case BYTES_FIXED_SORTED:
+      case BYTES_FIXED_STRAIGHT:
+      case BYTES_VAR_DEREF:
+      case BYTES_VAR_SORTED:
+      case BYTES_VAR_STRAIGHT:
+        assert comp != null;
+        hash = new BytesRefHash();
+        BytesSource bytesSource = new BytesSource(type, comp, maxDocs, hash);
+        ints = bytesSource.docIdToEntry;
+        source = bytesSource;
+        scratch = new BytesRef();
+        break;
+
+      }
+      if (docValuesArray != null) {
+        assert source == null;
+        this.source = docValuesArray;
+      }
     }
+
+    public void fromString(int ord, BytesRef ref, int offset) {
+      switch (type) {
+      case FIXED_INTS_16:
+        assert shorts != null;
+        shorts[ord] = Short.parseShort(readString(offset, ref));
+        break;
+      case FIXED_INTS_32:
+        assert ints != null;
+        ints[ord] = Integer.parseInt(readString(offset, ref));
+        break;
+      case FIXED_INTS_64:
+      case VAR_INTS:
+        assert longs != null;
+        longs[ord] = Long.parseLong(readString(offset, ref));
+        break;
+      case FIXED_INTS_8:
+        assert bytes != null;
+        bytes[ord] = (byte) Integer.parseInt(readString(offset, ref));
+        break;
+      case FLOAT_32:
+        assert floats != null;
+        floats[ord] = Float.parseFloat(readString(offset, ref));
+        break;
+      case FLOAT_64:
+        assert doubles != null;
+        doubles[ord] = Double.parseDouble(readString(offset, ref));
+        break;
+      case BYTES_FIXED_DEREF:
+      case BYTES_FIXED_SORTED:
+      case BYTES_FIXED_STRAIGHT:
+      case BYTES_VAR_DEREF:
+      case BYTES_VAR_SORTED:
+      case BYTES_VAR_STRAIGHT:
+        scratch.bytes = ref.bytes;
+        scratch.length = ref.length - offset;
+        scratch.offset = ref.offset + offset;
+        int key = hash.add(scratch);
+        ints[ord] = key < 0 ? (-key) - 1 : key;
+        break;
+      }
+    }
+
+    public Source getSource() {
+      if (source instanceof BytesSource) {
+        ((BytesSource) source).maybeSort();
+      }
+      return source;
+    }
+  }
+
+  private static final class BytesSource extends SortedSource {
+
+    private final BytesRefHash hash;
+    int[] docIdToEntry;
+    int[] sortedEntries;
+    int[] adresses;
+    private final boolean isSorted;
+
+    protected BytesSource(Type type, Comparator<BytesRef> comp, int maxDoc,
+        BytesRefHash hash) {
+      super(type, comp);
+      docIdToEntry = new int[maxDoc];
+      this.hash = hash;
+      isSorted = type == Type.BYTES_FIXED_SORTED
+          || type == Type.BYTES_VAR_SORTED;
+    }
+
+    void maybeSort() {
+      if (isSorted) {
+        adresses = new int[hash.size()];
+        sortedEntries = hash.sort(getComparator());
+        for (int i = 0; i < adresses.length; i++) {
+          int entry = sortedEntries[i];
+          adresses[entry] = i;
+        }
+      }
+
+    }
+
+    @Override
+    public BytesRef getBytes(int docID, BytesRef ref) {
+      if (isSorted) {
+        return hash.get(sortedEntries[ord(docID)], ref);
+      } else {
+        return hash.get(docIdToEntry[docID], ref);
+      }
+    }
+
+    @Override
+    public SortedSource asSortedSource() {
+      if (isSorted) {
+        return this;
+      }
+      return null;
+    }
+
+    @Override
+    public int ord(int docID) {
+      assert isSorted;
+      try {
+        return adresses[docIdToEntry[docID]];
+      } catch (Exception e) {
+
+        return 0;
+      }
+    }
+
+    @Override
+    public BytesRef getByOrd(int ord, BytesRef bytesRef) {
+      assert isSorted;
+      return hash.get(sortedEntries[ord], bytesRef);
+    }
+
+    @Override
+    public Reader getDocToOrd() {
+      return null;
+    }
+
+    @Override
+    public int getValueCount() {
+      return hash.size();
+    }
+
+  }
+  
+  private static class VarIntsArraySource extends Source {
+
+    private final long[] array;
+
+    protected VarIntsArraySource(Type type, long[] array) {
+      super(type);
+      this.array = array;
+    }
+
+    @Override
+    public long getInt(int docID) {
+      return array[docID];
+    }
+
+    @Override
+    public BytesRef getBytes(int docID, BytesRef ref) {
+      DocValuesArraySource.copyLong(ref, getInt(docID));
+      return ref;
+    }
+    
   }
 
 }

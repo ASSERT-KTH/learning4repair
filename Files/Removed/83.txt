@@ -1,605 +1,1069 @@
-/*
-
-   Derby - Class org.apache.derby.iapi.store.raw.ContainerHandle
-
-   Licensed to the Apache Software Foundation (ASF) under one or more
-   contributor license agreements.  See the NOTICE file distributed with
-   this work for additional information regarding copyright ownership.
-   The ASF licenses this file to you under the Apache License, Version 2.0
-   (the "License"); you may not use this file except in compliance with
-   the License.  You may obtain a copy of the License at
-
-      http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
-
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
-package org.apache.derby.iapi.store.raw;
+package org.apache.cassandra.db;
 
-import org.apache.derby.iapi.store.access.SpaceInfo;
-import org.apache.derby.iapi.error.StandardException;
+import java.io.File;
+import java.io.IOError;
+import java.io.IOException;
+import java.lang.management.ManagementFactory;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.Condition;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import javax.management.MBeanServer;
+import javax.management.ObjectName;
 
-import java.util.Properties;
+import org.apache.commons.collections.IteratorUtils;
 
-/**
-	A Container contains a contigious address space of pages, the pages
-	start at page number Container.FIRST_PAGE_NUMBER and are numbered sequentially.
-	
-	The page size is set at addContainer() time.
+import com.google.common.collect.Iterables;
+import org.apache.cassandra.concurrent.JMXEnabledThreadPoolExecutor;
+import org.apache.cassandra.concurrent.NamedThreadFactory;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.commitlog.CommitLog;
+import org.apache.cassandra.db.commitlog.CommitLogSegment;
+import org.apache.cassandra.db.filter.*;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.dht.AbstractBounds;
+import org.apache.cassandra.dht.Bounds;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.io.sstable.*;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.thrift.SliceRange;
+import org.apache.cassandra.utils.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-
-	RESOLVE: this style of coding is not currently enforced
-	If the caller calls getPage (or one of its variants) more than once on the 
-    same page, the caller must call unlatch a corresponding number of times in 
-    order to ensure that the page is latched.  For example:
-	<p>
-	<blockquote><pre>
-    Container c;
-	Page p1 = c.getPage(Container.FIRST_PAGE_NUMBER);
-	Page p2 = c.getPage(Container.FIRST_PAGE_NUMBER);
-	p1.unlatch();  -- Page is still latched.
-	p2.unlatch();  -- Page is now unlatched.
-	</pre></blockquote>
-
-	<p>
-	There is no restriction on the order in which latching and unlatching is 
-    done.  In the example, p1 could have been unlatched after p2 with no ill 	
-    effects.
-
-	<P>	<B>Open container modes</B>
-	ContainerHandle.MODE are used to open or create the container.
-	Unlike TableProperties, MODEs are not permanantely associated with the
-	container, it is effective only for the lifetime of the containerHandle
-	itself.
-	<BR>A container may use any of these mode flags when it is opened.
-	<UL>
-	<LI>MODE_READONLY - Open the container in read only mode.
-	<LI>MODE_FORUPDATE - Open the container in update mode, if the underlying 
-    storage does not allow updates
-	then the container will be opned in read only mode.
-	<LI>MODE_UNLOGGED - If Unset, any changes to the container are logged.
-	If set, any user changes to the container are unlogged. It is guaranteed
-    at commit time that all changes made during the transaction will have been 
-    flushed to disk. Using this mode automatically opens the container in 
-    container locking, isolation 3 level. The state of the container following
-    an abort or any type of rollback is unspecified.
-	<LI>MODE_CREATE_UNLOGGED - If set, not only are user changes to the
-	container are unlogged, page allocations are also unlogged.  This MODE is
-	only useful for container is created in the same statement and no change on
-	the container (other than the create) is ever logged.  The difference
-	between MODE_UNLOGGED and MODE_CREATE_UNLOGGED is that page allocation is
-	also unlogged and commit of nested transaction will not cause the container
-	to be forced from the cache.  Unlike MODE_UNLOGGED, MODE_CREATE_UNLOGGED
-	does not force the cache.  It is up to the client of raw store to force the
-	cache at the appropriate time - this allows a statement to create and open
-	the container serveral times for bulk loading without logging or doing any
-	synchronous I/O. 
-	<LI>MODE_LOCK_NOWAIT - if set, then don't wait for the container lock, else
-	wait for the container lock.  This flag only dictates whether the lock
-	should be waited for or not.  After the container is successfully opened,
-	whether this bit is set or not has no effect on the container handle.
-	</UL>
-	If neither or both of the {MODE_READONLY, MODE_FORUPDATE} modes are 
-    specified then the behaviour of the container is unspecified.
-	<BR>
-	MODE_UNLOGGED must be set for MODE_CREATE_UNLOGGED to be set.
-	<P>
-	<B>Temporary Containers</B><BR>
-	If when creating a container the segment used is 
-    ContainerHandle.TEMPORARY_SEGMENT then the container is a temporary 
-    container. Temporary containers are not logged or locked and do not live 
-    across re-boots of the system. In addition any abort or rollback including
-    rollbacks to savepoints truncate the container if it has been opened for 
-    update since the last commit or abort.  Temporary containers are private 
-    to a transaction and must only be used a single thread within the 
-    transaction at any time, these restrictions are not currently enforced.
-	<BR>
-	When opening a temporary container for update access these additional mode
-    flags may be used
-	<UL>
-	<LI> MODE_TRUNCATE_ON_COMMIT - At commit/abort time container is truncated.
-	<LI> MODE_DROP_ON_COMMIT - At commit/abort time the container is dropped.
-	<LI> MODE_TEMP_IS_KEPT - At commit/abort time the container is kept around.
-	</UL>
-	If a temporary container is opened multiple times in the same transaction 
-    with different modes then the most severe mode is used, ie. none &lt; 
-    truncate on commit &lt; drop on commit.
-	The MODE_UNLOGGED, MODE_CREAT_UNLOGGED flags are ignored when opening a 
-    temporary container, not logged is always assumed.  */
-
-public interface ContainerHandle 
+public class ColumnFamilyStore implements ColumnFamilyStoreMBean
 {
+    private static Logger logger_ = LoggerFactory.getLogger(ColumnFamilyStore.class);
 
-	/**
-		Used in add container.
-	*/
-	public static final int DEFAULT_PAGESIZE = -1;
+    /*
+     * submitFlush first puts [Binary]Memtable.getSortedContents on the flushSorter executor,
+     * which then puts the sorted results on the writer executor.  This is because sorting is CPU-bound,
+     * and writing is disk-bound; we want to be able to do both at once.  When the write is complete,
+     * we turn the writer into an SSTableReader and add it to ssTables_ where it is available for reads.
+     *
+     * For BinaryMemtable that's about all that happens.  For live Memtables there are two other things
+     * that switchMemtable does (which should be the only caller of submitFlush in this case).
+     * First, it puts the Memtable into memtablesPendingFlush, where it stays until the flush is complete
+     * and it's been added as an SSTableReader to ssTables_.  Second, it adds an entry to commitLogUpdater
+     * that waits for the flush to complete, then calls onMemtableFlush.  This allows multiple flushes
+     * to happen simultaneously on multicore systems, while still calling onMF in the correct order,
+     * which is necessary for replay in case of a restart since CommitLog assumes that when onMF is
+     * called, all data up to the given context has been persisted to SSTables.
+     */
+    private static ExecutorService flushSorter_
+            = new JMXEnabledThreadPoolExecutor(1,
+                                               Runtime.getRuntime().availableProcessors(),
+                                               Integer.MAX_VALUE,
+                                               TimeUnit.SECONDS,
+                                               new LinkedBlockingQueue<Runnable>(1 + Runtime.getRuntime().availableProcessors()),
+                                               new NamedThreadFactory("FLUSH-SORTER-POOL"));
+    private static ExecutorService flushWriter_
+            = new JMXEnabledThreadPoolExecutor(1,
+                                               DatabaseDescriptor.getAllDataFileLocations().length,
+                                               Integer.MAX_VALUE,
+                                               TimeUnit.SECONDS,
+                                               new LinkedBlockingQueue<Runnable>(1 + 2 * DatabaseDescriptor.getAllDataFileLocations().length),
+                                               new NamedThreadFactory("FLUSH-WRITER-POOL"));
+    private static ExecutorService commitLogUpdater_ = new JMXEnabledThreadPoolExecutor("MEMTABLE-POST-FLUSHER");
 
-	public static final int DEFAULT_SPARESPACE = -1;
+    private Set<Memtable> memtablesPendingFlush = new ConcurrentSkipListSet<Memtable>();
 
-	public static final int DEFAULT_ASSIGN_ID = 0;
+    private final String table_;
+    public final String columnFamily_;
+    private final boolean isSuper_;
 
-	/**
-		See comments above for these modes.
-	 */
-	public static final int MODE_DEFAULT               = 0x00000000;
-	public static final int MODE_UNLOGGED              = 0x00000001;
-	public static final int MODE_CREATE_UNLOGGED       = 0x00000002;
-	public static final int MODE_FORUPDATE             = 0x00000004;
-	public static final int MODE_READONLY	           = 0x00000008;
-	public static final int MODE_TRUNCATE_ON_COMMIT    = 0x00000010;
-	public static final int MODE_DROP_ON_COMMIT        = 0x00000020;
-	public static final int MODE_OPEN_FOR_LOCK_ONLY    = 0x00000040;
-	public static final int MODE_LOCK_NOWAIT           = 0x00000080;
-	public static final int MODE_TRUNCATE_ON_ROLLBACK  = 0x00000100; // internal raw store
-	public static final int MODE_FLUSH_ON_COMMIT       = 0x00000200; // internal raw store
-	public static final int MODE_NO_ACTIONS_ON_COMMIT  = 0x00000400; // internal raw store
-	public static final int MODE_TEMP_IS_KEPT		   = 0x00000800; // internal raw store
+    private volatile Integer memtableSwitchCount = 0;
 
-	public static final int MODE_USE_UPDATE_LOCKS	   = 0x00001000; // external access
-    public static final int MODE_SECONDARY_LOCKED      = 0x00002000; // external access
-    public static final int MODE_BASEROW_INSERT_LOCKED = 0x00004000; // external access
+    /* This is used to generate the next index for a SSTable */
+    private AtomicInteger fileIndexGenerator_ = new AtomicInteger(0);
 
-	public static final int TEMPORARY_SEGMENT = -1;
+    /* active memtable associated with this ColumnFamilyStore. */
+    private Memtable memtable_;
 
+    // TODO binarymemtable ops are not threadsafe (do they need to be?)
+    private AtomicReference<BinaryMemtable> binaryMemtable_;
 
-	/**
-		The first valid page number
-	*/
-	public static final long FIRST_PAGE_NUMBER = 1;
-	
-	/**
-		A page number that is guaranteed to be invalid.
-	*/
-	public static final long INVALID_PAGE_NUMBER = -1;
+    /* SSTables on disk for this column family */
+    private SSTableTracker ssTables_;
 
-	/**
-		Return my identifier.
-	*/
-	public ContainerKey getId();
+    private LatencyTracker readStats_ = new LatencyTracker();
+    private LatencyTracker writeStats_ = new LatencyTracker();
 
-	/**
-		Return my unique identifier, this identifier will be unique to each
-        instance of an open container handle.  This id is used by the locking
-        system to group locks to an open container handle.
-	*/
-	public Object getUniqueId();
+    private long minRowCompactedSize = 0L;
+    private long maxRowCompactedSize = 0L;
+    private long rowsCompactedTotalSize = 0L;
+    private long rowsCompactedCount = 0L;
+    
+    ColumnFamilyStore(String table, String columnFamilyName, boolean isSuper, int indexValue)
+    {
+        table_ = table;
+        columnFamily_ = columnFamilyName;
+        isSuper_ = isSuper;
+        fileIndexGenerator_.set(indexValue);
+        memtable_ = new Memtable(this);
+        binaryMemtable_ = new AtomicReference<BinaryMemtable>(new BinaryMemtable(this));
+
+        if (logger_.isDebugEnabled())
+            logger_.debug("Starting CFS {}", columnFamily_);
+        // scan for data files corresponding to this CF
+        List<File> sstableFiles = new ArrayList<File>();
+        Pattern auxFilePattern = Pattern.compile("(.*)(-Filter\\.db$|-Index\\.db$)");
+        for (File file : files())
+        {
+            String filename = file.getName();
+
+            /* look for and remove orphans. An orphan is a -Filter.db or -Index.db with no corresponding -Data.db. */
+            Matcher matcher = auxFilePattern.matcher(file.getAbsolutePath());
+            if (matcher.matches())
+            {
+                String basePath = matcher.group(1);
+                if (!new File(basePath + "-Data.db").exists())
+                {
+                    logger_.info(String.format("Removing orphan %s", file.getAbsolutePath()));
+                    try
+                    {
+                        FileUtils.deleteWithConfirm(file);
+                    }
+                    catch (IOException e)
+                    {
+                        throw new IOError(e);
+                    }
+                    continue;
+                }
+            }
+
+            if (((file.length() == 0 && !filename.endsWith("-Compacted")) || (filename.contains("-" + SSTable.TEMPFILE_MARKER))))
+            {
+                try
+                {
+                    FileUtils.deleteWithConfirm(file);
+                }
+                catch (IOException e)
+                {
+                    throw new IOError(e);
+                }
+                continue;
+            }
+
+            if (filename.contains("-Data.db"))
+            {
+                sstableFiles.add(file.getAbsoluteFile());
+            }
+        }
+        Collections.sort(sstableFiles, new FileUtils.FileComparator());
+
+        /* Load the index files and the Bloom Filters associated with them. */
+        List<SSTableReader> sstables = new ArrayList<SSTableReader>();
+        for (File file : sstableFiles)
+        {
+            String filename = file.getAbsolutePath();
+            if (SSTable.deleteIfCompacted(filename))
+                continue;
+
+            SSTableReader sstable;
+            try
+            {
+                sstable = SSTableReader.open(filename);
+            }
+            catch (IOException ex)
+            {
+                logger_.error("Corrupt file " + filename + "; skipped", ex);
+                continue;
+            }
+            sstables.add(sstable);
+        }
+        ssTables_ = new SSTableTracker(table, columnFamilyName);
+        ssTables_.add(sstables);
+    }
+
+    public void addToCompactedRowStats(Long rowsize)
+    {
+        if (minRowCompactedSize < 1 || rowsize < minRowCompactedSize)
+            minRowCompactedSize = rowsize;
+        if (rowsize > maxRowCompactedSize)
+            maxRowCompactedSize = rowsize;
+        rowsCompactedCount++;
+        rowsCompactedTotalSize += rowsize;
+    }
+
+    public long getMinRowCompactedSize()
+    {
+        return minRowCompactedSize;
+    }
+
+    public long getMaxRowCompactedSize()
+    {
+        return maxRowCompactedSize;
+    }
+
+    public long getMeanRowCompactedSize()
+    {
+        if (rowsCompactedCount > 0)
+            return rowsCompactedTotalSize / rowsCompactedCount;
+        else
+            return 0L;
+    }
+
+    public static ColumnFamilyStore createColumnFamilyStore(String table, String columnFamily)
+    {
+        /*
+         * Get all data files associated with old Memtables for this table.
+         * These files are named as follows <Table>-1.db, ..., <Table>-n.db. Get
+         * the max which in this case is n and increment it to use it for next
+         * index.
+         */
+        List<Integer> generations = new ArrayList<Integer>();
+        String[] dataFileDirectories = DatabaseDescriptor.getAllDataFileLocationsForTable(table);
+        for (String directory : dataFileDirectories)
+        {
+            File fileDir = new File(directory);
+            File[] files = fileDir.listFiles();
+            
+            for (File file : files)
+            {
+                String filename = file.getAbsolutePath();
+                String cfName = getColumnFamilyFromFileName(filename);
+
+                if (cfName.equals(columnFamily))
+                {
+                    generations.add(getGenerationFromFileName(filename));
+                }
+            }
+        }
+        Collections.sort(generations);
+        int value = (generations.size() > 0) ? (generations.get(generations.size() - 1)) : 0;
+
+        ColumnFamilyStore cfs = new ColumnFamilyStore(table, columnFamily, "Super".equals(DatabaseDescriptor.getColumnType(table, columnFamily)), value);
+
+        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+        try
+        {
+            ObjectName mbeanName = new ObjectName("org.apache.cassandra.db:type=ColumnFamilyStores,keyspace=" + table + ",columnfamily=" + columnFamily);
+            if (mbs.isRegistered(mbeanName))
+                mbs.unregisterMBean(mbeanName);
+            mbs.registerMBean(cfs, mbeanName);
+        }
+        catch (Exception e)
+        {
+            throw new RuntimeException(e);
+        }
+
+        return cfs;
+    }
+
+    private Set<File> files()
+    {
+        Set<File> fileSet = new HashSet<File>();
+        for (String directory : DatabaseDescriptor.getAllDataFileLocationsForTable(table_))
+        {
+            File[] files = new File(directory).listFiles();
+            for (File file : files)
+            {
+                String cfName = getColumnFamilyFromFileName(file.getAbsolutePath());
+                if (cfName.equals(columnFamily_))
+                    fileSet.add(file);
+            }
+        }
+        return fileSet;
+    }
 
     /**
-     * Is the container opened for read only or update?
-     *
-	 * @return true if container is opened for read only, else false.
-     **/
-    boolean isReadOnly();
+     * @return the name of the column family
+     */
+    public String getColumnFamilyName()
+    {
+        return columnFamily_;
+    }
 
-	/**
-		Add an empty page to the container and obtain exclusive access to it.
-		<P>
-		Note that the added page may not be the last page in the Container.
+    private static String getColumnFamilyFromFileName(String filename)
+    {
+        return SSTable.Descriptor.fromFilename(filename).cfname;
+    }
 
-		Once the Page is no longer required the Page's unlatch() method must 
-        be called.
+    public static int getGenerationFromFileName(String filename)
+    {
+        return SSTable.Descriptor.fromFilename(filename).generation;
+    }
 
-		@return a reference to the page that was added.
+    /*
+     * @return a temporary file name for an sstable.
+     * When the sstable object is closed, it will be renamed to a non-temporary
+     * format, so incomplete sstables can be recognized and removed on startup.
+     */
+    public String getFlushPath()
+    {
+        long guessedSize = 2 * DatabaseDescriptor.getMemtableThroughput() * 1024*1024; // 2* adds room for keys, column indexes
+        String location = DatabaseDescriptor.getDataFileLocationForTable(table_, guessedSize);
+        if (location == null)
+            throw new RuntimeException("Insufficient disk space to flush");
+        return getTempSSTablePath(location);
+    }
 
-		@see Page#unlatch
+    public String getTempSSTablePath(String directory)
+    {
+        SSTable.Descriptor desc = new SSTable.Descriptor(new File(directory),
+                                                         table_,
+                                                         columnFamily_,
+                                                         fileIndexGenerator_.incrementAndGet(),
+                                                         true);
+        return desc.filenameFor("Data.db");
+    }
 
-		@exception StandardException	Standard Derby error policy
-		@exception StandardException If a page could not be allocated.
-	*/
-	public Page addPage() throws StandardException;
+    /** flush the given memtable and swap in a new one for its CFS, if it hasn't been frozen already.  threadsafe. */
+    Future<?> maybeSwitchMemtable(Memtable oldMemtable, final boolean writeCommitLog)
+    {
+        /**
+         *  If we can get the writelock, that means no new updates can come in and 
+         *  all ongoing updates to memtables have completed. We can get the tail
+         *  of the log and use it as the starting position for log replay on recovery.
+         */
+        Table.flusherLock.writeLock().lock();
+        try
+        {
+            if (oldMemtable.isFrozen())
+            {
+                return null;
+            }
+            oldMemtable.freeze();
 
+            final CommitLogSegment.CommitLogContext ctx = writeCommitLog ? CommitLog.instance().getContext() : null;
+            logger_.info(columnFamily_ + " has reached its threshold; switching in a fresh Memtable at " + ctx);
+            final Condition condition = submitFlush(oldMemtable);
+            memtable_ = new Memtable(this);
+            // a second executor that makes sure the onMemtableFlushes get called in the right order,
+            // while keeping the wait-for-flush (future.get) out of anything latency-sensitive.
+            return commitLogUpdater_.submit(new WrappedRunnable()
+            {
+                public void runMayThrow() throws InterruptedException, IOException
+                {
+                    condition.await();
+                    if (writeCommitLog)
+                    {
+                        // if we're not writing to the commit log, we are replaying the log, so marking
+                        // the log header with "you can discard anything written before the context" is not valid
+                        final int cfId = DatabaseDescriptor.getTableMetaData(table_).get(columnFamily_).cfId;
+                        CommitLog.instance().discardCompletedSegments(cfId, ctx);
+                    }
+                }
+            });
+        }
+        finally
+        {
+            Table.flusherLock.writeLock().unlock();
+            if (memtableSwitchCount == Integer.MAX_VALUE)
+            {
+                memtableSwitchCount = 0;
+            }
+            memtableSwitchCount++;
+        }
+    }
 
-	/**
-		Release free space to the OS.
-		<P>
-        As is possible release any free space to the operating system.  This
-        will usually mean releasing any free pages located at the end of the
-        file using the java truncate() interface.
+    void switchBinaryMemtable(DecoratedKey key, byte[] buffer)
+    {
+        binaryMemtable_.set(new BinaryMemtable(this));
+        binaryMemtable_.get().put(key, buffer);
+    }
 
-		@exception StandardException	Standard Derby error policy
-	*/
-	public void compressContainer() throws StandardException;
+    public void forceFlushIfExpired()
+    {
+        if (memtable_.isExpired())
+            forceFlush();
+    }
 
-	/**
-	 * Get the reusable recordId sequence number.
-	 * @return version sequence number
-	 * @exception StandardException	Standard Derby error policy
-	 */
-	public long getReusableRecordIdSequenceNumber() throws StandardException;
+    public Future<?> forceFlush()
+    {
+        if (memtable_.isClean())
+            return null;
 
-	/**	
-		Add an empty page to the container and obtain exclusive access to it.
-		<P>
-		If flag == ADD_PAGE_DEFAULT, this call is identical to addPage().
-		<BR>
-		If flag == ADD_PAGE_BULK, then this call signifies to the container that
-		this addPage is part of a large number of additional pages and it is
-		desirable to do whatever possible to facilitate adding many subsequent pages.
-		The actual container implementation will decide whether or not to heed
-		this hint and what to do about it.
+        return maybeSwitchMemtable(memtable_, true);
+    }
 
-		@return a reference to the page that was added.
+    public void forceBlockingFlush() throws ExecutionException, InterruptedException
+    {
+        Future<?> future = forceFlush();
+        if (future != null)
+            future.get();
+    }
 
-		@see Page#unlatch
+    public void forceFlushBinary()
+    {
+        if (binaryMemtable_.get().isClean())
+            return;
 
-		@exception StandardException	Standard Derby error policy
-		@exception StandardException If a page could not be allocated.
-
-	*/
-	public Page addPage(int flag) throws StandardException;
-	public static final int ADD_PAGE_DEFAULT = 0x1;
-	public static final int ADD_PAGE_BULK = 0x2;
-
-
-	/**
-		Try to preallocate numPage new pages if possible.
-	 */
-	public void preAllocate(int numPage);
-
-
-	/**
-		Remove this page from the container and unlatch the page.  <B>Caller
-		should commit or abort this transaction ASAP because failure to do so
-		will slow down page allocation of this container. </B>
-
-		<BR>The page to be removed must be latched and gotten (or added) by
-		this ContainerHandle.  The page should not be used again after this
-		call as if it has been unlatched.  If the call to removePage is
-		successful, this page is invalid should not be gotten again with
-		getPage. 
-
-		<BR>RemovePage will guarantee to unlatch the page even if a
-		StandardException is thrown. 
-
-		<P>
-		<B>Locking Policy</B>
-		<BR>
-		The page will not be freed until the transaction that removed the page 
-		commits.  A special RecordHandle.DEALLOC_PROTECTION_HANDLE lock will be 
-		gotten for the transaction and which is used to prevent the page from 
-		being freed.  This lock will be held regardless of the default locking 
-		policy of the transaction that called removedPage.
-
-		@see LockingPolicy
-		@see RecordHandle
-
-		@exception StandardException Standard Derby error policy 
-	*/
-	public void removePage(Page page) throws StandardException;
-
-
-	/**
-		Obtain exclusive access to the page with the given page number.
-		
-		Once the Page is no longer required the Page's unlatch() method must 
-        be called.
-
-		<P>
-		The Page object is guaranteed to remain in-memory and exclusive to the 
-        caller until its unlatch() method is called.
-
-		@return the required Page or null if the page does not exist or is not 
-        valid (i.e, it has been deallocated or freed or never initialized)
-		Note that an overflow page will be returned since it is a valid page.
-
-		@exception StandardException	Standard Derby error policy
-	*/
-	public Page getPage(long pageNumber)
-		throws StandardException;
-
-	/**
-		Identical to getPage but returns null immediately if the desired page
-        is already latched by another Container.
-
-		@return the required Page or null if the page does not exist or the page
-		is already latched.
-
-		@exception StandardException	Standard Derby error policy
-
-	*/
-	public Page getPageNoWait(long pageNumber) throws StandardException;
-
-	/**
-        Obtain exclusive access to the page with the given page number.
-
-        Will only return a valid, non-overflow user page - so can be used by
-        routines in post commit to get pages to attempt deleted row space
-        reclamation.  If for some reason a request is made for an overflow
-        page a null will be returned.
-
-		Once the Page is no longer required the Page's unlatch() method must 
-        be called.
-
-		<P>
-		The Page object is guaranteed to remain in-memory and exclusive to the 
-        caller until its unlatch() method is called.
-
-		@return the required Page or null if the page does not exist or is not 
-        valid (i.e, it has been deallocated, freed, never initialized, or is
-        an allocation page or overflow page)
-
-		@exception StandardException	Standard Derby error policy
-	*/
-	public Page getUserPageNoWait(long pageNumber) throws StandardException;
-	/**
-        Obtain exclusive access to the page with the given page number.
-
-        Will only return a valid, non-overflow user page - so can be used by
-        routines in post commit to get pages to attempt deleted row space
-        reclamation.  If for some reason a request is made for an overflow
-        page a null will be returned.
-
-		Once the Page is no longer required the Page's unlatch() method must 
-        be called.
-
-		<P>
-		The Page object is guaranteed to remain in-memory and exclusive to the 
-        caller until its unlatch() method is called.
-
-		@return the required Page or null if the page does not exist or is not 
-        valid (i.e, it has been deallocated, freed, never initialized, or is
-        an allocation page or overflow page)
-
-		@exception StandardException	Standard Derby error policy
-	*/
-	public Page getUserPageWait(long pageNumber) throws StandardException;
-
-	/**
-		Obtain exclusive access to the current first page of the container.
-		Only a valid, non overflow page will be returned.
-		Pages in the container are ordered in an internally defined ordering.
-		<P>
-		Note that once this method returns this page may no longer be the 
-		first page of the container.  I.e, other threads may allocate pages 
-		prior to this page number while this page is latched.  It is up to
-		the caller of this routine to synchronize this call with addPage to 
-		assure that this is the first page.  
-		<BR>
-		As long as the client provide the necessary lock to ensure 
-		that no addPage is called, then this page is guaranteed to be the
-		first page of the container in some internally defined ordering of
-		the pages.
-
-		@return latched page or null if there is no page in the container
-		@exception StandardException	Standard Derby error policy
-
-		@see ContainerHandle#getPage
-	*/
-	public Page getFirstPage() throws StandardException;
-
-	/**
-		Obtain exclusive access to the next valid page of the given page number 
-		in the container. Only a valid, non overflow page will be returned.
-		Pages in the container are ordered in an internally defined ordering.
-		<P>
-		Note that once this method returns this page may no longer be the 
-		next page of the container.  I.e, other threads may allocate pages 
-		prior to this page number while this page is latched.  It is up to
-		the caller of this routine to synchronize this call with addPage to 
-		assure that this is the first page.  
-		<BR>
-		As long as the client provide the necessary lock to ensure 
-		that no addPage is called, then this page is guaranteed to be the
-		next page of the container in some internally defined ordering of
-		the pages.
-		<BR>
-		If no pages are added or removed, then an iteration such as:
-		<PRE>
-		for (Page p = containerHandle.getFirstPage();
-			 p != null;
-			 p = containerHandle.getNextPage(p.getPageNumber()))
-		<PRE>
-		will guarentee to iterate thru and latched all the valid pages 
-		in the container
-
-		@param prevNum the pagenumber of the page previous to the page
-		that is to be gotten.  The page which correspond to prevNum
-		may or may not be latched by the caller, but it must be gotten 
-		via a page which was (or currently still is) latched, and the page
-		number must be gotten while the container must not have been closed 
-		or dropped or removed in the interim.
-
-		In other words, if the user manufactures a page number, or remembers 
-		the page number from a previous session or a previous openContainer, 
-		then the behavior of this routine is undefined.
-
-		@return latched page or null if there is no next page in the container
-		@exception StandardException	Standard Derby error policy
-
-		@see ContainerHandle#getPage
-	*/
-	public Page getNextPage(long prevNum) throws StandardException;
-
-
-	/**
-		Get a page for insert.  If RawStore thinks it knows where a potentially
-		suitable page is for insert, it will return it.  If RawStore doesn't
-		know where a suitable page for insert is, or if there are no allocated
-		page, then null is returned.  If a page is returned, it will be a
-		valid, non-overflow page.   A potentially suitable page is one which
-		has enough space for a minium sized record.
-
-		@return a valid, non-overflow page.  Or null if RawStore doesn't know
-		where to find a good valid, non-overflow page.
-
-		@param flag a GET_PAGE_* flag.
-
-		@exception StandardException Standard Derby error policy 
-	*/
-	public Page getPageForInsert(int flag) 
-		 throws StandardException;
-
-	public Page getPageForCompress(
-    int     flag,
-    long    pageno) 
-		 throws StandardException;
-
-	// Try to get a page that is unfilled, 'unfill-ness' is defined by the
-	// page.  Since unfill-ness is defined by the page, the only thing RawStore
-	// guarentees about the page is that it has space for a a minimum sized
-	// record.
-	//
-	// If this bit is not set, then getPageForInsert will get the page that was
-	// last gotten, provided it has space for a minimum sized record.
-	//
-	// If for whatever reasons RawStore is unable to come up with such a page,
-	// null will be returned.
-	public static final int GET_PAGE_UNFILLED = 0x1;
-
+        submitFlush(binaryMemtable_.get());
+    }
 
     /**
-     * Request the system properties associated with a container. 
-     * <p>
-     * Request the value of properties that are associated with a table.  The
-     * following properties can be requested:
-     *     derby.storage.pageSize 
-     *     derby.storage.pageReservedSpace
-     *     derby.storage.minimumRecordSize
-     * <p>
-     * To get the value of a particular property add it to the property list,
-     * and on return the value of the property will be set to it's current 
-     * value.  For example:
+     * Insert/Update the column family for this key.
+     * Caller is responsible for acquiring Table.flusherLock!
+     * param @ lock - lock that needs to be used.
+     * param @ key - key for update/insert
+     * param @ columnFamily - columnFamily changes
+     */
+    Memtable apply(DecoratedKey key, ColumnFamily columnFamily)
+    {
+        long start = System.nanoTime();
+
+        boolean flushRequested = memtable_.isThresholdViolated();
+        memtable_.put(key, columnFamily);
+        writeStats_.addNano(System.nanoTime() - start);
+        
+        return flushRequested ? memtable_ : null;
+    }
+
+    /*
+     * Insert/Update the column family for this key. param @ lock - lock that
+     * needs to be used. param @ key - key for update/insert param @
+     * columnFamily - columnFamily changes
+     */
+    void applyBinary(DecoratedKey key, byte[] buffer)
+    {
+        long start = System.nanoTime();
+        binaryMemtable_.get().put(key, buffer);
+        writeStats_.addNano(System.nanoTime() - start);
+    }
+
+    /*
+     This is complicated because we need to preserve deleted columns, supercolumns, and columnfamilies
+     until they have been deleted for at least GC_GRACE_IN_SECONDS.  But, we do not need to preserve
+     their contents; just the object itself as a "tombstone" that can be used to repair other
+     replicas that do not know about the deletion.
+     */
+    public static ColumnFamily removeDeleted(ColumnFamily cf, int gcBefore)
+    {
+        if (cf == null)
+        {
+            return null;
+        }
+
+        if (cf.isSuper())
+            removeDeletedSuper(cf, gcBefore);
+        else
+            removeDeletedStandard(cf, gcBefore);
+
+        // in case of a timestamp tie, tombstones get priority over non-tombstones.
+        // (we want this to be deterministic to avoid confusion.)
+        if (cf.getColumnCount() == 0 && cf.getLocalDeletionTime() <= gcBefore)
+        {
+            return null;
+        }
+        return cf;
+    }
+
+    private static void removeDeletedStandard(ColumnFamily cf, int gcBefore)
+    {
+        for (byte[] cname : cf.getColumnNames())
+        {
+            IColumn c = cf.getColumnsMap().get(cname);
+            if ((c.isMarkedForDelete() && c.getLocalDeletionTime() <= gcBefore)
+                || c.timestamp() <= cf.getMarkedForDeleteAt())
+            {
+                cf.remove(cname);
+            }
+        }
+    }
+
+    private static void removeDeletedSuper(ColumnFamily cf, int gcBefore)
+    {
+        // TODO assume deletion means "most are deleted?" and add to clone, instead of remove from original?
+        // this could be improved by having compaction, or possibly even removeDeleted, r/m the tombstone
+        // once gcBefore has passed, so if new stuff is added in it doesn't used the wrong algorithm forever
+        for (byte[] cname : cf.getColumnNames())
+        {
+            IColumn c = cf.getColumnsMap().get(cname);
+            long minTimestamp = Math.max(c.getMarkedForDeleteAt(), cf.getMarkedForDeleteAt());
+            for (IColumn subColumn : c.getSubColumns())
+            {
+                if (subColumn.timestamp() <= minTimestamp
+                    || (subColumn.isMarkedForDelete() && subColumn.getLocalDeletionTime() <= gcBefore))
+                {
+                    ((SuperColumn)c).remove(subColumn.name());
+                }
+            }
+            if (c.getSubColumns().isEmpty() && c.getLocalDeletionTime() <= gcBefore)
+            {
+                cf.remove(c.name());
+            }
+        }
+    }
+
+    /*
+     * Called after the Memtable flushes its in-memory data, or we add a file
+     * via bootstrap. This information is
+     * cached in the ColumnFamilyStore. This is useful for reads because the
+     * ColumnFamilyStore first looks in the in-memory store and the into the
+     * disk to find the key. If invoked during recoveryMode the
+     * onMemtableFlush() need not be invoked.
      *
-     * get_prop(ConglomerateController cc)
-     * {
-     *     Properties prop = new Properties();
-     *     prop.put("derby.storage.pageSize", "");
-     *     cc.getTableProperties(prop);
-     *
-     *     System.out.println(
-     *         "table's page size = " + 
-     *         prop.getProperty("derby.storage.pageSize");
-     * }
-     *
-     * @param prop   Property list to fill in.
-     *
-	 * @exception  StandardException  Standard exception policy.
-     **/
-    void getContainerProperties(Properties prop)
-		throws StandardException;
+     * param @ filename - filename just flushed to disk
+     */
+    public void addSSTable(SSTableReader sstable)
+    {
+        ssTables_.add(Arrays.asList(sstable));
+        CompactionManager.instance.submitMinorIfNeeded(this);
+    }
 
-	/**
-		Close me. After using this method the caller must throw away the
-		reference to the Container object, e.g.
-		<PRE>
-			ref.close();
-			ref = null;
-		</PRE>
-		<BR>
-		The container will be closed automatically at the commit or abort
-		of the transaction if this method is not called explictly.
-		<BR>
-		Any pages that were obtained using me and have not been released
-		using Page's unlatch method are released, and references to them must be
-		thrown away.
+    /*
+     * Add up all the files sizes this is the worst case file
+     * size for compaction of all the list of files given.
+     */
+    long getExpectedCompactedFileSize(Iterable<SSTableReader> sstables)
+    {
+        long expectedFileSize = 0;
+        for (SSTableReader sstable : sstables)
+        {
+            long size = sstable.length();
+            expectedFileSize = expectedFileSize + size;
+        }
+        return expectedFileSize;
+    }
 
+    /*
+     *  Find the maximum size file in the list .
+     */
+    SSTableReader getMaxSizeFile(Iterable<SSTableReader> sstables)
+    {
+        long maxSize = 0L;
+        SSTableReader maxFile = null;
+        for (SSTableReader sstable : sstables)
+        {
+            if (sstable.length() > maxSize)
+            {
+                maxSize = sstable.length();
+                maxFile = sstable;
+            }
+        }
+        return maxFile;
+    }
 
-		@see Page#unlatch
-	*/
-	public void close();
+    void forceCleanup()
+    {
+        CompactionManager.instance.submitCleanup(ColumnFamilyStore.this);
+    }
 
-	/**
-		Cost estimation
-	*/
+    public Table getTable()
+    {
+        return Table.open(table_);
+    }
 
-	/**
-		Get the total estimated number of rows in the container, not including
-		overflow rows.  This number is a rough estimate and may be grossly off.
+    void markCompacted(Collection<SSTableReader> sstables)
+    {
+        ssTables_.markCompacted(sstables);
+    }
 
-		@param flag different flavors of row count (reserved for future use)
-		@exception StandardException	Standard Derby error policy
-	 */
-	public long getEstimatedRowCount(int flag) throws StandardException;
+    boolean isCompleteSSTables(Collection<SSTableReader> sstables)
+    {
+        return ssTables_.getSSTables().equals(new HashSet<SSTableReader>(sstables));
+    }
 
-	/**
-		Set the total estimated number of rows in the container.  Often, after
-		a scan, the client of RawStore has a much better estimate of the number
-		of rows in the container then what RawStore has.  Use this better
-		number for future reference.
-		<BR>
-		It is OK for a ReadOnly ContainerHandle to set the estimated row count.
-
-		@param count the estimated number of rows in the container.
-		@param flag different flavors of row count (reserved for future use)
-
-		@exception StandardException	Standard Derby error policy
-	 */
-	public void setEstimatedRowCount(long count, int flag) throws StandardException;
-
-	/**
-		Get the total estimated number of allocated (not freed, not
-		deallocated) user pages in the container, including overflow pages.
-		this number is a rough estimate and may be grossly off.
-
-		@param flag different flavors of page count (reserved for future use)
-
-		@exception StandardException	Standard Derby error policy
-	 */
-	public long getEstimatedPageCount(int flag) throws StandardException;
-
-
-	/**
-		Flush all dirty pages of the container to disk.  Used mainly for
-		UNLOGGED or CREATE_UNLOGGED operation.
-
-		@exception StandardException	Standard Derby error policy
-	*/
-	public void flushContainer() throws StandardException;
-
-	/**
-		Return the locking policy for this open container.
-	*/
-	public LockingPolicy getLockingPolicy();
-
-	/**
-		Set the locking policy for this open container
-	*/
-	public void setLockingPolicy(LockingPolicy newLockingPolicy);
-
-	/**
-		Return a record handle that is initialized to the given segment id,
-        container id, page number and record id.
-
-		@exception StandardException Standard Derby exception policy.
-
-		@param pageNumber   the page number of the RecordHandle.
-		@param recordId     the record id of the RecordHandle.
-
-		@see RecordHandle
-	*/
-	public RecordHandle makeRecordHandle(long pageNumber, int recordId)
-		 throws	StandardException;
-
-
-	/**
-		This record probably has shrunk considerably.  Free its reserved space
-		or compact it.
-
-		@param record	The record handle, the record must have been locked execlusively already.
-		@exception StandardException Standard Derby exception policy.
-	*/
-	public void compactRecord(RecordHandle record) throws StandardException;
-
-	/**
-		Return true if this containerHandle refers to a temporary container.
-		@exception StandardException Standard Derby exception policy.
-	 */
-	public boolean isTemporaryContainer() throws StandardException;
+    void replaceCompactedSSTables(Collection<SSTableReader> sstables, Iterable<SSTableReader> replacements)
+    {
+        ssTables_.replace(sstables, replacements);
+    }
 
     /**
-    Get information about space used by the container.
-    **/
-    public SpaceInfo getSpaceInfo() throws StandardException;
+     * submits flush sort on the flushSorter executor, which will in turn submit to flushWriter when sorted.
+     * TODO because our executors use CallerRunsPolicy, when flushSorter fills up, no writes will proceed
+     * because the next flush will start executing on the caller, mutation-stage thread that has the
+     * flush write lock held.  (writes aquire this as a read lock before proceeding.)
+     * This is good, because it backpressures flushes, but bad, because we can't write until that last
+     * flushing thread finishes sorting, which will almost always be longer than any of the flushSorter threads proper
+     * (since, by definition, it started last).
+     */
+    Condition submitFlush(IFlushable flushable)
+    {
+        logger_.info("Enqueuing flush of {}", flushable);
+        final Condition condition = new SimpleCondition();
+        flushable.flushAndSignal(condition, flushSorter_, flushWriter_);
+        return condition;
+    }
 
-	/**
-	   Backup the container to the specified path.
-	   @exception StandardException	Standard Derby error policy
-	*/
-	public void backupContainer(String backupContainerPath) throws StandardException;
+    public boolean isSuper()
+    {
+        return isSuper_;
+    }
+
+    public int getMemtableColumnsCount()
+    {
+        return getMemtableThreadSafe().getCurrentOperations();
+    }
+
+    public int getMemtableDataSize()
+    {
+        return getMemtableThreadSafe().getCurrentThroughput();
+    }
+
+    public int getMemtableSwitchCount()
+    {
+        return memtableSwitchCount;
+    }
+
+    /**
+     * get the current memtable in a threadsafe fashion.  note that simply "return memtable_" is
+     * incorrect; you need to lock to introduce a thread safe happens-before ordering.
+     *
+     * do NOT use this method to do either a put or get on the memtable object, since it could be
+     * flushed in the meantime (and its executor terminated).
+     *
+     * also do NOT make this method public or it will really get impossible to reason about these things.
+     * @return
+     */
+    private Memtable getMemtableThreadSafe()
+    {
+        Table.flusherLock.readLock().lock();
+        try
+        {
+            return memtable_;
+        }
+        finally
+        {
+            Table.flusherLock.readLock().unlock();
+        }
+    }
+
+    public Collection<SSTableReader> getSSTables()
+    {
+        return ssTables_.getSSTables();
+    }
+
+    public long getReadCount()
+    {
+        return readStats_.getOpCount();
+    }
+
+    public double getRecentReadLatencyMicros()
+    {
+        return readStats_.getRecentLatencyMicros();
+    }
+
+    public long getTotalReadLatencyMicros()
+    {
+        return readStats_.getTotalLatencyMicros();
+    }
+
+// TODO this actually isn't a good meature of pending tasks
+    public int getPendingTasks()
+    {
+        return Table.flusherLock.getQueueLength();
+    }
+
+    public long getWriteCount()
+    {
+        return writeStats_.getOpCount();
+    }
+
+    public long getTotalWriteLatencyMicros()
+    {
+        return writeStats_.getTotalLatencyMicros();
+    }
+
+    public double getRecentWriteLatencyMicros()
+    {
+        return writeStats_.getRecentLatencyMicros();
+    }
+
+    public ColumnFamily getColumnFamily(DecoratedKey key, QueryPath path, byte[] start, byte[] finish, List<byte[]> bitmasks, boolean reversed, int limit)
+    {
+        return getColumnFamily(QueryFilter.getSliceFilter(key, path, start, finish, bitmasks, reversed, limit));
+    }
+
+    public ColumnFamily getColumnFamily(DecoratedKey key, QueryPath path, byte[] start, byte[] finish, boolean reversed, int limit)
+    {
+        return getColumnFamily(QueryFilter.getSliceFilter(key, path, start, finish, null, reversed, limit));
+    }
+
+    public ColumnFamily getColumnFamily(QueryFilter filter)
+    {
+        return getColumnFamily(filter, CompactionManager.getDefaultGCBefore());
+    }
+
+    private ColumnFamily cacheRow(DecoratedKey key)
+    {
+        ColumnFamily cached;
+        if ((cached = ssTables_.getRowCache().get(key)) == null)
+        {
+            cached = getTopLevelColumns(QueryFilter.getIdentityFilter(key, new QueryPath(columnFamily_)), Integer.MIN_VALUE);
+            if (cached == null)
+                return null;
+            ssTables_.getRowCache().put(key, cached);
+        }
+        return cached;
+    }
+
+    /**
+     * get a list of columns starting from a given column, in a specified order.
+     * only the latest version of a column is returned.
+     * @return null if there is no data and no tombstones; otherwise a ColumnFamily
+     */
+    public ColumnFamily getColumnFamily(QueryFilter filter, int gcBefore)
+    {
+        assert columnFamily_.equals(filter.getColumnFamilyName());
+
+        long start = System.nanoTime();
+        try
+        {
+            if (ssTables_.getRowCache().getCapacity() == 0)
+                return removeDeleted(getTopLevelColumns(filter, gcBefore), gcBefore);
+
+            ColumnFamily cached = cacheRow(filter.key);
+            if (cached == null)
+                return null;
+            IColumnIterator ci = filter.getMemtableColumnIterator(cached, null, getComparator());
+            ColumnFamily returnCF = ci.getColumnFamily().cloneMeShallow();
+            filter.collectCollatedColumns(returnCF, ci, gcBefore);
+            // TODO this is necessary because when we collate supercolumns together, we don't check
+            // their subcolumns for relevance, so we need to do a second prune post facto here.
+            return removeDeleted(returnCF, gcBefore);
+        }
+        catch (IOException e)
+        {
+            throw new IOError(e);
+        }
+        finally
+        {
+            readStats_.addNano(System.nanoTime() - start);
+        }
+    }
+
+    private ColumnFamily getTopLevelColumns(QueryFilter filter, int gcBefore)
+    {
+        // we are querying top-level columns, do a merging fetch with indexes.
+        List<IColumnIterator> iterators = new ArrayList<IColumnIterator>();
+        final ColumnFamily returnCF = ColumnFamily.create(table_, columnFamily_);
+        try
+        {
+            IColumnIterator iter;
+
+            /* add the current memtable */
+            Table.flusherLock.readLock().lock();
+            try
+            {
+                iter = filter.getMemtableColumnIterator(memtable_, getComparator());
+            }
+            finally
+            {
+                Table.flusherLock.readLock().unlock();
+            }
+            if (iter != null)
+            {
+                returnCF.delete(iter.getColumnFamily());
+                iterators.add(iter);
+            }
+
+            /* add the memtables being flushed */
+            for (Memtable memtable : getMemtablesPendingFlush())
+            {
+                iter = filter.getMemtableColumnIterator(memtable, getComparator());
+                if (iter != null)
+                {
+                    returnCF.delete(iter.getColumnFamily());
+                    iterators.add(iter);
+                }
+            }
+
+            /* add the SSTables on disk */
+            for (SSTableReader sstable : ssTables_)
+            {
+                iter = filter.getSSTableColumnIterator(sstable);
+                if (iter.hasNext()) // initializes iter.CF
+                {
+                    returnCF.delete(iter.getColumnFamily());
+                }
+                iterators.add(iter);
+            }
+
+            Comparator<IColumn> comparator = QueryFilter.getColumnComparator(getComparator());
+            Iterator collated = IteratorUtils.collatedIterator(comparator, iterators);
+            if (!collated.hasNext())
+                return null;
+
+            filter.collectCollatedColumns(returnCF, collated, gcBefore);
+            return returnCF; // caller is responsible for final removeDeleted
+        }
+        catch (IOException e)
+        {
+            throw new IOError(e);
+        }
+        finally
+        {
+            /* close all cursors */
+            for (IColumnIterator ci : iterators)
+            {
+                try
+                {
+                    ci.close();
+                }
+                catch (Throwable th)
+                {
+                    logger_.error("error closing " + ci, th);
+                }
+            }
+        }
+    }
+
+    /**
+      * Fetch a range of rows and columns from memtables/sstables.
+      * 
+      * @param rows The resulting rows fetched during this operation 
+      * @param superColumn Super column to filter by
+      * @param range Either a Bounds, which includes start key, or a Range, which does not.
+      * @param maxResults Maximum rows to return
+      * @param sliceRange Information on how to slice columns
+      * @param columnNames Column names to filter by 
+      * @return true if we found all keys we were looking for, otherwise false
+     */
+    private boolean getRangeRows(List<Row> rows, byte[] superColumn, final AbstractBounds range, int maxResults, SliceRange sliceRange, List<byte[]> columnNames)
+    throws ExecutionException, InterruptedException
+    {
+        final DecoratedKey startWith = new DecoratedKey(range.left, (byte[])null);
+        final DecoratedKey stopAt = new DecoratedKey(range.right, (byte[])null);
+        
+        final int gcBefore = CompactionManager.getDefaultGCBefore();
+
+        final QueryPath queryPath =  new QueryPath(columnFamily_, superColumn, null);
+        final SortedSet<byte[]> columnNameSet = new TreeSet<byte[]>(getComparator());
+        if (columnNames != null)
+            columnNameSet.addAll(columnNames);
+
+        final QueryFilter filter = sliceRange == null ? QueryFilter.getNamesFilter(null, queryPath, columnNameSet)
+                                                      : QueryFilter.getSliceFilter(null, queryPath, sliceRange.start, sliceRange.finish, sliceRange.bitmasks, sliceRange.reversed, sliceRange.count);
+
+        Collection<Memtable> memtables = new ArrayList<Memtable>(memtablesPendingFlush);
+
+        Collection<SSTableReader> sstables = new ArrayList<SSTableReader>();
+        Iterables.addAll(sstables, ssTables_);
+
+        RowIterator iterator = RowIteratorFactory.getIterator(memtable_, memtables, sstables, startWith, stopAt, filter, getComparator(), gcBefore);
+
+        try
+        {
+            // pull rows out of the iterator
+            boolean first = true;
+            IPartitioner partitioner = StorageService.getPartitioner(); 
+            while(iterator.hasNext())
+            {
+                Row current = iterator.next();
+                DecoratedKey key = current.key;
+
+                if (!stopAt.isEmpty() && stopAt.compareTo(key) < 0)
+                    return true;
+
+                // skip first one
+                if(range instanceof Bounds || !first || !key.equals(startWith))
+                    rows.add(current);
+                first = false;
+
+                if (rows.size() >= maxResults)
+                    return true;
+            }
+            return false;
+        }
+        finally
+        {
+            try
+            {
+                iterator.close();
+            }
+            catch (IOException e)
+            {
+                throw new IOError(e);
+            }
+        }
+    }
+
+    /**
+     *
+     * @param super_column
+     * @param range: either a Bounds, which includes start key, or a Range, which does not.
+     * @param keyMax maximum number of keys to process, regardless of startKey/finishKey
+     * @param sliceRange may be null if columnNames is specified. specifies contiguous columns to return in what order.
+     * @param columnNames may be null if sliceRange is specified. specifies which columns to return in what order.      @return list of key->list<column> tuples.
+     * @throws ExecutionException
+     * @throws InterruptedException
+     */
+    public RangeSliceReply getRangeSlice(byte[] super_column, final AbstractBounds range, int keyMax, SliceRange sliceRange, List<byte[]> columnNames)
+    throws ExecutionException, InterruptedException
+    {
+        List<Row> rows = new ArrayList<Row>();
+        boolean completed;
+        if ((range instanceof Bounds || !((Range)range).isWrapAround()))
+        {
+            completed = getRangeRows(rows, super_column, range, keyMax, sliceRange, columnNames);
+        }
+        else
+        {
+            // wrapped range
+            Token min = StorageService.getPartitioner().getMinimumToken();
+            Range first = new Range(range.left, min);
+            completed = getRangeRows(rows, super_column, first, keyMax, sliceRange, columnNames);
+            if (!completed && min.compareTo(range.right) < 0)
+            {
+                Range second = new Range(min, range.right);
+                getRangeRows(rows, super_column, second, keyMax, sliceRange, columnNames);
+            }
+        }
+
+        return new RangeSliceReply(rows);
+    }
+
+    public AbstractType getComparator()
+    {
+        return DatabaseDescriptor.getComparator(table_, columnFamily_);
+    }
+
+    /**
+     * Take a snap shot of this columnfamily store.
+     * 
+     * @param snapshotName the name of the associated with the snapshot 
+     */
+    public void snapshot(String snapshotName)
+    {
+        try
+        {
+            forceBlockingFlush();
+        }
+        catch (ExecutionException e)
+        {
+            throw new RuntimeException(e);
+        }
+        catch (InterruptedException e)
+        {
+            throw new AssertionError(e);
+        }
+
+        for (SSTableReader ssTable : ssTables_)
+        {
+            try
+            {
+                // mkdir
+                File sourceFile = new File(ssTable.getFilename());
+                File dataDirectory = sourceFile.getParentFile().getParentFile();
+                String snapshotDirectoryPath = Table.getSnapshotPath(dataDirectory.getAbsolutePath(), table_, snapshotName);
+                FileUtils.createDirectory(snapshotDirectoryPath);
+
+                // hard links
+                File targetLink = new File(snapshotDirectoryPath, sourceFile.getName());
+                FileUtils.createHardLink(sourceFile, targetLink);
+
+                sourceFile = new File(ssTable.indexFilename());
+                targetLink = new File(snapshotDirectoryPath, sourceFile.getName());
+                FileUtils.createHardLink(sourceFile, targetLink);
+
+                sourceFile = new File(ssTable.filterFilename());
+                targetLink = new File(snapshotDirectoryPath, sourceFile.getName());
+                FileUtils.createHardLink(sourceFile, targetLink);
+                if (logger_.isDebugEnabled())
+                    logger_.debug("Snapshot for " + table_ + " table data file " + sourceFile.getAbsolutePath() +
+                        " created as " + targetLink.getAbsolutePath());
+            }
+            catch (IOException e)
+            {
+                throw new IOError(e);
+            }
+
+        }
+    }
+
+    public boolean hasUnreclaimedSpace()
+    {
+        return ssTables_.getLiveSize() < ssTables_.getTotalSize();
+    }
+
+    public long getTotalDiskSpaceUsed()
+    {
+        return ssTables_.getTotalSize();
+    }
+
+    public long getLiveDiskSpaceUsed()
+    {
+        return ssTables_.getLiveSize();
+    }
+
+    public int getLiveSSTableCount()
+    {
+        return ssTables_.size();
+    }
+
+    /** raw cached row -- does not fetch the row if it is not present.  not counted in cache statistics.  */
+    public ColumnFamily getRawCachedRow(DecoratedKey key)
+    {
+        return ssTables_.getRowCache().getCapacity() == 0 ? null : ssTables_.getRowCache().getInternal(key);
+    }
+
+    void invalidateCachedRow(DecoratedKey key)
+    {
+        ssTables_.getRowCache().remove(key);
+    }
+
+    public void forceMajorCompaction()
+    {
+        CompactionManager.instance.submitMajor(this);
+    }
+
+    public void invalidateRowCache()
+    {
+        ssTables_.getRowCache().clear();
+    }
+
+    public static Iterable<ColumnFamilyStore> all()
+    {
+        Iterable<ColumnFamilyStore>[] stores = new Iterable[DatabaseDescriptor.getTables().size()];
+        int i = 0;
+        for (Table table : Table.all())
+        {
+            stores[i++] = table.getColumnFamilyStores();
+        }
+        return Iterables.concat(stores);
+    }
+
+    public Iterable<DecoratedKey> allKeySamples()
+    {
+        Collection<SSTableReader> sstables = getSSTables();
+        Iterable<DecoratedKey>[] samples = new Iterable[sstables.size()];
+        int i = 0;
+        for (SSTableReader sstable: sstables)
+        {
+            samples[i++] = sstable.getKeySamples();
+        }
+        return Iterables.concat(samples);
+    }
+
+    /**
+     * for testing.  no effort is made to clear historical memtables.
+     */
+    void clearUnsafe()
+    {
+        memtable_.clearUnsafe();
+        ssTables_.clearUnsafe();
+    }
+
+
+    public Set<Memtable> getMemtablesPendingFlush()
+    {
+        return memtablesPendingFlush;
+    }
 }

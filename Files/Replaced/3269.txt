@@ -1,14 +1,13 @@
-Scorer subQueryScorer, Scorer[] valSrcScorers) {
+? CompressedRandomAccessReader.open(header.file.getFilename(), header.file.sstable.getCompressionMetadata(), true)
 
-package org.apache.lucene.queries;
-
-/*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -19,357 +18,216 @@ package org.apache.lucene.queries;
  * limitations under the License.
  */
 
+package org.apache.cassandra.streaming;
+
+import java.io.File;
 import java.io.IOException;
-import java.util.Set;
-import java.util.Arrays;
+import java.io.OutputStream;
+import java.net.InetAddress;
+import java.net.Socket;
+import java.nio.ByteBuffer;
 
-import org.apache.lucene.index.AtomicReaderContext;
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.Term;
-import org.apache.lucene.search.ComplexExplanation;
-import org.apache.lucene.search.Explanation;
-import org.apache.lucene.search.Query;
-import org.apache.lucene.search.Weight;
-import org.apache.lucene.search.Scorer;
-import org.apache.lucene.search.IndexSearcher;
-import org.apache.lucene.util.Bits;
-import org.apache.lucene.util.ToStringUtils;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.gms.Gossiper;
+import org.apache.cassandra.io.compress.CompressedRandomAccessReader;
+import org.apache.cassandra.io.util.RandomAccessReader;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.Throttle;
+import org.apache.cassandra.utils.WrappedRunnable;
 
-/**
- * Query that sets document score as a programmatic function of several (sub) scores:
- * <ol>
- *    <li>the score of its subQuery (any query)</li>
- *    <li>(optional) the score of its ValueSourceQuery (or queries).</li>
- * </ol>
- * Subclasses can modify the computation by overriding {@link #getCustomScoreProvider}.
- * 
- * @lucene.experimental
- */
-public class CustomScoreQuery extends Query {
+import com.ning.compress.lzf.LZFOutputStream;
 
-  private Query subQuery;
-  private Query[] scoringQueries; // never null (empty array if there are no valSrcQueries).
-  private boolean strict = false; // if true, valueSource part of query does not take part in weights normalization.
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-  /**
-   * Create a CustomScoreQuery over input subQuery.
-   * @param subQuery the sub query whose scored is being customized. Must not be null. 
-   */
-  public CustomScoreQuery(Query subQuery) {
-    this(subQuery, new Query[0]);
-  }
-
-  /**
-   * Create a CustomScoreQuery over input subQuery and a {@link org.apache.lucene.queries.function.FunctionQuery}.
-   * @param subQuery the sub query whose score is being customized. Must not be null.
-   * @param scoringQuery a value source query whose scores are used in the custom score
-   * computation.  This parameter is optional - it can be null.
-   */
-  public CustomScoreQuery(Query subQuery, Query scoringQuery) {
-    this(subQuery, scoringQuery!=null ? // don't want an array that contains a single null..
-        new Query[] {scoringQuery} : new Query[0]);
-  }
-
-  /**
-   * Create a CustomScoreQuery over input subQuery and a {@link org.apache.lucene.queries.function.FunctionQuery}.
-   * @param subQuery the sub query whose score is being customized. Must not be null.
-   * @param scoringQueries value source queries whose scores are used in the custom score
-   * computation.  This parameter is optional - it can be null or even an empty array.
-   */
-  public CustomScoreQuery(Query subQuery, Query... scoringQueries) {
-    this.subQuery = subQuery;
-    this.scoringQueries = scoringQueries !=null?
-        scoringQueries : new Query[0];
-    if (subQuery == null) throw new IllegalArgumentException("<subquery> must not be null!");
-  }
-
-  /*(non-Javadoc) @see org.apache.lucene.search.Query#rewrite(org.apache.lucene.index.IndexReader) */
-  @Override
-  public Query rewrite(IndexReader reader) throws IOException {
-    CustomScoreQuery clone = null;
+public class FileStreamTask extends WrappedRunnable
+{
+    private static Logger logger = LoggerFactory.getLogger(FileStreamTask.class);
     
-    final Query sq = subQuery.rewrite(reader);
-    if (sq != subQuery) {
-      clone = clone();
-      clone.subQuery = sq;
-    }
+    public static final int CHUNK_SIZE = 64 * 1024;
+    // around 10 minutes at the default rpctimeout
+    public static final int MAX_CONNECT_ATTEMPTS = 8;
 
-    for(int i = 0; i < scoringQueries.length; i++) {
-      final Query v = scoringQueries[i].rewrite(reader);
-      if (v != scoringQueries[i]) {
-        if (clone == null) clone = clone();
-        clone.scoringQueries[i] = v;
-      }
+    protected final StreamHeader header;
+    protected final InetAddress to;
+
+    // communication socket
+    private Socket socket;
+    // socket's output stream
+    private OutputStream output;
+    // allocate buffer to use for transfers only once
+    private final byte[] transferBuffer = new byte[CHUNK_SIZE];
+    // outbound global throughput limiter
+    private final Throttle throttle;
+
+    public FileStreamTask(StreamHeader header, InetAddress to)
+    {
+        this.header = header;
+        this.to = to;
+        this.throttle = new Throttle(toString(), new Throttle.ThroughputFunction()
+        {
+            /** @return Instantaneous throughput target in bytes per millisecond. */
+            public int targetThroughput()
+            {
+                if (DatabaseDescriptor.getStreamThroughputOutboundMegabitsPerSec() < 1)
+                    // throttling disabled
+                    return 0;
+                // total throughput
+                int totalBytesPerMS = DatabaseDescriptor.getStreamThroughputOutboundMegabitsPerSec() * 1024 * 1024 / 8 / 1000;
+                // per stream throughput (target bytes per MS)
+                return totalBytesPerMS / Math.max(1, MessagingService.instance().getActiveStreamsOutbound());
+            }
+        });
     }
     
-    return (clone == null) ? this : clone;
-  }
-
-  /*(non-Javadoc) @see org.apache.lucene.search.Query#extractTerms(java.util.Set) */
-  @Override
-  public void extractTerms(Set<Term> terms) {
-    subQuery.extractTerms(terms);
-    for (Query scoringQuery : scoringQueries) {
-      scoringQuery.extractTerms(terms);
-    }
-  }
-
-  /*(non-Javadoc) @see org.apache.lucene.search.Query#clone() */
-  @Override
-  public CustomScoreQuery clone() {
-    CustomScoreQuery clone = (CustomScoreQuery)super.clone();
-    clone.subQuery = subQuery.clone();
-    clone.scoringQueries = new Query[scoringQueries.length];
-    for(int i = 0; i < scoringQueries.length; i++) {
-      clone.scoringQueries[i] = scoringQueries[i].clone();
-    }
-    return clone;
-  }
-
-  /* (non-Javadoc) @see org.apache.lucene.search.Query#toString(java.lang.String) */
-  @Override
-  public String toString(String field) {
-    StringBuilder sb = new StringBuilder(name()).append("(");
-    sb.append(subQuery.toString(field));
-    for (Query scoringQuery : scoringQueries) {
-      sb.append(", ").append(scoringQuery.toString(field));
-    }
-    sb.append(")");
-    sb.append(strict?" STRICT" : "");
-    return sb.toString() + ToStringUtils.boost(getBoost());
-  }
-
-  /** Returns true if <code>o</code> is equal to this. */
-  @Override
-  public boolean equals(Object o) {
-    if (this == o)
-      return true;
-    if (!super.equals(o))
-      return false;
-    if (getClass() != o.getClass()) {
-      return false;
-    }
-    CustomScoreQuery other = (CustomScoreQuery)o;
-    if (this.getBoost() != other.getBoost() ||
-        !this.subQuery.equals(other.subQuery) ||
-        this.strict != other.strict ||
-        this.scoringQueries.length != other.scoringQueries.length) {
-      return false;
-    }
-    return Arrays.equals(scoringQueries, other.scoringQueries);
-  }
-
-  /** Returns a hash code value for this object. */
-  @Override
-  public int hashCode() {
-    return (getClass().hashCode() + subQuery.hashCode() + Arrays.hashCode(scoringQueries))
-      ^ Float.floatToIntBits(getBoost()) ^ (strict ? 1234 : 4321);
-  }
-  
-  /**
-   * Returns a {@link CustomScoreProvider} that calculates the custom scores
-   * for the given {@link IndexReader}. The default implementation returns a default
-   * implementation as specified in the docs of {@link CustomScoreProvider}.
-   * @since 2.9.2
-   */
-  protected CustomScoreProvider getCustomScoreProvider(AtomicReaderContext context) throws IOException {
-    return new CustomScoreProvider(context);
-  }
-
-  //=========================== W E I G H T ============================
-  
-  private class CustomWeight extends Weight {
-    Weight subQueryWeight;
-    Weight[] valSrcWeights;
-    boolean qStrict;
-
-    public CustomWeight(IndexSearcher searcher) throws IOException {
-      this.subQueryWeight = subQuery.createWeight(searcher);
-      this.valSrcWeights = new Weight[scoringQueries.length];
-      for(int i = 0; i < scoringQueries.length; i++) {
-        this.valSrcWeights[i] = scoringQueries[i].createWeight(searcher);
-      }
-      this.qStrict = strict;
-    }
-
-    /*(non-Javadoc) @see org.apache.lucene.search.Weight#getQuery() */
-    @Override
-    public Query getQuery() {
-      return CustomScoreQuery.this;
-    }
-
-    @Override
-    public float getValueForNormalization() throws IOException {
-      float sum = subQueryWeight.getValueForNormalization();
-      for (Weight valSrcWeight : valSrcWeights) {
-        if (qStrict) {
-          valSrcWeight.getValueForNormalization(); // do not include ValueSource part in the query normalization
-        } else {
-          sum += valSrcWeight.getValueForNormalization();
+    public void runMayThrow() throws IOException
+    {
+        try
+        {
+            connectAttempt();
+            // successfully connected: stream.
+            // (at this point, if we fail, it is the receiver's job to re-request)
+            stream();
         }
-      }
-      sum *= getBoost() * getBoost(); // boost each sub-weight
-      return sum ;
-    }
-
-    /*(non-Javadoc) @see org.apache.lucene.search.Weight#normalize(float) */
-    @Override
-    public void normalize(float norm, float topLevelBoost) {
-      topLevelBoost *= getBoost(); // incorporate boost
-      subQueryWeight.normalize(norm, topLevelBoost);
-      for (Weight valSrcWeight : valSrcWeights) {
-        if (qStrict) {
-          valSrcWeight.normalize(1, 1); // do not normalize the ValueSource part
-        } else {
-          valSrcWeight.normalize(norm, topLevelBoost);
+        finally
+        {
+            try
+            {
+                close();
+            }
+            catch (IOException e)
+            {
+                if (logger.isDebugEnabled())
+                    logger.debug("error closing socket", e);
+            }
         }
-      }
+        if (logger.isDebugEnabled())
+            logger.debug("Done streaming " + header.file);
     }
 
-    @Override
-    public Scorer scorer(AtomicReaderContext context, boolean scoreDocsInOrder,
-        boolean topScorer, Bits acceptDocs) throws IOException {
-      // Pass true for "scoresDocsInOrder", because we
-      // require in-order scoring, even if caller does not,
-      // since we call advance on the valSrcScorers.  Pass
-      // false for "topScorer" because we will not invoke
-      // score(Collector) on these scorers:
-      Scorer subQueryScorer = subQueryWeight.scorer(context, true, false, acceptDocs);
-      if (subQueryScorer == null) {
-        return null;
-      }
-      Scorer[] valSrcScorers = new Scorer[valSrcWeights.length];
-      for(int i = 0; i < valSrcScorers.length; i++) {
-         valSrcScorers[i] = valSrcWeights[i].scorer(context, true, topScorer, acceptDocs);
-      }
-      return new CustomScorer(CustomScoreQuery.this.getCustomScoreProvider(context), this, getBoost(), subQueryScorer, valSrcScorers);
-    }
+    /**
+     * Stream file by it's sections specified by this.header
+     * @throws IOException on any I/O error
+     */
+    private void stream() throws IOException
+    {
+        ByteBuffer HeaderBuffer = MessagingService.instance().constructStreamHeader(header, false, Gossiper.instance.getVersion(to));
+        // write header (this should not be compressed for compatibility with other messages)
+        output.write(ByteBufferUtil.getArray(HeaderBuffer));
 
-    @Override
-    public Explanation explain(AtomicReaderContext context, int doc) throws IOException {
-      Explanation explain = doExplain(context, doc);
-      return explain == null ? new Explanation(0.0f, "no matching docs") : explain;
-    }
-    
-    private Explanation doExplain(AtomicReaderContext info, int doc) throws IOException {
-      Explanation subQueryExpl = subQueryWeight.explain(info, doc);
-      if (!subQueryExpl.isMatch()) {
-        return subQueryExpl;
-      }
-      // match
-      Explanation[] valSrcExpls = new Explanation[valSrcWeights.length];
-      for(int i = 0; i < valSrcWeights.length; i++) {
-        valSrcExpls[i] = valSrcWeights[i].explain(info, doc);
-      }
-      Explanation customExp = CustomScoreQuery.this.getCustomScoreProvider(info).customExplain(doc,subQueryExpl,valSrcExpls);
-      float sc = getBoost() * customExp.getValue();
-      Explanation res = new ComplexExplanation(
-        true, sc, CustomScoreQuery.this.toString() + ", product of:");
-      res.addDetail(customExp);
-      res.addDetail(new Explanation(getBoost(), "queryBoost")); // actually using the q boost as q weight (== weight value)
-      return res;
-    }
+        if (header.file == null)
+            return;
 
-    @Override
-    public boolean scoresDocsOutOfOrder() {
-      return false;
-    }
-    
-  }
+        // TODO just use a raw RandomAccessFile since we're managing our own buffer here
+        RandomAccessReader file = (header.file.sstable.compression) // try to skip kernel page cache if possible
+                                ? CompressedRandomAccessReader.open(header.file.getFilename(), true)
+                                : RandomAccessReader.open(new File(header.file.getFilename()), true);
 
+        // setting up data compression stream
+        output = new LZFOutputStream(output);
 
-  //=========================== S C O R E R ============================
-  
-  /**
-   * A scorer that applies a (callback) function on scores of the subQuery.
-   */
-  private class CustomScorer extends Scorer {
-    private final float qWeight;
-    private final Scorer subQueryScorer;
-    private final Scorer[] valSrcScorers;
-    private final CustomScoreProvider provider;
-    private final float[] vScores; // reused in score() to avoid allocating this array for each doc
+        try
+        {
+            // stream each of the required sections of the file
+            for (Pair<Long, Long> section : header.file.sections)
+            {
+                // seek to the beginning of the section
+                file.seek(section.left);
 
-    // constructor
-    private CustomScorer(CustomScoreProvider provider, CustomWeight w, float qWeight,
-        Scorer subQueryScorer, Scorer[] valSrcScorers) throws IOException {
-      super(w);
-      this.qWeight = qWeight;
-      this.subQueryScorer = subQueryScorer;
-      this.valSrcScorers = valSrcScorers;
-      this.vScores = new float[valSrcScorers.length];
-      this.provider = provider;
-    }
+                // length of the section to stream
+                long length = section.right - section.left;
+                // tracks write progress
+                long bytesTransferred = 0;
 
-    @Override
-    public int nextDoc() throws IOException {
-      int doc = subQueryScorer.nextDoc();
-      if (doc != NO_MORE_DOCS) {
-        for (Scorer valSrcScorer : valSrcScorers) {
-          valSrcScorer.advance(doc);
+                while (bytesTransferred < length)
+                {
+                    long lastWrite = write(file, length, bytesTransferred);
+                    bytesTransferred += lastWrite;
+                    // store streaming progress
+                    header.file.progress += lastWrite;
+                }
+
+                // make sure that current section is send
+                output.flush();
+
+                if (logger.isDebugEnabled())
+                    logger.debug("Bytes transferred " + bytesTransferred + "/" + header.file.size);
+            }
         }
-      }
-      return doc;
-    }
-
-    @Override
-    public int docID() {
-      return subQueryScorer.docID();
-    }
-    
-    /*(non-Javadoc) @see org.apache.lucene.search.Scorer#score() */
-    @Override
-    public float score() throws IOException {
-      for (int i = 0; i < valSrcScorers.length; i++) {
-        vScores[i] = valSrcScorers[i].score();
-      }
-      return qWeight * provider.customScore(subQueryScorer.docID(), subQueryScorer.score(), vScores);
-    }
-
-    @Override
-    public int advance(int target) throws IOException {
-      int doc = subQueryScorer.advance(target);
-      if (doc != NO_MORE_DOCS) {
-        for (Scorer valSrcScorer : valSrcScorers) {
-          valSrcScorer.advance(doc);
+        finally
+        {
+            // no matter what happens close file
+            FileUtils.closeQuietly(file);
         }
-      }
-      return doc;
     }
-  }
 
-  @Override
-  public Weight createWeight(IndexSearcher searcher) throws IOException {
-    return new CustomWeight(searcher);
-  }
+    /**
+     * Sequentially read bytes from the file and write them to the output stream
+     *
+     * @param reader The file reader to read from
+     * @param length The full length that should be transferred
+     * @param bytesTransferred Number of bytes remaining to transfer
+     *
+     * @return Number of bytes transferred
+     *
+     * @throws IOException on any I/O error
+     */
+    protected long write(RandomAccessReader reader, long length, long bytesTransferred) throws IOException
+    {
+        int toTransfer = (int) Math.min(CHUNK_SIZE, length - bytesTransferred);
 
-  /**
-   * Checks if this is strict custom scoring.
-   * In strict custom scoring, the ValueSource part does not participate in weight normalization.
-   * This may be useful when one wants full control over how scores are modified, and does 
-   * not care about normalizing by the ValueSource part.
-   * One particular case where this is useful if for testing this query.   
-   * <P>
-   * Note: only has effect when the ValueSource part is not null.
-   */
-  public boolean isStrict() {
-    return strict;
-  }
+        reader.readFully(transferBuffer, 0, toTransfer);
+        output.write(transferBuffer, 0, toTransfer);
+        throttle.throttleDelta(toTransfer);
 
-  /**
-   * Set the strict mode of this query. 
-   * @param strict The strict mode to set.
-   * @see #isStrict()
-   */
-  public void setStrict(boolean strict) {
-    this.strict = strict;
-  }
+        return toTransfer;
+    }
 
-  /**
-   * A short name of this query, used in {@link #toString(String)}.
-   */
-  public String name() {
-    return "custom";
-  }
+    /**
+     * Connects to the destination, with backoff for failed attempts.
+     * TODO: all nodes on a cluster must currently use the same storage port
+     * @throws IOException If all attempts fail.
+     */
+    private void connectAttempt() throws IOException
+    {
+        int attempts = 0;
+        while (true)
+        {
+            try
+            {
+                socket = MessagingService.instance().getConnectionPool(to).newSocket();
+                output = socket.getOutputStream();
+                break;
+            }
+            catch (IOException e)
+            {
+                if (++attempts >= MAX_CONNECT_ATTEMPTS)
+                    throw e;
 
+                long waitms = DatabaseDescriptor.getRpcTimeout() * (long)Math.pow(2, attempts);
+                logger.warn("Failed attempt " + attempts + " to connect to " + to + " to stream " + header.file + ". Retrying in " + waitms + " ms. (" + e + ")");
+                try
+                {
+                    Thread.sleep(waitms);
+                }
+                catch (InterruptedException wtf)
+                {
+                    throw new RuntimeException(wtf);
+                }
+            }
+        }
+    }
+
+    protected void close() throws IOException
+    {
+        output.close();
+    }
+
+    public String toString()
+    {
+        return String.format("FileStreamTask(session=%s, to=%s)", header.sessionId, to);
+    }
 }

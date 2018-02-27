@@ -1,14 +1,13 @@
-IndexReader reader = IndexReader.open(dir, true);
-
-package org.apache.lucene.index;
+if (row == null || row.cf == null)
 
 /**
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -19,107 +18,201 @@ package org.apache.lucene.index;
  * limitations under the License.
  */
 
+package org.apache.cassandra.db;
+
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.net.InetAddress;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.List;
+import java.util.LinkedList;
 
-import org.apache.lucene.util.LuceneTestCase;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import org.apache.lucene.analysis.WhitespaceAnalyzer;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.Field;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.RAMDirectory;
-import org.apache.lucene.store.MockRAMDirectory;
+import org.apache.cassandra.db.filter.QueryPath;
+import org.apache.cassandra.db.marshal.AbstractCommutativeType;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.io.ICompactSerializer;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.thrift.ConsistencyLevel;
 
-
-public class TestSegmentTermEnum extends LuceneTestCase
+public class CounterMutation implements IMutation
 {
-  Directory dir = new RAMDirectory();
+    private static final Logger logger = LoggerFactory.getLogger(CounterMutation.class);
+    private static final CounterMutationSerializer serializer = new CounterMutationSerializer();
 
-  public void testTermEnum() throws IOException
-  {
-    IndexWriter writer = null;
+    private final RowMutation rowMutation;
+    private final ConsistencyLevel consistency;
 
-    writer  = new IndexWriter(dir, new WhitespaceAnalyzer(), true, IndexWriter.MaxFieldLength.LIMITED);
-
-    // ADD 100 documents with term : aaa
-    // add 100 documents with terms: aaa bbb
-    // Therefore, term 'aaa' has document frequency of 200 and term 'bbb' 100
-    for (int i = 0; i < 100; i++) {
-      addDoc(writer, "aaa");
-      addDoc(writer, "aaa bbb");
+    public CounterMutation(RowMutation rowMutation, ConsistencyLevel consistency)
+    {
+        this.rowMutation = rowMutation;
+        this.consistency = consistency;
     }
 
-    writer.close();
+    public String getTable()
+    {
+        return rowMutation.getTable();
+    }
 
-    // verify document frequency of terms in an unoptimized index
-    verifyDocFreq();
+    public ByteBuffer key()
+    {
+        return rowMutation.key();
+    }
 
-    // merge segments by optimizing the index
-    writer = new IndexWriter(dir, new WhitespaceAnalyzer(), false, IndexWriter.MaxFieldLength.LIMITED);
-    writer.optimize();
-    writer.close();
+    public RowMutation rowMutation()
+    {
+        return rowMutation;
+    }
 
-    // verify document frequency of terms in an optimized index
-    verifyDocFreq();
-  }
+    public ConsistencyLevel consistency()
+    {
+        return consistency;
+    }
 
-  public void testPrevTermAtEnd() throws IOException
-  {
-    Directory dir = new MockRAMDirectory();
-    IndexWriter writer  = new IndexWriter(dir, new WhitespaceAnalyzer(), true, IndexWriter.MaxFieldLength.LIMITED);
-    addDoc(writer, "aaa bbb");
-    writer.close();
-    SegmentReader reader = SegmentReader.getOnlySegmentReader(dir);
-    SegmentTermEnum termEnum = (SegmentTermEnum) reader.terms();
-    assertTrue(termEnum.next());
-    assertEquals("aaa", termEnum.term().text());
-    assertTrue(termEnum.next());
-    assertEquals("aaa", termEnum.prev().text());
-    assertEquals("bbb", termEnum.term().text());
-    assertFalse(termEnum.next());
-    assertEquals("bbb", termEnum.prev().text());
-  }
+    public static CounterMutationSerializer serializer()
+    {
+        return serializer;
+    }
 
-  private void verifyDocFreq()
-      throws IOException
-  {
-      IndexReader reader = IndexReader.open(dir);
-      TermEnum termEnum = null;
+    public RowMutation makeReplicationMutation() throws IOException
+    {
+        List<ReadCommand> readCommands = new LinkedList<ReadCommand>();
+        for (ColumnFamily columnFamily : rowMutation.getColumnFamilies())
+        {
+            if (!columnFamily.metadata().getReplicateOnWrite())
+                continue;
 
-    // create enumeration of all terms
-    termEnum = reader.terms();
-    // go to the first term (aaa)
-    termEnum.next();
-    // assert that term is 'aaa'
-    assertEquals("aaa", termEnum.term().text());
-    assertEquals(200, termEnum.docFreq());
-    // go to the second term (bbb)
-    termEnum.next();
-    // assert that term is 'bbb'
-    assertEquals("bbb", termEnum.term().text());
-    assertEquals(100, termEnum.docFreq());
+            // CF type: regular
+            if (!columnFamily.isSuper())
+            {
+                QueryPath queryPath = new QueryPath(columnFamily.metadata().cfName);
+                ReadCommand readCommand = new SliceByNamesReadCommand(rowMutation.getTable(), rowMutation.key(), queryPath, columnFamily.getColumnNames());
+                readCommands.add(readCommand);
+                continue;
+            }
 
-    termEnum.close();
+            // CF type: super
+            for (IColumn superColumn : columnFamily.getSortedColumns())
+            {
+                QueryPath queryPath = new QueryPath(columnFamily.metadata().cfName, superColumn.name());
 
+                // construct set of sub-column names
+                Collection<IColumn> subColumns = superColumn.getSubColumns();
+                Collection<ByteBuffer> subColNames = new HashSet<ByteBuffer>(subColumns.size());
+                for (IColumn subCol : subColumns)
+                {
+                    subColNames.add(subCol.name());
+                }
 
-    // create enumeration of terms after term 'aaa', including 'aaa'
-    termEnum = reader.terms(new Term("content", "aaa"));
-    // assert that term is 'aaa'
-    assertEquals("aaa", termEnum.term().text());
-    assertEquals(200, termEnum.docFreq());
-    // go to term 'bbb'
-    termEnum.next();
-    // assert that term is 'bbb'
-    assertEquals("bbb", termEnum.term().text());
-    assertEquals(100, termEnum.docFreq());
+                ReadCommand readCommand = new SliceByNamesReadCommand(rowMutation.getTable(), rowMutation.key(), queryPath, subColNames);
+                readCommands.add(readCommand);
+            }
+        }
 
-    termEnum.close();
-  }
+        // replicate to non-local replicas
+        List<InetAddress> foreignReplicas = StorageService.instance.getLiveNaturalEndpoints(rowMutation.getTable(), rowMutation.key());
+        foreignReplicas.remove(FBUtilities.getLocalAddress()); // remove local replica
 
-  private void addDoc(IndexWriter writer, String value) throws IOException
-  {
-    Document doc = new Document();
-    doc.add(new Field("content", value, Field.Store.NO, Field.Index.ANALYZED));
-    writer.addDocument(doc);
-  }
+        // create a replication RowMutation
+        RowMutation replicationMutation = new RowMutation(rowMutation.getTable(), rowMutation.key());
+        for (ReadCommand readCommand : readCommands)
+        {
+            Table table = Table.open(readCommand.table);
+            Row row = readCommand.getRow(table);
+            if (null == row)
+                continue;
+            AbstractType defaultValidator = row.cf.metadata().getDefaultValidator();
+            if (defaultValidator.isCommutative())
+            {
+                /**
+                 * Clean out contexts for all nodes we're sending the repair to, otherwise,
+                 * we could send a context which is local to one of the foreign replicas,
+                 * which would then incorrectly add that to its own count, because
+                 * local resolution aggregates.
+                 */
+                // note: the following logic could be optimized
+                for (InetAddress foreignNode : foreignReplicas)
+                {
+                    ((AbstractCommutativeType)defaultValidator).cleanContext(row.cf, foreignNode);
+                }
+            }
+            replicationMutation.add(row.cf);
+        }
+        return replicationMutation;
+    }
+
+    public Message makeMutationMessage(int version) throws IOException
+    {
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        DataOutputStream dos = new DataOutputStream(bos);
+        serializer().serialize(this, dos, version);
+        return new Message(FBUtilities.getLocalAddress(), StorageService.Verb.COUNTER_MUTATION, bos.toByteArray(), version);
+    }
+
+    public boolean shouldReplicateOnWrite()
+    {
+        for (ColumnFamily cf : rowMutation.getColumnFamilies())
+            if (cf.metadata().getReplicateOnWrite())
+                return true;
+        return false;
+    }
+
+    public void apply() throws IOException
+    {
+        // We need to transform all CounterUpdateColumn to CounterColumn and we need to deepCopy. Both are done 
+        // below since CUC.asCounterColumn() does a deep copy.
+        RowMutation rm = new RowMutation(rowMutation.getTable(), ByteBufferUtil.clone(rowMutation.key()));
+        Table table = Table.open(rm.getTable());
+
+        for (ColumnFamily cf_ : rowMutation.getColumnFamilies())
+        {
+            ColumnFamily cf = cf_.cloneMeShallow();
+            ColumnFamilyStore cfs = table.getColumnFamilyStore(cf.id());
+            for (IColumn column : cf_.getColumnsMap().values())
+            {
+                cf.addColumn(column.localCopy(cfs));
+            }
+            rm.add(cf);
+        }
+        rm.apply();
+    }
+
+    @Override
+    public String toString()
+    {
+        return toString(false);
+    }
+
+    public String toString(boolean shallow)
+    {
+        StringBuilder buff = new StringBuilder("CounterMutation(");
+        buff.append(rowMutation.toString(shallow));
+        buff.append(", ").append(consistency.toString());
+        return buff.append(")").toString();
+    }
+}
+
+class CounterMutationSerializer implements ICompactSerializer<CounterMutation>
+{
+    public void serialize(CounterMutation cm, DataOutputStream dos, int version) throws IOException
+    {
+        RowMutation.serializer().serialize(cm.rowMutation(), dos, version);
+        dos.writeUTF(cm.consistency().name());
+    }
+
+    public CounterMutation deserialize(DataInputStream dis, int version) throws IOException
+    {
+        RowMutation rm = RowMutation.serializer().deserialize(dis, version);
+        ConsistencyLevel consistency = Enum.valueOf(ConsistencyLevel.class, dis.readUTF());
+        return new CounterMutation(rm, consistency);
+    }
 }

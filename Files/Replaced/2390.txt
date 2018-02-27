@@ -1,13 +1,14 @@
-TProtocolFactory tProtocolFactory = new TBinaryProtocol.Factory(true,
+offsetAtt.setOffset(correctOffset(startOffset), correctOffset(endOffset));
+
+package org.apache.lucene.analysis;
 
 /**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,212 +19,162 @@ TProtocolFactory tProtocolFactory = new TBinaryProtocol.Factory(true,
  * limitations under the License.
  */
 
-package org.apache.cassandra.thrift;
-
 import java.io.IOException;
-import java.net.InetAddress;
-import java.net.InetSocketAddress;
-import java.util.UUID;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.SynchronousQueue;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
+import java.io.Reader;
 
-import org.apache.cassandra.config.ConfigurationException;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.db.CompactionManager;
-import org.apache.cassandra.db.SystemTable;
-import org.apache.cassandra.db.Table;
-import org.apache.cassandra.db.commitlog.CommitLog;
-import org.apache.cassandra.db.migration.Migration;
-import org.apache.cassandra.service.MigrationManager;
-import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.utils.FBUtilities;
-import org.apache.cassandra.utils.Mx4jTool;
-import org.apache.thrift.TProcessorFactory;
-import org.apache.thrift.protocol.TBinaryProtocol;
-import org.apache.thrift.protocol.TProtocolFactory;
-import org.apache.thrift.server.TServer;
-import org.apache.thrift.transport.TFramedTransport;
-import org.apache.thrift.transport.TServerSocket;
-import org.apache.thrift.transport.TTransportException;
-import org.apache.thrift.transport.TTransportFactory;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
+import org.apache.lucene.analysis.tokenattributes.OffsetAttribute;
 
 /**
- * This class supports two methods for creating a Cassandra node daemon, 
- * invoking the class's main method, and using the jsvc wrapper from 
- * commons-daemon, (for more information on using this class with the 
- * jsvc wrapper, see the 
- * <a href="http://commons.apache.org/daemon/jsvc.html">Commons Daemon</a>
- * documentation).
+ * tokenizer for testing. Optionally lowercases.
  */
+public class MockTokenizer extends Tokenizer {
+  /** Acts Similar to WhitespaceTokenizer */
+  public static final int WHITESPACE = 0; 
+  /** Acts Similar to KeywordTokenizer.
+   * TODO: Keyword returns an "empty" token for an empty reader... 
+   */
+  public static final int KEYWORD = 1;
+  /** Acts like LetterTokenizer. */
+  public static final int SIMPLE = 2;
 
-public class CassandraDaemon extends org.apache.cassandra.service.AbstractCassandraDaemon
-{
-    private static Logger logger = LoggerFactory.getLogger(CassandraDaemon.class);
-    private TServer serverEngine;
+  private final int pattern;
+  private final boolean lowerCase;
 
-    protected void setup() throws IOException
-    {
-        int listenPort = DatabaseDescriptor.getRpcPort();
-        InetAddress listenAddr = DatabaseDescriptor.getRpcAddress();
-        
-        /* 
-         * If ThriftAddress was left completely unconfigured, then assume
-         * the same default as ListenAddress
-         */
-        if (listenAddr == null)
-            listenAddr = FBUtilities.getLocalAddress();
-        
-        Thread.setDefaultUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler()
-        {
-            public void uncaughtException(Thread t, Throwable e)
-            {
-                logger.error("Uncaught exception in thread " + t, e);
-                if (e instanceof OutOfMemoryError)
-                {
-                    System.exit(100);
-                }
-            }
-        });
-        
-        // check the system table for mismatched partitioner.
-        try
-        {
-            SystemTable.checkHealth();
-        }
-        catch (ConfigurationException e)
-        {
-            logger.error("Fatal exception during initialization", e);
-            System.exit(100);
-        }
+  private final CharTermAttribute termAtt = addAttribute(CharTermAttribute.class);
+  private final OffsetAttribute offsetAtt = addAttribute(OffsetAttribute.class);
+  int off = 0;
 
-        try
-        {
-            DatabaseDescriptor.loadSchemas();
-        }
-        catch (IOException e)
-        {
-            logger.error("Fatal exception during initialization", e);
-            System.exit(100);
-        }
-        
-        // initialize keyspaces
-        for (String table : DatabaseDescriptor.getTables())
-        {
-            if (logger.isDebugEnabled())
-                logger.debug("opening keyspace " + table);
-            Table.open(table);
-        }
+  // TODO: "register" with LuceneTestCase to ensure all streams are closed() ?
+  // currently, we can only check that the lifecycle is correct if someone is reusing,
+  // but not for "one-offs".
+  private static enum State { 
+    SETREADER,       // consumer set a reader input either via ctor or via reset(Reader)
+    RESET,           // consumer has called reset()
+    INCREMENT,       // consumer is consuming, has called incrementToken() == true
+    INCREMENT_FALSE, // consumer has called incrementToken() which returned false
+    END,             // consumer has called end() to perform end of stream operations
+    CLOSE            // consumer has called close() to release any resources
+  };
+  
+  private State streamState = State.CLOSE;
+  private boolean enableChecks = true;
+  
+  public MockTokenizer(AttributeFactory factory, Reader input, int pattern, boolean lowerCase) {
+    super(factory, input);
+    this.pattern = pattern;
+    this.lowerCase = lowerCase;
+    this.streamState = State.SETREADER;
+  }
 
-        // replay the log if necessary and check for compaction candidates
-        CommitLog.recover();
-        CompactionManager.instance.checkAllColumnFamilies();
-        
-        // check to see if CL.recovery modified the lastMigrationId. if it did, we need to re apply migrations. this isn't
-        // the same as merely reloading the schema (which wouldn't perform file deletion after a DROP). The solution
-        // is to read those migrations from disk and apply them.
-        UUID currentMigration = DatabaseDescriptor.getDefsVersion();
-        UUID lastMigration = Migration.getLastMigrationId();
-        if ((lastMigration != null) && (lastMigration.timestamp() > currentMigration.timestamp()))
-        {
-            MigrationManager.applyMigrations(currentMigration, lastMigration);
-        }
-        
-        // start server internals
-        StorageService.instance.initServer();
-        
-        // now we start listening for clients
-        final CassandraServer cassandraServer = new CassandraServer();
-        Cassandra.Processor processor = new Cassandra.Processor(cassandraServer);
-
-        // Transport
-        TServerSocket tServerSocket = null;
-        
-        try
-        {
-            tServerSocket = new TServerSocket(new InetSocketAddress(listenAddr, listenPort));
-        } catch (TTransportException e)
-        {
-            throw new IOException(String.format(
-                    "Unable to create thrift socket to %s:%s", listenAddr,
-                    listenPort), e);
-        }
-        
-        logger.info(String.format("Binding thrift service to %s:%s", listenAddr, listenPort));
-
-        // Protocol factory
-        TProtocolFactory tProtocolFactory = new TBinaryProtocol.Factory(false, 
-                                                                        true, 
-                                                                        DatabaseDescriptor.getThriftMaxMessageLength());
-        
-        // Transport factory
-        TTransportFactory inTransportFactory, outTransportFactory;
-        if (DatabaseDescriptor.isThriftFramed())
-        {
-            int tFramedTransportSize = DatabaseDescriptor.getThriftFramedTransportSize();
-            inTransportFactory = new TFramedTransport.Factory(tFramedTransportSize);
-            outTransportFactory = new TFramedTransport.Factory(tFramedTransportSize);
-            logger.info("Using TFramedTransport with a max frame size of {} bytes.", tFramedTransportSize);
-            
-        }
-        else
-        {
-            inTransportFactory = new TTransportFactory();
-            outTransportFactory = new TTransportFactory();
-        }
-
-
-        // ThreadPool Server
-        CustomTThreadPoolServer.Options options = new CustomTThreadPoolServer.Options();
-        options.minWorkerThreads = 64;
-
-        SynchronousQueue<Runnable> executorQueue = new SynchronousQueue<Runnable>();
-
-        ExecutorService executorService = new ThreadPoolExecutor(options.minWorkerThreads,
-                                                                 options.maxWorkerThreads,
-                                                                 60,
-                                                                 TimeUnit.SECONDS,
-                                                                 executorQueue)
-        {
-            @Override
-            protected void afterExecute(Runnable r, Throwable t)
-            {
-                super.afterExecute(r, t);
-                cassandraServer.logout();
-            }
-        };
-        serverEngine = new CustomTThreadPoolServer(new TProcessorFactory(processor),
-                                             tServerSocket,
-                                             inTransportFactory,
-                                             outTransportFactory,
-                                             tProtocolFactory,
-                                             tProtocolFactory,
-                                             options,
-                                             executorService);
+  public MockTokenizer(Reader input, int pattern, boolean lowerCase) {
+    super(input);
+    this.pattern = pattern;
+    this.lowerCase = lowerCase;
+    this.streamState = State.SETREADER;
+  }
+  
+  @Override
+  public final boolean incrementToken() throws IOException {
+    assert !enableChecks || (streamState == State.RESET || streamState == State.INCREMENT) 
+                            : "incrementToken() called while in wrong state: " + streamState;
+    clearAttributes();
+    for (;;) {
+      int startOffset = off;
+      int cp = readCodePoint();
+      if (cp < 0) {
+        break;
+      } else if (isTokenChar(cp)) {
+        int endOffset;
+        do {
+          char chars[] = Character.toChars(normalize(cp));
+          for (int i = 0; i < chars.length; i++)
+            termAtt.append(chars[i]);
+          endOffset = off;
+          cp = readCodePoint();
+        } while (cp >= 0 && isTokenChar(cp));
+        offsetAtt.setOffset(startOffset, endOffset);
+        streamState = State.INCREMENT;
+        return true;
+      }
     }
+    streamState = State.INCREMENT_FALSE;
+    return false;
+  }
 
-    /** hook for JSVC */
-    public void start()
-    {
-        logger.info("Listening for thrift clients...");
-        Mx4jTool.maybeLoad();
-        serverEngine.serve();
+  protected int readCodePoint() throws IOException {
+    int ch = input.read();
+    if (ch < 0) {
+      return ch;
+    } else {
+      assert ch != 0xffff; /* only on 3.x */
+      assert !Character.isLowSurrogate((char) ch);
+      off++;
+      if (Character.isHighSurrogate((char) ch)) {
+        int ch2 = input.read();
+        if (ch2 >= 0) {
+          off++;
+          assert Character.isLowSurrogate((char) ch2);
+          return Character.toCodePoint((char) ch, (char) ch2);
+        }
+      }
+      return ch;
     }
+  }
 
-    /** hook for JSVC */
-    public void stop()
-    {
-        // this doesn't entirely shut down Cassandra, just the Thrift server.
-        // jsvc takes care of taking the rest down
-        logger.info("Cassandra shutting down...");
-        serverEngine.stop();
+  protected boolean isTokenChar(int c) {
+    switch(pattern) {
+      case WHITESPACE: return !Character.isWhitespace(c);
+      case KEYWORD: return true;
+      case SIMPLE: return Character.isLetter(c);
+      default: throw new RuntimeException("invalid pattern constant:" + pattern);
     }
-    
-    public static void main(String[] args)
-    {
-        new CassandraDaemon().activate();
-    }
+  }
+  
+  protected int normalize(int c) {
+    return lowerCase ? Character.toLowerCase(c) : c;
+  }
+
+  @Override
+  public void reset() throws IOException {
+    super.reset();
+    off = 0;
+    assert !enableChecks || streamState != State.RESET : "double reset()";
+    streamState = State.RESET;
+  }
+  
+  @Override
+  public void close() throws IOException {
+    super.close();
+    // in some exceptional cases (e.g. TestIndexWriterExceptions) a test can prematurely close()
+    // these tests should disable this check, by default we check the normal workflow.
+    // TODO: investigate the CachingTokenFilter "double-close"... for now we ignore this
+    assert !enableChecks || streamState == State.END || streamState == State.CLOSE : "close() called in wrong state: " + streamState;
+    streamState = State.CLOSE;
+  }
+
+  @Override
+  public void reset(Reader input) throws IOException {
+    super.reset(input);
+    assert !enableChecks || streamState == State.CLOSE : "setReader() called in wrong state: " + streamState;
+    streamState = State.SETREADER;
+  }
+
+  @Override
+  public void end() throws IOException {
+    int finalOffset = correctOffset(off);
+    offsetAtt.setOffset(finalOffset, finalOffset);
+    // some tokenizers, such as limiting tokenizers, call end() before incrementToken() returns false.
+    // these tests should disable this check (in general you should consume the entire stream)
+    assert !enableChecks || streamState == State.INCREMENT_FALSE : "end() called before incrementToken() returned false!";
+    streamState = State.END;
+  }
+
+  /** 
+   * Toggle consumer workflow checking: if your test consumes tokenstreams normally you
+   * should leave this enabled.
+   */
+  public void setEnableChecks(boolean enableChecks) {
+    this.enableChecks = enableChecks;
+  }
 }

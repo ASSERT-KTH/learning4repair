@@ -1,4 +1,4 @@
-ignoreErrors = true;
+rval = (T) cls.getDeclaredMethod("getInstance").invoke(new Object[] {null, null});
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one
@@ -17,370 +17,590 @@ ignoreErrors = true;
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.cassandra.contrib.stress;
 
-import org.apache.cassandra.db.ColumnFamilyType;
-import org.apache.cassandra.thrift.*;
-import org.apache.commons.cli.*;
-import org.apache.thrift.protocol.TBinaryProtocol;
-import org.apache.thrift.transport.TFramedTransport;
-import org.apache.thrift.transport.TSocket;
-import org.apache.thrift.transport.TTransport;
+package org.apache.cassandra.utils;
 
-import java.io.FileNotFoundException;
-import java.io.FileOutputStream;
-import java.io.PrintStream;
+import java.io.*;
+import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
+import java.math.BigInteger;
+import java.net.InetAddress;
+import java.net.URL;
+import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.concurrent.atomic.AtomicIntegerArray;
-import java.util.concurrent.atomic.AtomicLongArray;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.*;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
-public class Session
+import com.google.common.base.Joiner;
+import org.apache.commons.collections.iterators.CollatingIterator;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.ConfigurationException;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.locator.PropertyFileSnitch;
+import org.apache.thrift.TBase;
+import org.apache.thrift.TDeserializer;
+import org.apache.thrift.TException;
+import org.apache.thrift.TSerializer;
+
+public class FBUtilities
 {
-    // command line options
-    public static final Options availableOptions = new Options();
+    private static Logger logger_ = LoggerFactory.getLogger(FBUtilities.class);
 
-    public final AtomicIntegerArray operationCount;
-    public final AtomicIntegerArray keyCount;
-    public final AtomicLongArray latencies;
+    public static final BigInteger TWO = new BigInteger("2");
 
-    static
+    private static volatile InetAddress localInetAddress_;
+
+    private static final ThreadLocal<MessageDigest> localMD5Digest = new ThreadLocal<MessageDigest>()
     {
-        availableOptions.addOption("h",  "help",                 false,  "show this help message and exit.");
-        availableOptions.addOption("n",  "num-keys",             true,   "Number of keys, default:1000000.");
-        availableOptions.addOption("N",  "skip-keys",            true,   "Fraction of keys to skip initially, default:0.");
-        availableOptions.addOption("t",  "threads",              true,   "Number of threads to use, default:50.");
-        availableOptions.addOption("c",  "columns",              true,   "Number of columns per key, default:5.");
-        availableOptions.addOption("S",  "column-size",          true,   "Size of column values in bytes, default:34.");
-        availableOptions.addOption("C",  "cardinality",          true,   "Number of unique values stored in columns, default:50.");
-        availableOptions.addOption("d",  "nodes",                true,   "Host nodes (comma separated), default:locahost.");
-        availableOptions.addOption("s",  "stdev",                true,   "Standard Deviation Factor, default:0.1.");
-        availableOptions.addOption("r",  "random",               false,  "Use random key generator (STDEV will have no effect), default:false.");
-        availableOptions.addOption("f",  "file",                 true,   "Write output to file");
-        availableOptions.addOption("p",  "port",                 true,   "Thrift port, default:9160.");
-        availableOptions.addOption("m",  "unframed",             false,  "Use unframed transport, default:false.");
-        availableOptions.addOption("o",  "operation",            true,   "Operation to perform (INSERT, READ, RANGE_SLICE, INDEXED_RANGE_SLICE, MULTI_GET), default:INSERT.");
-        availableOptions.addOption("u",  "supercolumns",         true,   "Number of super columns per key, default:1.");
-        availableOptions.addOption("y",  "family-type",          true,   "Column Family Type (Super, Standard), default:Standard.");
-        availableOptions.addOption("k",  "keep-going",           false,  "Ignore errors inserting or reading, default:false.");
-        availableOptions.addOption("i",  "progress-interval",    true,   "Progress Report Interval (seconds), default:10.");
-        availableOptions.addOption("g",  "keys-per-call",        true,   "Amount of keys to get_range_slices or multiget per call, default:1000.");
-        availableOptions.addOption("l",  "replication-factor",   true,   "Replication Factor to use when creating needed column families, default:1.");
-        availableOptions.addOption("e",  "consistency-level",    true,   "Consistency Level to use (ONE, QUORUM, LOCAL_QUORUM, EACH_QUORUM, ALL, ANY), default:ONE.");
-        availableOptions.addOption("x",  "create-index",         true,   "Type of index to create on needed column families (KEYS).");
+        @Override
+        protected MessageDigest initialValue()
+        {
+            return newMessageDigest("MD5");
+        }
+
+        @Override
+        public MessageDigest get()
+        {
+            MessageDigest digest = super.get();
+            digest.reset();
+            return digest;
+        }
+    };
+
+    public static final int MAX_UNSIGNED_SHORT = 0xFFFF;
+
+    public static MessageDigest threadLocalMD5Digest()
+    {
+        return localMD5Digest.get();
     }
 
-    private int numKeys          = 1000 * 1000;
-    private float skipKeys       = 0;
-    private int threads          = 50;
-    private int columns          = 5;
-    private int columnSize       = 34;
-    private int cardinality      = 50;
-    private String[] nodes       = new String[] { "127.0.0.1" };
-    private boolean random       = false;
-    private boolean unframed     = false;
-    private boolean ignoreErrors = false;
-    private int port             = 9160;
-    private int superColumns     = 1;
-
-    private int progressInterval  = 10;
-    private int keysPerCall       = 1000;
-    private int replicationFactor = 1;
-
-    private PrintStream out = System.out;
-
-    private IndexType indexType = null;
-    private Stress.Operation operation = Stress.Operation.INSERT;
-    private ColumnFamilyType columnFamilyType = ColumnFamilyType.Standard;
-    private ConsistencyLevel consistencyLevel = ConsistencyLevel.ONE;
-
-    // required by Gaussian distribution.
-    protected int   mean;
-    protected float sigma;
-
-    public Session(String[] arguments) throws IllegalArgumentException
+    public static MessageDigest newMessageDigest(String algorithm)
     {
-        float STDev = 0.1f;
-        CommandLineParser parser = new PosixParser();
-
         try
         {
-            CommandLine cmd = parser.parse(availableOptions, arguments);
-
-            if (cmd.hasOption("h"))
-                throw new IllegalArgumentException("help");
-
-            if (cmd.hasOption("n"))
-                numKeys = Integer.parseInt(cmd.getOptionValue("n"));
-
-            if (cmd.hasOption("N"))
-                skipKeys = Float.parseFloat(cmd.getOptionValue("N"));
-
-            if (cmd.hasOption("t"))
-                threads = Integer.parseInt(cmd.getOptionValue("t"));
-
-            if (cmd.hasOption("c"))
-                columns = Integer.parseInt(cmd.getOptionValue("c"));
-
-            if (cmd.hasOption("S"))
-                columnSize = Integer.parseInt(cmd.getOptionValue("S"));
-
-            if (cmd.hasOption("C"))
-                cardinality = Integer.parseInt(cmd.getOptionValue("t"));
-
-            if (cmd.hasOption("d"))
-                nodes = cmd.getOptionValue("d").split(",");
-
-            if (cmd.hasOption("s"))
-                STDev = Float.parseFloat(cmd.getOptionValue("s"));
-
-            if (cmd.hasOption("r"))
-                random = Boolean.parseBoolean(cmd.getOptionValue("r"));
-
-            if (cmd.hasOption("f"))
-            {
-                try
-                {
-                    out = new PrintStream(new FileOutputStream(cmd.getOptionValue("f")));
-                }
-                catch (FileNotFoundException e)
-                {
-                    System.out.println(e.getMessage());
-                }
-            }
-
-            if (cmd.hasOption("p"))
-                port = Integer.parseInt(cmd.getOptionValue("p"));
-
-            if (cmd.hasOption("m"))
-                unframed = Boolean.parseBoolean(cmd.getOptionValue("m"));
-
-            if (cmd.hasOption("o"))
-                operation = Stress.Operation.valueOf(cmd.getOptionValue("o").toUpperCase());
-
-            if (cmd.hasOption("u"))
-                superColumns = Integer.parseInt(cmd.getOptionValue("u"));
-
-            if (cmd.hasOption("y"))
-                columnFamilyType = ColumnFamilyType.valueOf(cmd.getOptionValue("y"));
-
-            if (cmd.hasOption("k"))
-                ignoreErrors = Boolean.parseBoolean(cmd.getOptionValue("k"));
-
-            if (cmd.hasOption("i"))
-                progressInterval = Integer.parseInt(cmd.getOptionValue("i"));
-
-            if (cmd.hasOption("g"))
-                keysPerCall = Integer.parseInt(cmd.getOptionValue("g"));
-
-            if (cmd.hasOption("l"))
-                replicationFactor = Integer.parseInt(cmd.getOptionValue("l"));
-
-            if (cmd.hasOption("e"))
-                consistencyLevel = ConsistencyLevel.valueOf(cmd.getOptionValue("e").toUpperCase());
-
-            if (cmd.hasOption("x"))
-                indexType = IndexType.valueOf(cmd.getOptionValue("x").toUpperCase());
+            return MessageDigest.getInstance(algorithm);
         }
-        catch (ParseException e)
+        catch (NoSuchAlgorithmException nsae)
         {
-            throw new IllegalArgumentException(e.getMessage(), e);
+            throw new RuntimeException("the requested digest algorithm (" + algorithm + ") is not available", nsae);
+        }
+    }
+
+    /**
+     * Parses a string representing either a fraction, absolute value or percentage.
+     */
+    public static double parseDoubleOrPercent(String value)
+    {
+        if (value.endsWith("%"))
+        {
+            return Double.parseDouble(value.substring(0, value.length() - 1)) / 100;
+        }
+        else
+        {
+            return Double.parseDouble(value);
+        }
+    }
+
+    public static InetAddress getLocalAddress()
+    {
+        if (localInetAddress_ == null)
+            try
+            {
+                localInetAddress_ = DatabaseDescriptor.getListenAddress() == null
+                                    ? InetAddress.getLocalHost()
+                                    : DatabaseDescriptor.getListenAddress();
+            }
+            catch (UnknownHostException e)
+            {
+                throw new RuntimeException(e);
+            }
+        return localInetAddress_;
+    }
+
+    /**
+     * @param fractOrAbs A double that may represent a fraction or absolute value.
+     * @param total If fractionOrAbs is a fraction, the total to take the fraction from
+     * @return An absolute value which may be larger than the total.
+     */
+    public static long absoluteFromFraction(double fractOrAbs, long total)
+    {
+        if (fractOrAbs < 0)
+            throw new UnsupportedOperationException("unexpected negative value " + fractOrAbs);
+
+        if (0 < fractOrAbs && fractOrAbs <= 1)
+        {
+            // fraction
+            return Math.max(1, (long)(fractOrAbs * total));
         }
 
-        mean  = numKeys / 2;
-        sigma = numKeys * STDev;
-
-        operationCount = new AtomicIntegerArray(threads);
-        keyCount = new AtomicIntegerArray(threads);
-        latencies = new AtomicLongArray(threads);
+        // absolute
+        assert fractOrAbs >= 1 || fractOrAbs == 0;
+        return (long)fractOrAbs;
     }
 
-    public int getCardinality()
+    /**
+     * Given two bit arrays represented as BigIntegers, containing the given
+     * number of significant bits, calculate a midpoint.
+     *
+     * @param left The left point.
+     * @param right The right point.
+     * @param sigbits The number of bits in the points that are significant.
+     * @return A midpoint that will compare bitwise halfway between the params, and
+     * a boolean representing whether a non-zero lsbit remainder was generated.
+     */
+    public static Pair<BigInteger,Boolean> midpoint(BigInteger left, BigInteger right, int sigbits)
     {
-        return cardinality;
+        BigInteger midpoint;
+        boolean remainder;
+        if (left.compareTo(right) < 0)
+        {
+            BigInteger sum = left.add(right);
+            remainder = sum.testBit(0);
+            midpoint = sum.shiftRight(1);
+        }
+        else
+        {
+            BigInteger max = TWO.pow(sigbits);
+            // wrapping case
+            BigInteger distance = max.add(right).subtract(left);
+            remainder = distance.testBit(0);
+            midpoint = distance.shiftRight(1).add(left).mod(max);
+        }
+        return new Pair<BigInteger, Boolean>(midpoint, remainder);
     }
 
-    public int getColumnSize()
+    public static int compareUnsigned(byte[] bytes1, byte[] bytes2, int offset1, int offset2, int len1, int len2)
     {
-        return columnSize;
+        if (bytes1 == null)
+        {
+            return bytes2 == null ? 0 : -1;
+        }
+        if (bytes2 == null) return 1;
+
+        int minLength = Math.min(len1 - offset1, len2 - offset2);
+        for (int x = 0, i = offset1, j = offset2; x < minLength; x++, i++, j++)
+        {
+            if (bytes1[i] == bytes2[j])
+                continue;
+            // compare non-equal bytes as unsigned
+            return (bytes1[i] & 0xFF) < (bytes2[j] & 0xFF) ? -1 : 1;
+        }
+        if ((len1 - offset1) == (len2 - offset2)) return 0;
+        else return ((len1 - offset1) < (len2 - offset2)) ? -1 : 1;
     }
 
-    public boolean isUnframed()
+    /**
+     * @return The bitwise XOR of the inputs. The output will be the same length as the
+     * longer input, but if either input is null, the output will be null.
+     */
+    public static byte[] xor(byte[] left, byte[] right)
     {
-        return unframed;
-    }
+        if (left == null || right == null)
+            return null;
+        if (left.length > right.length)
+        {
+            byte[] swap = left;
+            left = right;
+            right = swap;
+        }
 
-    public int getColumnsPerKey()
-    {
-        return columns;
-    }
-
-    public ColumnFamilyType getColumnFamilyType()
-    {
-        return columnFamilyType;
-    }
-
-    public int getNumKeys()
-    {
-        return numKeys;
-    }
-
-    public int getThreads()
-    {
-        return threads;
-    }
-
-    public float getSkipKeys()
-    {
-        return skipKeys;
-    }
-
-    public int getSuperColumns()
-    {
-        return superColumns;
-    }
-
-    public int getKeysPerThread()
-    {
-        return numKeys / threads;
-    }
-
-    public int getTotalKeysLength()
-    {
-        return Integer.toString(numKeys).length();
-    }
-
-    public ConsistencyLevel getConsistencyLevel()
-    {
-        return consistencyLevel;
-    }
-
-    public boolean ignoreErrors()
-    {
-        return ignoreErrors;
-    }
-
-    public Stress.Operation getOperation()
-    {
-        return operation;
-    }
-
-    public PrintStream getOutputStream()
-    {
+        // left.length is now <= right.length
+        byte[] out = Arrays.copyOf(right, right.length);
+        for (int i = 0; i < left.length; i++)
+        {
+            out[i] = (byte)((left[i] & 0xFF) ^ (right[i] & 0xFF));
+        }
         return out;
     }
 
-    public int getProgressInterval()
+    public static BigInteger hashToBigInteger(ByteBuffer data)
     {
-        return progressInterval;
+        byte[] result = hash(data);
+        BigInteger hash = new BigInteger(result);
+        return hash.abs();        
     }
 
-    public boolean useRandomGenerator()
+    public static byte[] hash(ByteBuffer... data)
     {
-        return random;
+        MessageDigest messageDigest = localMD5Digest.get();
+        for(ByteBuffer block : data)
+        {
+            messageDigest.update(block.duplicate());
+        }
+
+        return messageDigest.digest();
     }
 
-    public int getKeysPerCall()
+    public static byte[] hexToBytes(String str)
     {
-        return keysPerCall;
+        if (str.length() % 2 == 1)
+            str = "0" + str;
+        byte[] bytes = new byte[str.length()/2];
+        for (int i = 0; i < bytes.length; i++)
+        {
+            bytes[i] = (byte)Integer.parseInt(str.substring(i*2, i*2+2), 16);
+        }
+        return bytes;
     }
 
-    // required by Gaussian distribution
-    public int getMean()
+    public static String bytesToHex(byte... bytes)
     {
-        return mean;
+        StringBuilder sb = new StringBuilder();
+        for (byte b : bytes)
+        {
+            int bint = b & 0xff;
+            if (bint <= 0xF)
+                // toHexString does not 0 pad its results.
+                sb.append("0");
+            sb.append(Integer.toHexString(bint));
+        }
+        return sb.toString();
     }
 
-    // required by Gaussian distribution
-    public float getSigma()
+    public static void renameWithConfirm(String tmpFilename, String filename) throws IOException
     {
-        return sigma;
+        if (!new File(tmpFilename).renameTo(new File(filename)))
+        {
+            throw new IOException("rename failed of " + filename);
+        }
     }
 
-    /**
-     * Create Keyspace1 with Standard1 and Super1 column families
+    /*
+    TODO how to make this work w/ ReducingKeyIterator?
+    public static <T extends Comparable<T>> CollatingIterator getCollatingIterator()
+    {
+        // CollatingIterator will happily NPE if you do not specify a comparator explicitly
+        return new CollatingIterator(new Comparator<T>()
+        {
+            public int compare(T o1, T o2)
+            {
+                return o1.compareTo(o2);
+            }
+        });
+    }
      */
-    public void createKeySpaces()
+    public static CollatingIterator getCollatingIterator()
     {
-        KsDef keyspace = new KsDef();
-        ColumnDef standardColumn = new ColumnDef(ByteBuffer.wrap("C1".getBytes()), "UTF8Type");
-        ColumnDef superSubColumn = new ColumnDef(ByteBuffer.wrap("S1".getBytes()), "UTF8Type");
+        // CollatingIterator will happily NPE if you do not specify a comparator explicitly
+        return new CollatingIterator(new Comparator()
+        {
+            public int compare(Object o1, Object o2)
+            {
+                return ((Comparable) o1).compareTo(o2);
+            }
+        });
+    }
 
-        if (indexType != null)
-            standardColumn.setIndex_type(indexType).setIndex_name("Idx1");
+    public static void atomicSetMax(AtomicInteger atomic, int i)
+    {
+        while (true)
+        {
+            int j = atomic.get();
+            if (j >= i || atomic.compareAndSet(j, i))
+                break;
+        }
+    }
 
-        // column family for standard columns
-        CfDef standardCfDef = new CfDef("Keyspace1", "Standard1").setColumn_metadata(Arrays.asList(standardColumn));
+    public static void atomicSetMax(AtomicLong atomic, long i)
+    {
+        while (true)
+        {
+            long j = atomic.get();
+            if (j >= i || atomic.compareAndSet(j, i))
+                break;
+        }
+    }
 
-        // column family with super columns
-        CfDef superCfDef = new CfDef("Keyspace1", "Super1").setColumn_metadata(Arrays.asList(superSubColumn)).setColumn_type("Super");
-
-        keyspace.setName("Keyspace1");
-        keyspace.setStrategy_class("org.apache.cassandra.locator.SimpleStrategy");
-        keyspace.setReplication_factor(replicationFactor);
-        keyspace.setCf_defs(new ArrayList<CfDef>(Arrays.asList(standardCfDef, superCfDef)));
-
-        Cassandra.Client client = getClient(false);
-
+    public static void serialize(TSerializer serializer, TBase struct, DataOutput out)
+    throws IOException
+    {
+        assert serializer != null;
+        assert struct != null;
+        assert out != null;
+        byte[] bytes;
         try
         {
-            client.system_add_keyspace(keyspace);
-            out.println(String.format("Created keyspaces. Sleeping %ss for propagation.", nodes.length));
-
-            Thread.sleep(nodes.length * 1000); // seconds
+            bytes = serializer.serialize(struct);
         }
-        catch (InvalidRequestException e)
+        catch (TException e)
         {
-            out.println(e.getWhy());
+            throw new RuntimeException(e);
+        }
+        out.writeInt(bytes.length);
+        out.write(bytes);
+    }
+
+    public static void deserialize(TDeserializer deserializer, TBase struct, DataInput in)
+    throws IOException
+    {
+        assert deserializer != null;
+        assert struct != null;
+        assert in != null;
+        byte[] bytes = new byte[in.readInt()];
+        in.readFully(bytes);
+        try
+        {
+            deserializer.deserialize(struct, bytes);
+        }
+        catch (TException ex)
+        {
+            throw new IOException(ex);
+        }
+    }
+
+    public static void sortSampledKeys(List<DecoratedKey> keys, Range range)
+    {
+        if (range.left.compareTo(range.right) >= 0)
+        {
+            // range wraps.  have to be careful that we sort in the same order as the range to find the right midpoint.
+            final Token right = range.right;
+            Comparator<DecoratedKey> comparator = new Comparator<DecoratedKey>()
+            {
+                public int compare(DecoratedKey o1, DecoratedKey o2)
+                {
+                    if ((right.compareTo(o1.token) < 0 && right.compareTo(o2.token) < 0)
+                        || (right.compareTo(o1.token) > 0 && right.compareTo(o2.token) > 0))
+                    {
+                        // both tokens are on the same side of the wrap point
+                        return o1.compareTo(o2);
+                    }
+                    return -o1.compareTo(o2);
+                }
+            };
+            Collections.sort(keys, comparator);
+        }
+        else
+        {
+            // unwrapped range (left < right).  standard sort is all we need.
+            Collections.sort(keys);
+        }
+    }
+
+    public static int encodedUTF8Length(String st)
+    {
+        int strlen = st.length();
+        int utflen = 0;
+        for (int i = 0; i < strlen; i++)
+        {
+            int c = st.charAt(i);
+            if ((c >= 0x0001) && (c <= 0x007F))
+                utflen++;
+            else if (c > 0x07FF)
+                utflen += 3;
+            else
+                utflen += 2;
+        }
+        return utflen;
+    }
+
+    public static ByteBuffer toByteBuffer(long n)
+    {
+        byte[] bytes = new byte[8];
+        return ByteBuffer.wrap(bytes).putLong(0, n);
+    }
+
+    public static String resourceToFile(String filename) throws ConfigurationException
+    {
+        ClassLoader loader = PropertyFileSnitch.class.getClassLoader();
+        URL scpurl = loader.getResource(filename);
+        if (scpurl == null)
+            throw new ConfigurationException("unable to locate " + filename);
+
+        return scpurl.getFile();
+    }
+
+    public static String getReleaseVersionString()
+    {
+        try
+        {
+            InputStream in = FBUtilities.class.getClassLoader().getResourceAsStream("org/apache/cassandra/config/version.properties");
+            Properties props = new Properties();
+            props.load(in);
+            return props.getProperty("CassandraVersion");
         }
         catch (Exception e)
         {
-            out.println(e.getMessage());
+            logger_.warn("Unable to load version.properties", e);
+            return "debug version";
         }
     }
 
-    /**
-     * Thrift client connection with Keyspace1 set.
-     * @return cassandra client connection
-     */
-    public Cassandra.Client getClient()
+    public static long timestampMicros()
     {
-        return getClient(true);
+        // we use microsecond resolution for compatibility with other client libraries, even though
+        // we can't actually get microsecond precision.
+        return System.currentTimeMillis() * 1000;
     }
-    /**
-     * Thrift client connection
-     * @param setKeyspace - should we set keyspace for client or not
-     * @return cassandra client connection
-     */
-    public Cassandra.Client getClient(boolean setKeyspace)
+
+    public static void waitOnFutures(Iterable<Future<?>> futures)
     {
-        // random node selection for fake load balancing
-        String currentNode = nodes[Stress.randomizer.nextInt(nodes.length)];
-
-        TSocket socket = new TSocket(currentNode, port);
-        TTransport transport = (isUnframed()) ? socket : new TFramedTransport(socket);
-        Cassandra.Client client = new Cassandra.Client(new TBinaryProtocol(transport));
-
-        try
+        for (Future f : futures)
         {
-            transport.open();
-
-            if (setKeyspace)
+            try
             {
-                client.set_keyspace("Keyspace1");
+                f.get();
+            }
+            catch (ExecutionException ee)
+            {
+                throw new RuntimeException(ee);
+            }
+            catch (InterruptedException ie)
+            {
+                throw new AssertionError(ie);
             }
         }
-        catch (InvalidRequestException e)
+    }
+
+    public static IPartitioner newPartitioner(String partitionerClassName) throws ConfigurationException
+    {
+        if (!partitionerClassName.contains("."))
+            partitionerClassName = "org.apache.cassandra.dht." + partitionerClassName;
+        return FBUtilities.construct(partitionerClassName, "partitioner");
+    }
+
+    public static AbstractType getComparator(String compareWith) throws ConfigurationException
+    {
+        String className = compareWith.contains(".") ? compareWith : "org.apache.cassandra.db.marshal." + compareWith;
+        Class<? extends AbstractType> typeClass = FBUtilities.<AbstractType>classForName(className, "abstract-type");
+        try
         {
-            throw new RuntimeException(e.getWhy());
+            Field field = typeClass.getDeclaredField("instance");
+            return (AbstractType) field.get(null);
+        }
+        catch (NoSuchFieldException e)
+        {
+            ConfigurationException ex = new ConfigurationException("Invalid comparator " + compareWith + " : must define a public static instance field.");
+            ex.initCause(e);
+            throw ex;
+        }
+        catch (IllegalAccessException e)
+        {
+            ConfigurationException ex = new ConfigurationException("Invalid comparator " + compareWith + " : must define a public static instance field.");
+            ex.initCause(e);
+            throw ex;
+        }
+    }
+
+    /**
+     * @return The Class for the given name.
+     * @param classname Fully qualified classname.
+     * @param readable Descriptive noun for the role the class plays.
+     * @throws ConfigurationException If the class cannot be found.
+     */
+    public static <T> Class<T> classForName(String classname, String readable) throws ConfigurationException
+    {
+        try
+        {
+            return (Class<T>)Class.forName(classname);
+        }
+        catch (ClassNotFoundException e)
+        {
+            throw new ConfigurationException(String.format("Unable to find %s class '%s'", readable, classname));
+        }
+    }
+
+    /**
+     * Constructs an instance of the given class, which must have a no-arg constructor.
+     * TODO: Similar method for our 'instance member' singleton pattern would be nice.
+     * @param classname Fully qualified classname.
+     * @param readable Descriptive noun for the role the class plays.
+     * @throws ConfigurationException If the class cannot be found.
+     */
+    public static <T> T construct(String classname, String readable) throws ConfigurationException
+    {
+        Class<T> cls = FBUtilities.classForName(classname, readable);
+        try
+        {
+            return cls.getConstructor().newInstance();
+        }
+        catch (NoSuchMethodException e)
+        {
+            throw new ConfigurationException(String.format("No default constructor for %s class '%s'.", readable, classname));
+        }
+        catch (IllegalAccessException e)
+        {
+            throw new ConfigurationException(String.format("Default constructor for %s class '%s' is inaccessible.", readable, classname));
+        }
+        catch (InstantiationException e)
+        {
+            throw new ConfigurationException(String.format("Cannot use abstract class '%s' as %s.", classname, readable));
+        }
+        catch (InvocationTargetException e)
+        {
+            if (e.getCause() instanceof ConfigurationException)
+                throw (ConfigurationException)e.getCause();
+            throw new ConfigurationException(String.format("Error instantiating %s class '%s'.", readable, classname), e);
+        }
+    }
+
+    public static <T> T getInstance(String classname, String readable) throws ConfigurationException
+    {
+        Class cls = classForName(classname,  readable);
+        T rval = null;
+        try
+        {
+            rval = (T) cls.getDeclaredMethod("getInstance").invoke(null, (Object) null);
+
+        }
+        catch (NoSuchMethodException e)
+        {
+            throw new ConfigurationException("Class does not have the getInstance method with no arguments");
+        }
+        catch (InvocationTargetException e)
+        {
+            throw new ConfigurationException(String.format("Could not call method getInstance on %s class %s", readable, classname));
+        }
+        catch (IllegalAccessException e)
+        {
+            throw new ConfigurationException(String.format("Could not call method getInstance on %s class %s", readable, classname));
+        }
+
+        return rval;
+    }
+
+    public static <T extends Comparable> SortedSet<T> singleton(T column)
+    {
+        return new TreeSet<T>(Arrays.asList(column));
+    }
+
+    public static String toString(Map<?,?> map)
+    {
+        Joiner.MapJoiner joiner = Joiner.on(",").withKeyValueSeparator(":");
+        return joiner.join(map);
+    }
+
+    /**
+     * Used to get access to protected/private field of the specified class
+     * @param klass - name of the class
+     * @param fieldName - name of the field
+     * @return Field or null on error
+     */
+    public static Field getProtectedField(Class klass, String fieldName)
+    {
+        Field field;
+
+        try
+        {
+            field = klass.getDeclaredField(fieldName);
+            field.setAccessible(true);
         }
         catch (Exception e)
         {
-            throw new RuntimeException(e.getMessage());
+            throw new AssertionError(e);
         }
 
-        return client;
+        return field;
     }
-
 }

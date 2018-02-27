@@ -1,45 +1,6 @@
 @Override
 
-package org.apache.solr.handler.component;
-
-import java.io.IOException;
-import java.util.Arrays;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.LinkedHashSet;
-import java.util.Set;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-import java.util.Map.Entry;
-
-import org.apache.lucene.index.DocsAndPositionsEnum;
-import org.apache.lucene.index.FieldInfo;
-import org.apache.lucene.index.Fields;
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.StoredFieldVisitor;
-import org.apache.lucene.index.Term;
-import org.apache.lucene.index.Terms;
-import org.apache.lucene.index.TermsEnum;
-import org.apache.lucene.util.BytesRef;
-import org.apache.solr.common.SolrException;
-import org.apache.solr.common.params.CommonParams;
-import org.apache.solr.common.params.ModifiableSolrParams;
-import org.apache.solr.common.params.SolrParams;
-import org.apache.solr.common.params.TermVectorParams;
-import org.apache.solr.common.util.NamedList;
-import org.apache.solr.common.util.StrUtils;
-import org.apache.solr.core.SolrCore;
-import org.apache.solr.schema.IndexSchema;
-import org.apache.solr.schema.SchemaField;
-import org.apache.solr.search.ReturnFields;
-import org.apache.solr.search.DocList;
-import org.apache.solr.search.DocListAndSet;
-import org.apache.solr.search.SolrIndexSearcher;
-import org.apache.solr.util.SolrPluginUtils;
-import org.apache.solr.util.plugin.SolrCoreAware;
+package org.apache.solr.update;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -58,428 +19,518 @@ import org.apache.solr.util.plugin.SolrCoreAware;
  * limitations under the License.
  */
 
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CompletionService;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorCompletionService;
+import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
 
-/**
- * Return term vectors for the documents in a query result set.
- * <p/>
- * Info available:
- * term, frequency, position, offset, IDF.
- * <p/>
- * <b>Note</b> Returning IDF can be expensive.
- * 
- * <pre class="prettyprint">
- * &lt;searchComponent name="tvComponent" class="solr.TermVectorComponent"/&gt;
- * 
- * &lt;requestHandler name="/terms" class="solr.SearchHandler"&gt;
- *   &lt;lst name="defaults"&gt;
- *     &lt;bool name="tv"&gt;true&lt;/bool&gt;
- *   &lt;/lst&gt;
- *   &lt;arr name="last-component"&gt;
- *     &lt;str&gt;tvComponent&lt;/str&gt;
- *   &lt;/arr&gt;
- * &lt;/requestHandler&gt;</pre>
- *
- *
- */
-public class TermVectorComponent extends SearchComponent implements SolrCoreAware {
+import org.apache.http.client.HttpClient;
+import org.apache.solr.client.solrj.SolrServerException;
+import org.apache.solr.client.solrj.impl.HttpClientUtil;
+import org.apache.solr.client.solrj.impl.HttpSolrServer;
+import org.apache.solr.client.solrj.request.AbstractUpdateRequest;
+import org.apache.solr.client.solrj.request.UpdateRequestExt;
+import org.apache.solr.common.SolrException;
+import org.apache.solr.common.SolrException.ErrorCode;
+import org.apache.solr.common.cloud.ZkCoreNodeProps;
+import org.apache.solr.common.params.ModifiableSolrParams;
+import org.apache.solr.common.util.NamedList;
+import org.apache.solr.core.SolrCore;
+import org.apache.solr.util.AdjustableSemaphore;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 
-  public static final String COMPONENT_NAME = "tv";
+public class SolrCmdDistributor {
+  private static final int MAX_RETRIES_ON_FORWARD = 10;
+  public static Logger log = LoggerFactory.getLogger(SolrCmdDistributor.class);
 
-  protected NamedList initParams;
-  public static final String TERM_VECTORS = "termVectors";
-
-  /**
-   * Helper method for determining the list of fields that we should 
-   * try to find term vectors on.  
-   * <p>
-   * Does simple (non-glob-supporting) parsing on the 
-   * {@link TermVectorParams#FIELDS} param if specified, otherwise it returns 
-   * the concrete field values specified in {@link CommonParams#FL} -- 
-   * ignoring functions, transformers, or literals.  
-   * </p>
-   * <p>
-   * If "fl=*" is used, or neither param is specified, then <code>null</code> 
-   * will be returned.  If the empty set is returned, it means the "fl" 
-   * specified consisted entirely of things that are not real fields 
-   * (ie: functions, transformers, partial-globs, score, etc...) and not 
-   * supported by this component. 
-   * </p>
-   */
-  private Set<String> getFields(ResponseBuilder rb) {
-    SolrParams params = rb.req.getParams();
-    String[] fldLst = params.getParams(TermVectorParams.FIELDS);
-    if (null == fldLst || 0 == fldLst.length || 
-        (1 == fldLst.length && 0 == fldLst[0].length())) {
-
-      // no tv.fl, parse the main fl
-      ReturnFields rf = new ReturnFields
-        (params.getParams(CommonParams.FL), rb.req);
-
-      if (rf.wantsAllFields()) {
-        return null;
-      }
-
-      Set<String> fieldNames = rf.getLuceneFieldNames();
-      return (null != fieldNames) ?
-        fieldNames :
-        // return empty set indicating no fields should be used
-        Collections.<String>emptySet();
-    }
-
-    // otherwise us the raw fldList as is, no special parsing or globs
-    Set<String> fieldNames = new LinkedHashSet<String>();
-    for (String fl : fldLst) {
-      fieldNames.addAll(Arrays.asList(SolrPluginUtils.split(fl)));
-    }
-    return fieldNames;
+  static final HttpClient client;
+  static AdjustableSemaphore semaphore = new AdjustableSemaphore(8);
+  
+  static {
+    ModifiableSolrParams params = new ModifiableSolrParams();
+    params.set(HttpClientUtil.PROP_MAX_CONNECTIONS, 500);
+    params.set(HttpClientUtil.PROP_MAX_CONNECTIONS_PER_HOST, 16);
+    client = HttpClientUtil.createClient(params);
   }
+  
+  CompletionService<Request> completionService;
+  Set<Future<Request>> pending;
+  
+  int maxBufferedAddsPerServer = 10;
+  int maxBufferedDeletesPerServer = 10;
 
-  @Override
-  public void process(ResponseBuilder rb) throws IOException {
-    SolrParams params = rb.req.getParams();
-    if (!params.getBool(COMPONENT_NAME, false)) {
-      return;
+  private Response response = new Response();
+  
+  private final Map<Node,List<AddRequest>> adds = new HashMap<Node,List<AddRequest>>();
+  private final Map<Node,List<DeleteRequest>> deletes = new HashMap<Node,List<DeleteRequest>>();
+  
+  class AddRequest {
+    AddUpdateCommand cmd;
+    ModifiableSolrParams params;
+  }
+  
+  class DeleteRequest {
+    DeleteUpdateCommand cmd;
+    ModifiableSolrParams params;
+  }
+  
+  public static interface AbortCheck {
+    public boolean abortCheck();
+  }
+  
+  public SolrCmdDistributor(int numHosts, ThreadPoolExecutor executor) {
+    int maxPermits = Math.max(16, numHosts * 16);
+    // limits how many tasks can actually execute at once
+    if (maxPermits != semaphore.getMaxPermits()) {
+      semaphore.setMaxPermits(maxPermits);
     }
 
-    NamedList<Object> termVectors = new NamedList<Object>();
-    rb.rsp.add(TERM_VECTORS, termVectors);
+    completionService = new ExecutorCompletionService<Request>(executor);
+    pending = new HashSet<Future<Request>>();
+  }
+  
+  public void finish() {
 
-    IndexSchema schema = rb.req.getSchema();
-    SchemaField keyField = schema.getUniqueKeyField();
-    String uniqFieldName = null;
-    if (keyField != null) {
-      uniqFieldName = keyField.getName();
-      termVectors.add("uniqueKeyFieldName", uniqFieldName);
-    }
+    flushAdds(1);
+    flushDeletes(1);
 
-    FieldOptions allFields = new FieldOptions();
-    //figure out what options we have, and try to get the appropriate vector
-    allFields.termFreq = params.getBool(TermVectorParams.TF, false);
-    allFields.positions = params.getBool(TermVectorParams.POSITIONS, false);
-    allFields.offsets = params.getBool(TermVectorParams.OFFSETS, false);
-    allFields.docFreq = params.getBool(TermVectorParams.DF, false);
-    allFields.tfIdf = params.getBool(TermVectorParams.TF_IDF, false);
-    //boolean cacheIdf = params.getBool(TermVectorParams.IDF, false);
-    //short cut to all values.
-    if (params.getBool(TermVectorParams.ALL, false)) {
-      allFields.termFreq = true;
-      allFields.positions = true;
-      allFields.offsets = true;
-      allFields.docFreq = true;
-      allFields.tfIdf = true;
-    }
-
-    //Build up our per field mapping
-    Map<String, FieldOptions> fieldOptions = new HashMap<String, FieldOptions>();
-    NamedList<List<String>> warnings = new NamedList<List<String>>();
-    List<String>  noTV = new ArrayList<String>();
-    List<String>  noPos = new ArrayList<String>();
-    List<String>  noOff = new ArrayList<String>();
-
-    Set<String> fields = getFields(rb);
-    if ( null != fields ) {
-      //we have specific fields to retrieve, or no fields
-      for (String field : fields) {
-
-        // workarround SOLR-3523
-        if (null == field || "score".equals(field)) continue; 
-
-        // we don't want to issue warnings about the uniqueKey field
-        // since it can cause lots of confusion in distributed requests
-        // where the uniqueKey field is injected into the fl for merging
-        final boolean fieldIsUniqueKey = field.equals(uniqFieldName);
-
-        SchemaField sf = schema.getFieldOrNull(field);
-        if (sf != null) {
-          if (sf.storeTermVector()) {
-            FieldOptions option = fieldOptions.get(field);
-            if (option == null) {
-              option = new FieldOptions();
-              option.fieldName = field;
-              fieldOptions.put(field, option);
-            }
-            //get the per field mappings
-            option.termFreq = params.getFieldBool(field, TermVectorParams.TF, allFields.termFreq);
-            option.docFreq = params.getFieldBool(field, TermVectorParams.DF, allFields.docFreq);
-            option.tfIdf = params.getFieldBool(field, TermVectorParams.TF_IDF, allFields.tfIdf);
-            //Validate these are even an option
-            option.positions = params.getFieldBool(field, TermVectorParams.POSITIONS, allFields.positions);
-            if (option.positions && !sf.storeTermPositions() && !fieldIsUniqueKey){
-              noPos.add(field);
-            }
-            option.offsets = params.getFieldBool(field, TermVectorParams.OFFSETS, allFields.offsets);
-            if (option.offsets && !sf.storeTermOffsets() && !fieldIsUniqueKey){
-              noOff.add(field);
-            }
-          } else {//field doesn't have term vectors
-            if (!fieldIsUniqueKey) noTV.add(field);
-          }
-        } else {
-          //field doesn't exist
-          throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, "undefined field: " + field);
-        }
-      }
-    } //else, deal with all fields
-
-    // NOTE: currently all typs of warnings are schema driven, and garunteed
-    // to be consistent across all shards - if additional types of warnings 
-    // are added that might be differnet between shards, finishStage() needs 
-    // to be changed to account for that.
-    boolean hasWarnings = false;
-    if (!noTV.isEmpty()) {
-      warnings.add("noTermVectors", noTV);
-      hasWarnings = true;
-    }
-    if (!noPos.isEmpty()) {
-      warnings.add("noPositions", noPos);
-      hasWarnings = true;
-    }
-    if (!noOff.isEmpty()) {
-      warnings.add("noOffsets", noOff);
-      hasWarnings = true;
-    }
-    if (hasWarnings) {
-      termVectors.add("warnings", warnings);
-    }
-
-    DocListAndSet listAndSet = rb.getResults();
-    List<Integer> docIds = getInts(params.getParams(TermVectorParams.DOC_IDS));
-    Iterator<Integer> iter;
-    if (docIds != null && !docIds.isEmpty()) {
-      iter = docIds.iterator();
-    } else {
-      DocList list = listAndSet.docList;
-      iter = list.iterator();
-    }
-    SolrIndexSearcher searcher = rb.req.getSearcher();
-
-    IndexReader reader = searcher.getIndexReader();
-    //the TVMapper is a TermVectorMapper which can be used to optimize loading of Term Vectors
-
-    //Only load the id field to get the uniqueKey of that
-    //field
-
-    final String finalUniqFieldName = uniqFieldName;
-
-    final List<String> uniqValues = new ArrayList<String>();
+    checkResponses(true);
+  }
+  
+  public void distribDelete(DeleteUpdateCommand cmd, List<Node> urls, ModifiableSolrParams params) throws IOException {
+    checkResponses(false);
     
-    // TODO: is this required to be single-valued? if so, we should STOP
-    // once we find it...
-    final StoredFieldVisitor getUniqValue = new StoredFieldVisitor() {
-      @Override 
-      public void stringField(FieldInfo fieldInfo, String value) {
-        uniqValues.add(value);
-      }
+    if (cmd.isDeleteById()) {
+      doDelete(cmd, urls, params);
+    } else {
+      doDelete(cmd, urls, params);
+    }
+  }
+  
+  public void distribAdd(AddUpdateCommand cmd, List<Node> nodes, ModifiableSolrParams params) throws IOException {
+    checkResponses(false);
+    
+    // make sure any pending deletes are flushed
+    flushDeletes(1);
+    
+    // TODO: this is brittle
+    // need to make a clone since these commands may be reused
+    AddUpdateCommand clone = new AddUpdateCommand(null);
+    
+    clone.solrDoc = cmd.solrDoc;
+    clone.commitWithin = cmd.commitWithin;
+    clone.overwrite = cmd.overwrite;
+    clone.setVersion(cmd.getVersion());
+    AddRequest addRequest = new AddRequest();
+    addRequest.cmd = clone;
+    addRequest.params = params;
 
-      @Override 
-      public void intField(FieldInfo fieldInfo, int value) {
-        uniqValues.add(Integer.toString(value));
+    for (Node node : nodes) {
+      List<AddRequest> alist = adds.get(node);
+      if (alist == null) {
+        alist = new ArrayList<AddRequest>(2);
+        adds.put(node, alist);
       }
+      alist.add(addRequest);
+    }
+    
+    flushAdds(maxBufferedAddsPerServer);
+  }
+  
+  public void distribCommit(CommitUpdateCommand cmd, List<Node> nodes,
+      ModifiableSolrParams params) throws IOException {
+    
+    // make sure we are ordered
+    flushAdds(1);
+    flushDeletes(1);
 
-      @Override 
-      public void longField(FieldInfo fieldInfo, long value) {
-        uniqValues.add(Long.toString(value));
+    
+    // Wait for all outstanding responses to make sure that a commit
+    // can't sneak in ahead of adds or deletes we already sent.
+    // We could do this on a per-server basis, but it's more complex
+    // and this solution will lead to commits happening closer together.
+    checkResponses(true);
+    
+    // currently, we dont try to piggy back on outstanding adds or deletes
+    
+    UpdateRequestExt ureq = new UpdateRequestExt();
+    ureq.setParams(params);
+    
+    addCommit(ureq, cmd);
+    
+    log.info("Distrib commit to:" + nodes + " params:" + params);
+    
+    for (Node node : nodes) {
+      submit(ureq, node);
+    }
+    
+    // if the command wanted to block until everything was committed,
+    // then do that here.
+    
+    if (cmd.waitSearcher) {
+      checkResponses(true);
+    }
+  }
+  
+  private void doDelete(DeleteUpdateCommand cmd, List<Node> nodes,
+      ModifiableSolrParams params) {
+    
+    flushAdds(1);
+    
+    DeleteUpdateCommand clonedCmd = clone(cmd);
+    DeleteRequest deleteRequest = new DeleteRequest();
+    deleteRequest.cmd = clonedCmd;
+    deleteRequest.params = params;
+    for (Node node : nodes) {
+      List<DeleteRequest> dlist = deletes.get(node);
+      
+      if (dlist == null) {
+        dlist = new ArrayList<DeleteRequest>(2);
+        deletes.put(node, dlist);
       }
+      dlist.add(deleteRequest);
+    }
+    
+    flushDeletes(maxBufferedDeletesPerServer);
+  }
+  
+  void addCommit(UpdateRequestExt ureq, CommitUpdateCommand cmd) {
+    if (cmd == null) return;
+    ureq.setAction(cmd.optimize ? AbstractUpdateRequest.ACTION.OPTIMIZE
+        : AbstractUpdateRequest.ACTION.COMMIT, false, cmd.waitSearcher, cmd.maxOptimizeSegments, cmd.softCommit, cmd.expungeDeletes);
+  }
+  
+  boolean flushAdds(int limit) {
+    // check for pending deletes
+  
+    Set<Node> removeNodes = new HashSet<Node>();
+    Set<Node> nodes = adds.keySet();
+ 
+    for (Node node : nodes) {
+      List<AddRequest> alist = adds.get(node);
+      if (alist == null || alist.size() < limit) continue;
+  
+      UpdateRequestExt ureq = new UpdateRequestExt();
+      
+      ModifiableSolrParams combinedParams = new ModifiableSolrParams();
+      
+      for (AddRequest aReq : alist) {
+        AddUpdateCommand cmd = aReq.cmd;
+        combinedParams.add(aReq.params);
+       
+        ureq.add(cmd.solrDoc, cmd.commitWithin, cmd.overwrite);
+      }
+      
+      if (ureq.getParams() == null) ureq.setParams(new ModifiableSolrParams());
+      ureq.getParams().add(combinedParams);
 
+      removeNodes.add(node);
+      
+      submit(ureq, node);
+    }
+    
+    for (Node node : removeNodes) {
+      adds.remove(node);
+    }
+    
+    return true;
+  }
+  
+  boolean flushDeletes(int limit) {
+    // check for pending deletes
+ 
+    Set<Node> removeNodes = new HashSet<Node>();
+    Set<Node> nodes = deletes.keySet();
+    for (Node node : nodes) {
+      List<DeleteRequest> dlist = deletes.get(node);
+      if (dlist == null || dlist.size() < limit) continue;
+      UpdateRequestExt ureq = new UpdateRequestExt();
+      
+      ModifiableSolrParams combinedParams = new ModifiableSolrParams();
+      
+      for (DeleteRequest dReq : dlist) {
+        DeleteUpdateCommand cmd = dReq.cmd;
+        combinedParams.add(dReq.params);
+        if (cmd.isDeleteById()) {
+          ureq.deleteById(cmd.getId(), cmd.getVersion());
+        } else {
+          ureq.deleteByQuery(cmd.query);
+        }
+        
+        if (ureq.getParams() == null) ureq
+            .setParams(new ModifiableSolrParams());
+        ureq.getParams().add(combinedParams);
+      }
+      
+      removeNodes.add(node);
+      submit(ureq, node);
+    }
+    
+    for (Node node : removeNodes) {
+      deletes.remove(node);
+    }
+    
+    return true;
+  }
+  
+  private DeleteUpdateCommand clone(DeleteUpdateCommand cmd) {
+    DeleteUpdateCommand c = (DeleteUpdateCommand)cmd.clone();
+    // TODO: shouldnt the clone do this?
+    c.setFlags(cmd.getFlags());
+    c.setVersion(cmd.getVersion());
+    return c;
+  }
+  
+  public static class Request {
+    public Node node;
+    UpdateRequestExt ureq;
+    NamedList<Object> ursp;
+    int rspCode;
+    public Exception exception;
+    int retries;
+  }
+  
+  void submit(UpdateRequestExt ureq, Node node) {
+    Request sreq = new Request();
+    sreq.node = node;
+    sreq.ureq = ureq;
+    submit(sreq);
+  }
+  
+  public void submit(final Request sreq) {
+
+    final String url = sreq.node.getUrl();
+
+    Callable<Request> task = new Callable<Request>() {
       @Override
-      public Status needsField(FieldInfo fieldInfo) {
-        return (fieldInfo.name.equals(finalUniqFieldName)) ? Status.YES : Status.NO;
+      public Request call() throws Exception {
+        Request clonedRequest = null;
+        try {
+          clonedRequest = new Request();
+          clonedRequest.node = sreq.node;
+          clonedRequest.ureq = sreq.ureq;
+          clonedRequest.retries = sreq.retries;
+          
+          String fullUrl;
+          if (!url.startsWith("http://") && !url.startsWith("https://")) {
+            fullUrl = "http://" + url;
+          } else {
+            fullUrl = url;
+          }
+  
+          HttpSolrServer server = new HttpSolrServer(fullUrl,
+              client);
+          
+          if (Thread.currentThread().isInterrupted()) {
+            clonedRequest.rspCode = 503;
+            clonedRequest.exception = new SolrException(ErrorCode.SERVICE_UNAVAILABLE, "Shutting down.");
+            return clonedRequest;
+          }
+          
+          clonedRequest.ursp = server.request(clonedRequest.ureq);
+          
+          // currently no way to get the request body.
+        } catch (Exception e) {
+          clonedRequest.exception = e;
+          if (e instanceof SolrException) {
+            clonedRequest.rspCode = ((SolrException) e).code();
+          } else {
+            clonedRequest.rspCode = -1;
+          }
+        } finally {
+          semaphore.release();
+        }
+        return clonedRequest;
       }
     };
-
-    TermsEnum termsEnum = null;
-
-    while (iter.hasNext()) {
-      Integer docId = iter.next();
-      NamedList<Object> docNL = new NamedList<Object>();
-
-      if (keyField != null) {
-        reader.document(docId, getUniqValue);
-        String uniqVal = null;
-        if (uniqValues.size() != 0) {
-          uniqVal = uniqValues.get(0);
-          uniqValues.clear();
-          docNL.add("uniqueKey", uniqVal);
-          termVectors.add(uniqVal, docNL);
-        }
-      } else {
-        // support for schemas w/o a unique key,
-        termVectors.add("doc-" + docId, docNL);
-      }
-
-      if ( null != fields ) {
-        for (Map.Entry<String, FieldOptions> entry : fieldOptions.entrySet()) {
-          final String field = entry.getKey();
-          final Terms vector = reader.getTermVector(docId, field);
-          if (vector != null) {
-            termsEnum = vector.iterator(termsEnum);
-            mapOneVector(docNL, entry.getValue(), reader, docId, vector.iterator(termsEnum), field);
-          }
-        }
-      } else {
-        // extract all fields
-        final Fields vectors = reader.getTermVectors(docId);
-        for (String field : vectors) {
-          Terms terms = vectors.terms(field);
-          if (terms != null) {
-            termsEnum = terms.iterator(termsEnum);
-            mapOneVector(docNL, allFields, reader, docId, termsEnum, field);
-          }
-        }
-      }
+    try {
+      semaphore.acquire();
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new SolrException(ErrorCode.SERVICE_UNAVAILABLE, "Update thread interrupted", e);
     }
+    try {
+      pending.add(completionService.submit(task));
+    } catch (RejectedExecutionException e) {
+      semaphore.release();
+      throw e;
+    }
+    
   }
 
-  private void mapOneVector(NamedList<Object> docNL, FieldOptions fieldOptions, IndexReader reader, int docID, TermsEnum termsEnum, String field) throws IOException {
-    NamedList<Object> fieldNL = new NamedList<Object>();
-    docNL.add(field, fieldNL);
+  void checkResponses(boolean block) {
 
-    BytesRef text;
-    DocsAndPositionsEnum dpEnum = null;
-    while((text = termsEnum.next()) != null) {
-      String term = text.utf8ToString();
-      NamedList<Object> termInfo = new NamedList<Object>();
-      fieldNL.add(term, termInfo);
-      final int freq = (int) termsEnum.totalTermFreq();
-      if (fieldOptions.termFreq == true) {
-        termInfo.add("tf", freq);
-      }
-
-      dpEnum = termsEnum.docsAndPositions(null, dpEnum);
-      boolean useOffsets = false;
-      boolean usePositions = false;
-      if (dpEnum != null) {
-        dpEnum.nextDoc();
-        usePositions = fieldOptions.positions;
-        useOffsets = fieldOptions.offsets;
-      }
-
-      NamedList<Integer> positionsNL = null;
-      NamedList<Number> theOffsets = null;
-
-      if (usePositions || useOffsets) {
-        for (int i = 0; i < freq; i++) {
-          final int pos = dpEnum.nextPosition();
-          if (usePositions && pos >= 0) {
-            if (positionsNL == null) {
-              positionsNL = new NamedList<Integer>();
-              termInfo.add("positions", positionsNL);
-            }
-            positionsNL.add("position", pos);
-          }
-
-          if (useOffsets && theOffsets == null) {
-            if (dpEnum.startOffset() == -1) {
-              useOffsets = false;
-            } else {
-              theOffsets = new NamedList<Number>();
-              termInfo.add("offsets", theOffsets);
-            }
-          }
-
-          if (theOffsets != null) {
-            theOffsets.add("start", dpEnum.startOffset());
-            theOffsets.add("end", dpEnum.endOffset());
-          }
-        }
-      }
-      
-      int df = 0;
-      if (fieldOptions.docFreq || fieldOptions.tfIdf) {
-        df = reader.docFreq(new Term(field, text));
-      }
-
-      if (fieldOptions.docFreq) {
-        termInfo.add("df", df);
-      }
-
-      // TODO: this is not TF/IDF by anyone's definition!
-      if (fieldOptions.tfIdf) {
-        double tfIdfVal = ((double) freq) / df;
-        termInfo.add("tf-idf", tfIdfVal);
-      }
-    }
-  }
-
-  private List<Integer> getInts(String[] vals) {
-    List<Integer> result = null;
-    if (vals != null && vals.length > 0) {
-      result = new ArrayList<Integer>(vals.length);
-      for (int i = 0; i < vals.length; i++) {
+    while (pending != null && pending.size() > 0) {
+      try {
+        Future<Request> future = block ? completionService.take()
+            : completionService.poll();
+        if (future == null) return;
+        pending.remove(future);
+        
         try {
-          result.add(new Integer(vals[i]));
-        } catch (NumberFormatException e) {
-          throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, e.getMessage(), e);
-        }
-      }
-    }
-    return result;
-  }
-
-  @Override
-  public void prepare(ResponseBuilder rb) throws IOException {
-
-  }
-
-  @Override
-  public void finishStage(ResponseBuilder rb) {
-    if (rb.stage == ResponseBuilder.STAGE_GET_FIELDS) {
-      
-      NamedList termVectors = new NamedList<Object>();
-      Map.Entry<String, Object>[] arr = new NamedList.NamedListEntry[rb.resultIds.size()];
-
-      for (ShardRequest sreq : rb.finished) {
-        if ((sreq.purpose & ShardRequest.PURPOSE_GET_FIELDS) == 0 || !sreq.params.getBool(COMPONENT_NAME, false)) {
-          continue;
-        }
-        for (ShardResponse srsp : sreq.responses) {
-          NamedList<Object> nl = (NamedList<Object>)srsp.getSolrResponse().getResponse().get(TERM_VECTORS);
-          for (int i=0; i < nl.size(); i++) {
-            String key = nl.getName(i);
-            ShardDoc sdoc = rb.resultIds.get(key);
-            if (null == sdoc) {
-              // metadata, only need from one node, leave in order
-              if (termVectors.indexOf(key,0) < 0) {
-                termVectors.add(key, nl.getVal(i));
+          Request sreq = future.get();
+          if (sreq.rspCode != 0) {
+            // error during request
+            
+            // if there is a retry url, we want to retry...
+            boolean isRetry = sreq.node.checkRetry();
+            boolean doRetry = false;
+            int rspCode = sreq.rspCode;
+            
+            // this can happen in certain situations such as shutdown
+            if (isRetry) {
+              if (rspCode == 404 || rspCode == 403 || rspCode == 503
+                  || rspCode == 500) {
+                doRetry = true;
               }
+              
+              // if its an ioexception, lets try again
+              if (sreq.exception instanceof IOException) {
+                doRetry = true;
+              } else if (sreq.exception instanceof SolrServerException) {
+                if (((SolrServerException) sreq.exception).getRootCause() instanceof IOException) {
+                  doRetry = true;
+                }
+              }
+            }
+            
+            if (isRetry && sreq.retries < MAX_RETRIES_ON_FORWARD && doRetry) {
+              sreq.retries++;
+              sreq.rspCode = 0;
+              sreq.exception = null;
+              SolrException.log(SolrCmdDistributor.log, "forwarding update to " + sreq.node.getUrl() + " failed - retrying ... ");
+              Thread.sleep(500);
+              submit(sreq);
+              checkResponses(block);
             } else {
-              int idx = sdoc.positionInResponse;
-              arr[idx] = new NamedList.NamedListEntry<Object>(key, nl.getVal(i));
+              Exception e = sreq.exception;
+              Error error = new Error();
+              error.e = e;
+              error.node = sreq.node;
+              response.errors.add(error);
+              response.sreq = sreq;
+              SolrException.log(SolrCmdDistributor.log, "shard update error "
+                  + sreq.node, sreq.exception);
             }
           }
+          
+        } catch (ExecutionException e) {
+          // shouldn't happen since we catch exceptions ourselves
+          SolrException.log(SolrCore.log,
+              "error sending update request to shard", e);
         }
+        
+      } catch (InterruptedException e) {
+        throw new SolrException(SolrException.ErrorCode.SERVICE_UNAVAILABLE,
+            "interrupted waiting for shard update response", e);
       }
-      // remove nulls in case not all docs were able to be retrieved
-      termVectors.addAll(SolrPluginUtils.removeNulls(new NamedList<Object>(arr)));
-      rb.rsp.add(TERM_VECTORS, termVectors);
     }
   }
-
-  //////////////////////// NamedListInitializedPlugin methods //////////////////////
-
-  @Override
-  public void init(NamedList args) {
-    super.init(args);
-    this.initParams = args;
+  
+  public static class Response {
+    public Request sreq;
+    public List<Error> errors = new ArrayList<Error>();
+  }
+  
+  public static class Error {
+    public Node node;
+    public Exception e;
   }
 
-  public void inform(SolrCore core) {
-
+  public Response getResponse() {
+    return response;
+  }
+  
+  public static abstract class Node {
+    public abstract String getUrl();
+    public abstract boolean checkRetry();
+    public abstract String getCoreName();
+    public abstract String getBaseUrl();
+    public abstract ZkCoreNodeProps getNodeProps();
   }
 
-  @Override
-  public String getSource() {
-    return "$URL$";
-  }
+  public static class StdNode extends Node {
+    protected String url;
+    protected String baseUrl;
+    protected String coreName;
+    private ZkCoreNodeProps nodeProps;
 
-  @Override
-  public String getDescription() {
-    return "A Component for working with Term Vectors";
+    public StdNode(ZkCoreNodeProps nodeProps) {
+      this.url = nodeProps.getCoreUrl();
+      this.baseUrl = nodeProps.getBaseUrl();
+      this.coreName = nodeProps.getCoreName();
+      this.nodeProps = nodeProps;
+    }
+    
+    @Override
+    public String getUrl() {
+      return url;
+    }
+    
+    @Override
+    public String toString() {
+      return this.getClass().getSimpleName() + ": " + url;
+    }
+
+    @Override
+    public boolean checkRetry() {
+      return false;
+    }
+
+    @Override
+    public String getBaseUrl() {
+      return baseUrl;
+    }
+
+    @Override
+    public String getCoreName() {
+      return coreName;
+    }
+
+    @Override
+    public int hashCode() {
+      final int prime = 31;
+      int result = 1;
+      result = prime * result + ((baseUrl == null) ? 0 : baseUrl.hashCode());
+      result = prime * result + ((coreName == null) ? 0 : coreName.hashCode());
+      result = prime * result + ((url == null) ? 0 : url.hashCode());
+      return result;
+    }
+
+    @Override
+    public boolean equals(Object obj) {
+      if (this == obj) return true;
+      if (obj == null) return false;
+      if (getClass() != obj.getClass()) return false;
+      StdNode other = (StdNode) obj;
+      if (baseUrl == null) {
+        if (other.baseUrl != null) return false;
+      } else if (!baseUrl.equals(other.baseUrl)) return false;
+      if (coreName == null) {
+        if (other.coreName != null) return false;
+      } else if (!coreName.equals(other.coreName)) return false;
+      if (url == null) {
+        if (other.url != null) return false;
+      } else if (!url.equals(other.url)) return false;
+      return true;
+    }
+
+    public ZkCoreNodeProps getNodeProps() {
+      return nodeProps;
+    }
   }
+  
 }
 
-class FieldOptions {
-  String fieldName;
-  boolean termFreq, positions, offsets, docFreq, tfIdf;
-}

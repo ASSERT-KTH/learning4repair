@@ -1,5 +1,6 @@
 @Override
 
+package org.apache.solr.util;
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
@@ -11,435 +12,465 @@
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
+ * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
 
-package org.apache.solr.handler;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import java.io.IOException;
-import java.io.Reader;
-import java.net.MalformedURLException;
-import java.net.URL;
-import java.util.ArrayList;
-import java.util.Comparator;
-
-import java.util.Iterator;
-import java.util.List;
+import java.lang.ref.WeakReference;
+import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.regex.Pattern;
-
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.StoredDocument;
-import org.apache.lucene.index.Term;
-import org.apache.lucene.search.*;
-import org.apache.lucene.queries.mlt.MoreLikeThis;
-import org.apache.solr.common.SolrException;
-import org.apache.solr.common.params.CommonParams;
-import org.apache.solr.common.params.FacetParams;
-import org.apache.solr.common.params.MoreLikeThisParams;
-import org.apache.solr.common.params.SolrParams;
-import org.apache.solr.common.params.MoreLikeThisParams.TermStyle;
-import org.apache.solr.common.util.ContentStream;
-import org.apache.solr.common.util.NamedList;
-import org.apache.solr.common.util.SimpleOrderedMap;
-import org.apache.solr.core.SolrCore;
-import org.apache.solr.request.SimpleFacets;
-import org.apache.solr.request.SolrQueryRequest;
-import org.apache.solr.response.SolrQueryResponse;
-import org.apache.solr.schema.IndexSchema;
-import org.apache.solr.schema.SchemaField;
-import org.apache.solr.search.*;
-
-import org.apache.solr.util.SolrPluginUtils;
+import java.util.TreeSet;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * Solr MoreLikeThis --
- * 
- * Return similar documents either based on a single document or based on posted text.
- * 
- * @since solr 1.3
+ * A LFU cache implementation based upon ConcurrentHashMap.
+ * <p/>
+ * This is not a terribly efficient implementation.  The tricks used in the
+ * LRU version were not directly usable, perhaps it might be possible to
+ * rewrite them with LFU in mind.
+ * <p/>
+ * <b>This API is experimental and subject to change</b>
+ *
+ * @since solr 1.6
  */
-public class MoreLikeThisHandler extends RequestHandlerBase  
-{
-  // Pattern is thread safe -- TODO? share this with general 'fl' param
-  private static final Pattern splitList = Pattern.compile(",| ");
-  
-  @Override
-  public void init(NamedList args) {
-    super.init(args);
+public class ConcurrentLFUCache<K, V> {
+  private static Logger log = LoggerFactory.getLogger(ConcurrentLFUCache.class);
+
+  private final ConcurrentHashMap<Object, CacheEntry<K, V>> map;
+  private final int upperWaterMark, lowerWaterMark;
+  private final ReentrantLock markAndSweepLock = new ReentrantLock(true);
+  private boolean isCleaning = false;  // not volatile... piggybacked on other volatile vars
+  private final boolean newThreadForCleanup;
+  private volatile boolean islive = true;
+  private final Stats stats = new Stats();
+  private final int acceptableWaterMark;
+  private long lowHitCount = 0;  // not volatile, only accessed in the cleaning method
+  private final EvictionListener<K, V> evictionListener;
+  private CleanupThread cleanupThread;
+  private final boolean timeDecay;
+
+  public ConcurrentLFUCache(int upperWaterMark, final int lowerWaterMark, int acceptableSize,
+                            int initialSize, boolean runCleanupThread, boolean runNewThreadForCleanup,
+                            EvictionListener<K, V> evictionListener, boolean timeDecay) {
+    if (upperWaterMark < 1) throw new IllegalArgumentException("upperWaterMark must be > 0");
+    if (lowerWaterMark >= upperWaterMark)
+      throw new IllegalArgumentException("lowerWaterMark must be  < upperWaterMark");
+    map = new ConcurrentHashMap<Object, CacheEntry<K, V>>(initialSize);
+    newThreadForCleanup = runNewThreadForCleanup;
+    this.upperWaterMark = upperWaterMark;
+    this.lowerWaterMark = lowerWaterMark;
+    this.acceptableWaterMark = acceptableSize;
+    this.evictionListener = evictionListener;
+    this.timeDecay = timeDecay;
+    if (runCleanupThread) {
+      cleanupThread = new CleanupThread(this);
+      cleanupThread.start();
+    }
   }
 
-  @Override
-  public void handleRequestBody(SolrQueryRequest req, SolrQueryResponse rsp) throws Exception 
-  {
-    SolrParams params = req.getParams();
+  public ConcurrentLFUCache(int size, int lowerWatermark) {
+    this(size, lowerWatermark, (int) Math.floor((lowerWatermark + size) / 2),
+        (int) Math.ceil(0.75 * size), false, false, null, true);
+  }
 
-    // Set field flags
-    ReturnFields returnFields = new ReturnFields( req );
-    rsp.setReturnFields( returnFields );
-    int flags = 0;
-    if (returnFields.wantsScore()) {
-      flags |= SolrIndexSearcher.GET_SCORES;
+  public void setAlive(boolean live) {
+    islive = live;
+  }
+
+  public V get(K key) {
+    CacheEntry<K, V> e = map.get(key);
+    if (e == null) {
+      if (islive) stats.missCounter.incrementAndGet();
+      return null;
     }
-
-    String defType = params.get(QueryParsing.DEFTYPE, QParserPlugin.DEFAULT_QTYPE);
-    String q = params.get( CommonParams.Q );
-    Query query = null;
-    SortSpec sortSpec = null;
-    List<Query> filters = null;
-
-    try {
-      if (q != null) {
-        QParser parser = QParser.getParser(q, defType, req);
-        query = parser.getQuery();
-        sortSpec = parser.getSort(true);
-      }
-
-      String[] fqs = req.getParams().getParams(CommonParams.FQ);
-      if (fqs!=null && fqs.length!=0) {
-          filters = new ArrayList<Query>();
-        for (String fq : fqs) {
-          if (fq != null && fq.trim().length()!=0) {
-            QParser fqp = QParser.getParser(fq, null, req);
-            filters.add(fqp.getQuery());
-          }
-        }
-      }
-    } catch (SyntaxError e) {
-      throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, e);
+    if (islive) {
+      e.lastAccessed = stats.accessCounter.incrementAndGet();
+      e.hits.incrementAndGet();
     }
+    return e.value;
+  }
 
-    SolrIndexSearcher searcher = req.getSearcher();
-
-    MoreLikeThisHelper mlt = new MoreLikeThisHelper( params, searcher );
-
-    // Hold on to the interesting terms if relevant
-    TermStyle termStyle = TermStyle.get( params.get( MoreLikeThisParams.INTERESTING_TERMS ) );
-    List<InterestingTerm> interesting = (termStyle == TermStyle.NONE )
-      ? null : new ArrayList<InterestingTerm>( mlt.mlt.getMaxQueryTerms() );
-    
-    DocListAndSet mltDocs = null;
-
-    // Parse Required Params
-    // This will either have a single Reader or valid query
-    Reader reader = null;
-    try {
-      if (q == null || q.trim().length() < 1) {
-        Iterable<ContentStream> streams = req.getContentStreams();
-        if (streams != null) {
-          Iterator<ContentStream> iter = streams.iterator();
-          if (iter.hasNext()) {
-            reader = iter.next().getReader();
-          }
-          if (iter.hasNext()) {
-            throw new SolrException(SolrException.ErrorCode.BAD_REQUEST,
-                "MoreLikeThis does not support multiple ContentStreams");
-          }
-        }
-      }
-
-      int start = params.getInt(CommonParams.START, 0);
-      int rows = params.getInt(CommonParams.ROWS, 10);
-
-      // Find documents MoreLikeThis - either with a reader or a query
-      // --------------------------------------------------------------------------------
-      if (reader != null) {
-        mltDocs = mlt.getMoreLikeThis(reader, start, rows, filters,
-            interesting, flags);
-      } else if (q != null) {
-        // Matching options
-        boolean includeMatch = params.getBool(MoreLikeThisParams.MATCH_INCLUDE,
-            true);
-        int matchOffset = params.getInt(MoreLikeThisParams.MATCH_OFFSET, 0);
-        // Find the base match
-        DocList match = searcher.getDocList(query, null, null, matchOffset, 1,
-            flags); // only get the first one...
-        if (includeMatch) {
-          rsp.add("match", match);
-        }
-
-        // This is an iterator, but we only handle the first match
-        DocIterator iterator = match.iterator();
-        if (iterator.hasNext()) {
-          // do a MoreLikeThis query for each document in results
-          int id = iterator.nextDoc();
-          mltDocs = mlt.getMoreLikeThis(id, start, rows, filters, interesting,
-              flags);
-        }
-      } else {
-        throw new SolrException(SolrException.ErrorCode.BAD_REQUEST,
-            "MoreLikeThis requires either a query (?q=) or text to find similar documents.");
-      }
-
-    } finally {
-      if (reader != null) {
-        reader.close();
-      }
+  public V remove(K key) {
+    CacheEntry<K, V> cacheEntry = map.remove(key);
+    if (cacheEntry != null) {
+      stats.size.decrementAndGet();
+      return cacheEntry.value;
     }
-    
-    if( mltDocs == null ) {
-      mltDocs = new DocListAndSet(); // avoid NPE
-    }
-    rsp.add( "response", mltDocs.docList );
-    
-  
-    if( interesting != null ) {
-      if( termStyle == TermStyle.DETAILS ) {
-        NamedList<Float> it = new NamedList<Float>();
-        for( InterestingTerm t : interesting ) {
-          it.add( t.term.toString(), t.boost );
-        }
-        rsp.add( "interestingTerms", it );
-      }
-      else {
-        List<String> it = new ArrayList<String>( interesting.size() );
-        for( InterestingTerm t : interesting ) {
-          it.add( t.term.text());
-        }
-        rsp.add( "interestingTerms", it );
-      }
-    }
-    
-    // maybe facet the results
-    if (params.getBool(FacetParams.FACET,false)) {
-      if( mltDocs.docSet == null ) {
-        rsp.add( "facet_counts", null );
-      }
-      else {
-        SimpleFacets f = new SimpleFacets(req, mltDocs.docSet, params );
-        rsp.add( "facet_counts", f.getFacetCounts() );
-      }
-    }
-    boolean dbg = req.getParams().getBool(CommonParams.DEBUG_QUERY, false);
+    return null;
+  }
 
-    boolean dbgQuery = false, dbgResults = false;
-    if (dbg == false){//if it's true, we are doing everything anyway.
-      String[] dbgParams = req.getParams().getParams(CommonParams.DEBUG);
-      if (dbgParams != null) {
-        for (int i = 0; i < dbgParams.length; i++) {
-          if (dbgParams[i].equals(CommonParams.QUERY)){
-            dbgQuery = true;
-          } else if (dbgParams[i].equals(CommonParams.RESULTS)){
-            dbgResults = true;
-          }
-        }
-      }
+  public V put(K key, V val) {
+    if (val == null) return null;
+    CacheEntry<K, V> e = new CacheEntry<K, V>(key, val, stats.accessCounter.incrementAndGet());
+    CacheEntry<K, V> oldCacheEntry = map.put(key, e);
+    int currentSize;
+    if (oldCacheEntry == null) {
+      currentSize = stats.size.incrementAndGet();
     } else {
-      dbgQuery = true;
-      dbgResults = true;
+      currentSize = stats.size.get();
     }
-    // Copied from StandardRequestHandler... perhaps it should be added to doStandardDebug?
-    if (dbg == true) {
-      try {
-        NamedList<Object> dbgInfo = SolrPluginUtils.doStandardDebug(req, q, mlt.getRawMLTQuery(), mltDocs.docList, dbgQuery, dbgResults);
-        if (null != dbgInfo) {
-          if (null != filters) {
-            dbgInfo.add("filter_queries",req.getParams().getParams(CommonParams.FQ));
-            List<String> fqs = new ArrayList<String>(filters.size());
-            for (Query fq : filters) {
-              fqs.add(QueryParsing.toString(fq, req.getSchema()));
-            }
-            dbgInfo.add("parsed_filter_queries",fqs);
+    if (islive) {
+      stats.putCounter.incrementAndGet();
+    } else {
+      stats.nonLivePutCounter.incrementAndGet();
+    }
+
+    // Check if we need to clear out old entries from the cache.
+    // isCleaning variable is checked instead of markAndSweepLock.isLocked()
+    // for performance because every put invokation will check until
+    // the size is back to an acceptable level.
+    //
+    // There is a race between the check and the call to markAndSweep, but
+    // it's unimportant because markAndSweep actually aquires the lock or returns if it can't.
+    //
+    // Thread safety note: isCleaning read is piggybacked (comes after) other volatile reads
+    // in this method.
+    if (currentSize > upperWaterMark && !isCleaning) {
+      if (newThreadForCleanup) {
+        new Thread() {
+          @Override
+          public void run() {
+            markAndSweep();
           }
-          rsp.add("debug", dbgInfo);
-        }
-      } catch (Exception e) {
-        SolrException.log(SolrCore.log, "Exception during debug", e);
-        rsp.add("exception_during_debug", SolrException.toStr(e));
+        }.start();
+      } else if (cleanupThread != null) {
+        cleanupThread.wakeThread();
+      } else {
+        markAndSweep();
       }
     }
+    return oldCacheEntry == null ? null : oldCacheEntry.value;
   }
-  
-  public static class InterestingTerm
-  {
-    public Term term;
-    public float boost;
-        
-    public static Comparator<InterestingTerm> BOOST_ORDER = new Comparator<InterestingTerm>() {
-      public int compare(InterestingTerm t1, InterestingTerm t2) {
-        float d = t1.boost - t2.boost;
-        if( d == 0 ) {
+
+  /**
+   * Removes items from the cache to bring the size down
+   * to an acceptable value ('acceptableWaterMark').
+   * <p/>
+   * It is done in two stages. In the first stage, least recently used items are evicted.
+   * If, after the first stage, the cache size is still greater than 'acceptableSize'
+   * config parameter, the second stage takes over.
+   * <p/>
+   * The second stage is more intensive and tries to bring down the cache size
+   * to the 'lowerWaterMark' config parameter.
+   */
+  private void markAndSweep() {
+    if (!markAndSweepLock.tryLock()) return;
+    try {
+      long lowHitCount = this.lowHitCount;
+      isCleaning = true;
+      this.lowHitCount = lowHitCount;     // volatile write to make isCleaning visible
+
+      int sz = stats.size.get();
+
+      int wantToRemove = sz - lowerWaterMark;
+
+      TreeSet<CacheEntry> tree = new TreeSet<CacheEntry>();
+
+      for (CacheEntry<K, V> ce : map.values()) {
+        // set hitsCopy to avoid later Atomic reads
+        ce.hitsCopy = ce.hits.get();
+        ce.lastAccessedCopy = ce.lastAccessed;
+        if (timeDecay) {
+          ce.hits.set(ce.hitsCopy >>> 1);
+        }
+
+        if (tree.size() < wantToRemove) {
+          tree.add(ce);
+        } else {
+          // If the hits are not equal, we can remove before adding
+          // which is slightly faster
+          if (ce.hitsCopy < tree.first().hitsCopy) {
+            tree.remove(tree.first());
+            tree.add(ce);
+          } else if (ce.hitsCopy == tree.first().hitsCopy) {
+            tree.add(ce);
+            tree.remove(tree.first());
+          }
+        }
+      }
+
+      for (CacheEntry<K, V> e : tree) {
+        evictEntry(e.key);
+      }
+    } finally {
+      isCleaning = false;  // set before markAndSweep.unlock() for visibility
+      markAndSweepLock.unlock();
+    }
+  }
+
+  private void evictEntry(K key) {
+    CacheEntry<K, V> o = map.remove(key);
+    if (o == null) return;
+    stats.size.decrementAndGet();
+    stats.evictionCounter.incrementAndGet();
+    if (evictionListener != null) evictionListener.evictedEntry(o.key, o.value);
+  }
+
+  /**
+   * Returns 'n' number of least used entries present in this cache.
+   * <p/>
+   * This uses a TreeSet to collect the 'n' least used items ordered by ascending hitcount
+   * and returns a LinkedHashMap containing 'n' or less than 'n' entries.
+   *
+   * @param n the number of items needed
+   * @return a LinkedHashMap containing 'n' or less than 'n' entries
+   */
+  public Map<K, V> getLeastUsedItems(int n) {
+    Map<K, V> result = new LinkedHashMap<K, V>();
+    if (n <= 0)
+      return result;
+    TreeSet<CacheEntry> tree = new TreeSet<CacheEntry>();
+    // we need to grab the lock since we are changing the copy variables
+    markAndSweepLock.lock();
+    try {
+      for (Map.Entry<Object, CacheEntry<K, V>> entry : map.entrySet()) {
+        CacheEntry ce = entry.getValue();
+        ce.hitsCopy = ce.hits.get();
+        ce.lastAccessedCopy = ce.lastAccessed;
+        if (tree.size() < n) {
+          tree.add(ce);
+        } else {
+          // If the hits are not equal, we can remove before adding
+          // which is slightly faster
+          if (ce.hitsCopy < tree.first().hitsCopy) {
+            tree.remove(tree.first());
+            tree.add(ce);
+          } else if (ce.hitsCopy == tree.first().hitsCopy) {
+            tree.add(ce);
+            tree.remove(tree.first());
+          }
+        }
+      }
+    } finally {
+      markAndSweepLock.unlock();
+    }
+    for (CacheEntry<K, V> e : tree) {
+      result.put(e.key, e.value);
+    }
+    return result;
+  }
+
+  /**
+   * Returns 'n' number of most used entries present in this cache.
+   * <p/>
+   * This uses a TreeSet to collect the 'n' most used items ordered by descending hitcount
+   * and returns a LinkedHashMap containing 'n' or less than 'n' entries.
+   *
+   * @param n the number of items needed
+   * @return a LinkedHashMap containing 'n' or less than 'n' entries
+   */
+  public Map<K, V> getMostUsedItems(int n) {
+    Map<K, V> result = new LinkedHashMap<K, V>();
+    if (n <= 0)
+      return result;
+    TreeSet<CacheEntry> tree = new TreeSet<CacheEntry>();
+    // we need to grab the lock since we are changing the copy variables
+    markAndSweepLock.lock();
+    try {
+      for (Map.Entry<Object, CacheEntry<K, V>> entry : map.entrySet()) {
+        CacheEntry<K, V> ce = entry.getValue();
+        ce.hitsCopy = ce.hits.get();
+        ce.lastAccessedCopy = ce.lastAccessed;
+        if (tree.size() < n) {
+          tree.add(ce);
+        } else {
+          // If the hits are not equal, we can remove before adding
+          // which is slightly faster
+          if (ce.hitsCopy > tree.last().hitsCopy) {
+            tree.remove(tree.last());
+            tree.add(ce);
+          } else if (ce.hitsCopy == tree.last().hitsCopy) {
+            tree.add(ce);
+            tree.remove(tree.last());
+          }
+        }
+      }
+    } finally {
+      markAndSweepLock.unlock();
+    }
+    for (CacheEntry<K, V> e : tree) {
+      result.put(e.key, e.value);
+    }
+    return result;
+  }
+
+  public int size() {
+    return stats.size.get();
+  }
+
+  public void clear() {
+    map.clear();
+  }
+
+  public Map<Object, CacheEntry<K, V>> getMap() {
+    return map;
+  }
+
+  private static class CacheEntry<K, V> implements Comparable<CacheEntry<K, V>> {
+    K key;
+    V value;
+    volatile AtomicLong hits = new AtomicLong(0);
+    long hitsCopy = 0;
+    volatile long lastAccessed = 0;
+    long lastAccessedCopy = 0;
+
+    public CacheEntry(K key, V value, long lastAccessed) {
+      this.key = key;
+      this.value = value;
+      this.lastAccessed = lastAccessed;
+    }
+
+    public int compareTo(CacheEntry<K, V> that) {
+      if (this.hitsCopy == that.hitsCopy) {
+        if (this.lastAccessedCopy == that.lastAccessedCopy) {
           return 0;
         }
-        return (d>0)?1:-1;
+        return this.lastAccessedCopy < that.lastAccessedCopy ? 1 : -1;
       }
-    };
+      return this.hitsCopy < that.hitsCopy ? 1 : -1;
+    }
+
+    @Override
+    public int hashCode() {
+      return value.hashCode();
+    }
+
+    @Override
+    public boolean equals(Object obj) {
+      return value.equals(obj);
+    }
+
+    @Override
+    public String toString() {
+      return "key: " + key + " value: " + value + " hits:" + hits.get();
+    }
   }
-  
-  /**
-   * Helper class for MoreLikeThis that can be called from other request handlers
-   */
-  public static class MoreLikeThisHelper 
-  { 
-    final SolrIndexSearcher searcher;
-    final MoreLikeThis mlt;
-    final IndexReader reader;
-    final SchemaField uniqueKeyField;
-    final boolean needDocSet;
-    Map<String,Float> boostFields;
-    
-    public MoreLikeThisHelper( SolrParams params, SolrIndexSearcher searcher )
-    {
-      this.searcher = searcher;
-      this.reader = searcher.getIndexReader();
-      this.uniqueKeyField = searcher.getSchema().getUniqueKeyField();
-      this.needDocSet = params.getBool(FacetParams.FACET,false);
-      
-      SolrParams required = params.required();
-      String[] fields = splitList.split( required.get(MoreLikeThisParams.SIMILARITY_FIELDS) );
-      if( fields.length < 1 ) {
-        throw new SolrException( SolrException.ErrorCode.BAD_REQUEST, 
-            "MoreLikeThis requires at least one similarity field: "+MoreLikeThisParams.SIMILARITY_FIELDS );
+
+  private boolean isDestroyed = false;
+
+  public void destroy() {
+    try {
+      if (cleanupThread != null) {
+        cleanupThread.stopThread();
       }
-      
-      this.mlt = new MoreLikeThis( reader ); // TODO -- after LUCENE-896, we can use , searcher.getSimilarity() );
-      mlt.setFieldNames(fields);
-      mlt.setAnalyzer( searcher.getSchema().getAnalyzer() );
-      
-      // configurable params
-      
-      mlt.setMinTermFreq(       params.getInt(MoreLikeThisParams.MIN_TERM_FREQ,         MoreLikeThis.DEFAULT_MIN_TERM_FREQ));
-      mlt.setMinDocFreq(        params.getInt(MoreLikeThisParams.MIN_DOC_FREQ,          MoreLikeThis.DEFAULT_MIN_DOC_FREQ));
-      mlt.setMaxDocFreq(        params.getInt(MoreLikeThisParams.MAX_DOC_FREQ,          MoreLikeThis.DEFAULT_MAX_DOC_FREQ));
-      mlt.setMinWordLen(        params.getInt(MoreLikeThisParams.MIN_WORD_LEN,          MoreLikeThis.DEFAULT_MIN_WORD_LENGTH));
-      mlt.setMaxWordLen(        params.getInt(MoreLikeThisParams.MAX_WORD_LEN,          MoreLikeThis.DEFAULT_MAX_WORD_LENGTH));
-      mlt.setMaxQueryTerms(     params.getInt(MoreLikeThisParams.MAX_QUERY_TERMS,       MoreLikeThis.DEFAULT_MAX_QUERY_TERMS));
-      mlt.setMaxNumTokensParsed(params.getInt(MoreLikeThisParams.MAX_NUM_TOKENS_PARSED, MoreLikeThis.DEFAULT_MAX_NUM_TOKENS_PARSED));
-      mlt.setBoost(            params.getBool(MoreLikeThisParams.BOOST, false ) );
-      boostFields = SolrPluginUtils.parseFieldBoosts(params.getParams(MoreLikeThisParams.QF));
+    } finally {
+      isDestroyed = true;
     }
-    
-    private Query rawMLTQuery;
-    private Query boostedMLTQuery;
-    private BooleanQuery realMLTQuery;
-    
-    public Query getRawMLTQuery(){
-      return rawMLTQuery;
+  }
+
+  public Stats getStats() {
+    return stats;
+  }
+
+
+  public static class Stats {
+    private final AtomicLong accessCounter = new AtomicLong(0),
+        putCounter = new AtomicLong(0),
+        nonLivePutCounter = new AtomicLong(0),
+        missCounter = new AtomicLong();
+    private final AtomicInteger size = new AtomicInteger();
+    private AtomicLong evictionCounter = new AtomicLong();
+
+    public long getCumulativeLookups() {
+      return (accessCounter.get() - putCounter.get() - nonLivePutCounter.get()) + missCounter.get();
     }
-    
-    public Query getBoostedMLTQuery(){
-      return boostedMLTQuery;
+
+    public long getCumulativeHits() {
+      return accessCounter.get() - putCounter.get() - nonLivePutCounter.get();
     }
-    
-    public Query getRealMLTQuery(){
-      return realMLTQuery;
+
+    public long getCumulativePuts() {
+      return putCounter.get();
     }
-    
-    private Query getBoostedQuery(Query mltquery) {
-      BooleanQuery boostedQuery = (BooleanQuery)mltquery.clone();
-      if (boostFields.size() > 0) {
-        List clauses = boostedQuery.clauses();
-        for( Object o : clauses ) {
-          TermQuery q = (TermQuery)((BooleanClause)o).getQuery();
-          Float b = this.boostFields.get(q.getTerm().field());
-          if (b != null) {
-            q.setBoost(b*q.getBoost());
+
+    public long getCumulativeEvictions() {
+      return evictionCounter.get();
+    }
+
+    public int getCurrentSize() {
+      return size.get();
+    }
+
+    public long getCumulativeNonLivePuts() {
+      return nonLivePutCounter.get();
+    }
+
+    public long getCumulativeMisses() {
+      return missCounter.get();
+    }
+
+    public void add(Stats other) {
+      accessCounter.addAndGet(other.accessCounter.get());
+      putCounter.addAndGet(other.putCounter.get());
+      nonLivePutCounter.addAndGet(other.nonLivePutCounter.get());
+      missCounter.addAndGet(other.missCounter.get());
+      evictionCounter.addAndGet(other.evictionCounter.get());
+      size.set(Math.max(size.get(), other.size.get()));
+    }
+  }
+
+  public static interface EvictionListener<K, V> {
+    public void evictedEntry(K key, V value);
+  }
+
+  private static class CleanupThread extends Thread {
+    private WeakReference<ConcurrentLFUCache> cache;
+
+    private boolean stop = false;
+
+    public CleanupThread(ConcurrentLFUCache c) {
+      cache = new WeakReference<ConcurrentLFUCache>(c);
+    }
+
+    @Override
+    public void run() {
+      while (true) {
+        synchronized (this) {
+          if (stop) break;
+          try {
+            this.wait();
+          } catch (InterruptedException e) {
           }
         }
+        if (stop) break;
+        ConcurrentLFUCache c = cache.get();
+        if (c == null) break;
+        c.markAndSweep();
       }
-      return boostedQuery;
-    }
-    
-    public DocListAndSet getMoreLikeThis( int id, int start, int rows, List<Query> filters, List<InterestingTerm> terms, int flags ) throws IOException
-    {
-      StoredDocument doc = reader.document(id);
-      rawMLTQuery = mlt.like(id);
-      boostedMLTQuery = getBoostedQuery( rawMLTQuery );
-      if( terms != null ) {
-        fillInterestingTermsFromMLTQuery( rawMLTQuery, terms );
-      }
-
-      // exclude current document from results
-      realMLTQuery = new BooleanQuery();
-      realMLTQuery.add(boostedMLTQuery, BooleanClause.Occur.MUST);
-      realMLTQuery.add(
-          new TermQuery(new Term(uniqueKeyField.getName(), uniqueKeyField.getType().storedToIndexed(doc.getField(uniqueKeyField.getName())))), 
-            BooleanClause.Occur.MUST_NOT);
-      
-      DocListAndSet results = new DocListAndSet();
-      if (this.needDocSet) {
-        results = searcher.getDocListAndSet(realMLTQuery, filters, null, start, rows, flags);
-      } else {
-        results.docList = searcher.getDocList(realMLTQuery, filters, null, start, rows, flags);
-      }
-      return results;
     }
 
-    public DocListAndSet getMoreLikeThis( Reader reader, int start, int rows, List<Query> filters, List<InterestingTerm> terms, int flags ) throws IOException
-    {
-      // analyzing with the first field: previous (stupid) behavior
-      rawMLTQuery = mlt.like(reader, mlt.getFieldNames()[0]);
-      boostedMLTQuery = getBoostedQuery( rawMLTQuery );
-      if( terms != null ) {
-        fillInterestingTermsFromMLTQuery( boostedMLTQuery, terms );
+    void wakeThread() {
+      synchronized (this) {
+        this.notify();
       }
-      DocListAndSet results = new DocListAndSet();
-      if (this.needDocSet) {
-        results = searcher.getDocListAndSet( boostedMLTQuery, filters, null, start, rows, flags);
-      } else {
-        results.docList = searcher.getDocList( boostedMLTQuery, filters, null, start, rows, flags);
-      }
-      return results;
     }
 
-    @Deprecated
-    public NamedList<DocList> getMoreLikeThese( DocList docs, int rows, int flags ) throws IOException
-    {
-      IndexSchema schema = searcher.getSchema();
-      NamedList<DocList> mlt = new SimpleOrderedMap<DocList>();
-      DocIterator iterator = docs.iterator();
-      while( iterator.hasNext() ) {
-        int id = iterator.nextDoc();
-        
-        DocListAndSet sim = getMoreLikeThis( id, 0, rows, null, null, flags );
-        String name = schema.printableUniqueKey( reader.document( id ) );
-
-        mlt.add(name, sim.docList);
+    void stopThread() {
+      synchronized (this) {
+        stop = true;
+        this.notify();
       }
-      return mlt;
     }
-    
-    private void fillInterestingTermsFromMLTQuery( Query query, List<InterestingTerm> terms )
-    { 
-      List clauses = ((BooleanQuery)query).clauses();
-      for( Object o : clauses ) {
-        TermQuery q = (TermQuery)((BooleanClause)o).getQuery();
-        InterestingTerm it = new InterestingTerm();
-        it.boost = q.getBoost();
-        it.term = q.getTerm();
-        terms.add( it );
-      } 
-      // alternatively we could use
-      // mltquery.extractTerms( terms );
-    }
-    
-    public MoreLikeThis getMoreLikeThis()
-    {
-      return mlt;
-    }
-  }
-  
-  
-  //////////////////////// SolrInfoMBeans methods //////////////////////
-
-  @Override
-  public String getDescription() {
-    return "Solr MoreLikeThis";
   }
 
   @Override
-  public String getSource() {
-    return "$URL$";
-  }
-
-  @Override
-  public URL[] getDocs() {
+  protected void finalize() throws Throwable {
     try {
-      return new URL[] { new URL("http://wiki.apache.org/solr/MoreLikeThis") };
+      if (!isDestroyed) {
+        log.error("ConcurrentLFUCache was not destroyed prior to finalize(), indicates a bug -- POSSIBLE RESOURCE LEAK!!!");
+        destroy();
+      }
+    } finally {
+      super.finalize();
     }
-    catch( MalformedURLException ex ) { return null; }
   }
 }

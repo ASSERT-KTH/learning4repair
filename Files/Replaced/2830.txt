@@ -1,4 +1,4 @@
-position += code >>> 1;
+super(size);
 
 package org.apache.lucene.index;
 
@@ -19,308 +19,427 @@ package org.apache.lucene.index;
  * limitations under the License.
  */
 
-import org.apache.lucene.index.FieldInfo.IndexOptions;
-import org.apache.lucene.util.UnicodeUtil;
+import org.apache.lucene.util.PriorityQueue;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.BitsSlice;
+import org.apache.lucene.util.MultiBits;
+import org.apache.lucene.util.ReaderUtil;
 
 import java.io.IOException;
-import java.util.Collection;
-import java.util.Map;
-import java.util.ArrayList;
-import java.util.List;
-import org.apache.lucene.util.BitVector;
-import org.apache.lucene.util.CollectionUtil;
+import java.util.Comparator;
 
-final class FreqProxTermsWriter extends TermsHashConsumer {
+/**
+ * Exposes flex API, merged from flex API of sub-segments.
+ * This does a merge sort, by term text, of the sub-readers.
+ *
+ * @lucene.experimental
+ */
+public final class MultiTermsEnum extends TermsEnum {
+    
+  private final TermMergeQueue queue;
+  private final TermsEnumWithSlice[] subs;        // all of our subs (one per sub-reader)
+  private final TermsEnumWithSlice[] currentSubs; // current subs that have at least one term for this field
+  private final TermsEnumWithSlice[] top;
+  private final MultiDocsEnum.EnumWithSlice[] subDocs;
+  private final MultiDocsAndPositionsEnum.EnumWithSlice[] subDocsAndPositions;
 
-  @Override
-  public TermsHashConsumerPerThread addThread(TermsHashPerThread perThread) {
-    return new FreqProxTermsWriterPerThread(perThread);
-  }
+  private BytesRef lastSeek;
+  private final BytesRef lastSeekScratch = new BytesRef();
 
-  private static int compareText(final char[] text1, int pos1, final char[] text2, int pos2) {
-    while(true) {
-      final char c1 = text1[pos1++];
-      final char c2 = text2[pos2++];
-      if (c1 != c2) {
-        if (0xffff == c2)
-          return 1;
-        else if (0xffff == c1)
-          return -1;
-        else
-          return c1-c2;
-      } else if (0xffff == c1)
-        return 0;
+  private int numTop;
+  private int numSubs;
+  private BytesRef current;
+  private Comparator<BytesRef> termComp;
+
+  public static class TermsEnumIndex {
+    public final static TermsEnumIndex[] EMPTY_ARRAY = new TermsEnumIndex[0];
+    final int subIndex;
+    final TermsEnum termsEnum;
+
+    public TermsEnumIndex(TermsEnum termsEnum, int subIndex) {
+      this.termsEnum = termsEnum;
+      this.subIndex = subIndex;
     }
   }
 
-  @Override
-  void abort() {}
+  public int getMatchCount() {
+    return numTop;
+  }
 
-  // TODO: would be nice to factor out more of this, eg the
-  // FreqProxFieldMergeState, and code to visit all Fields
-  // under the same FieldInfo together, up into TermsHash*.
-  // Other writers would presumably share alot of this...
+  public TermsEnumWithSlice[] getMatchArray() {
+    return top;
+  }
 
-  @Override
-  public void flush(Map<TermsHashConsumerPerThread,Collection<TermsHashConsumerPerField>> threadsAndFields, final SegmentWriteState state) throws IOException {
-
-    // Gather all FieldData's that have postings, across all
-    // ThreadStates
-    List<FreqProxTermsWriterPerField> allFields = new ArrayList<FreqProxTermsWriterPerField>();
-
-    for (Map.Entry<TermsHashConsumerPerThread,Collection<TermsHashConsumerPerField>> entry : threadsAndFields.entrySet()) {
-
-      Collection<TermsHashConsumerPerField> fields = entry.getValue();
-
-      for (final TermsHashConsumerPerField i : fields) {
-        final FreqProxTermsWriterPerField perField = (FreqProxTermsWriterPerField) i;
-        if (perField.termsHashPerField.numPostings > 0)
-          allFields.add(perField);
-      }
+  public MultiTermsEnum(ReaderUtil.Slice[] slices) {
+    queue = new TermMergeQueue(slices.length);
+    top = new TermsEnumWithSlice[slices.length];
+    subs = new TermsEnumWithSlice[slices.length];
+    subDocs = new MultiDocsEnum.EnumWithSlice[slices.length];
+    subDocsAndPositions = new MultiDocsAndPositionsEnum.EnumWithSlice[slices.length];
+    for(int i=0;i<slices.length;i++) {
+      subs[i] = new TermsEnumWithSlice(slices[i]);
+      subDocs[i] = new MultiDocsEnum.EnumWithSlice();
+      subDocs[i].slice = slices[i];
+      subDocsAndPositions[i] = new MultiDocsAndPositionsEnum.EnumWithSlice();
+      subDocsAndPositions[i].slice = slices[i];
     }
+    currentSubs = new TermsEnumWithSlice[slices.length];
+  }
 
-    // Sort by field name
-    CollectionUtil.quickSort(allFields);
-    final int numAllFields = allFields.size();
+  @Override
+  public BytesRef term() {
+    return current;
+  }
 
-    // TODO: allow Lucene user to customize this consumer:
-    final FormatPostingsFieldsConsumer consumer = new FormatPostingsFieldsWriter(state, fieldInfos);
-    /*
-    Current writer chain:
-      FormatPostingsFieldsConsumer
-        -> IMPL: FormatPostingsFieldsWriter
-          -> FormatPostingsTermsConsumer
-            -> IMPL: FormatPostingsTermsWriter
-              -> FormatPostingsDocConsumer
-                -> IMPL: FormatPostingsDocWriter
-                  -> FormatPostingsPositionsConsumer
-                    -> IMPL: FormatPostingsPositionsWriter
-    */
-    try {
-      int start = 0;
-      while(start < numAllFields) {
-        final FieldInfo fieldInfo = allFields.get(start).fieldInfo;
-        final String fieldName = fieldInfo.name;
-        
-        int end = start+1;
-        while(end < numAllFields && allFields.get(end).fieldInfo.name.equals(fieldName))
-          end++;
-        
-        FreqProxTermsWriterPerField[] fields = new FreqProxTermsWriterPerField[end-start];
-        for(int i=start;i<end;i++) {
-          fields[i-start] = allFields.get(i);
-          
-          // Aggregate the storePayload as seen by the same
-          // field across multiple threads
-          if (fieldInfo.indexOptions == IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) {
-            fieldInfo.storePayloads |= fields[i-start].hasPayloads;
-          }
+  @Override
+  public Comparator<BytesRef> getComparator() {
+    return termComp;
+  }
+
+  /** The terms array must be newly created TermsEnum, ie
+   *  {@link TermsEnum#next} has not yet been called. */
+  public TermsEnum reset(TermsEnumIndex[] termsEnumsIndex) throws IOException {
+    assert termsEnumsIndex.length <= top.length;
+    numSubs = 0;
+    numTop = 0;
+    termComp = null;
+    queue.clear();
+    for(int i=0;i<termsEnumsIndex.length;i++) {
+
+      final TermsEnumIndex termsEnumIndex = termsEnumsIndex[i];
+      assert termsEnumIndex != null;
+
+      // init our term comp
+      if (termComp == null) {
+        queue.termComp = termComp = termsEnumIndex.termsEnum.getComparator();
+      } else {
+        // We cannot merge sub-readers that have
+        // different TermComps
+        final Comparator<BytesRef> subTermComp = termsEnumIndex.termsEnum.getComparator();
+        if (subTermComp != null && !subTermComp.equals(termComp)) {
+          throw new IllegalStateException("sub-readers have different BytesRef.Comparators: " + subTermComp + " vs " + termComp + "; cannot merge");
         }
-        
-        // If this field has postings then add them to the
-        // segment
-        appendPostings(fieldName, state, fields, consumer);
-        
-        for(int i=0;i<fields.length;i++) {
-          TermsHashPerField perField = fields[i].termsHashPerField;
-          int numPostings = perField.numPostings;
-          perField.reset();
-          perField.shrinkHash(numPostings);
-          fields[i].reset();
-        }
-        
-        start = end;
       }
-      
-      for (Map.Entry<TermsHashConsumerPerThread,Collection<TermsHashConsumerPerField>> entry : threadsAndFields.entrySet()) {
-        FreqProxTermsWriterPerThread perThread = (FreqProxTermsWriterPerThread) entry.getKey();
-        perThread.termsHashPerThread.reset(true);
+
+      final BytesRef term = termsEnumIndex.termsEnum.next();
+      if (term != null) {
+        final TermsEnumWithSlice entry = subs[termsEnumIndex.subIndex];
+        entry.reset(termsEnumIndex.termsEnum, term);
+        queue.add(entry);
+        currentSubs[numSubs++] = entry;
+      } else {
+        // field has no terms
       }
-    } finally {
-      consumer.finish();
-    }
-  }
-
-  private byte[] payloadBuffer;
-
-  /* Walk through all unique text tokens (Posting
-   * instances) found in this field and serialize them
-   * into a single RAM segment. */
-  void appendPostings(String fieldName, SegmentWriteState state,
-                      FreqProxTermsWriterPerField[] fields,
-                      FormatPostingsFieldsConsumer consumer)
-    throws CorruptIndexException, IOException {
-
-    int numFields = fields.length;
-
-    final FreqProxFieldMergeState[] mergeStates = new FreqProxFieldMergeState[numFields];
-
-    for(int i=0;i<numFields;i++) {
-      FreqProxFieldMergeState fms = mergeStates[i] = new FreqProxFieldMergeState(fields[i]);
-
-      assert fms.field.fieldInfo == fields[0].fieldInfo;
-
-      // Should always be true
-      boolean result = fms.nextTerm();
-      assert result;
     }
 
-    final FormatPostingsTermsConsumer termsConsumer = consumer.addField(fields[0].fieldInfo);
-    final Term protoTerm = new Term(fieldName);
-
-    FreqProxFieldMergeState[] termStates = new FreqProxFieldMergeState[numFields];
-
-    final IndexOptions currentFieldIndexOptions = fields[0].fieldInfo.indexOptions;
-
-    final Map<Term,Integer> segDeletes;
-    if (state.segDeletes != null && state.segDeletes.terms.size() > 0) {
-      segDeletes = state.segDeletes.terms;
+    if (queue.size() == 0) {
+      return TermsEnum.EMPTY;
     } else {
-      segDeletes = null;
+      return this;
     }
+  }
 
-    try {
-      // TODO: really TermsHashPerField should take over most
-      // of this loop, including merge sort of terms from
-      // multiple threads and interacting with the
-      // TermsConsumer, only calling out to us (passing us the
-      // DocsConsumer) to handle delivery of docs/positions
-      while(numFields > 0) {
+  @Override
+  public SeekStatus seek(BytesRef term, boolean useCache) throws IOException {
+    queue.clear();
+    numTop = 0;
 
-        // Get the next term to merge
-        termStates[0] = mergeStates[0];
-        int numToMerge = 1;
+    boolean seekOpt = false;
+    if (lastSeek != null && termComp.compare(lastSeek, term) <= 0) {
+      seekOpt = true;
+    }
+    lastSeekScratch.copy(term);
+    lastSeek = lastSeekScratch;
 
-        // TODO: pqueue
-        for(int i=1;i<numFields;i++) {
-          final char[] text = mergeStates[i].text;
-          final int textOffset = mergeStates[i].textOffset;
-          final int cmp = compareText(text, textOffset, termStates[0].text, termStates[0].textOffset);
-
-          if (cmp < 0) {
-            termStates[0] = mergeStates[i];
-            numToMerge = 1;
-          } else if (cmp == 0)
-            termStates[numToMerge++] = mergeStates[i];
-        }
-
-        final FormatPostingsDocsConsumer docConsumer = termsConsumer.addTerm(termStates[0].text, termStates[0].textOffset);
-
-        final int delDocLimit;
-        if (segDeletes != null) {
-          final Integer docIDUpto = segDeletes.get(protoTerm.createTerm(termStates[0].termText()));
-          if (docIDUpto != null) {
-            delDocLimit = docIDUpto;
+    for(int i=0;i<numSubs;i++) {
+      final SeekStatus status;
+      // LUCENE-2130: if we had just seek'd already, prior
+      // to this seek, and the new seek term is after the
+      // previous one, don't try to re-seek this sub if its
+      // current term is already beyond this new seek term.
+      // Doing so is a waste because this sub will simply
+      // seek to the same spot.
+      if (seekOpt) {
+        final BytesRef curTerm = currentSubs[i].current;
+        if (curTerm != null) {
+          final int cmp = termComp.compare(term, curTerm);
+          if (cmp == 0) {
+            status = SeekStatus.FOUND;
+          } else if (cmp < 0) {
+            status = SeekStatus.NOT_FOUND;
           } else {
-            delDocLimit = 0;
+            status = currentSubs[i].terms.seek(term, useCache);
           }
         } else {
-          delDocLimit = 0;
+          status = SeekStatus.END;
         }
-
-        try {
-          // Now termStates has numToMerge FieldMergeStates
-          // which all share the same term.  Now we must
-          // interleave the docID streams.
-          while(numToMerge > 0) {
-            
-            FreqProxFieldMergeState minState = termStates[0];
-            for(int i=1;i<numToMerge;i++)
-              if (termStates[i].docID < minState.docID)
-                minState = termStates[i];
-
-            final int termDocFreq = minState.termFreq;
-
-            final FormatPostingsPositionsConsumer posConsumer = docConsumer.addDoc(minState.docID, termDocFreq);
-
-            // NOTE: we could check here if the docID was
-            // deleted, and skip it.  However, this is somewhat
-            // dangerous because it can yield non-deterministic
-            // behavior since we may see the docID before we see
-            // the term that caused it to be deleted.  This
-            // would mean some (but not all) of its postings may
-            // make it into the index, which'd alter the docFreq
-            // for those terms.  We could fix this by doing two
-            // passes, ie first sweep marks all del docs, and
-            // 2nd sweep does the real flush, but I suspect
-            // that'd add too much time to flush.
-
-            if (minState.docID < delDocLimit) {
-              // Mark it deleted.  TODO: we could also skip
-              // writing its postings; this would be
-              // deterministic (just for this Term's docs).
-              if (state.deletedDocs == null) {
-                state.deletedDocs = new BitVector(state.numDocs);
-              }
-              state.deletedDocs.set(minState.docID);
-            }
-
-            final ByteSliceReader prox = minState.prox;
-
-            // Carefully copy over the prox + payload info,
-            // changing the format to match Lucene's segment
-            // format.
-            if (currentFieldIndexOptions == IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) {
-              // omitTermFreqAndPositions == false so we do write positions &
-              // payload  
-              try {
-                int position = 0;
-                for(int j=0;j<termDocFreq;j++) {
-                  final int code = prox.readVInt();
-                  position += code >> 1;
-                
-                final int payloadLength;
-                if ((code & 1) != 0) {
-                  // This position has a payload
-                  payloadLength = prox.readVInt();
-                  
-                  if (payloadBuffer == null || payloadBuffer.length < payloadLength)
-                    payloadBuffer = new byte[payloadLength];
-                  
-                  prox.readBytes(payloadBuffer, 0, payloadLength);
-                  
-                } else
-                  payloadLength = 0;
-                
-                posConsumer.addPosition(position, payloadBuffer, 0, payloadLength);
-                } //End for
-              } finally {
-                posConsumer.finish();
-              }
-            }
-
-            if (!minState.nextDoc()) {
-
-              // Remove from termStates
-              int upto = 0;
-              for(int i=0;i<numToMerge;i++)
-                if (termStates[i] != minState)
-                  termStates[upto++] = termStates[i];
-              numToMerge--;
-              assert upto == numToMerge;
-
-              // Advance this state to the next term
-
-              if (!minState.nextTerm()) {
-                // OK, no more terms, so remove from mergeStates
-                // as well
-                upto = 0;
-                for(int i=0;i<numFields;i++)
-                  if (mergeStates[i] != minState)
-                    mergeStates[upto++] = mergeStates[i];
-                numFields--;
-                assert upto == numFields;
-              }
-            }
-          }
-        } finally {
-          docConsumer.finish();
-        }
+      } else {
+        status = currentSubs[i].terms.seek(term, useCache);
       }
-    } finally {
-      termsConsumer.finish();
+
+      if (status == SeekStatus.FOUND) {
+        top[numTop++] = currentSubs[i];
+        current = currentSubs[i].current = currentSubs[i].terms.term();
+      } else if (status == SeekStatus.NOT_FOUND) {
+        currentSubs[i].current = currentSubs[i].terms.term();
+        assert currentSubs[i].current != null;
+        queue.add(currentSubs[i]);
+      } else {
+        // enum exhausted
+        currentSubs[i].current = null;
+      }
+    }
+
+    if (numTop > 0) {
+      // at least one sub had exact match to the requested term
+      return SeekStatus.FOUND;
+    } else if (queue.size() > 0) {
+      // no sub had exact match, but at least one sub found
+      // a term after the requested term -- advance to that
+      // next term:
+      pullTop();
+      return SeekStatus.NOT_FOUND;
+    } else {
+      return SeekStatus.END;
     }
   }
 
-  final UnicodeUtil.UTF8Result termsUTF8 = new UnicodeUtil.UTF8Result();
+  @Override
+  public SeekStatus seek(long ord) throws IOException {
+    throw new UnsupportedOperationException();
+  }
+
+  @Override
+  public long ord() throws IOException {
+    throw new UnsupportedOperationException();
+  }
+
+  private void pullTop() {
+    // extract all subs from the queue that have the same
+    // top term
+    assert numTop == 0;
+    while(true) {
+      top[numTop++] = queue.pop();
+      if (queue.size() == 0 || !(queue.top()).current.bytesEquals(top[0].current)) {
+        break;
+      }
+    } 
+    current = top[0].current;
+  }
+
+  private void pushTop() throws IOException {
+    // call next() on each top, and put back into queue
+    for(int i=0;i<numTop;i++) {
+      top[i].current = top[i].terms.next();
+      if (top[i].current != null) {
+        queue.add(top[i]);
+      } else {
+        // no more fields in this reader
+      }
+    }
+    numTop = 0;
+  }
+
+  @Override
+  public BytesRef next() throws IOException {
+    lastSeek = null;
+
+    // restore queue
+    pushTop();
+
+    // gather equal top fields
+    if (queue.size() > 0) {
+      pullTop();
+    } else {
+      current = null;
+    }
+
+    return current;
+  }
+
+  @Override
+  public int docFreq() throws IOException {
+    int sum = 0;
+    for(int i=0;i<numTop;i++) {
+      sum += top[i].terms.docFreq();
+    }
+    return sum;
+  }
+
+  @Override
+  public long totalTermFreq() throws IOException {
+    long sum = 0;
+    for(int i=0;i<numTop;i++) {
+      final long v = top[i].terms.totalTermFreq();
+      if (v == -1) {
+        return v;
+      }
+      sum += v;
+    }
+    return sum;
+  }
+
+  @Override
+  public DocsEnum docs(Bits skipDocs, DocsEnum reuse) throws IOException {
+    final MultiDocsEnum docsEnum;
+    if (reuse != null) {
+      docsEnum = (MultiDocsEnum) reuse;
+    } else {
+      docsEnum = new MultiDocsEnum();
+    }
+    
+    final MultiBits multiSkipDocs;
+    if (skipDocs instanceof MultiBits) {
+      multiSkipDocs = (MultiBits) skipDocs;
+    } else {
+      multiSkipDocs = null;
+    }
+
+    int upto = 0;
+
+    for(int i=0;i<numTop;i++) {
+
+      final TermsEnumWithSlice entry = top[i];
+
+      final Bits b;
+
+      if (multiSkipDocs != null) {
+        // optimize for common case: requested skip docs is a
+        // congruent sub-slice of MultiBits: in this case, we
+        // just pull the skipDocs from the sub reader, rather
+        // than making the inefficient
+        // Slice(Multi(sub-readers)):
+        final MultiBits.SubResult sub = multiSkipDocs.getMatchingSub(entry.subSlice);
+        if (sub.matches) {
+          b = sub.result;
+        } else {
+          // custom case: requested skip docs is foreign:
+          // must slice it on every access
+          b = new BitsSlice(skipDocs, entry.subSlice);
+        }
+      } else if (skipDocs != null) {
+        b = new BitsSlice(skipDocs, entry.subSlice);
+      } else {
+        // no deletions
+        b = null;
+      }
+
+      final DocsEnum subDocsEnum = entry.terms.docs(b, null);
+      if (subDocsEnum != null) {
+        subDocs[upto].docsEnum = subDocsEnum;
+        subDocs[upto].slice = entry.subSlice;
+
+        upto++;
+      }
+    }
+
+    if (upto == 0) {
+      return null;
+    } else {
+      return docsEnum.reset(subDocs, upto);
+    }
+  }
+
+  @Override
+  public DocsAndPositionsEnum docsAndPositions(Bits skipDocs, DocsAndPositionsEnum reuse) throws IOException {
+    final MultiDocsAndPositionsEnum docsAndPositionsEnum;
+    if (reuse != null) {
+      docsAndPositionsEnum = (MultiDocsAndPositionsEnum) reuse;
+    } else {
+      docsAndPositionsEnum = new MultiDocsAndPositionsEnum();
+    }
+    
+    final MultiBits multiSkipDocs;
+    if (skipDocs instanceof MultiBits) {
+      multiSkipDocs = (MultiBits) skipDocs;
+    } else {
+      multiSkipDocs = null;
+    }
+
+    int upto = 0;
+
+    for(int i=0;i<numTop;i++) {
+
+      final TermsEnumWithSlice entry = top[i];
+
+      final Bits b;
+
+      if (multiSkipDocs != null) {
+        // Optimize for common case: requested skip docs is a
+        // congruent sub-slice of MultiBits: in this case, we
+        // just pull the skipDocs from the sub reader, rather
+        // than making the inefficient
+        // Slice(Multi(sub-readers)):
+        final MultiBits.SubResult sub = multiSkipDocs.getMatchingSub(top[i].subSlice);
+        if (sub.matches) {
+          b = sub.result;
+        } else {
+          // custom case: requested skip docs is foreign:
+          // must slice it on every access (very
+          // inefficient)
+          b = new BitsSlice(skipDocs, top[i].subSlice);
+        }
+      } else if (skipDocs != null) {
+        b = new BitsSlice(skipDocs, top[i].subSlice);
+      } else {
+        // no deletions
+        b = null;
+      }
+
+      final DocsAndPositionsEnum subPostings = entry.terms.docsAndPositions(b, null);
+
+      if (subPostings != null) {
+        subDocsAndPositions[upto].docsAndPositionsEnum = subPostings;
+        subDocsAndPositions[upto].slice = entry.subSlice;
+        upto++;
+      } else {
+        if (entry.terms.docs(b, null) != null) {
+          // At least one of our subs does not store
+          // positions -- we can't correctly produce a
+          // MultiDocsAndPositions enum
+          return null;
+        }
+      }
+    }
+
+    if (upto == 0) {
+      return null;
+    } else {
+      return docsAndPositionsEnum.reset(subDocsAndPositions, upto);
+    }
+  }
+
+  private final static class TermsEnumWithSlice {
+    private final ReaderUtil.Slice subSlice;
+    private TermsEnum terms;
+    public BytesRef current;
+
+    public TermsEnumWithSlice(ReaderUtil.Slice subSlice) {
+      this.subSlice = subSlice;
+      assert subSlice.length >= 0: "length=" + subSlice.length;
+    }
+
+    public void reset(TermsEnum terms, BytesRef term) {
+      this.terms = terms;
+      current = term;
+    }
+  }
+
+  private final static class TermMergeQueue extends PriorityQueue<TermsEnumWithSlice> {
+    Comparator<BytesRef> termComp;
+    TermMergeQueue(int size) {
+      initialize(size);
+    }
+
+    @Override
+    protected boolean lessThan(TermsEnumWithSlice termsA, TermsEnumWithSlice termsB) {
+      final int cmp = termComp.compare(termsA.current, termsB.current);
+      if (cmp != 0) {
+        return cmp < 0;
+      } else {
+        return termsA.subSlice.start < termsB.subSlice.start;
+      }
+    }
+  }
 }

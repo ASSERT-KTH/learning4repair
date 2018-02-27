@@ -18,269 +18,333 @@ package org.apache.lucene.store;
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
- 
+
+import java.io.Closeable;
+import java.io.FileNotFoundException;
 import java.io.IOException;
-import java.io.File;
-import java.io.RandomAccessFile;
-import java.nio.ByteBuffer;
-import java.nio.channels.ClosedChannelException; // javadoc @link
-import java.nio.channels.FileChannel;
-import java.nio.channels.FileChannel.MapMode;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedList;
+import java.util.Map;
+import java.util.Queue;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 
-import java.security.AccessController;
-import java.security.PrivilegedExceptionAction;
-import java.security.PrivilegedActionException;
-import java.lang.reflect.Method;
+import org.apache.lucene.codecs.CodecUtil;
+import org.apache.lucene.index.IndexFileNames;
+import org.apache.lucene.util.IOUtils;
 
-import org.apache.lucene.util.Constants;
-
-/** File-based {@link Directory} implementation that uses
- *  mmap for reading, and {@link
- *  FSDirectory.FSIndexOutput} for writing.
- *
- * <p><b>NOTE</b>: memory mapping uses up a portion of the
- * virtual memory address space in your process equal to the
- * size of the file being mapped.  Before using this class,
- * be sure your have plenty of virtual address space, e.g. by
- * using a 64 bit JRE, or a 32 bit JRE with indexes that are
- * guaranteed to fit within the address space.
- * On 32 bit platforms also consult {@link #MMapDirectory(File, LockFactory, int)}
- * if you have problems with mmap failing because of fragmented
- * address space. If you get an OutOfMemoryException, it is recommended
- * to reduce the chunk size, until it works.
- *
- * <p>Due to <a href="http://bugs.sun.com/bugdatabase/view_bug.do?bug_id=4724038">
- * this bug</a> in Sun's JRE, MMapDirectory's {@link IndexInput#close}
- * is unable to close the underlying OS file handle.  Only when GC
- * finally collects the underlying objects, which could be quite
- * some time later, will the file handle be closed.
- *
- * <p>This will consume additional transient disk usage: on Windows,
- * attempts to delete or overwrite the files will result in an
- * exception; on other platforms, which typically have a &quot;delete on
- * last close&quot; semantics, while such operations will succeed, the bytes
- * are still consuming space on disk.  For many applications this
- * limitation is not a problem (e.g. if you have plenty of disk space,
- * and you don't rely on overwriting files on Windows) but it's still
- * an important limitation to be aware of.
- *
- * <p>This class supplies the workaround mentioned in the bug report
- * (see {@link #setUseUnmap}), which may fail on
- * non-Sun JVMs. It forcefully unmaps the buffer on close by using
- * an undocumented internal cleanup functionality.
- * {@link #UNMAP_SUPPORTED} is <code>true</code>, if the workaround
- * can be enabled (with no guarantees).
- * <p>
- * <b>NOTE:</b> Accessing this class either directly or
- * indirectly from a thread while it's interrupted can close the
- * underlying channel immediately if at the same time the thread is
- * blocked on IO. The channel will remain closed and subsequent access
- * to {@link MMapDirectory} will throw a {@link ClosedChannelException}. 
- * </p>
+/**
+ * Combines multiple files into a single compound file.
+ * 
+ * @see CompoundFileDirectory
+ * @lucene.internal
  */
-public class MMapDirectory extends FSDirectory {
-  private boolean useUnmapHack = UNMAP_SUPPORTED;
-  /** 
-   * Default max chunk size.
-   * @see #MMapDirectory(File, LockFactory, int)
-   */
-  public static final int DEFAULT_MAX_BUFF = Constants.JRE_IS_64BIT ? (1 << 30) : (1 << 28);
-  final int chunkSizePower;
+final class CompoundFileWriter implements Closeable{
 
-  /** Create a new MMapDirectory for the named location.
-   *
-   * @param path the path of the directory
-   * @param lockFactory the lock factory to use, or null for the default
-   * ({@link NativeFSLockFactory});
-   * @throws IOException if there is a low-level I/O error
-   */
-  public MMapDirectory(File path, LockFactory lockFactory) throws IOException {
-    this(path, lockFactory, DEFAULT_MAX_BUFF);
+  private static final class FileEntry {
+    /** source file */
+    String file;
+    long length;
+    /** temporary holder for the start of this file's data section */
+    long offset;
+    /** the directory which contains the file. */
+    Directory dir;
   }
 
-  /** Create a new MMapDirectory for the named location and {@link NativeFSLockFactory}.
-   *
-   * @param path the path of the directory
-   * @throws IOException if there is a low-level I/O error
-   */
-  public MMapDirectory(File path) throws IOException {
-    this(path, null);
-  }
-  
+  // versioning for the .cfs file
+  static final String DATA_CODEC = "CompoundFileWriterData";
+  static final int VERSION_START = 0;
+  static final int VERSION_CURRENT = VERSION_START;
+
+  // versioning for the .cfe file
+  static final String ENTRY_CODEC = "CompoundFileWriterEntries";
+
+  private final Directory directory;
+  private final Map<String, FileEntry> entries = new HashMap<String, FileEntry>();
+  private final Set<String> seenIDs = new HashSet<String>();
+  // all entries that are written to a sep. file but not yet moved into CFS
+  private final Queue<FileEntry> pendingEntries = new LinkedList<FileEntry>();
+  private boolean closed = false;
+  private IndexOutput dataOut;
+  private final AtomicBoolean outputTaken = new AtomicBoolean(false);
+  final String entryTableName;
+  final String dataFileName;
+
   /**
-   * Create a new MMapDirectory for the named location, specifying the 
-   * maximum chunk size used for memory mapping.
+   * Create the compound stream in the specified file. The file name is the
+   * entire name (no extensions are added).
    * 
-   * @param path the path of the directory
-   * @param lockFactory the lock factory to use, or null for the default
-   * ({@link NativeFSLockFactory});
-   * @param maxChunkSize maximum chunk size (default is 1 GiBytes for
-   * 64 bit JVMs and 256 MiBytes for 32 bit JVMs) used for memory mapping.
-   * <p>
-   * Especially on 32 bit platform, the address space can be very fragmented,
-   * so large index files cannot be mapped. Using a lower chunk size makes 
-   * the directory implementation a little bit slower (as the correct chunk 
-   * may be resolved on lots of seeks) but the chance is higher that mmap 
-   * does not fail. On 64 bit Java platforms, this parameter should always 
-   * be {@code 1 << 30}, as the address space is big enough.
-   * <p>
-   * <b>Please note:</b> The chunk size is always rounded down to a power of 2.
-   * @throws IOException if there is a low-level I/O error
+   * @throws NullPointerException
+   *           if <code>dir</code> or <code>name</code> is null
    */
-  public MMapDirectory(File path, LockFactory lockFactory, int maxChunkSize) throws IOException {
-    super(path, lockFactory);
-    if (maxChunkSize <= 0) {
-      throw new IllegalArgumentException("Maximum chunk size for mmap must be >0");
-    }
-    this.chunkSizePower = 31 - Integer.numberOfLeadingZeros(maxChunkSize);
-    assert this.chunkSizePower >= 0 && this.chunkSizePower <= 30;
-  }
-
-  /**
-   * <code>true</code>, if this platform supports unmapping mmapped files.
-   */
-  public static final boolean UNMAP_SUPPORTED;
-  static {
-    boolean v;
-    try {
-      Class.forName("sun.misc.Cleaner");
-      Class.forName("java.nio.DirectByteBuffer")
-        .getMethod("cleaner");
-      v = true;
-    } catch (Exception e) {
-      v = false;
-    }
-    UNMAP_SUPPORTED = v;
+  CompoundFileWriter(Directory dir, String name) {
+    if (dir == null)
+      throw new NullPointerException("directory cannot be null");
+    if (name == null)
+      throw new NullPointerException("name cannot be null");
+    directory = dir;
+    entryTableName = IndexFileNames.segmentFileName(
+        IndexFileNames.stripExtension(name), "",
+        IndexFileNames.COMPOUND_FILE_ENTRIES_EXTENSION);
+    dataFileName = name;
+    
   }
   
-  /**
-   * This method enables the workaround for unmapping the buffers
-   * from address space after closing {@link IndexInput}, that is
-   * mentioned in the bug report. This hack may fail on non-Sun JVMs.
-   * It forcefully unmaps the buffer on close by using
-   * an undocumented internal cleanup functionality.
-   * <p><b>NOTE:</b> Enabling this is completely unsupported
-   * by Java and may lead to JVM crashes if <code>IndexInput</code>
-   * is closed while another thread is still accessing it (SIGSEGV).
-   * @throws IllegalArgumentException if {@link #UNMAP_SUPPORTED}
-   * is <code>false</code> and the workaround cannot be enabled.
-   */
-  public void setUseUnmap(final boolean useUnmapHack) {
-    if (useUnmapHack && !UNMAP_SUPPORTED)
-      throw new IllegalArgumentException("Unmap hack not supported on this platform!");
-    this.useUnmapHack=useUnmapHack;
-  }
-  
-  /**
-   * Returns <code>true</code>, if the unmap workaround is enabled.
-   * @see #setUseUnmap
-   */
-  public boolean getUseUnmap() {
-    return useUnmapHack;
-  }
-  
-  /**
-   * Try to unmap the buffer, this method silently fails if no support
-   * for that in the JVM. On Windows, this leads to the fact,
-   * that mmapped files cannot be modified or deleted.
-   */
-  final void cleanMapping(final ByteBuffer buffer) throws IOException {
-    if (useUnmapHack) {
+  private synchronized IndexOutput getOutput() throws IOException {
+    if (dataOut == null) {
+      boolean success = false;
       try {
-        AccessController.doPrivileged(new PrivilegedExceptionAction<Object>() {
-          public Object run() throws Exception {
-            final Method getCleanerMethod = buffer.getClass()
-              .getMethod("cleaner");
-            getCleanerMethod.setAccessible(true);
-            final Object cleaner = getCleanerMethod.invoke(buffer);
-            if (cleaner != null) {
-              cleaner.getClass().getMethod("clean")
-                .invoke(cleaner);
-            }
-            return null;
-          }
-        });
-      } catch (PrivilegedActionException e) {
-        final IOException ioe = new IOException("unable to unmap the mapped buffer");
-        ioe.initCause(e.getCause());
-        throw ioe;
+        dataOut = directory.createOutput(dataFileName, IOContext.DEFAULT);
+        CodecUtil.writeHeader(dataOut, DATA_CODEC, VERSION_CURRENT);
+        success = true;
+      } finally {
+        if (!success) {
+          IOUtils.closeWhileHandlingException(dataOut);
+        }
       }
-    }
+    } 
+    return dataOut;
   }
-  
+
+  /** Returns the directory of the compound file. */
+  Directory getDirectory() {
+    return directory;
+  }
+
+  /** Returns the name of the compound file. */
+  String getName() {
+    return dataFileName;
+  }
+
   /**
-   * Returns the current mmap chunk size.
-   * @see #MMapDirectory(File, LockFactory, int)
+   * Closes all resources and writes the entry table
+   * 
+   * @throws IllegalStateException
+   *           if close() had been called before or if no file has been added to
+   *           this object
    */
-  public final int getMaxChunkSize() {
-    return 1 << chunkSizePower;
-  }
-
-  /** Creates an IndexInput for the file with the given name. */
-  @Override
-  public IndexInput openInput(String name, IOContext context) throws IOException {
-    ensureOpen();
-    File f = new File(getDirectory(), name);
-    RandomAccessFile raf = new RandomAccessFile(f, "r");
+  public void close() throws IOException {
+    if (closed) {
+      return;
+    }
+    IOException priorException = null;
+    IndexOutput entryTableOut = null;
+    // TODO this code should clean up after itself
+    // (remove partial .cfs/.cfe)
     try {
-      return new MMapIndexInput("MMapIndexInput(path=\"" + f + "\")", raf);
+      if (!pendingEntries.isEmpty() || outputTaken.get()) {
+        throw new IllegalStateException("CFS has pending open files");
+      }
+      closed = true;
+      // open the compound stream
+      getOutput();
+      assert dataOut != null;
+    } catch (IOException e) {
+      priorException = e;
     } finally {
-      raf.close();
+      IOUtils.closeWhileHandlingException(priorException, dataOut);
     }
-  }
-  
-  @Override
-  public IndexInputSlicer createSlicer(String name, IOContext context) throws IOException {
-    final MMapIndexInput full = (MMapIndexInput) openInput(name, context);
-    return new IndexInputSlicer() {
-      @Override
-      public IndexInput openSlice(String sliceDescription, long offset, long length) throws IOException {
-        ensureOpen();
-        return full.slice(sliceDescription, offset, length);
-      }
-      
-      @Override
-      public void close() throws IOException {
-        full.close();
-      }
-    };
+    try {
+      entryTableOut = directory.createOutput(entryTableName, IOContext.DEFAULT);
+      writeEntryTable(entries.values(), entryTableOut);
+    } catch (IOException e) {
+      priorException = e;
+    } finally {
+      IOUtils.closeWhileHandlingException(priorException, entryTableOut);
+    }
   }
 
-  private final class MMapIndexInput extends ByteBufferIndexInput {
-    
-    MMapIndexInput(String resourceDescription, RandomAccessFile raf) throws IOException {
-      super(resourceDescription, map(raf, 0, raf.length()), raf.length(), chunkSizePower);
+  private final void ensureOpen() {
+    if (closed) {
+      throw new AlreadyClosedException("CFS Directory is already closed");
     }
-    
+  }
+
+  /**
+   * Copy the contents of the file with specified extension into the provided
+   * output stream.
+   */
+  private final long copyFileEntry(IndexOutput dataOut, FileEntry fileEntry)
+      throws IOException {
+    final IndexInput is = fileEntry.dir.openInput(fileEntry.file, IOContext.READONCE);
+    boolean success = false;
+    try {
+      final long startPtr = dataOut.getFilePointer();
+      final long length = fileEntry.length;
+      dataOut.copyBytes(is, length);
+      // Verify that the output length diff is equal to original file
+      long endPtr = dataOut.getFilePointer();
+      long diff = endPtr - startPtr;
+      if (diff != length)
+        throw new IOException("Difference in the output file offsets " + diff
+            + " does not match the original file length " + length);
+      fileEntry.offset = startPtr;
+      success = true;
+      return length;
+    } finally {
+      if (success) {
+        IOUtils.close(is);
+        // copy successful - delete file
+        fileEntry.dir.deleteFile(fileEntry.file);
+      } else {
+        IOUtils.closeWhileHandlingException(is);
+      }
+    }
+  }
+
+  protected void writeEntryTable(Collection<FileEntry> entries,
+      IndexOutput entryOut) throws IOException {
+    CodecUtil.writeHeader(entryOut, ENTRY_CODEC, VERSION_CURRENT);
+    entryOut.writeVInt(entries.size());
+    for (FileEntry fe : entries) {
+      entryOut.writeString(IndexFileNames.stripSegmentName(fe.file));
+      entryOut.writeLong(fe.offset);
+      entryOut.writeLong(fe.length);
+    }
+  }
+
+  IndexOutput createOutput(String name, IOContext context) throws IOException {
+    ensureOpen();
+    boolean success = false;
+    boolean outputLocked = false;
+    try {
+      assert name != null : "name must not be null";
+      if (entries.containsKey(name)) {
+        throw new IllegalArgumentException("File " + name + " already exists");
+      }
+      final FileEntry entry = new FileEntry();
+      entry.file = name;
+      entries.put(name, entry);
+      final String id = IndexFileNames.stripSegmentName(name);
+      assert !seenIDs.contains(id): "file=\"" + name + "\" maps to id=\"" + id + "\", which was already written";
+      seenIDs.add(id);
+      final DirectCFSIndexOutput out;
+      if ((outputLocked = outputTaken.compareAndSet(false, true))) {
+        out = new DirectCFSIndexOutput(getOutput(), entry, false);
+      } else {
+        entry.dir = this.directory;
+        if (directory.fileExists(name)) {
+          throw new IllegalArgumentException("File " + name + " already exists");
+        }
+        out = new DirectCFSIndexOutput(directory.createOutput(name, context), entry,
+            true);
+      }
+      success = true;
+      return out;
+    } finally {
+      if (!success) {
+        entries.remove(name);
+        if (outputLocked) { // release the output lock if not successful
+          assert outputTaken.get();
+          releaseOutputLock();
+        }
+      }
+    }
+  }
+
+  final void releaseOutputLock() {
+    outputTaken.compareAndSet(true, false);
+  }
+
+  private final void prunePendingEntries() throws IOException {
+    // claim the output and copy all pending files in
+    if (outputTaken.compareAndSet(false, true)) {
+      try {
+        while (!pendingEntries.isEmpty()) {
+          FileEntry entry = pendingEntries.poll();
+          copyFileEntry(getOutput(), entry);
+          entries.put(entry.file, entry);
+        }
+      } finally {
+        final boolean compareAndSet = outputTaken.compareAndSet(true, false);
+        assert compareAndSet;
+      }
+    }
+  }
+
+  long fileLength(String name) throws IOException {
+    FileEntry fileEntry = entries.get(name);
+    if (fileEntry == null) {
+      throw new FileNotFoundException(name + " does not exist");
+    }
+    return fileEntry.length;
+  }
+
+  boolean fileExists(String name) {
+    return entries.containsKey(name);
+  }
+
+  String[] listAll() {
+    return entries.keySet().toArray(new String[0]);
+  }
+
+  private final class DirectCFSIndexOutput extends IndexOutput {
+    private final IndexOutput delegate;
+    private final long offset;
+    private boolean closed;
+    private FileEntry entry;
+    private long writtenBytes;
+    private final boolean isSeparate;
+
+    DirectCFSIndexOutput(IndexOutput delegate, FileEntry entry,
+        boolean isSeparate) {
+      super();
+      this.delegate = delegate;
+      this.entry = entry;
+      entry.offset = offset = delegate.getFilePointer();
+      this.isSeparate = isSeparate;
+
+    }
+
     @Override
-    protected void freeBuffer(ByteBuffer buffer) throws IOException {
-      cleanMapping(buffer);
+    public void flush() throws IOException {
+      delegate.flush();
+    }
+
+    @Override
+    public void close() throws IOException {
+      if (!closed) {
+        closed = true;
+        entry.length = writtenBytes;
+        if (isSeparate) {
+          delegate.close();
+          // we are a separate file - push into the pending entries
+          pendingEntries.add(entry);
+        } else {
+          // we have been written into the CFS directly - release the lock
+          releaseOutputLock();
+        }
+        // now prune all pending entries and push them into the CFS
+        prunePendingEntries();
+      }
+    }
+
+    @Override
+    public long getFilePointer() {
+      return delegate.getFilePointer() - offset;
+    }
+
+    @Override
+    public long length() throws IOException {
+      assert !closed;
+      return delegate.length() - offset;
+    }
+
+    @Override
+    public void writeByte(byte b) throws IOException {
+      assert !closed;
+      writtenBytes++;
+      delegate.writeByte(b);
+    }
+
+    @Override
+    public void writeBytes(byte[] b, int offset, int length) throws IOException {
+      assert !closed;
+      writtenBytes += length;
+      delegate.writeBytes(b, offset, length);
     }
   }
-  
-  /** Maps a file into a set of buffers */
-  ByteBuffer[] map(RandomAccessFile raf, long offset, long length) throws IOException {
-    if ((length >>> chunkSizePower) >= Integer.MAX_VALUE)
-      throw new IllegalArgumentException("RandomAccessFile too big for chunk size: " + raf.toString());
-    
-    final long chunkSize = 1L << chunkSizePower;
-    
-    // we always allocate one more buffer, the last one may be a 0 byte one
-    final int nrBuffers = (int) (length >>> chunkSizePower) + 1;
-    
-    ByteBuffer buffers[] = new ByteBuffer[nrBuffers];
-    
-    long bufferStart = 0L;
-    FileChannel rafc = raf.getChannel();
-    for (int bufNr = 0; bufNr < nrBuffers; bufNr++) { 
-      int bufSize = (int) ( (length > (bufferStart + chunkSize))
-          ? chunkSize
-              : (length - bufferStart)
-          );
-      buffers[bufNr] = rafc.map(MapMode.READ_ONLY, offset + bufferStart, bufSize);
-      bufferStart += bufSize;
-    }
-    
-    return buffers;
-  }
+
 }

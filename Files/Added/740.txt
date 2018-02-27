@@ -1,4 +1,6 @@
-import org.apache.lucene.search.CachingCollector;
+result.newSegments.changed();
+
+package org.apache.lucene.index;
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -17,525 +19,1018 @@ import org.apache.lucene.search.CachingCollector;
  * limitations under the License.
  */
 
-package org.apache.lucene.search.grouping;
-
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.List;
-
-import org.apache.lucene.analysis.MockAnalyzer;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.Field;
-import org.apache.lucene.document.NumericField;
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.RandomIndexWriter;
-import org.apache.lucene.index.Term;
-import org.apache.lucene.search.Collector;
-import org.apache.lucene.search.FieldCache;
-import org.apache.lucene.search.FieldDoc;
+import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.IndexSearcher;
-import org.apache.lucene.search.ScoreDoc;
-import org.apache.lucene.search.Sort;
-import org.apache.lucene.search.SortField;
 import org.apache.lucene.search.TermQuery;
+import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.document.AbstractField;  // for javadocs
+import org.apache.lucene.document.Document;
+import org.apache.lucene.index.codecs.CodecProvider;
+import org.apache.lucene.index.codecs.DefaultSegmentInfosWriter;
+import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.LuceneTestCase;
-import org.apache.lucene.util._TestUtil;
 
-// TODO
-//   - should test relevance sort too
-//   - test null
-//   - test ties
-//   - test compound sort
+import java.text.NumberFormat;
+import java.io.PrintStream;
+import java.io.IOException;
+import java.io.File;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.List;
+import java.util.ArrayList;
+import java.util.Map;
 
-public class TestGrouping extends LuceneTestCase {
+/**
+ * Basic tool and API to check the health of an index and
+ * write a new segments file that removes reference to
+ * problematic segments.
+ * 
+ * <p>As this tool checks every byte in the index, on a large
+ * index it can take quite a long time to run.
+ *
+ * @lucene.experimental Please make a complete backup of your
+ * index before using this to fix your index!
+ */
+public class CheckIndex {
 
-  public void testBasic() throws Exception {
+  private PrintStream infoStream;
+  private Directory dir;
 
-    final String groupField = "author";
+  /**
+   * Returned from {@link #checkIndex()} detailing the health and status of the index.
+   *
+   * @lucene.experimental
+   **/
 
-    Directory dir = newDirectory();
-    RandomIndexWriter w = new RandomIndexWriter(
-                               random,
-                               dir,
-                               newIndexWriterConfig(TEST_VERSION_CURRENT,
-                                                    new MockAnalyzer(random)).setMergePolicy(newLogMergePolicy()));
-    // 0
-    Document doc = new Document();
-    doc.add(new Field(groupField, "author1", Field.Store.YES, Field.Index.ANALYZED));
-    doc.add(new Field("content", "random text", Field.Store.YES, Field.Index.ANALYZED));
-    doc.add(new Field("id", "1", Field.Store.YES, Field.Index.NO));
-    w.addDocument(doc);
+  public static class Status {
 
-    // 1
-    doc = new Document();
-    doc.add(new Field(groupField, "author1", Field.Store.YES, Field.Index.ANALYZED));
-    doc.add(new Field("content", "some more random text", Field.Store.YES, Field.Index.ANALYZED));
-    doc.add(new Field("id", "2", Field.Store.YES, Field.Index.NO));
-    w.addDocument(doc);
+    /** True if no problems were found with the index. */
+    public boolean clean;
 
-    // 2
-    doc = new Document();
-    doc.add(new Field(groupField, "author1", Field.Store.YES, Field.Index.ANALYZED));
-    doc.add(new Field("content", "some more random textual data", Field.Store.YES, Field.Index.ANALYZED));
-    doc.add(new Field("id", "3", Field.Store.YES, Field.Index.NO));
-    w.addDocument(doc);
+    /** True if we were unable to locate and load the segments_N file. */
+    public boolean missingSegments;
 
-    // 3
-    doc = new Document();
-    doc.add(new Field(groupField, "author2", Field.Store.YES, Field.Index.ANALYZED));
-    doc.add(new Field("content", "some random text", Field.Store.YES, Field.Index.ANALYZED));
-    doc.add(new Field("id", "4", Field.Store.YES, Field.Index.NO));
-    w.addDocument(doc);
+    /** True if we were unable to open the segments_N file. */
+    public boolean cantOpenSegments;
 
-    // 4
-    doc = new Document();
-    doc.add(new Field(groupField, "author3", Field.Store.YES, Field.Index.ANALYZED));
-    doc.add(new Field("content", "some more random text", Field.Store.YES, Field.Index.ANALYZED));
-    doc.add(new Field("id", "5", Field.Store.YES, Field.Index.NO));
-    w.addDocument(doc);
+    /** True if we were unable to read the version number from segments_N file. */
+    public boolean missingSegmentVersion;
 
-    // 5
-    doc = new Document();
-    doc.add(new Field(groupField, "author3", Field.Store.YES, Field.Index.ANALYZED));
-    doc.add(new Field("content", "random", Field.Store.YES, Field.Index.ANALYZED));
-    doc.add(new Field("id", "6", Field.Store.YES, Field.Index.NO));
-    w.addDocument(doc);
+    /** Name of latest segments_N file in the index. */
+    public String segmentsFileName;
 
-    // 6 -- no author field
-    doc = new Document();
-    doc.add(new Field("content", "random word stuck in alot of other text", Field.Store.YES, Field.Index.ANALYZED));
-    doc.add(new Field("id", "6", Field.Store.YES, Field.Index.NO));
-    w.addDocument(doc);
+    /** Number of segments in the index. */
+    public int numSegments;
 
-    IndexSearcher indexSearcher = new IndexSearcher(w.getReader());
-    w.close();
+    /** String description of the version of the index. */
+    public String segmentFormat;
 
-    final Sort groupSort = Sort.RELEVANCE;
-    final FirstPassGroupingCollector c1 = new FirstPassGroupingCollector(groupField, groupSort, 10);
-    indexSearcher.search(new TermQuery(new Term("content", "random")), c1);
+    /** Empty unless you passed specific segments list to check as optional 3rd argument.
+     *  @see CheckIndex#checkIndex(List) */
+    public List<String> segmentsChecked = new ArrayList<String>();
+  
+    /** True if the index was created with a newer version of Lucene than the CheckIndex tool. */
+    public boolean toolOutOfDate;
 
-    final SecondPassGroupingCollector c2 = new SecondPassGroupingCollector(groupField, c1.getTopGroups(0, true), groupSort, null, 5, true, false, true);
-    indexSearcher.search(new TermQuery(new Term("content", "random")), c2);
+    /** List of {@link SegmentInfoStatus} instances, detailing status of each segment. */
+    public List<SegmentInfoStatus> segmentInfos = new ArrayList<SegmentInfoStatus>();
+  
+    /** Directory index is in. */
+    public Directory dir;
+
+    /** 
+     * SegmentInfos instance containing only segments that
+     * had no problems (this is used with the {@link CheckIndex#fixIndex} 
+     * method to repair the index. 
+     */
+    SegmentInfos newSegments;
+
+    /** How many documents will be lost to bad segments. */
+    public int totLoseDocCount;
+
+    /** How many bad segments were found. */
+    public int numBadSegments;
+
+    /** True if we checked only specific segments ({@link
+     * #checkIndex(List)}) was called with non-null
+     * argument). */
+    public boolean partial;
+
+    /** Holds the userData of the last commit in the index */
+    public Map<String, String> userData;
+
+    /** Holds the status of each segment in the index.
+     *  See {@link #segmentInfos}.
+     *
+     * <p><b>WARNING</b>: this API is new and experimental and is
+     * subject to suddenly change in the next release.
+     */
+    public static class SegmentInfoStatus {
+      /** Name of the segment. */
+      public String name;
+
+      /** CodecInfo used to read this segment. */
+      public SegmentCodecs codec;
+
+      /** Document count (does not take deletions into account). */
+      public int docCount;
+
+      /** True if segment is compound file format. */
+      public boolean compound;
+
+      /** Number of files referenced by this segment. */
+      public int numFiles;
+
+      /** Net size (MB) of the files referenced by this
+       *  segment. */
+      public double sizeMB;
+
+      /** Doc store offset, if this segment shares the doc
+       *  store files (stored fields and term vectors) with
+       *  other segments.  This is -1 if it does not share. */
+      public int docStoreOffset = -1;
     
-    final TopGroups groups = c2.getTopGroups(0);
+      /** String of the shared doc store segment, or null if
+       *  this segment does not share the doc store files. */
+      public String docStoreSegment;
 
-    assertEquals(7, groups.totalHitCount);
-    assertEquals(7, groups.totalGroupedHitCount);
-    assertEquals(4, groups.groups.length);
+      /** True if the shared doc store files are compound file
+       *  format. */
+      public boolean docStoreCompoundFile;
 
-    // relevance order: 5, 0, 3, 4, 1, 2, 6
+      /** True if this segment has pending deletions. */
+      public boolean hasDeletions;
 
-    // the later a document is added the higher this docId
-    // value
-    GroupDocs group = groups.groups[0];
-    assertEquals(new BytesRef("author3"), group.groupValue);
-    assertEquals(2, group.scoreDocs.length);
-    assertEquals(5, group.scoreDocs[0].doc);
-    assertEquals(4, group.scoreDocs[1].doc);
-    assertTrue(group.scoreDocs[0].score > group.scoreDocs[1].score);
+      /** Name of the current deletions file name. */
+      public String deletionsFileName;
+    
+      /** Number of deleted documents. */
+      public int numDeleted;
 
-    group = groups.groups[1];
-    assertEquals(new BytesRef("author1"), group.groupValue);
-    assertEquals(3, group.scoreDocs.length);
-    assertEquals(0, group.scoreDocs[0].doc);
-    assertEquals(1, group.scoreDocs[1].doc);
-    assertEquals(2, group.scoreDocs[2].doc);
-    assertTrue(group.scoreDocs[0].score > group.scoreDocs[1].score);
-    assertTrue(group.scoreDocs[1].score > group.scoreDocs[2].score);
+      /** True if we were able to open a SegmentReader on this
+       *  segment. */
+      public boolean openReaderPassed;
 
-    group = groups.groups[2];
-    assertEquals(new BytesRef("author2"), group.groupValue);
-    assertEquals(1, group.scoreDocs.length);
-    assertEquals(3, group.scoreDocs[0].doc);
+      /** Number of fields in this segment. */
+      int numFields;
 
-    group = groups.groups[3];
-    assertNull(group.groupValue);
-    assertEquals(1, group.scoreDocs.length);
-    assertEquals(6, group.scoreDocs[0].doc);
+      /** True if at least one of the fields in this segment
+       *  does not omitTermFreqAndPositions.
+       *  @see AbstractField#setOmitTermFreqAndPositions */
+      public boolean hasProx;
 
-    indexSearcher.getIndexReader().close();
-    dir.close();
-  }
+      /** Map that includes certain
+       *  debugging details that IndexWriter records into
+       *  each segment it creates */
+      public Map<String,String> diagnostics;
 
-  private static class GroupDoc {
-    final int id;
-    final BytesRef group;
-    final BytesRef sort1;
-    final BytesRef sort2;
-    final String content;
+      /** Status for testing of field norms (null if field norms could not be tested). */
+      public FieldNormStatus fieldNormStatus;
 
-    public GroupDoc(int id, BytesRef group, BytesRef sort1, BytesRef sort2, String content) {
-      this.id = id;
-      this.group = group;
-      this.sort1 = sort1;
-      this.sort2 = sort2;
-      this.content = content;
+      /** Status for testing of indexed terms (null if indexed terms could not be tested). */
+      public TermIndexStatus termIndexStatus;
+
+      /** Status for testing of stored fields (null if stored fields could not be tested). */
+      public StoredFieldStatus storedFieldStatus;
+
+      /** Status for testing of term vectors (null if term vectors could not be tested). */
+      public TermVectorStatus termVectorStatus;
+    }
+
+    /**
+     * Status from testing field norms.
+     */
+    public static final class FieldNormStatus {
+      /** Number of fields successfully tested */
+      public long totFields = 0L;
+
+      /** Exception thrown during term index test (null on success) */
+      public Throwable error = null;
+    }
+
+    /**
+     * Status from testing term index.
+     */
+    public static final class TermIndexStatus {
+      /** Total term count */
+      public long termCount = 0L;
+
+      /** Total frequency across all terms. */
+      public long totFreq = 0L;
+      
+      /** Total number of positions. */
+      public long totPos = 0L;
+
+      /** Exception thrown during term index test (null on success) */
+      public Throwable error = null;
+    }
+
+    /**
+     * Status from testing stored fields.
+     */
+    public static final class StoredFieldStatus {
+      
+      /** Number of documents tested. */
+      public int docCount = 0;
+      
+      /** Total number of stored fields tested. */
+      public long totFields = 0;
+      
+      /** Exception thrown during stored fields test (null on success) */
+      public Throwable error = null;
+    }
+
+    /**
+     * Status from testing stored fields.
+     */
+    public static final class TermVectorStatus {
+      
+      /** Number of documents tested. */
+      public int docCount = 0;
+      
+      /** Total number of term vectors tested. */
+      public long totVectors = 0;
+      
+      /** Exception thrown during term vector test (null on success) */
+      public Throwable error = null;
     }
   }
 
-  private Sort getRandomSort() {
-    final List<SortField> sortFields = new ArrayList<SortField>();
-    if (random.nextBoolean()) {
-      if (random.nextBoolean()) {
-        sortFields.add(new SortField("sort1", SortField.STRING, random.nextBoolean()));
-      } else {
-        sortFields.add(new SortField("sort2", SortField.STRING, random.nextBoolean()));
-      }
-    } else if (random.nextBoolean()) {
-      sortFields.add(new SortField("sort1", SortField.STRING, random.nextBoolean()));
-      sortFields.add(new SortField("sort2", SortField.STRING, random.nextBoolean()));
+  /** Create a new CheckIndex on the directory. */
+  public CheckIndex(Directory dir) {
+    this.dir = dir;
+    infoStream = null;
+  }
+
+  /** Set infoStream where messages should go.  If null, no
+   *  messages are printed */
+  public void setInfoStream(PrintStream out) {
+    infoStream = out;
+  }
+
+  private void msg(String msg) {
+    if (infoStream != null)
+      infoStream.println(msg);
+  }
+
+  /** Returns a {@link Status} instance detailing
+   *  the state of the index.
+   *
+   *  <p>As this method checks every byte in the index, on a large
+   *  index it can take quite a long time to run.
+   *
+   *  <p><b>WARNING</b>: make sure
+   *  you only call this when the index is not opened by any
+   *  writer. */
+  public Status checkIndex() throws IOException {
+    return checkIndex(null);
+  }
+
+  public Status checkIndex(List<String> onlySegments) throws IOException {
+    return checkIndex(onlySegments, CodecProvider.getDefault());
+  }
+  
+  /** Returns a {@link Status} instance detailing
+   *  the state of the index.
+   * 
+   *  @param onlySegments list of specific segment names to check
+   *
+   *  <p>As this method checks every byte in the specified
+   *  segments, on a large index it can take quite a long
+   *  time to run.
+   *
+   *  <p><b>WARNING</b>: make sure
+   *  you only call this when the index is not opened by any
+   *  writer. */
+  public Status checkIndex(List<String> onlySegments, CodecProvider codecs) throws IOException {
+    NumberFormat nf = NumberFormat.getInstance();
+    SegmentInfos sis = new SegmentInfos(codecs);
+    Status result = new Status();
+    result.dir = dir;
+    try {
+      sis.read(dir, codecs);
+    } catch (Throwable t) {
+      msg("ERROR: could not read any segments file in directory");
+      result.missingSegments = true;
+      if (infoStream != null)
+        t.printStackTrace(infoStream);
+      return result;
     }
-    sortFields.add(new SortField("id", SortField.INT));
-    return new Sort(sortFields.toArray(new SortField[sortFields.size()]));
-  }
 
-  private Comparator<GroupDoc> getComparator(Sort sort) {
-    final SortField[] sortFields = sort.getSort();
-    return new Comparator<GroupDoc>() {
-      public int compare(GroupDoc d1, GroupDoc d2) {
-        for(SortField sf : sortFields) {
-          final int cmp;
-          if (sf.getField().equals("sort1")) {
-            cmp = d1.sort1.compareTo(d2.sort1);
-          } else if (sf.getField().equals("sort2")) {
-            cmp = d1.sort2.compareTo(d2.sort2);
-          } else {
-            assertEquals(sf.getField(), "id");
-            cmp = d1.id - d2.id;
-          }
-          if (cmp != 0) {
-            return sf.getReverse() ? -cmp : cmp;
-          }
-        }
-        // Our sort always fully tie breaks:
-        fail();
-        return 0;
-      }
-    };
-  }
-
-  private Comparable<?>[] fillFields(GroupDoc d, Sort sort) {
-    final SortField[] sortFields = sort.getSort();
-    final Comparable<?>[] fields = new Comparable[sortFields.length];
-    for(int fieldIDX=0;fieldIDX<sortFields.length;fieldIDX++) {
-      final Comparable<?> c;
-      final SortField sf = sortFields[fieldIDX];
-      if (sf.getField().equals("sort1")) {
-        c = d.sort1;
-      } else if (sf.getField().equals("sort2")) {
-        c = d.sort2;
-      } else {
-        assertEquals("id", sf.getField());
-        c = new Integer(d.id);
-      }
-      fields[fieldIDX] = c;
+    final int numSegments = sis.size();
+    final String segmentsFileName = sis.getCurrentSegmentFileName();
+    IndexInput input = null;
+    try {
+      input = dir.openInput(segmentsFileName);
+    } catch (Throwable t) {
+      msg("ERROR: could not open segments file in directory");
+      if (infoStream != null)
+        t.printStackTrace(infoStream);
+      result.cantOpenSegments = true;
+      return result;
     }
-    return fields;
-  }
+    int format = 0;
+    try {
+      format = input.readInt();
+    } catch (Throwable t) {
+      msg("ERROR: could not read segment file version in directory");
+      if (infoStream != null)
+        t.printStackTrace(infoStream);
+      result.missingSegmentVersion = true;
+      return result;
+    } finally {
+      if (input != null)
+        input.close();
+    }
 
-  private TopGroups slowGrouping(GroupDoc[] groupDocs,
-                                 String searchTerm,
-                                 boolean fillFields,
-                                 boolean getScores,
-                                 boolean getMaxScores,
-                                 Sort groupSort,
-                                 Sort docSort,
-                                 int topNGroups,
-                                 int docsPerGroup,
-                                 int groupOffset,
-                                 int docOffset) {
+    String sFormat = "";
+    boolean skip = false;
 
-    final Comparator<GroupDoc> groupSortComp = getComparator(groupSort);
+    if (format == DefaultSegmentInfosWriter.FORMAT_DIAGNOSTICS) {
+      sFormat = "FORMAT_DIAGNOSTICS [Lucene 2.9]";
+    } else if (format == DefaultSegmentInfosWriter.FORMAT_4_0) {
+      sFormat = "FORMAT_4_0 [Lucene 4.0]";
+    } else if (format < DefaultSegmentInfosWriter.FORMAT_CURRENT) {
+      sFormat = "int=" + format + " [newer version of Lucene than this tool supports]";
+      skip = true;
+    } else if (format > DefaultSegmentInfosWriter.FORMAT_MINIMUM) {
+      sFormat = "int=" + format + " [older version of Lucene than this tool supports]";
+      skip = true;
+    }
 
-    Arrays.sort(groupDocs, groupSortComp);
-    final HashMap<BytesRef,List<GroupDoc>> groups = new HashMap<BytesRef,List<GroupDoc>>();
-    final List<BytesRef> sortedGroups = new ArrayList<BytesRef>();
-    final List<Comparable<?>[]> sortedGroupFields = new ArrayList<Comparable<?>[]>();
+    result.segmentsFileName = segmentsFileName;
+    result.numSegments = numSegments;
+    result.segmentFormat = sFormat;
+    result.userData = sis.getUserData();
+    String userDataString;
+    if (sis.getUserData().size() > 0) {
+      userDataString = " userData=" + sis.getUserData();
+    } else {
+      userDataString = "";
+    }
 
-    int totalHitCount = 0;
+    msg("Segments file=" + segmentsFileName + " numSegments=" + numSegments + " version=" + sFormat + userDataString);
 
-    for(GroupDoc d : groupDocs) {
-      // TODO: would be better to filter by searchTerm before sorting!
-      if (!d.content.equals(searchTerm)) {
+    if (onlySegments != null) {
+      result.partial = true;
+      if (infoStream != null)
+        infoStream.print("\nChecking only these segments:");
+      for (String s : onlySegments) {
+        if (infoStream != null)
+          infoStream.print(" " + s);
+      }
+      result.segmentsChecked.addAll(onlySegments);
+      msg(":");
+    }
+
+    if (skip) {
+      msg("\nERROR: this index appears to be created by a newer version of Lucene than this tool was compiled on; please re-compile this tool on the matching version of Lucene; exiting");
+      result.toolOutOfDate = true;
+      return result;
+    }
+
+
+    result.newSegments = (SegmentInfos) sis.clone();
+    result.newSegments.clear();
+
+    for(int i=0;i<numSegments;i++) {
+      final SegmentInfo info = sis.info(i);
+      if (onlySegments != null && !onlySegments.contains(info.name))
         continue;
-      }
-      totalHitCount++;
-      List<GroupDoc> l = groups.get(d.group);
-      if (l == null) {
-        sortedGroups.add(d.group);
-        if (fillFields) {
-          sortedGroupFields.add(fillFields(d, groupSort));
+      Status.SegmentInfoStatus segInfoStat = new Status.SegmentInfoStatus();
+      result.segmentInfos.add(segInfoStat);
+      msg("  " + (1+i) + " of " + numSegments + ": name=" + info.name + " docCount=" + info.docCount);
+      segInfoStat.name = info.name;
+      segInfoStat.docCount = info.docCount;
+
+      int toLoseDocCount = info.docCount;
+
+      SegmentReader reader = null;
+
+      try {
+        final SegmentCodecs codec = info.getSegmentCodecs();
+        msg("    codec=" + codec);
+        segInfoStat.codec = codec;
+        msg("    compound=" + info.getUseCompoundFile());
+        segInfoStat.compound = info.getUseCompoundFile();
+        msg("    hasProx=" + info.getHasProx());
+        segInfoStat.hasProx = info.getHasProx();
+        msg("    numFiles=" + info.files().size());
+        segInfoStat.numFiles = info.files().size();
+        msg("    size (MB)=" + nf.format(info.sizeInBytes()/(1024.*1024.)));
+        segInfoStat.sizeMB = info.sizeInBytes()/(1024.*1024.);
+        Map<String,String> diagnostics = info.getDiagnostics();
+        segInfoStat.diagnostics = diagnostics;
+        if (diagnostics.size() > 0) {
+          msg("    diagnostics = " + diagnostics);
         }
-        l = new ArrayList<GroupDoc>();
-        groups.put(d.group, l);
-      }
-      l.add(d);
-    }
 
-    if (groupOffset >= sortedGroups.size()) {
-      // slice is out of bounds
-      return null;
-    }
+        final int docStoreOffset = info.getDocStoreOffset();
+        if (docStoreOffset != -1) {
+          msg("    docStoreOffset=" + docStoreOffset);
+          segInfoStat.docStoreOffset = docStoreOffset;
+          msg("    docStoreSegment=" + info.getDocStoreSegment());
+          segInfoStat.docStoreSegment = info.getDocStoreSegment();
+          msg("    docStoreIsCompoundFile=" + info.getDocStoreIsCompoundFile());
+          segInfoStat.docStoreCompoundFile = info.getDocStoreIsCompoundFile();
+        }
 
-    final int limit = Math.min(groupOffset + topNGroups, groups.size());
+        final String delFileName = info.getDelFileName();
+        if (delFileName == null){
+          msg("    no deletions");
+          segInfoStat.hasDeletions = false;
+        }
+        else{
+          msg("    has deletions [delFileName=" + delFileName + "]");
+          segInfoStat.hasDeletions = true;
+          segInfoStat.deletionsFileName = delFileName;
+        }
+        if (infoStream != null)
+          infoStream.print("    test: open reader.........");
+        reader = SegmentReader.get(true, info, IndexReader.DEFAULT_TERMS_INDEX_DIVISOR);
 
-    final Comparator<GroupDoc> docSortComp = getComparator(docSort);
-    final GroupDocs[] result = new GroupDocs[limit-groupOffset];
-    int totalGroupedHitCount = 0;
-    for(int idx=groupOffset;idx < limit;idx++) {
-      final BytesRef group = sortedGroups.get(idx);
-      final List<GroupDoc> docs = groups.get(group);
-      totalGroupedHitCount += docs.size();
-      Collections.sort(docs, docSortComp);
-      final ScoreDoc[] hits;
-      if (docs.size() > docOffset) {
-        final int docIDXLimit = Math.min(docOffset + docsPerGroup, docs.size());
-        hits = new ScoreDoc[docIDXLimit - docOffset];
-        for(int docIDX=docOffset; docIDX < docIDXLimit; docIDX++) {
-          final GroupDoc d = docs.get(docIDX);
-          final FieldDoc fd;
-          if (fillFields) {
-            fd = new FieldDoc(d.id, 0.0f, fillFields(d, docSort));
-          } else {
-            fd = new FieldDoc(d.id, 0.0f);
+        segInfoStat.openReaderPassed = true;
+
+        final int numDocs = reader.numDocs();
+        toLoseDocCount = numDocs;
+        if (reader.hasDeletions()) {
+          if (reader.deletedDocs.count() != info.getDelCount()) {
+            throw new RuntimeException("delete count mismatch: info=" + info.getDelCount() + " vs deletedDocs.count()=" + reader.deletedDocs.count());
           }
-          hits[docIDX-docOffset] = fd;
+          if (reader.deletedDocs.count() > reader.maxDoc()) {
+            throw new RuntimeException("too many deleted docs: maxDoc()=" + reader.maxDoc() + " vs deletedDocs.count()=" + reader.deletedDocs.count());
+          }
+          if (info.docCount - numDocs != info.getDelCount()){
+            throw new RuntimeException("delete count mismatch: info=" + info.getDelCount() + " vs reader=" + (info.docCount - numDocs));
+          }
+          segInfoStat.numDeleted = info.docCount - numDocs;
+          msg("OK [" + (segInfoStat.numDeleted) + " deleted docs]");
+        } else {
+          if (info.getDelCount() != 0) {
+            throw new RuntimeException("delete count mismatch: info=" + info.getDelCount() + " vs reader=" + (info.docCount - numDocs));
+          }
+          msg("OK");
         }
-      } else  {
-        hits = new ScoreDoc[0];
+        if (reader.maxDoc() != info.docCount)
+          throw new RuntimeException("SegmentReader.maxDoc() " + reader.maxDoc() + " != SegmentInfos.docCount " + info.docCount);
+
+        // Test getFieldNames()
+        if (infoStream != null) {
+          infoStream.print("    test: fields..............");
+        }         
+        Collection<String> fieldNames = reader.getFieldNames(IndexReader.FieldOption.ALL);
+        msg("OK [" + fieldNames.size() + " fields]");
+        segInfoStat.numFields = fieldNames.size();
+        
+        // Test Field Norms
+        segInfoStat.fieldNormStatus = testFieldNorms(fieldNames, reader);
+
+        // Test the Term Index
+        segInfoStat.termIndexStatus = testTermIndex(reader);
+
+        // Test Stored Fields
+        segInfoStat.storedFieldStatus = testStoredFields(info, reader, nf);
+
+        // Test Term Vectors
+        segInfoStat.termVectorStatus = testTermVectors(info, reader, nf);
+
+        // Rethrow the first exception we encountered
+        //  This will cause stats for failed segments to be incremented properly
+        if (segInfoStat.fieldNormStatus.error != null) {
+          throw new RuntimeException("Field Norm test failed");
+        } else if (segInfoStat.termIndexStatus.error != null) {
+          throw new RuntimeException("Term Index test failed");
+        } else if (segInfoStat.storedFieldStatus.error != null) {
+          throw new RuntimeException("Stored Field test failed");
+        } else if (segInfoStat.termVectorStatus.error != null) {
+          throw new RuntimeException("Term Vector test failed");
+        }
+
+        msg("");
+
+      } catch (Throwable t) {
+        msg("FAILED");
+        String comment;
+        comment = "fixIndex() would remove reference to this segment";
+        msg("    WARNING: " + comment + "; full exception:");
+        if (infoStream != null)
+          t.printStackTrace(infoStream);
+        msg("");
+        result.totLoseDocCount += toLoseDocCount;
+        result.numBadSegments++;
+        continue;
+      } finally {
+        if (reader != null)
+          reader.close();
       }
 
-      result[idx-groupOffset] = new GroupDocs(0.0f,
-                                              docs.size(),
-                                              hits,
-                                              group,
-                                              fillFields ? sortedGroupFields.get(idx) : null);
+      // Keeper
+      result.newSegments.add((SegmentInfo) info.clone());
     }
 
-    return new TopGroups(groupSort.getSort(), docSort.getSort(), totalHitCount, totalGroupedHitCount, result);
+    if (0 == result.numBadSegments) {
+      result.clean = true;
+      msg("No problems were detected with this index.\n");
+    } else
+      msg("WARNING: " + result.numBadSegments + " broken segments (containing " + result.totLoseDocCount + " documents) detected");
+
+    return result;
   }
 
-  public void testRandom() throws Exception {
-    for(int iter=0;iter<3;iter++) {
+  /**
+   * Test field norms.
+   */
+  private Status.FieldNormStatus testFieldNorms(Collection<String> fieldNames, SegmentReader reader) {
+    final Status.FieldNormStatus status = new Status.FieldNormStatus();
 
-      if (VERBOSE) {
-        System.out.println("TEST: iter=" + iter);
+    try {
+      // Test Field Norms
+      if (infoStream != null) {
+        infoStream.print("    test: field norms.........");
+      }
+      final byte[] b = new byte[reader.maxDoc()];
+      for (final String fieldName : fieldNames) {
+        if (reader.hasNorms(fieldName)) {
+          reader.norms(fieldName, b, 0);
+          ++status.totFields;
+        }
       }
 
-      final int numDocs = _TestUtil.nextInt(random, 100, 1000) * RANDOM_MULTIPLIER;
-      //final int numDocs = _TestUtil.nextInt(random, 5, 20);
+      msg("OK [" + status.totFields + " fields]");
+    } catch (Throwable e) {
+      msg("ERROR [" + String.valueOf(e.getMessage()) + "]");
+      status.error = e;
+      if (infoStream != null) {
+        e.printStackTrace(infoStream);
+      }
+    }
 
-      final int numGroups = _TestUtil.nextInt(random, 1, numDocs);
+    return status;
+  }
 
-      if (VERBOSE) {
-        System.out.println("TEST: numDocs=" + numDocs + " numGroups=" + numGroups);
+  /**
+   * Test the term index.
+   */
+  private Status.TermIndexStatus testTermIndex(SegmentReader reader) {
+    final Status.TermIndexStatus status = new Status.TermIndexStatus();
+
+    final int maxDoc = reader.maxDoc();
+    final Bits delDocs = reader.getDeletedDocs();
+
+    final IndexSearcher is = new IndexSearcher(reader);
+
+    try {
+
+      if (infoStream != null) {
+        infoStream.print("    test: terms, freq, prox...");
+      }
+
+      final Fields fields = reader.fields();
+      if (fields == null) {
+        msg("OK [no fields/terms]");
+        return status;
+      }
+     
+      DocsEnum docs = null;
+      DocsAndPositionsEnum postings = null;
+
+      final FieldsEnum fieldsEnum = fields.iterator();
+      while(true) {
+        final String field = fieldsEnum.next();
+        if (field == null) {
+          break;
+        }
+        
+        final TermsEnum terms = fieldsEnum.terms();
+        assert terms != null;
+        boolean hasOrd = true;
+        final long termCountStart = status.termCount;
+
+        BytesRef lastTerm = null;
+
+        Comparator<BytesRef> termComp = terms.getComparator();
+
+        while(true) {
+
+          final BytesRef term = terms.next();
+          if (term == null) {
+            break;
+          }
+
+          // make sure terms arrive in order according to
+          // the comp
+          if (lastTerm == null) {
+            lastTerm = new BytesRef(term);
+          } else {
+            if (termComp.compare(lastTerm, term) >= 0) {
+              throw new RuntimeException("terms out of order: lastTerm=" + lastTerm + " term=" + term);
+            }
+            lastTerm.copy(term);
+          }
+
+          final int docFreq = terms.docFreq();
+          status.totFreq += docFreq;
+
+          docs = terms.docs(delDocs, docs);
+          postings = terms.docsAndPositions(delDocs, postings);
+
+          if (hasOrd) {
+            long ord = -1;
+            try {
+              ord = terms.ord();
+            } catch (UnsupportedOperationException uoe) {
+              hasOrd = false;
+            }
+
+            if (hasOrd) {
+              final long ordExpected = status.termCount - termCountStart;
+              if (ord != ordExpected) {
+                throw new RuntimeException("ord mismatch: TermsEnum has ord=" + ord + " vs actual=" + ordExpected);
+              }
+            }
+          }
+
+          status.termCount++;
+
+          final DocsEnum docs2;
+          if (postings != null) {
+            docs2 = postings;
+          } else {
+            docs2 = docs;
+          }
+
+          int lastDoc = -1;
+          while(true) {
+            final int doc = docs2.nextDoc();
+            if (doc == DocIdSetIterator.NO_MORE_DOCS) {
+              break;
+            }
+            final int freq = docs2.freq();
+            status.totPos += freq;
+
+            if (doc <= lastDoc) {
+              throw new RuntimeException("term " + term + ": doc " + doc + " <= lastDoc " + lastDoc);
+            }
+            if (doc >= maxDoc) {
+              throw new RuntimeException("term " + term + ": doc " + doc + " >= maxDoc " + maxDoc);
+            }
+
+            lastDoc = doc;
+            if (freq <= 0) {
+              throw new RuntimeException("term " + term + ": doc " + doc + ": freq " + freq + " is out of bounds");
+            }
+            
+            int lastPos = -1;
+            if (postings != null) {
+              for(int j=0;j<freq;j++) {
+                final int pos = postings.nextPosition();
+                if (pos < -1) {
+                  throw new RuntimeException("term " + term + ": doc " + doc + ": pos " + pos + " is out of bounds");
+                }
+                if (pos < lastPos) {
+                  throw new RuntimeException("term " + term + ": doc " + doc + ": pos " + pos + " < lastPos " + lastPos);
+                }
+                lastPos = pos;
+                if (postings.hasPayload()) {
+                  postings.getPayload();
+                }
+              }
+            }
+          }
+
+          // Now count how many deleted docs occurred in
+          // this term:
+
+          if (reader.hasDeletions()) {
+            final DocsEnum docsNoDel = terms.docs(null, docs);
+            int count = 0;
+            while(docsNoDel.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
+              count++;
+            }
+            if (count != docFreq) {
+              throw new RuntimeException("term " + term + " docFreq=" + docFreq + " != tot docs w/o deletions " + count);
+            }
+          }
+        }
+
+        // Test seek to last term:
+        if (lastTerm != null) {
+          if (terms.seek(lastTerm) != TermsEnum.SeekStatus.FOUND) {
+            throw new RuntimeException("seek to last term " + lastTerm + " failed");
+          }
+
+          is.search(new TermQuery(new Term(field, lastTerm)), 1);
+        }
+
+        // Test seeking by ord
+        if (hasOrd && status.termCount-termCountStart > 0) {
+          long termCount;
+          try {
+            termCount = fields.terms(field).getUniqueTermCount();
+          } catch (UnsupportedOperationException uoe) {
+            termCount = -1;
+          }
+
+          if (termCount != -1 && termCount != status.termCount - termCountStart) {
+            throw new RuntimeException("termCount mismatch " + termCount + " vs " + (status.termCount - termCountStart));
+          }
+
+          int seekCount = (int) Math.min(10000L, termCount);
+          if (seekCount > 0) {
+            BytesRef[] seekTerms = new BytesRef[seekCount];
+            
+            // Seek by ord
+            for(int i=seekCount-1;i>=0;i--) {
+              long ord = i*(termCount/seekCount);
+              terms.seek(ord);
+              seekTerms[i] = new BytesRef(terms.term());
+            }
+
+            // Seek by term
+            long totDocCount = 0;
+            for(int i=seekCount-1;i>=0;i--) {
+              if (terms.seek(seekTerms[i]) != TermsEnum.SeekStatus.FOUND) {
+                throw new RuntimeException("seek to existing term " + seekTerms[i] + " failed");
+              }
+              
+              docs = terms.docs(delDocs, docs);
+              if (docs == null) {
+                throw new RuntimeException("null DocsEnum from to existing term " + seekTerms[i]);
+              }
+
+              while(docs.nextDoc() != DocsEnum.NO_MORE_DOCS) {
+                totDocCount++;
+              }
+            }
+
+            // TermQuery
+            long totDocCount2 = 0;
+            for(int i=0;i<seekCount;i++) {
+              totDocCount2 += is.search(new TermQuery(new Term(field, seekTerms[i])), 1).totalHits;
+            }
+
+            if (totDocCount != totDocCount2) {
+              throw new RuntimeException("search to seek terms produced wrong number of hits: " + totDocCount + " vs " + totDocCount2);
+            }
+          }
+        }
+      }
+
+      msg("OK [" + status.termCount + " terms; " + status.totFreq + " terms/docs pairs; " + status.totPos + " tokens]");
+
+    } catch (Throwable e) {
+      msg("ERROR [" + String.valueOf(e.getMessage()) + "]");
+      status.error = e;
+      if (infoStream != null) {
+        e.printStackTrace(infoStream);
+      }
+    }
+
+    return status;
+  }
+  
+  /**
+   * Test stored fields for a segment.
+   */
+  private Status.StoredFieldStatus testStoredFields(SegmentInfo info, SegmentReader reader, NumberFormat format) {
+    final Status.StoredFieldStatus status = new Status.StoredFieldStatus();
+
+    try {
+      if (infoStream != null) {
+        infoStream.print("    test: stored fields.......");
+      }
+
+      // Scan stored fields for all documents
+      final Bits delDocs = reader.getDeletedDocs();
+      for (int j = 0; j < info.docCount; ++j) {
+        if (delDocs == null || !delDocs.get(j)) {
+          status.docCount++;
+          Document doc = reader.document(j);
+          status.totFields += doc.getFields().size();
+        }
+      }      
+
+      // Validate docCount
+      if (status.docCount != reader.numDocs()) {
+        throw new RuntimeException("docCount=" + status.docCount + " but saw " + status.docCount + " undeleted docs");
+      }
+
+      msg("OK [" + status.totFields + " total field count; avg " + 
+          format.format((((float) status.totFields)/status.docCount)) + " fields per doc]");      
+    } catch (Throwable e) {
+      msg("ERROR [" + String.valueOf(e.getMessage()) + "]");
+      status.error = e;
+      if (infoStream != null) {
+        e.printStackTrace(infoStream);
+      }
+    }
+
+    return status;
+  }
+
+  /**
+   * Test term vectors for a segment.
+   */
+  private Status.TermVectorStatus testTermVectors(SegmentInfo info, SegmentReader reader, NumberFormat format) {
+    final Status.TermVectorStatus status = new Status.TermVectorStatus();
+    
+    try {
+      if (infoStream != null) {
+        infoStream.print("    test: term vectors........");
+      }
+
+      final Bits delDocs = reader.getDeletedDocs();
+      for (int j = 0; j < info.docCount; ++j) {
+        if (delDocs == null || !delDocs.get(j)) {
+          status.docCount++;
+          TermFreqVector[] tfv = reader.getTermFreqVectors(j);
+          if (tfv != null) {
+            status.totVectors += tfv.length;
+          }
+        }
       }
       
-      final List<BytesRef> groups = new ArrayList<BytesRef>();
-      for(int i=0;i<numGroups;i++) {
-        groups.add(new BytesRef(_TestUtil.randomRealisticUnicodeString(random)));
-        //groups.add(new BytesRef(_TestUtil.randomSimpleString(random)));
+      msg("OK [" + status.totVectors + " total vector count; avg " + 
+          format.format((((float) status.totVectors) / status.docCount)) + " term/freq vector fields per doc]");
+    } catch (Throwable e) {
+      msg("ERROR [" + String.valueOf(e.getMessage()) + "]");
+      status.error = e;
+      if (infoStream != null) {
+        e.printStackTrace(infoStream);
       }
-      final String[] contentStrings = new String[] {"a", "b", "c", "d"};
-
-      Directory dir = newDirectory();
-      RandomIndexWriter w = new RandomIndexWriter(
-                                                  random,
-                                                  dir,
-                                                  newIndexWriterConfig(TEST_VERSION_CURRENT,
-                                                                       new MockAnalyzer(random)).setMergePolicy(newLogMergePolicy()));
-
-      Document doc = new Document();
-      Document docNoGroup = new Document();
-      Field group = newField("group", "", Field.Index.NOT_ANALYZED);
-      doc.add(group);
-      Field sort1 = newField("sort1", "", Field.Index.NOT_ANALYZED);
-      doc.add(sort1);
-      docNoGroup.add(sort1);
-      Field sort2 = newField("sort2", "", Field.Index.NOT_ANALYZED);
-      doc.add(sort2);
-      docNoGroup.add(sort2);
-      Field content = newField("content", "", Field.Index.NOT_ANALYZED);
-      doc.add(content);
-      docNoGroup.add(content);
-      NumericField id = new NumericField("id");
-      doc.add(id);
-      docNoGroup.add(id);
-      final GroupDoc[] groupDocs = new GroupDoc[numDocs];
-      for(int i=0;i<numDocs;i++) {
-        final BytesRef groupValue;
-        if (random.nextInt(24) == 17) {
-          // So we test the "doc doesn't have the group'd
-          // field" case:
-          groupValue = null;
-        } else {
-          groupValue = groups.get(random.nextInt(groups.size()));
-        }
-        final GroupDoc groupDoc = new GroupDoc(i,
-                                               groupValue,
-                                               groups.get(random.nextInt(groups.size())),
-                                               groups.get(random.nextInt(groups.size())),
-                                               contentStrings[random.nextInt(contentStrings.length)]);
-        if (VERBOSE) {
-          System.out.println("  doc content=" + groupDoc.content + " id=" + i + " group=" + (groupDoc.group == null ? "null" : groupDoc.group.utf8ToString()) + " sort1=" + groupDoc.sort1.utf8ToString() + " sort2=" + groupDoc.sort2.utf8ToString());
-        }
-
-        groupDocs[i] = groupDoc;
-        if (groupDoc.group != null) {
-          group.setValue(groupDoc.group.utf8ToString());
-        }
-        sort1.setValue(groupDoc.sort1.utf8ToString());
-        sort2.setValue(groupDoc.sort2.utf8ToString());
-        content.setValue(groupDoc.content);
-        id.setIntValue(groupDoc.id);
-        if (groupDoc.group == null) {
-          w.addDocument(docNoGroup);
-        } else {
-          w.addDocument(doc);
-        }
-      }
-
-      final IndexReader r = w.getReader();
-      w.close();
-
-      final IndexSearcher s = new IndexSearcher(r);
-
-      for(int searchIter=0;searchIter<100;searchIter++) {
-
-        if (VERBOSE) {
-          System.out.println("TEST: searchIter=" + searchIter);
-        }
-
-        final String searchTerm = contentStrings[random.nextInt(contentStrings.length)];
-        final boolean fillFields = random.nextBoolean();
-        final boolean getScores = random.nextBoolean();
-        final boolean getMaxScores = random.nextBoolean();
-        final Sort groupSort = getRandomSort();
-        // TODO: also test null (= sort by relevance)
-        final Sort docSort = getRandomSort();
-
-        final int topNGroups = _TestUtil.nextInt(random, 1, 30);
-        final int docsPerGroup = _TestUtil.nextInt(random, 1, 50);
-        final int groupOffset = _TestUtil.nextInt(random, 0, (topNGroups-1)/2);
-        //final int groupOffset = 0;
-
-        final int docOffset = _TestUtil.nextInt(random, 0, docsPerGroup-1);
-        //final int docOffset = 0;
-
-        final boolean doCache = random.nextBoolean();
-        if (VERBOSE) {
-          System.out.println("TEST: groupSort=" + groupSort + " docSort=" + docSort + " searchTerm=" + searchTerm + " topNGroups=" + topNGroups + " groupOffset=" + groupOffset + " docOffset=" + docOffset + " doCache=" + doCache + " docsPerGroup=" + docsPerGroup);
-        }
-
-        final FirstPassGroupingCollector c1 = new FirstPassGroupingCollector("group", groupSort, groupOffset+topNGroups);
-        final CachingCollector cCache;
-        final Collector c;
-        if (doCache) {
-          final double maxCacheMB = random.nextDouble();
-          if (VERBOSE) {
-            System.out.println("TEST: maxCacheMB=" + maxCacheMB);
-          }
-          c = cCache = new CachingCollector(c1, true, maxCacheMB);
-        } else {
-          c = c1;
-          cCache = null;
-        }
-        s.search(new TermQuery(new Term("content", searchTerm)), c);
-
-        final Collection<SearchGroup> topGroups = c1.getTopGroups(groupOffset, fillFields);
-        final TopGroups groupsResult;
-
-        if (topGroups != null) {
-
-          if (VERBOSE) {
-            System.out.println("TEST: topGroups");
-            for (SearchGroup searchGroup : topGroups) {
-              System.out.println("  " + (searchGroup.groupValue == null ? "null" : searchGroup.groupValue.utf8ToString()) + ": " + Arrays.deepToString(searchGroup.sortValues));
-            }
-          }
-
-          final SecondPassGroupingCollector c2 = new SecondPassGroupingCollector("group", topGroups, groupSort, docSort, docOffset+docsPerGroup, getScores, getMaxScores, fillFields);
-          if (doCache) {
-            if (cCache.isCached()) {
-              if (VERBOSE) {
-                System.out.println("TEST: cache is intact");
-              }
-              cCache.replay(c2);
-            } else {
-              if (VERBOSE) {
-                System.out.println("TEST: cache was too large");
-              }
-              s.search(new TermQuery(new Term("content", searchTerm)), c2);
-            }
-          } else {
-            s.search(new TermQuery(new Term("content", searchTerm)), c2);
-          }
-        
-          groupsResult = c2.getTopGroups(docOffset);
-        } else {
-          groupsResult = null;
-          if (VERBOSE) {
-            System.out.println("TEST:   no results");
-          }
-        }
-
-        final TopGroups expectedGroups = slowGrouping(groupDocs, searchTerm, fillFields, getScores, getMaxScores, groupSort, docSort, topNGroups, docsPerGroup, groupOffset, docOffset);
-
-        try {
-          // NOTE: intentional but temporary field cache insanity!
-          assertEquals(FieldCache.DEFAULT.getInts(r, "id"), expectedGroups, groupsResult);
-        } finally {
-          FieldCache.DEFAULT.purge(r);
-        }
-      }
-
-      r.close();
-      dir.close();
     }
+    
+    return status;
   }
 
-  private void assertEquals(int[] docIDtoID, TopGroups expected, TopGroups actual) {
-    if (expected == null) {
-      assertNull(actual);
-      return;
-    }
-    assertNotNull(actual);
+  /** Repairs the index using previously returned result
+   *  from {@link #checkIndex}.  Note that this does not
+   *  remove any of the unreferenced files after it's done;
+   *  you must separately open an {@link IndexWriter}, which
+   *  deletes unreferenced files when it's created.
+   *
+   * <p><b>WARNING</b>: this writes a
+   *  new segments file into the index, effectively removing
+   *  all documents in broken segments from the index.
+   *  BE CAREFUL.
+   *
+   * <p><b>WARNING</b>: Make sure you only call this when the
+   *  index is not opened  by any writer. */
+  public void fixIndex(Status result) throws IOException {
+    if (result.partial)
+      throw new IllegalArgumentException("can only fix an index that was fully checked (this status checked a subset of segments)");
+    result.newSegments.commit(result.dir);
+  }
 
-    assertEquals(expected.groups.length, actual.groups.length);
-    assertEquals(expected.totalHitCount, actual.totalHitCount);
-    assertEquals(expected.totalGroupedHitCount, actual.totalGroupedHitCount);
-    
-    for(int groupIDX=0;groupIDX<expected.groups.length;groupIDX++) {
-      if (VERBOSE) {
-        System.out.println("  check groupIDX=" + groupIDX);
+  private static boolean assertsOn;
+
+  private static boolean testAsserts() {
+    assertsOn = true;
+    return true;
+  }
+
+  private static boolean assertsOn() {
+    assert testAsserts();
+    return assertsOn;
+  }
+
+  /** Command-line interface to check and fix an index.
+
+    <p>
+    Run it like this:
+    <pre>
+    java -ea:org.apache.lucene... org.apache.lucene.index.CheckIndex pathToIndex [-fix] [-segment X] [-segment Y]
+    </pre>
+    <ul>
+    <li><code>-fix</code>: actually write a new segments_N file, removing any problematic segments
+
+    <li><code>-segment X</code>: only check the specified
+    segment(s).  This can be specified multiple times,
+    to check more than one segment, eg <code>-segment _2
+    -segment _a</code>.  You can't use this with the -fix
+    option.
+    </ul>
+
+    <p><b>WARNING</b>: <code>-fix</code> should only be used on an emergency basis as it will cause
+                       documents (perhaps many) to be permanently removed from the index.  Always make
+                       a backup copy of your index before running this!  Do not run this tool on an index
+                       that is actively being written to.  You have been warned!
+
+    <p>                Run without -fix, this tool will open the index, report version information
+                       and report any exceptions it hits and what action it would take if -fix were
+                       specified.  With -fix, this tool will remove any segments that have issues and
+                       write a new segments_N file.  This means all documents contained in the affected
+                       segments will be removed.
+
+    <p>
+                       This tool exits with exit code 1 if the index cannot be opened or has any
+                       corruption, else 0.
+   */
+  public static void main(String[] args) throws IOException, InterruptedException {
+
+    boolean doFix = false;
+    List<String> onlySegments = new ArrayList<String>();
+    String indexPath = null;
+    int i = 0;
+    while(i < args.length) {
+      if (args[i].equals("-fix")) {
+        doFix = true;
+        i++;
+      } else if (args[i].equals("-segment")) {
+        if (i == args.length-1) {
+          System.out.println("ERROR: missing name for -segment option");
+          System.exit(1);
+        }
+        onlySegments.add(args[i+1]);
+        i += 2;
+      } else {
+        if (indexPath != null) {
+          System.out.println("ERROR: unexpected extra argument '" + args[i] + "'");
+          System.exit(1);
+        }
+        indexPath = args[i];
+        i++;
       }
-      final GroupDocs expectedGroup = expected.groups[groupIDX];
-      final GroupDocs actualGroup = actual.groups[groupIDX];
-      assertEquals(expectedGroup.groupValue, actualGroup.groupValue);
-      assertArrayEquals(expectedGroup.groupSortValues, actualGroup.groupSortValues);
+    }
 
-      // TODO
-      // assertEquals(expectedGroup.maxScore, actualGroup.maxScore);
-      assertEquals(expectedGroup.totalHits, actualGroup.totalHits);
+    if (indexPath == null) {
+      System.out.println("\nERROR: index path not specified");
+      System.out.println("\nUsage: java org.apache.lucene.index.CheckIndex pathToIndex [-fix] [-segment X] [-segment Y]\n" +
+                         "\n" +
+                         "  -fix: actually write a new segments_N file, removing any problematic segments\n" +
+                         "  -segment X: only check the specified segments.  This can be specified multiple\n" + 
+                         "              times, to check more than one segment, eg '-segment _2 -segment _a'.\n" +
+                         "              You can't use this with the -fix option\n" +
+                         "\n" + 
+                         "**WARNING**: -fix should only be used on an emergency basis as it will cause\n" +
+                         "documents (perhaps many) to be permanently removed from the index.  Always make\n" +
+                         "a backup copy of your index before running this!  Do not run this tool on an index\n" +
+                         "that is actively being written to.  You have been warned!\n" +
+                         "\n" +
+                         "Run without -fix, this tool will open the index, report version information\n" +
+                         "and report any exceptions it hits and what action it would take if -fix were\n" +
+                         "specified.  With -fix, this tool will remove any segments that have issues and\n" + 
+                         "write a new segments_N file.  This means all documents contained in the affected\n" +
+                         "segments will be removed.\n" +
+                         "\n" +
+                         "This tool exits with exit code 1 if the index cannot be opened or has any\n" +
+                         "corruption, else 0.\n");
+      System.exit(1);
+    }
 
-      final ScoreDoc[] expectedFDs = expectedGroup.scoreDocs;
-      final ScoreDoc[] actualFDs = actualGroup.scoreDocs;
+    if (!assertsOn())
+      System.out.println("\nNOTE: testing will be more thorough if you run java with '-ea:org.apache.lucene...', so assertions are enabled");
 
-      assertEquals(expectedFDs.length, actualFDs.length);
-      for(int docIDX=0;docIDX<expectedFDs.length;docIDX++) {
-        final FieldDoc expectedFD = (FieldDoc) expectedFDs[docIDX];
-        final FieldDoc actualFD = (FieldDoc) actualFDs[docIDX];
-        assertEquals(expectedFD.doc, docIDtoID[actualFD.doc]);
-        // TODO
-        // assertEquals(expectedFD.score, actualFD.score);
-        assertArrayEquals(expectedFD.fields, actualFD.fields);
+    if (onlySegments.size() == 0)
+      onlySegments = null;
+    else if (doFix) {
+      System.out.println("ERROR: cannot specify both -fix and -segment");
+      System.exit(1);
+    }
+
+    System.out.println("\nOpening index @ " + indexPath + "\n");
+    Directory dir = null;
+    try {
+      dir = FSDirectory.open(new File(indexPath));
+    } catch (Throwable t) {
+      System.out.println("ERROR: could not open directory \"" + indexPath + "\"; exiting");
+      t.printStackTrace(System.out);
+      System.exit(1);
+    }
+
+    CheckIndex checker = new CheckIndex(dir);
+    checker.setInfoStream(System.out);
+
+    Status result = checker.checkIndex(onlySegments);
+    if (result.missingSegments) {
+      System.exit(1);
+    }
+
+    if (!result.clean) {
+      if (!doFix) {
+        System.out.println("WARNING: would write new segments file, and " + result.totLoseDocCount + " documents would be lost, if -fix were specified\n");
+      } else {
+        System.out.println("WARNING: " + result.totLoseDocCount + " documents will be lost\n");
+        System.out.println("NOTE: will write new segments file in 5 seconds; this will remove " + result.totLoseDocCount + " docs from the index. THIS IS YOUR LAST CHANCE TO CTRL+C!");
+        for(int s=0;s<5;s++) {
+          Thread.sleep(1000);
+          System.out.println("  " + (5-s) + "...");
+        }
+        System.out.println("Writing...");
+        checker.fixIndex(result);
+        System.out.println("OK");
+        System.out.println("Wrote new segments file \"" + result.newSegments.getCurrentSegmentFileName() + "\"");
       }
     }
+    System.out.println("");
+
+    final int exitCode;
+    if (result.clean == true)
+      exitCode = 0;
+    else
+      exitCode = 1;
+    System.exit(exitCode);
   }
 }

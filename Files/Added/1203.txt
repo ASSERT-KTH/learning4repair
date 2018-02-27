@@ -1,5 +1,7 @@
 @Override
 
+package org.apache.solr.search.grouping.endresulttransformer;
+
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
@@ -16,38 +18,96 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.solr.search;
 
-import org.apache.lucene.index.Term;
-import org.apache.lucene.search.Query;
-import org.apache.lucene.search.TermQuery;
-import org.apache.solr.common.params.SolrParams;
+import org.apache.lucene.search.ScoreDoc;
+import org.apache.lucene.search.grouping.GroupDocs;
+import org.apache.lucene.search.grouping.TopGroups;
+import org.apache.lucene.util.BytesRef;
+import org.apache.solr.common.SolrDocumentList;
 import org.apache.solr.common.util.NamedList;
-import org.apache.solr.request.SolrQueryRequest;
+import org.apache.solr.common.util.SimpleOrderedMap;
+import org.apache.solr.handler.component.ResponseBuilder;
+import org.apache.solr.schema.FieldType;
+import org.apache.solr.schema.SchemaField;
+import org.apache.solr.search.SolrIndexSearcher;
+import org.apache.solr.search.grouping.distributed.command.QueryCommandResult;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
 
 /**
- * Create a term query from the input value without any text analysis or transformation whatsoever.
- * This is useful in debugging, or when raw terms are returned from the terms component (this is not the default).
- *
- * <br>For easy filter construction to drill down in faceting, the {@link TermQParserPlugin} is recommended.
- * <br>For full analysis on all fields, including text fields, see the {@link FieldQParserPlugin}. 
- *
- * <br>Other parameters: <code>f</code>, the field
- * <br>Example: <code>{!raw f=myfield}Foo Bar</code> creates <code>TermQuery(Term("myfield","Foo Bar"))</code>
+ * Implementation of {@link EndResultTransformer} that keeps each grouped result separate in the final response.
  */
-public class RawQParserPlugin extends QParserPlugin {
-  public static String NAME = "raw";
+public class GroupedEndResultTransformer implements EndResultTransformer {
 
-  public void init(NamedList args) {
+  private final SolrIndexSearcher searcher;
+
+  public GroupedEndResultTransformer(SolrIndexSearcher searcher) {
+    this.searcher = searcher;
   }
 
-  @Override
-  public QParser createParser(String qstr, SolrParams localParams, SolrParams params, SolrQueryRequest req) {
-    return new QParser(qstr, localParams, params, req) {
-      @Override
-      public Query parse() {
-        return new TermQuery(new Term(localParams.get(QueryParsing.F), localParams.get(QueryParsing.V)));
+  /**
+   * {@inheritDoc}
+   */
+  public void transform(Map<String, ?> result, ResponseBuilder rb, SolrDocumentSource solrDocumentSource) {
+    NamedList<Object> commands = new NamedList<Object>();
+    for (Map.Entry<String, ?> entry : result.entrySet()) {
+      Object value = entry.getValue();
+      if (TopGroups.class.isInstance(value)) {
+        @SuppressWarnings("unchecked")
+        TopGroups<BytesRef> topGroups = (TopGroups<BytesRef>) value;
+        NamedList<Object> command = new SimpleOrderedMap<Object>();
+        command.add("matches", rb.totalHitCount);
+        Integer totalGroupCount = rb.mergedGroupCounts.get(entry.getKey());
+        if (totalGroupCount != null) {
+          command.add("ngroups", totalGroupCount);
+        }
+
+        List<NamedList> groups = new ArrayList<NamedList>();
+        SchemaField groupField = searcher.getSchema().getField(entry.getKey());
+        FieldType groupFieldType = groupField.getType();
+        for (GroupDocs<BytesRef> group : topGroups.groups) {
+          SimpleOrderedMap<Object> groupResult = new SimpleOrderedMap<Object>();
+          if (group.groupValue != null) {
+            groupResult.add(
+                "groupValue", groupFieldType.toObject(groupField.createField(group.groupValue.utf8ToString(), 1.0f))
+            );
+          } else {
+            groupResult.add("groupValue", null);
+          }
+          SolrDocumentList docList = new SolrDocumentList();
+          docList.setNumFound(group.totalHits);
+          if (!Float.isNaN(group.maxScore)) {
+            docList.setMaxScore(group.maxScore);
+          }
+          docList.setStart(rb.getGroupingSpec().getGroupOffset());
+          for (ScoreDoc scoreDoc : group.scoreDocs) {
+            docList.add(solrDocumentSource.retrieve(scoreDoc));
+          }
+          groupResult.add("doclist", docList);
+          groups.add(groupResult);
+        }
+        command.add("groups", groups);
+        commands.add(entry.getKey(), command);
+      } else if (QueryCommandResult.class.isInstance(value)) {
+        QueryCommandResult queryCommandResult = (QueryCommandResult) value;
+        NamedList<Object> command = new SimpleOrderedMap<Object>();
+        command.add("matches", queryCommandResult.getMatches());
+        SolrDocumentList docList = new SolrDocumentList();
+        docList.setNumFound(queryCommandResult.getTopDocs().totalHits);
+        if (!Float.isNaN(queryCommandResult.getTopDocs().getMaxScore())) {
+          docList.setMaxScore(queryCommandResult.getTopDocs().getMaxScore());
+        }
+        docList.setStart(rb.getGroupingSpec().getGroupOffset());
+        for (ScoreDoc scoreDoc :queryCommandResult.getTopDocs().scoreDocs){
+          docList.add(solrDocumentSource.retrieve(scoreDoc));
+        }
+        command.add("doclist", docList);
+        commands.add(entry.getKey(), command);
       }
-    };
+    }
+    rb.rsp.add("grouped", commands);
   }
+
 }

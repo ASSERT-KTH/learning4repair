@@ -1,6 +1,8 @@
-params.remove("distrib");               // not a top-level request
+field = field.next;
 
-/**
+package org.apache.lucene.index;
+
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -17,551 +19,419 @@ params.remove("distrib");               // not a top-level request
  * limitations under the License.
  */
 
-package org.apache.solr.handler.component;
+import java.io.IOException;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
 
-import org.apache.solr.handler.RequestHandlerBase;
-import org.apache.solr.common.util.NamedList;
-import org.apache.solr.common.util.RTimer;
-import org.apache.solr.common.util.SimpleOrderedMap;
-import org.apache.solr.common.util.StrUtils;
-import org.apache.solr.common.params.CommonParams;
-import org.apache.solr.common.params.ModifiableSolrParams;
-import org.apache.solr.common.params.ShardParams;
-import org.apache.solr.common.SolrException;
-import org.apache.solr.request.SolrQueryRequest;
-import org.apache.solr.response.SolrQueryResponse;
-import org.apache.solr.client.solrj.SolrServer;
-import org.apache.solr.client.solrj.SolrRequest;
-import org.apache.solr.client.solrj.SolrResponse;
-import org.apache.solr.client.solrj.request.QueryRequest;
-import org.apache.solr.client.solrj.impl.CommonsHttpSolrServer;
-import org.apache.solr.client.solrj.impl.BinaryResponseParser;
-import org.apache.solr.client.solrj.impl.LBHttpSolrServer;
-import org.apache.solr.util.plugin.SolrCoreAware;
-import org.apache.solr.core.SolrCore;
-import org.apache.lucene.queryParser.ParseException;
-import org.apache.commons.httpclient.MultiThreadedHttpConnectionManager;
-import org.apache.commons.httpclient.HttpClient;
-import org.apache.commons.httpclient.DefaultHttpMethodRetryHandler;
-import org.apache.commons.httpclient.params.HttpMethodParams;
+import org.apache.lucene.codecs.Codec;
+import org.apache.lucene.codecs.DocValuesConsumer;
+import org.apache.lucene.codecs.FieldInfosWriter;
+import org.apache.lucene.codecs.PerDocConsumer;
+import org.apache.lucene.codecs.SimpleDVConsumer;
+import org.apache.lucene.codecs.SimpleDocValuesFormat;
+import org.apache.lucene.document.FieldType;
+import org.apache.lucene.index.DocumentsWriterPerThread.DocState;
+import org.apache.lucene.index.TypePromoter.TypeCompatibility;
+import org.apache.lucene.store.IOContext;
+import org.apache.lucene.util.ArrayUtil;
+import org.apache.lucene.util.Counter;
+import org.apache.lucene.util.IOUtils;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import java.util.*;
-import java.util.concurrent.*;
-import java.net.MalformedURLException;
 
 /**
- *
- * Refer SOLR-281
- *
+ * This is a DocConsumer that gathers all fields under the
+ * same name, and calls per-field consumers to process field
+ * by field.  This class doesn't doesn't do any "real" work
+ * of its own: it just forwards the fields to a
+ * DocFieldConsumer.
  */
-public class SearchHandler extends RequestHandlerBase implements SolrCoreAware
-{
-  static final String INIT_COMPONENTS = "components";
-  static final String INIT_FIRST_COMPONENTS = "first-components";
-  static final String INIT_LAST_COMPONENTS = "last-components";
 
-  // socket timeout measured in ms, closes a socket if read
-  // takes longer than x ms to complete. throws
-  // java.net.SocketTimeoutException: Read timed out exception
-  static final String INIT_SO_TIMEOUT = "shard-socket-timeout";
+final class DocFieldProcessor extends DocConsumer {
 
-  // connection timeout measures in ms, closes a socket if connection
-  // cannot be established within x ms. with a
-  // java.net.SocketTimeoutException: Connection timed out
-  static final String INIT_CONNECTION_TIMEOUT = "shard-connection-timeout";
-  static int soTimeout = 0; //current default values
-  static int connectionTimeout = 0; //current default values
+  final DocFieldConsumer consumer;
+  final StoredFieldsConsumer fieldsWriter;
+  final Codec codec;
 
-  protected static Logger log = LoggerFactory.getLogger(SearchHandler.class);
+  // Holds all fields seen in current doc
+  DocFieldProcessorPerField[] fields = new DocFieldProcessorPerField[1];
+  int fieldCount;
 
-  protected List<SearchComponent> components = null;
+  // Hash table for all fields ever seen
+  DocFieldProcessorPerField[] fieldHash = new DocFieldProcessorPerField[2];
+  int hashMask = 1;
+  int totalFieldCount;
 
-  protected List<String> getDefaultComponents()
-  {
-    ArrayList<String> names = new ArrayList<String>(6);
-    names.add( QueryComponent.COMPONENT_NAME );
-    names.add( FacetComponent.COMPONENT_NAME );
-    names.add( MoreLikeThisComponent.COMPONENT_NAME );
-    names.add( HighlightComponent.COMPONENT_NAME );
-    names.add( StatsComponent.COMPONENT_NAME );
-    names.add( DebugComponent.COMPONENT_NAME );
-    return names;
+  int fieldGen;
+  final DocumentsWriterPerThread.DocState docState;
+
+  final Counter bytesUsed;
+
+  public DocFieldProcessor(DocumentsWriterPerThread docWriter, DocFieldConsumer consumer) {
+    this.docState = docWriter.docState;
+    this.codec = docWriter.codec;
+    this.bytesUsed = docWriter.bytesUsed;
+    this.consumer = consumer;
+    fieldsWriter = new StoredFieldsConsumer(docWriter);
   }
 
-  /**
-   * Initialize the components based on name.  Note, if using {@link #INIT_FIRST_COMPONENTS} or {@link #INIT_LAST_COMPONENTS},
-   * then the {@link DebugComponent} will always occur last.  If this is not desired, then one must explicitly declare all components using
-   * the {@link #INIT_COMPONENTS} syntax.
-   */
-  @SuppressWarnings("unchecked")
-  public void inform(SolrCore core)
-  {
-    Object declaredComponents = initArgs.get(INIT_COMPONENTS);
-    List<String> first = (List<String>) initArgs.get(INIT_FIRST_COMPONENTS);
-    List<String> last  = (List<String>) initArgs.get(INIT_LAST_COMPONENTS);
+  @Override
+  public void flush(SegmentWriteState state) throws IOException {
 
-    List<String> list = null;
-    boolean makeDebugLast = true;
-    if( declaredComponents == null ) {
-      // Use the default component list
-      list = getDefaultComponents();
-
-      if( first != null ) {
-        List<String> clist = first;
-        clist.addAll( list );
-        list = clist;
-      }
-
-      if( last != null ) {
-        list.addAll( last );
-      }
-    }
-    else {
-      list = (List<String>)declaredComponents;
-      if( first != null || last != null ) {
-        throw new SolrException( SolrException.ErrorCode.SERVER_ERROR,
-            "First/Last components only valid if you do not declare 'components'");
-      }
-      makeDebugLast = false;
+    Map<String,DocFieldConsumerPerField> childFields = new HashMap<String,DocFieldConsumerPerField>();
+    Collection<DocFieldConsumerPerField> fields = fields();
+    for (DocFieldConsumerPerField f : fields) {
+      childFields.put(f.getFieldInfo().name, f);
     }
 
-    // Build the component list
-    components = new ArrayList<SearchComponent>( list.size() );
-    DebugComponent dbgCmp = null;
-    for(String c : list){
-      SearchComponent comp = core.getSearchComponent( c );
-      if (comp instanceof DebugComponent && makeDebugLast == true){
-        dbgCmp = (DebugComponent) comp;
-      } else {
-        components.add(comp);
-        log.info("Adding  component:"+comp);
+    SimpleDVConsumer dvConsumer = null;
+
+    for(int i=0;i<fieldHash.length;i++) {
+      DocFieldProcessorPerField field = fieldHash[i];
+      while(field != null) {
+        // nocommit maybe we should sort by .... somethign?
+        // field name?  field number?  else this is hash order!!
+        if (field.bytesDVWriter != null) {
+          if (dvConsumer == null) {
+            SimpleDocValuesFormat fmt =  state.segmentInfo.getCodec().simpleDocValuesFormat();
+            // nocommit once we make
+            // Codec.simpleDocValuesFormat abstract, change
+            // this to assert dvConsumer != null!
+            if (fmt == null) {
+              continue;
+            }
+
+            dvConsumer = fmt.fieldsConsumer(state.directory, state.segmentInfo, state.fieldInfos, state.context);
+          }
+          field.bytesDVWriter.flush(field.fieldInfo, state,
+                                    dvConsumer.addBinaryField(field.fieldInfo,
+                                                              field.bytesDVWriter.fixedLength >= 0,
+                                                              field.bytesDVWriter.maxLength));
+        }
+        field = field.next;
       }
     }
-    if (makeDebugLast == true && dbgCmp != null){
-      components.add(dbgCmp);
-      log.info("Adding  debug component:" + dbgCmp);
-    }
 
-    Object co = initArgs.get(INIT_CONNECTION_TIMEOUT);
-    if (co != null) {
-      connectionTimeout = (Integer) co;
-      log.info("Setting shard-connection-timeout to: " + connectionTimeout);
-    }
+    assert fields.size() == totalFieldCount;
 
-    Object so = initArgs.get(INIT_SO_TIMEOUT);
-    if (so != null) {
-      soTimeout = (Integer) so;
-      log.info("Setting shard-socket-timeout to: " + soTimeout);
+
+    fieldsWriter.flush(state);
+    consumer.flush(childFields, state);
+
+    for (DocValuesConsumerHolder consumer : docValues.values()) {
+      consumer.docValuesConsumer.finish(state.segmentInfo.getDocCount());
+    }
+    
+    // close perDocConsumer during flush to ensure all files are flushed due to PerCodec CFS
+    IOUtils.close(perDocConsumer);
+
+    // Important to save after asking consumer to flush so
+    // consumer can alter the FieldInfo* if necessary.  EG,
+    // FreqProxTermsWriter does this with
+    // FieldInfo.storePayload.
+    FieldInfosWriter infosWriter = codec.fieldInfosFormat().getFieldInfosWriter();
+    infosWriter.write(state.directory, state.segmentInfo.name, state.fieldInfos, IOContext.DEFAULT);
+  }
+
+  @Override
+  public void abort() {
+    Throwable th = null;
+    
+    for (DocFieldProcessorPerField field : fieldHash) {
+      while (field != null) {
+        final DocFieldProcessorPerField next = field.next;
+        try {
+          field.abort();
+        } catch (Throwable t) {
+          if (th == null) {
+            th = t;
+          }
+        }
+        field = next;
+      }
+    }
+    IOUtils.closeWhileHandlingException(perDocConsumer);
+    // TODO add abort to PerDocConsumer!
+    
+    try {
+      fieldsWriter.abort();
+    } catch (Throwable t) {
+      if (th == null) {
+        th = t;
+      }
+    }
+    
+    try {
+      consumer.abort();
+    } catch (Throwable t) {
+      if (th == null) {
+        th = t;
+      }
+    }
+    
+    try {
+      if (perDocConsumer != null) {
+        perDocConsumer.abort();  
+      }
+    } catch (Throwable t) {
+      if (th == null) {
+        th = t;
+      }
+    }
+    
+    // If any errors occured, throw it.
+    if (th != null) {
+      if (th instanceof RuntimeException) throw (RuntimeException) th;
+      if (th instanceof Error) throw (Error) th;
+      // defensive code - we should not hit unchecked exceptions
+      throw new RuntimeException(th);
     }
   }
 
-  public List<SearchComponent> getComponents() {
-    return components;
+  @Override
+  public boolean freeRAM() {
+    return consumer.freeRAM();
+  }
+
+  public Collection<DocFieldConsumerPerField> fields() {
+    Collection<DocFieldConsumerPerField> fields = new HashSet<DocFieldConsumerPerField>();
+    for(int i=0;i<fieldHash.length;i++) {
+      DocFieldProcessorPerField field = fieldHash[i];
+      while(field != null) {
+        fields.add(field.consumer);
+        field = field.next;
+      }
+    }
+    assert fields.size() == totalFieldCount;
+    return fields;
+  }
+
+  /** In flush we reset the fieldHash to not maintain per-field state
+   *  across segments */
+  @Override
+  void doAfterFlush() {
+    fieldHash = new DocFieldProcessorPerField[2];
+    hashMask = 1;
+    totalFieldCount = 0;
+    perDocConsumer = null;
+    docValues.clear();
+  }
+
+  private void rehash() {
+    final int newHashSize = (fieldHash.length*2);
+    assert newHashSize > fieldHash.length;
+
+    final DocFieldProcessorPerField newHashArray[] = new DocFieldProcessorPerField[newHashSize];
+
+    // Rehash
+    int newHashMask = newHashSize-1;
+    for(int j=0;j<fieldHash.length;j++) {
+      DocFieldProcessorPerField fp0 = fieldHash[j];
+      while(fp0 != null) {
+        final int hashPos2 = fp0.fieldInfo.name.hashCode() & newHashMask;
+        DocFieldProcessorPerField nextFP0 = fp0.next;
+        fp0.next = newHashArray[hashPos2];
+        newHashArray[hashPos2] = fp0;
+        fp0 = nextFP0;
+      }
+    }
+
+    fieldHash = newHashArray;
+    hashMask = newHashMask;
+  }
+
+  @Override
+  public void processDocument(FieldInfos.Builder fieldInfos) throws IOException {
+
+    consumer.startDocument();
+    fieldsWriter.startDocument();
+
+    fieldCount = 0;
+
+    final int thisFieldGen = fieldGen++;
+
+    // Absorb any new fields first seen in this document.
+    // Also absorb any changes to fields we had already
+    // seen before (eg suddenly turning on norms or
+    // vectors, etc.):
+
+    for(IndexableField field : docState.doc.indexableFields()) {
+      final String fieldName = field.name();
+      IndexableFieldType ft = field.fieldType();
+
+      DocFieldProcessorPerField fp = processField(fieldInfos, thisFieldGen, fieldName, ft);
+
+      fp.addField(field);
+    }
+    for (StorableField field: docState.doc.storableFields()) {
+      final String fieldName = field.name();
+      IndexableFieldType ft = field.fieldType();
+
+      DocFieldProcessorPerField fp = processField(fieldInfos, thisFieldGen, fieldName, ft);
+      if (ft.stored()) {
+        fieldsWriter.addField(field, fp.fieldInfo);
+      }
+      
+      // nocommit the DV indexing should be just another
+      // consumer in the chain, not stuck inside here?  this
+      // source should just "dispatch"
+      final DocValues.Type dvType = ft.docValueType();
+      if (dvType != null) {
+        switch(dvType) {
+        case BYTES_VAR_STRAIGHT:
+          fp.addBytesDVField(docState.docID, field.binaryValue());
+          break;
+        default:
+          break;
+        }
+        DocValuesConsumerHolder docValuesConsumer = docValuesConsumer(dvType,
+            docState, fp.fieldInfo);
+        DocValuesConsumer consumer = docValuesConsumer.docValuesConsumer;
+        if (docValuesConsumer.compatibility == null) {
+          consumer.add(docState.docID, field);
+          docValuesConsumer.compatibility = new TypeCompatibility(dvType,
+              consumer.getValueSize());
+        } else if (docValuesConsumer.compatibility.isCompatible(dvType,
+            TypePromoter.getValueSize(dvType, field.binaryValue()))) {
+          consumer.add(docState.docID, field);
+        } else {
+          docValuesConsumer.compatibility.isCompatible(dvType,
+              TypePromoter.getValueSize(dvType, field.binaryValue()));
+          TypeCompatibility compatibility = docValuesConsumer.compatibility;
+          throw new IllegalArgumentException("Incompatible DocValues type: "
+              + dvType.name() + " size: "
+              + TypePromoter.getValueSize(dvType, field.binaryValue())
+              + " expected: " + " type: " + compatibility.getBaseType()
+              + " size: " + compatibility.getBaseSize());
+        }
+      }
+    }
+
+    // If we are writing vectors then we must visit
+    // fields in sorted order so they are written in
+    // sorted order.  TODO: we actually only need to
+    // sort the subset of fields that have vectors
+    // enabled; we could save [small amount of] CPU
+    // here.
+    ArrayUtil.quickSort(fields, 0, fieldCount, fieldsComp);
+    for(int i=0;i<fieldCount;i++) {
+      final DocFieldProcessorPerField perField = fields[i];
+      perField.consumer.processFields(perField.fields, perField.fieldCount);
+    }
+
+    if (docState.maxTermPrefix != null && docState.infoStream.isEnabled("IW")) {
+      docState.infoStream.message("IW", "WARNING: document contains at least one immense term (whose UTF8 encoding is longer than the max length " + DocumentsWriterPerThread.MAX_TERM_LENGTH_UTF8 + "), all of which were skipped.  Please correct the analyzer to not produce such terms.  The prefix of the first immense term is: '" + docState.maxTermPrefix + "...'");
+      docState.maxTermPrefix = null;
+    }
+  }
+
+  private DocFieldProcessorPerField processField(FieldInfos.Builder fieldInfos,
+      final int thisFieldGen, final String fieldName, IndexableFieldType ft) {
+    // Make sure we have a PerField allocated
+    final int hashPos = fieldName.hashCode() & hashMask;
+    DocFieldProcessorPerField fp = fieldHash[hashPos];
+    while(fp != null && !fp.fieldInfo.name.equals(fieldName)) {
+      fp = fp.next;
+    }
+
+    if (fp == null) {
+
+      // TODO FI: we need to genericize the "flags" that a
+      // field holds, and, how these flags are merged; it
+      // needs to be more "pluggable" such that if I want
+      // to have a new "thing" my Fields can do, I can
+      // easily add it
+      FieldInfo fi = fieldInfos.addOrUpdate(fieldName, ft);
+
+      fp = new DocFieldProcessorPerField(this, fi);
+      fp.next = fieldHash[hashPos];
+      fieldHash[hashPos] = fp;
+      totalFieldCount++;
+
+      if (totalFieldCount >= fieldHash.length/2) {
+        rehash();
+      }
+    } else {
+      fieldInfos.addOrUpdate(fp.fieldInfo.name, ft);
+    }
+
+    if (thisFieldGen != fp.lastGen) {
+
+      // First time we're seeing this field for this doc
+      fp.fieldCount = 0;
+
+      if (fieldCount == fields.length) {
+        final int newSize = fields.length*2;
+        DocFieldProcessorPerField newArray[] = new DocFieldProcessorPerField[newSize];
+        System.arraycopy(fields, 0, newArray, 0, fieldCount);
+        fields = newArray;
+      }
+
+      fields[fieldCount++] = fp;
+      fp.lastGen = thisFieldGen;
+    }
+    return fp;
+  }
+
+  private static final Comparator<DocFieldProcessorPerField> fieldsComp = new Comparator<DocFieldProcessorPerField>() {
+    public int compare(DocFieldProcessorPerField o1, DocFieldProcessorPerField o2) {
+      return o1.fieldInfo.name.compareTo(o2.fieldInfo.name);
+    }
+  };
+  
+  @Override
+  void finishDocument() throws IOException {
+    try {
+      fieldsWriter.finishDocument();
+    } finally {
+      consumer.finishDocument();
+    }
+  }
+
+  private static class DocValuesConsumerHolder {
+    // Only used to enforce that same DV field name is never
+    // added more than once per doc:
+    int docID;
+    final DocValuesConsumer docValuesConsumer;
+    TypeCompatibility compatibility;
+
+    public DocValuesConsumerHolder(DocValuesConsumer docValuesConsumer) {
+      this.docValuesConsumer = docValuesConsumer;
+    }
+  }
+
+  final private Map<String, DocValuesConsumerHolder> docValues = new HashMap<String, DocValuesConsumerHolder>();
+  private PerDocConsumer perDocConsumer;
+
+  DocValuesConsumerHolder docValuesConsumer(DocValues.Type valueType, DocState docState, FieldInfo fieldInfo) 
+      throws IOException {
+    DocValuesConsumerHolder docValuesConsumerAndDocID = docValues.get(fieldInfo.name);
+    if (docValuesConsumerAndDocID != null) {
+      if (docState.docID == docValuesConsumerAndDocID.docID) {
+        throw new IllegalArgumentException("DocValuesField \"" + fieldInfo.name + "\" appears more than once in this document (only one value is allowed, per field)");
+      }
+      assert docValuesConsumerAndDocID.docID < docState.docID;
+      docValuesConsumerAndDocID.docID = docState.docID;
+      return docValuesConsumerAndDocID;
+    }
+
+    if (perDocConsumer == null) {
+      PerDocWriteState perDocWriteState = docState.docWriter.newPerDocWriteState("");
+      perDocConsumer = docState.docWriter.codec.docValuesFormat().docsConsumer(perDocWriteState);
+      if (perDocConsumer == null) {
+        throw new IllegalStateException("codec=" +  docState.docWriter.codec + " does not support docValues: from docValuesFormat().docsConsumer(...) returned null; field=" + fieldInfo.name);
+      }
+    }
+    DocValuesConsumer docValuesConsumer = perDocConsumer.addValuesField(valueType, fieldInfo);
+    assert fieldInfo.getDocValuesType() == null || fieldInfo.getDocValuesType() == valueType;
+    fieldInfo.setDocValuesType(valueType);
+
+    docValuesConsumerAndDocID = new DocValuesConsumerHolder(docValuesConsumer);
+    docValuesConsumerAndDocID.docID = docState.docID;
+    docValues.put(fieldInfo.name, docValuesConsumerAndDocID);
+    return docValuesConsumerAndDocID;
   }
   
-
-  @Override
-  public void handleRequestBody(SolrQueryRequest req, SolrQueryResponse rsp) throws Exception, ParseException, InstantiationException, IllegalAccessException
-  {
-    // int sleep = req.getParams().getInt("sleep",0);
-    // if (sleep > 0) {log.error("SLEEPING for " + sleep);  Thread.sleep(sleep);}
-    ResponseBuilder rb = new ResponseBuilder();
-    rb.req = req;
-    rb.rsp = rsp;
-    rb.components = components;
-    rb.setDebug(req.getParams().getBool(CommonParams.DEBUG_QUERY, false));
-
-    final RTimer timer = rb.isDebug() ? new RTimer() : null;
-
-    if (timer == null) {
-      // non-debugging prepare phase
-      for( SearchComponent c : components ) {
-        c.prepare(rb);
-      }
-    } else {
-      // debugging prepare phase
-      RTimer subt = timer.sub( "prepare" );
-      for( SearchComponent c : components ) {
-        rb.setTimer( subt.sub( c.getName() ) );
-        c.prepare(rb);
-        rb.getTimer().stop();
-      }
-      subt.stop();
-    }
-
-    if (!rb.isDistrib) {
-      // a normal non-distributed request
-
-      // The semantics of debugging vs not debugging are different enough that
-      // it makes sense to have two control loops
-      if(!rb.isDebug()) {
-        // Process
-        for( SearchComponent c : components ) {
-          c.process(rb);
-        }
-      }
-      else {
-        // Process
-        RTimer subt = timer.sub( "process" );
-        for( SearchComponent c : components ) {
-          rb.setTimer( subt.sub( c.getName() ) );
-          c.process(rb);
-          rb.getTimer().stop();
-        }
-        subt.stop();
-        timer.stop();
-
-        // add the timing info
-        if( rb.getDebugInfo() == null ) {
-          rb.setDebugInfo( new SimpleOrderedMap<Object>() );
-        }
-        rb.getDebugInfo().add( "timing", timer.asNamedList() );
-      }
-
-    } else {
-      // a distributed request
-
-      HttpCommComponent comm = new HttpCommComponent();
-
-      if (rb.outgoing == null) {
-        rb.outgoing = new LinkedList<ShardRequest>();
-      }
-      rb.finished = new ArrayList<ShardRequest>();
-
-      int nextStage = 0;
-      do {
-        rb.stage = nextStage;
-        nextStage = ResponseBuilder.STAGE_DONE;
-
-        // call all components
-        for( SearchComponent c : components ) {
-          // the next stage is the minimum of what all components report
-          nextStage = Math.min(nextStage, c.distributedProcess(rb));
-        }
-
-
-        // check the outgoing queue and send requests
-        while (rb.outgoing.size() > 0) {
-
-          // submit all current request tasks at once
-          while (rb.outgoing.size() > 0) {
-            ShardRequest sreq = rb.outgoing.remove(0);
-            sreq.actualShards = sreq.shards;
-            if (sreq.actualShards==ShardRequest.ALL_SHARDS) {
-              sreq.actualShards = rb.shards;
-            }
-            sreq.responses = new ArrayList<ShardResponse>();
-
-            // TODO: map from shard to address[]
-            for (String shard : sreq.actualShards) {
-              ModifiableSolrParams params = new ModifiableSolrParams(sreq.params);
-              params.remove(ShardParams.SHARDS);      // not a top-level request
-              params.remove("indent");
-              params.remove(CommonParams.HEADER_ECHO_PARAMS);
-              params.set(ShardParams.IS_SHARD, true);  // a sub (shard) request
-              String shardHandler = req.getParams().get(ShardParams.SHARDS_QT);
-              if (shardHandler == null) {
-                params.remove(CommonParams.QT);
-              } else {
-                params.set(CommonParams.QT, shardHandler);
-              }
-              comm.submit(sreq, shard, params);
-            }
-          }
-
-
-          // now wait for replies, but if anyone puts more requests on
-          // the outgoing queue, send them out immediately (by exiting
-          // this loop)
-          while (rb.outgoing.size() == 0) {
-            ShardResponse srsp = comm.takeCompletedOrError();
-            if (srsp == null) break;  // no more requests to wait for
-
-            // Was there an exception?  If so, abort everything and
-            // rethrow
-            if (srsp.getException() != null) {
-              comm.cancelAll();
-              if (srsp.getException() instanceof SolrException) {
-                throw (SolrException)srsp.getException();
-              } else {
-                throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, srsp.getException());
-              }
-            }
-
-            rb.finished.add(srsp.getShardRequest());
-
-            // let the components see the responses to the request
-            for(SearchComponent c : components) {
-              c.handleResponses(rb, srsp.getShardRequest());
-            }
-          }
-        }
-
-        for(SearchComponent c : components) {
-            c.finishStage(rb);
-         }
-
-        // we are done when the next stage is MAX_VALUE
-      } while (nextStage != Integer.MAX_VALUE);
-    }
-  }
-
-  //////////////////////// SolrInfoMBeans methods //////////////////////
-
-  @Override
-  public String getDescription() {
-    StringBuilder sb = new StringBuilder();
-    sb.append("Search using components: ");
-    if( components != null ) {
-      for(SearchComponent c : components){
-        sb.append(c.getName());
-        sb.append(",");
-      }
-    }
-    return sb.toString();
-  }
-
-  @Override
-  public String getVersion() {
-    return "$Revision$";
-  }
-
-  @Override
-  public String getSourceId() {
-    return "$Id$";
-  }
-
-  @Override
-  public String getSource() {
-    return "$URL$";
-  }
-}
-
-
-// TODO: generalize how a comm component can fit into search component framework
-// TODO: statics should be per-core singletons
-
-class HttpCommComponent {
-
-  // We want an executor that doesn't take up any resources if
-  // it's not used, so it could be created statically for
-  // the distributed search component if desired.
-  //
-  // Consider CallerRuns policy and a lower max threads to throttle
-  // requests at some point (or should we simply return failure?)
-  static Executor commExecutor = new ThreadPoolExecutor(
-          0,
-          Integer.MAX_VALUE,
-          5, TimeUnit.SECONDS, // terminate idle threads after 5 sec
-          new SynchronousQueue<Runnable>()  // directly hand off tasks
-  );
-
-
-  static HttpClient client;
-  static Random r = new Random();
-  static LBHttpSolrServer loadbalancer;
-
-  static {
-    MultiThreadedHttpConnectionManager mgr = new MultiThreadedHttpConnectionManager();
-    mgr.getParams().setDefaultMaxConnectionsPerHost(20);
-    mgr.getParams().setMaxTotalConnections(10000);
-    mgr.getParams().setConnectionTimeout(SearchHandler.connectionTimeout);
-    mgr.getParams().setSoTimeout(SearchHandler.soTimeout);
-    // mgr.getParams().setStaleCheckingEnabled(false);
-
-    client = new HttpClient(mgr);
-
-    // prevent retries  (note: this didn't work when set on mgr.. needed to be set on client)
-    DefaultHttpMethodRetryHandler retryhandler = new DefaultHttpMethodRetryHandler(0, false);
-    client.getParams().setParameter(HttpMethodParams.RETRY_HANDLER, retryhandler);
-
-    try {
-      loadbalancer = new LBHttpSolrServer(client);
-    } catch (MalformedURLException e) {
-      // should be impossible since we're not passing any URLs here
-      throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,e);
-    }
-  }
-
-  CompletionService<ShardResponse> completionService = new ExecutorCompletionService<ShardResponse>(commExecutor);
-  Set<Future<ShardResponse>> pending = new HashSet<Future<ShardResponse>>();
-
-  // maps "localhost:8983|localhost:7574" to a shuffled List("http://localhost:8983","http://localhost:7574")
-  // This is primarily to keep track of what order we should use to query the replicas of a shard
-  // so that we use the same replica for all phases of a distributed request.
-  Map<String,List<String>> shardToURLs = new HashMap<String,List<String>>();
-
-  HttpCommComponent() {
-  }
-
-  private static class SimpleSolrResponse extends SolrResponse {
-    long elapsedTime;
-    NamedList<Object> nl;
-    
-    @Override
-    public long getElapsedTime() {
-      return elapsedTime;
-    }
-
-    @Override
-    public NamedList<Object> getResponse() {
-      return nl;
-    }
-
-    @Override
-    public void setResponse(NamedList<Object> rsp) {
-      nl = rsp;
-    }
-  }
-
-
-  // Not thread safe... don't use in Callable.
-  // Don't modify the returned URL list.
-  private List<String> getURLs(String shard) {
-    List<String> urls = shardToURLs.get(shard);
-    if (urls==null) {
-      urls = StrUtils.splitSmart(shard,"|",true);
-
-      // convert shard to URL
-      for (int i=0; i<urls.size(); i++) {
-        urls.set(i, "http://"+urls.get(i));
-      }
-
-      //
-      // Shuffle the list instead of use round-robin by default.
-      // This prevents accidental synchronization where multiple shards could get in sync
-      // and query the same replica at the same time.
-      //
-      if (urls.size() > 1)
-        Collections.shuffle(urls, r);
-      shardToURLs.put(shard, urls);
-    }
-    return urls;
-  }
-
-
-  void submit(final ShardRequest sreq, final String shard, final ModifiableSolrParams params) {
-    // do this outside of the callable for thread safety reasons
-    final List<String> urls = getURLs(shard);
-
-    Callable<ShardResponse> task = new Callable<ShardResponse>() {
-      public ShardResponse call() throws Exception {
-
-        ShardResponse srsp = new ShardResponse();
-        srsp.setShardRequest(sreq);
-        srsp.setShard(shard);
-        SimpleSolrResponse ssr = new SimpleSolrResponse();
-        srsp.setSolrResponse(ssr);
-        long startTime = System.currentTimeMillis();
-
-        try {
-          params.remove(CommonParams.WT); // use default (currently javabin)
-          params.remove(CommonParams.VERSION);
-
-          // SolrRequest req = new QueryRequest(SolrRequest.METHOD.POST, "/select");
-          // use generic request to avoid extra processing of queries
-          QueryRequest req = new QueryRequest(params);
-          req.setMethod(SolrRequest.METHOD.POST);
-
-          // no need to set the response parser as binary is the default
-          // req.setResponseParser(new BinaryResponseParser());
-
-          // if there are no shards available for a slice, urls.size()==0
-          if (urls.size()==0) {
-            // TODO: what's the right error code here? We should use the same thing when
-            // all of the servers for a shard are down.
-            throw new SolrException(SolrException.ErrorCode.SERVICE_UNAVAILABLE, "no servers hosting shard");
-          }
-
-          if (urls.size() <= 1) {
-            String url = urls.get(0);
-            srsp.setShardAddress(url);
-            SolrServer server = new CommonsHttpSolrServer(url, client);
-            ssr.nl = server.request(req);
-          } else {
-            LBHttpSolrServer.Rsp rsp = loadbalancer.request(new LBHttpSolrServer.Req(req, urls));
-            ssr.nl = rsp.getResponse();
-            srsp.setShardAddress(rsp.getServer());
-          }
-        } catch (Throwable th) {
-          srsp.setException(th);
-          if (th instanceof SolrException) {
-            srsp.setResponseCode(((SolrException)th).code());
-          } else {
-            srsp.setResponseCode(-1);
-          }
-        }
-
-        ssr.elapsedTime = System.currentTimeMillis() - startTime;
-
-        return srsp;
-      }
-    };
-
-    pending.add( completionService.submit(task) );
-  }
-
-  /** returns a ShardResponse of the last response correlated with a ShardRequest */
-  ShardResponse take() {
-    while (pending.size() > 0) {
-      try {
-        Future<ShardResponse> future = completionService.take();
-        pending.remove(future);
-        ShardResponse rsp = future.get();
-        rsp.getShardRequest().responses.add(rsp);
-        if (rsp.getShardRequest().responses.size() == rsp.getShardRequest().actualShards.length) {
-          return rsp;
-        }
-      } catch (InterruptedException e) {
-        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, e);
-      } catch (ExecutionException e) {
-        // should be impossible... the problem with catching the exception
-        // at this level is we don't know what ShardRequest it applied to
-        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, "Impossible Exception",e);
-      }
-    }
-    return null;
-  }
-
-
-  /** returns a ShardResponse of the last response correlated with a ShardRequest,
-   * or immediately returns a ShardResponse if there was an error detected
-   */
-  ShardResponse takeCompletedOrError() {
-    while (pending.size() > 0) {
-      try {
-        Future<ShardResponse> future = completionService.take();
-        pending.remove(future);
-        ShardResponse rsp = future.get();
-        if (rsp.getException() != null) return rsp; // if exception, return immediately
-        // add response to the response list... we do this after the take() and
-        // not after the completion of "call" so we know when the last response
-        // for a request was received.  Otherwise we might return the same
-        // request more than once.
-        rsp.getShardRequest().responses.add(rsp);
-        if (rsp.getShardRequest().responses.size() == rsp.getShardRequest().actualShards.length) {
-          return rsp;
-        }
-      } catch (InterruptedException e) {
-        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, e);
-      } catch (ExecutionException e) {
-        // should be impossible... the problem with catching the exception
-        // at this level is we don't know what ShardRequest it applied to
-        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, "Impossible Exception",e);
-      }
-    }
-    return null;
-  }
-
-
-  void cancelAll() {
-    for (Future<ShardResponse> future : pending) {
-      // TODO: any issues with interrupting?  shouldn't be if
-      // there are finally blocks to release connections.
-      future.cancel(true);
-    }
-  }
-
 }

@@ -1,6 +1,6 @@
-Counter bytesUsed, IOContext context, float acceptableOverheadRatio) {
+public Set<String> files() {
 
-package org.apache.lucene.codecs.lucene40.values;
+package org.apache.lucene.index;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,242 +19,284 @@ package org.apache.lucene.codecs.lucene40.values;
  * limitations under the License.
  */
 
+
 import java.io.IOException;
-import java.util.Comparator;
-import java.util.List;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Set;
 
-import org.apache.lucene.codecs.lucene40.values.Bytes.BytesReaderBase;
-import org.apache.lucene.codecs.lucene40.values.Bytes.BytesSortedSourceBase;
-import org.apache.lucene.codecs.lucene40.values.Bytes.DerefBytesWriterBase;
-import org.apache.lucene.index.DocValues;
-import org.apache.lucene.index.SortedBytesMergeUtils;
-import org.apache.lucene.index.DocValues.SortedSource;
-import org.apache.lucene.index.DocValues.Type;
-import org.apache.lucene.index.SortedBytesMergeUtils.IndexOutputBytesRefConsumer;
-import org.apache.lucene.index.SortedBytesMergeUtils.MergeContext;
-import org.apache.lucene.index.SortedBytesMergeUtils.SortedSourceSlice;
-import org.apache.lucene.index.MergeState;
+import org.apache.lucene.codecs.Codec;
+import org.apache.lucene.codecs.lucene3x.Lucene3xSegmentInfoFormat;
 import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.IOContext;
-import org.apache.lucene.store.IndexInput;
-import org.apache.lucene.store.IndexOutput;
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.Counter;
-import org.apache.lucene.util.IOUtils;
-import org.apache.lucene.util.packed.PackedInts;
-
-// Stores variable-length byte[] by deref, ie when two docs
-// have the same value, they store only 1 byte[] and both
-// docs reference that single source
+import org.apache.lucene.store.TrackingDirectoryWrapper;
 
 /**
+ * Information about a segment such as it's name, directory, and files related
+ * to the segment.
+ *
  * @lucene.experimental
  */
-final class VarSortedBytesImpl {
+public final class SegmentInfo {
+  
+  // TODO: remove these from this class, for now this is the representation
+  public static final int NO = -1;          // e.g. no norms; no deletes;
+  public static final int YES = 1;          // e.g. have norms; have deletes;
 
-  static final String CODEC_NAME_IDX = "VarDerefBytesIdx";
-  static final String CODEC_NAME_DAT = "VarDerefBytesDat";
+  public final String name;				  // unique name in dir
+  private int docCount;				  // number of docs in seg
+  public final Directory dir;				  // where segment resides
 
-  static final int VERSION_START = 0;
-  static final int VERSION_CURRENT = VERSION_START;
+  private boolean isCompoundFile;
 
-  final static class Writer extends DerefBytesWriterBase {
-    private final Comparator<BytesRef> comp;
+  private volatile long sizeInBytes = -1;         // total byte size of all files (computed on demand)
 
-    public Writer(Directory dir, String id, Comparator<BytesRef> comp,
-        Counter bytesUsed, IOContext context, float acceptableOverheadRatio) throws IOException {
-      super(dir, id, CODEC_NAME_IDX, CODEC_NAME_DAT, VERSION_CURRENT, bytesUsed, context, acceptableOverheadRatio, Type.BYTES_VAR_SORTED);
-      this.comp = comp;
-      size = 0;
-    }
+  private Codec codec;
 
-    @Override
-    public void merge(MergeState mergeState, DocValues[] docValues)
-        throws IOException {
-      boolean success = false;
-      try {
-        MergeContext ctx = SortedBytesMergeUtils.init(Type.BYTES_VAR_SORTED, docValues, comp, mergeState.segmentInfo.getDocCount());
-        final List<SortedSourceSlice> slices = SortedBytesMergeUtils.buildSlices(mergeState.docBase, mergeState.docMaps, docValues, ctx);
-        IndexOutput datOut = getOrCreateDataOut();
-        
-        ctx.offsets = new long[1];
-        final int maxOrd = SortedBytesMergeUtils.mergeRecords(ctx, new IndexOutputBytesRefConsumer(datOut), slices);
-        final long[] offsets = ctx.offsets;
-        maxBytes = offsets[maxOrd-1];
-        final IndexOutput idxOut = getOrCreateIndexOut();
-        
-        idxOut.writeLong(maxBytes);
-        final PackedInts.Writer offsetWriter = PackedInts.getWriter(idxOut, maxOrd+1,
-            PackedInts.bitsRequired(maxBytes), PackedInts.DEFAULT);
-        offsetWriter.add(0);
-        for (int i = 0; i < maxOrd; i++) {
-          offsetWriter.add(offsets[i]);
-        }
-        offsetWriter.finish();
-        
-        final PackedInts.Writer ordsWriter = PackedInts.getWriter(idxOut, ctx.docToEntry.length,
-            PackedInts.bitsRequired(maxOrd-1), PackedInts.DEFAULT);
-        for (SortedSourceSlice slice : slices) {
-          slice.writeOrds(ordsWriter);
-        }
-        ordsWriter.finish();
-        success = true;
-      } finally {
-        releaseResources();
-        if (success) {
-          IOUtils.close(getIndexOut(), getDataOut());
-        } else {
-          IOUtils.closeWhileHandlingException(getIndexOut(), getDataOut());
-        }
+  private Map<String,String> diagnostics;
+  
+  private Map<String,String> attributes;
 
+  // Tracks the Lucene version this segment was created with, since 3.1. Null
+  // indicates an older than 3.0 index, and it's used to detect a too old index.
+  // The format expected is "x.y" - "2.x" for pre-3.0 indexes (or null), and
+  // specific versions afterwards ("3.0", "3.1" etc.).
+  // see Constants.LUCENE_MAIN_VERSION.
+  private String version;
+
+  void setDiagnostics(Map<String, String> diagnostics) {
+    this.diagnostics = diagnostics;
+  }
+
+  public Map<String, String> getDiagnostics() {
+    return diagnostics;
+  }
+
+  /**
+   * Construct a new complete SegmentInfo instance from input.
+   * <p>Note: this is public only to allow access from
+   * the codecs package.</p>
+   */
+  public SegmentInfo(Directory dir, String version, String name, int docCount, 
+                     boolean isCompoundFile, Codec codec, Map<String,String> diagnostics, Map<String,String> attributes) {
+    assert !(dir instanceof TrackingDirectoryWrapper);
+    this.dir = dir;
+    this.version = version;
+    this.name = name;
+    this.docCount = docCount;
+    this.isCompoundFile = isCompoundFile;
+    this.codec = codec;
+    this.diagnostics = diagnostics;
+    this.attributes = attributes;
+  }
+
+  /**
+   * Returns total size in bytes of all of files used by
+   * this segment.  Note that this will not include any live
+   * docs for the segment; to include that use {@link
+   * SegmentInfoPerCommit#sizeInBytes()} instead.
+   */
+  public long sizeInBytes() throws IOException {
+    if (sizeInBytes == -1) {
+      long sum = 0;
+      for (final String fileName : files()) {
+        sum += dir.fileLength(fileName);
       }
+      sizeInBytes = sum;
+    }
+    return sizeInBytes;
+  }
+
+  /**
+   * @deprecated separate norms are not supported in >= 4.0
+   */
+  @Deprecated
+  boolean hasSeparateNorms() {
+    return getAttribute(Lucene3xSegmentInfoFormat.NORMGEN_KEY) != null;
+  }
+
+  /**
+   * Mark whether this segment is stored as a compound file.
+   *
+   * @param isCompoundFile true if this is a compound file;
+   * else, false
+   */
+  void setUseCompoundFile(boolean isCompoundFile) {
+    this.isCompoundFile = isCompoundFile;
+  }
+  
+  /**
+   * Returns true if this segment is stored as a compound
+   * file; else, false.
+   */
+  public boolean getUseCompoundFile() {
+    return isCompoundFile;
+  }
+
+  /** Can only be called once. */
+  public void setCodec(Codec codec) {
+    assert this.codec == null;
+    if (codec == null) {
+      throw new IllegalArgumentException("segmentCodecs must be non-null");
+    }
+    this.codec = codec;
+  }
+
+  public Codec getCodec() {
+    return codec;
+  }
+
+  public int getDocCount() {
+    if (this.docCount == -1) {
+      throw new IllegalStateException("docCount isn't set yet");
+    }
+    return docCount;
+  }
+
+  // NOTE: leave package private
+  void setDocCount(int docCount) {
+    if (this.docCount != -1) {
+      throw new IllegalStateException("docCount was already set");
+    }
+    this.docCount = docCount;
+  }
+
+  /*
+   * Return all files referenced by this SegmentInfo.  The
+   * returns List is a locally cached List so you should not
+   * modify it.
+   */
+
+  public Set<String> files() throws IOException {
+    if (setFiles == null) {
+      throw new IllegalStateException("files were not computed yet");
+    }
+    return Collections.unmodifiableSet(setFiles);
+  }
+
+  /** {@inheritDoc} */
+  @Override
+  public String toString() {
+    return toString(dir, 0);
+  }
+
+  /** Used for debugging.  Format may suddenly change.
+   *
+   *  <p>Current format looks like
+   *  <code>_a(3.1):c45/4</code>, which means the segment's
+   *  name is <code>_a</code>; it was created with Lucene 3.1 (or
+   *  '?' if it's unknown); it's using compound file
+   *  format (would be <code>C</code> if not compound); it
+   *  has 45 documents; it has 4 deletions (this part is
+   *  left off when there are no deletions).</p>
+   */
+  public String toString(Directory dir, int delCount) {
+
+    StringBuilder s = new StringBuilder();
+    s.append(name).append('(').append(version == null ? "?" : version).append(')').append(':');
+    char cfs = getUseCompoundFile() ? 'c' : 'C';
+    s.append(cfs);
+
+    if (this.dir != dir) {
+      s.append('x');
+    }
+    s.append(docCount);
+
+    if (delCount != 0) {
+      s.append('/').append(delCount);
     }
 
-    @Override
-    protected void checkSize(BytesRef bytes) {
-      // allow var bytes sizes
-    }
+    // TODO: we could append toString of attributes() here?
 
-    // Important that we get docCount, in case there were
-    // some last docs that we didn't see
-    @Override
-    public void finishInternal(int docCount) throws IOException {
-      fillDefault(docCount);
-      final int count = hash.size();
-      final IndexOutput datOut = getOrCreateDataOut();
-      final IndexOutput idxOut = getOrCreateIndexOut();
-      long offset = 0;
-      final int[] index = new int[count];
-      final int[] sortedEntries = hash.sort(comp);
-      // total bytes of data
-      idxOut.writeLong(maxBytes);
-      PackedInts.Writer offsetWriter = PackedInts.getWriter(idxOut, count+1,
-          PackedInts.bitsRequired(maxBytes), PackedInts.DEFAULT);
-      // first dump bytes data, recording index & write offset as
-      // we go
-      final BytesRef spare = new BytesRef();
-      for (int i = 0; i < count; i++) {
-        final int e = sortedEntries[i];
-        offsetWriter.add(offset);
-        index[e] = i;
-        final BytesRef bytes = hash.get(e, spare);
-        // TODO: we could prefix code...
-        datOut.writeBytes(bytes.bytes, bytes.offset, bytes.length);
-        offset += bytes.length;
-      }
-      // write sentinel
-      offsetWriter.add(offset);
-      offsetWriter.finish();
-      // write index
-      writeIndex(idxOut, docCount, count, index, docToEntry);
+    return s.toString();
+  }
 
+  /** We consider another SegmentInfo instance equal if it
+   *  has the same dir and same name. */
+  @Override
+  public boolean equals(Object obj) {
+    if (this == obj) return true;
+    if (obj instanceof SegmentInfo) {
+      final SegmentInfo other = (SegmentInfo) obj;
+      return other.dir == dir && other.name.equals(name);
+    } else {
+      return false;
     }
   }
 
-  public static class Reader extends BytesReaderBase {
-
-    private final Comparator<BytesRef> comparator;
-
-    Reader(Directory dir, String id, int maxDoc,
-        IOContext context, Type type, Comparator<BytesRef> comparator)
-        throws IOException {
-      super(dir, id, CODEC_NAME_IDX, CODEC_NAME_DAT, VERSION_START, true, context, type);
-      this.comparator = comparator;
-    }
-
-    @Override
-    public org.apache.lucene.index.DocValues.Source load()
-        throws IOException {
-      return new VarSortedSource(cloneData(), cloneIndex(), comparator);
-    }
-
-    @Override
-    public Source getDirectSource() throws IOException {
-      return new DirectSortedSource(cloneData(), cloneIndex(), comparator, getType());
-    }
-    
-  }
-  private static final class VarSortedSource extends BytesSortedSourceBase {
-    private final int valueCount;
-
-    VarSortedSource(IndexInput datIn, IndexInput idxIn,
-        Comparator<BytesRef> comp) throws IOException {
-      super(datIn, idxIn, comp, idxIn.readLong(), Type.BYTES_VAR_SORTED, true);
-      valueCount = ordToOffsetIndex.size()-1; // the last value here is just a dummy value to get the length of the last value
-      closeIndexInput();
-    }
-
-    @Override
-    public BytesRef getByOrd(int ord, BytesRef bytesRef) {
-      final long offset = ordToOffsetIndex.get(ord);
-      final long nextOffset = ordToOffsetIndex.get(1 + ord);
-      data.fillSlice(bytesRef, offset, (int) (nextOffset - offset));
-      return bytesRef;
-    }
-
-    @Override
-    public int getValueCount() {
-      return valueCount;
-    }
+  @Override
+  public int hashCode() {
+    return dir.hashCode() + name.hashCode();
   }
 
-  private static final class DirectSortedSource extends SortedSource {
-    private final PackedInts.Reader docToOrdIndex;
-    private final PackedInts.Reader ordToOffsetIndex;
-    private final IndexInput datIn;
-    private final long basePointer;
-    private final int valueCount;
+  /**
+   * Used by DefaultSegmentInfosReader to upgrade a 3.0 segment to record its
+   * version is "3.0". This method can be removed when we're not required to
+   * support 3x indexes anymore, e.g. in 5.0.
+   * <p>
+   * <b>NOTE:</b> this method is used for internal purposes only - you should
+   * not modify the version of a SegmentInfo, or it may result in unexpected
+   * exceptions thrown when you attempt to open the index.
+   *
+   * @lucene.internal
+   */
+  public void setVersion(String version) {
+    this.version = version;
+  }
+
+  /** Returns the version of the code which wrote the segment. */
+  public String getVersion() {
+    return version;
+  }
+
+  private Set<String> setFiles;
+
+  public void setFiles(Set<String> files) {
+    setFiles = files;
+    sizeInBytes = -1;
+  }
+
+  public void addFiles(Collection<String> files) {
+    setFiles.addAll(files);
+  }
+
+  public void addFile(String file) {
+    setFiles.add(file);
+  }
     
-    DirectSortedSource(IndexInput datIn, IndexInput idxIn,
-        Comparator<BytesRef> comparator, Type type) throws IOException {
-      super(type, comparator);
-      idxIn.readLong();
-      ordToOffsetIndex = PackedInts.getDirectReader(idxIn);
-      valueCount = ordToOffsetIndex.size()-1; // the last value here is just a dummy value to get the length of the last value
-      // advance this iterator to the end and clone the stream once it points to the docToOrdIndex header
-      ordToOffsetIndex.get(valueCount);
-      docToOrdIndex = PackedInts.getDirectReader((IndexInput) idxIn.clone()); // read the ords in to prevent too many random disk seeks
-      basePointer = datIn.getFilePointer();
-      this.datIn = datIn;
+  /**
+   * Get a codec attribute value, or null if it does not exist
+   */
+  public String getAttribute(String key) {
+    if (attributes == null) {
+      return null;
+    } else {
+      return attributes.get(key);
     }
-
-    @Override
-    public int ord(int docID) {
-      return (int) docToOrdIndex.get(docID);
+  }
+  
+  /**
+   * Puts a codec attribute value.
+   * <p>
+   * This is a key-value mapping for the field that the codec can use
+   * to store additional metadata, and will be available to the codec
+   * when reading the segment via {@link #getAttribute(String)}
+   * <p>
+   * If a value already exists for the field, it will be replaced with 
+   * the new value.
+   */
+  public String putAttribute(String key, String value) {
+    if (attributes == null) {
+      attributes = new HashMap<String,String>();
     }
-
-    @Override
-    public boolean hasPackedDocToOrd() {
-      return true;
-    }
-
-    @Override
-    public PackedInts.Reader getDocToOrd() {
-      return docToOrdIndex;
-    }
-
-    @Override
-    public BytesRef getByOrd(int ord, BytesRef bytesRef) {
-      try {
-        final long offset = ordToOffsetIndex.get(ord);
-        // 1+ord is safe because we write a sentinel at the end
-        final long nextOffset = ordToOffsetIndex.get(1+ord);
-        datIn.seek(basePointer + offset);
-        final int length = (int) (nextOffset - offset);
-        bytesRef.offset = 0;
-        bytesRef.grow(length);
-        datIn.readBytes(bytesRef.bytes, 0, length);
-        bytesRef.length = length;
-        return bytesRef;
-      } catch (IOException ex) {
-        throw new IllegalStateException("failed", ex);
-      }
-    }
-    
-    @Override
-    public int getValueCount() {
-      return valueCount;
-    }
-
+    return attributes.put(key, value);
+  }
+  
+  /**
+   * @return internal codec attributes map. May be null if no mappings exist.
+   */
+  public Map<String,String> attributes() {
+    return attributes;
   }
 }

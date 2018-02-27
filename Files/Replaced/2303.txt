@@ -1,4 +1,4 @@
-Message msg = new Message(host, StorageService.Verb.REPLICATION_FINISHED, new byte[0], MessagingService.version_);
+SSTableReader sstable = writer.closeAndOpenReader(DatabaseDescriptor.getKeysCachedFraction(table_));
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one
@@ -9,224 +9,145 @@ Message msg = new Message(host, StorageService.Verb.REPLICATION_FINISHED, new by
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
-package org.apache.cassandra.service;
+package org.apache.cassandra.db;
 
 import java.io.IOException;
-import java.net.InetAddress;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Test;
+import org.apache.cassandra.io.SSTableWriter;
+import org.apache.cassandra.io.SSTableReader;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.config.DatabaseDescriptor;
 
-import org.apache.cassandra.CleanupHelper;
-import org.apache.cassandra.Util;
-import org.apache.cassandra.concurrent.Stage;
-import org.apache.cassandra.config.ConfigurationException;
+import org.apache.log4j.Logger;
+import org.cliffc.high_scale_lib.NonBlockingHashMap;
 import org.apache.cassandra.dht.IPartitioner;
-import org.apache.cassandra.dht.RandomPartitioner;
-import org.apache.cassandra.dht.Token;
-import org.apache.cassandra.gms.ApplicationState;
-import org.apache.cassandra.gms.Gossiper;
-import org.apache.cassandra.gms.VersionedValue;
-import org.apache.cassandra.locator.TokenMetadata;
-import org.apache.cassandra.net.Message;
-import org.apache.cassandra.net.MessagingService;
-import org.apache.cassandra.net.sink.IMessageSink;
-import org.apache.cassandra.net.sink.SinkManager;
-import org.apache.cassandra.streaming.StreamUtil;
-import org.apache.cassandra.utils.FBUtilities;
 
-import static org.junit.Assert.*;
-
-public class RemoveTest extends CleanupHelper
+public class BinaryMemtable implements IFlushable<DecoratedKey>
 {
-    StorageService ss = StorageService.instance;
-    TokenMetadata tmd = ss.getTokenMetadata();
-    IPartitioner oldPartitioner;
-    ArrayList<Token> endpointTokens = new ArrayList<Token>();
-    ArrayList<Token> keyTokens = new ArrayList<Token>();
-    List<InetAddress> hosts = new ArrayList<InetAddress>();
-    InetAddress removalhost;
-    Token removaltoken;
+    private static Logger logger_ = Logger.getLogger(BinaryMemtable.class);
+    private int threshold_ = DatabaseDescriptor.getBMTThreshold() * 1024 * 1024;
+    private AtomicInteger currentSize_ = new AtomicInteger(0);
 
-    @Before
-    public void setup() throws IOException, ConfigurationException
+    /* Table and ColumnFamily name are used to determine the ColumnFamilyStore */
+    private String table_;
+    private String cfName_;
+    private boolean isFrozen_ = false;
+    private Map<DecoratedKey, byte[]> columnFamilies_ = new NonBlockingHashMap<DecoratedKey, byte[]>();
+    /* Lock and Condition for notifying new clients about Memtable switches */
+    Lock lock_ = new ReentrantLock();
+    Condition condition_;
+    private final IPartitioner partitioner_ = StorageService.getPartitioner();
+
+    BinaryMemtable(String table, String cfName) throws IOException
     {
-        tmd.clearUnsafe();
-        IPartitioner partitioner = new RandomPartitioner();
+        condition_ = lock_.newCondition();
+        table_ = table;
+        cfName_ = cfName;
+    }
 
-        oldPartitioner = ss.setPartitionerUnsafe(partitioner);
+    public int getMemtableThreshold()
+    {
+        return currentSize_.get();
+    }
 
-        // create a ring of 5 nodes
-        Util.createInitialRing(ss, partitioner, endpointTokens, keyTokens, hosts, 6);
+    void resolveSize(int oldSize, int newSize)
+    {
+        currentSize_.addAndGet(newSize - oldSize);
+    }
 
-        MessagingService.instance().listen(FBUtilities.getLocalAddress());
-        Gossiper.instance.start(1);
-        for (int i = 0; i < 6; i++)
+
+    boolean isThresholdViolated()
+    {
+        return currentSize_.get() >= threshold_;
+    }
+
+    String getColumnFamily()
+    {
+    	return cfName_;
+    }
+
+    /*
+     * This version is used by the external clients to put data into
+     * the memtable. This version will respect the threshold and flush
+     * the memtable to disk when the size exceeds the threshold.
+    */
+    void put(String key, byte[] buffer) throws IOException
+    {
+        if (isThresholdViolated())
         {
-            Gossiper.instance.initializeNodeUnsafe(hosts.get(i), 1);
-        }
-        removalhost = hosts.get(5);
-        hosts.remove(removalhost);
-        removaltoken = endpointTokens.get(5);
-        endpointTokens.remove(removaltoken);
-    }
-
-    @After
-    public void tearDown()
-    {
-        SinkManager.clear();
-        MessagingService.instance().shutdown();
-        ss.setPartitionerUnsafe(oldPartitioner);
-    }
-
-    @Test(expected = UnsupportedOperationException.class)
-    public void testBadToken()
-    {
-        final String token = StorageService.getPartitioner().getTokenFactory().toString(keyTokens.get(2));
-        ss.removeToken(token);
-
-    }
-
-    @Test(expected = UnsupportedOperationException.class)
-    public void testLocalToken()
-    {
-        //first token should be localhost
-        final String token = StorageService.getPartitioner().getTokenFactory().toString(endpointTokens.get(0));
-        ss.removeToken(token);
-    }
-
-    @Test
-    public void testRemoveToken() throws InterruptedException
-    {
-        IPartitioner partitioner = StorageService.getPartitioner();
-
-        final String token = partitioner.getTokenFactory().toString(removaltoken);
-        ReplicationSink rSink = new ReplicationSink();
-        SinkManager.add(rSink);
-
-        // start removal in background and send replication confirmations
-        final AtomicBoolean success = new AtomicBoolean(false);
-        Thread remover = new Thread()
-        {
-            public void run()
+            lock_.lock();
+            try
             {
-                try
+                ColumnFamilyStore cfStore = Table.open(table_).getColumnFamilyStore(cfName_);
+                if (!isFrozen_)
                 {
-                    ss.removeToken(token);
+                    isFrozen_ = true;
+                    cfStore.submitFlush(this);
+                    cfStore.switchBinaryMemtable(key, buffer);
                 }
-                catch (Exception e)
+                else
                 {
-                    System.err.println(e);
-                    e.printStackTrace();
-                    return;
+                    cfStore.applyBinary(key, buffer);
                 }
-                success.set(true);
             }
-        };
-        remover.start();
-
-        Thread.sleep(1000); // make sure removal is waiting for confirmation
-
-        assertTrue(tmd.isLeaving(removalhost));
-        assertEquals(1, tmd.getLeavingEndpoints().size());
-
-        for (InetAddress host : hosts)
-        {
-            Message msg = new Message(host, StorageService.Verb.REPLICATION_FINISHED, new byte[0]);
-            MessagingService.instance().sendRR(msg, FBUtilities.getLocalAddress());
-        }
-
-        remover.join();
-
-        assertTrue(success.get());
-        assertTrue(tmd.getLeavingEndpoints().isEmpty());
-    }
-
-    @Test
-    public void testStartRemoving()
-    {
-        IPartitioner partitioner = StorageService.getPartitioner();
-        VersionedValue.VersionedValueFactory valueFactory = new VersionedValue.VersionedValueFactory(partitioner);
-
-        NotificationSink nSink = new NotificationSink();
-        ReplicationSink rSink = new ReplicationSink();
-        SinkManager.add(nSink);
-        SinkManager.add(rSink);
-
-        assertEquals(0, tmd.getLeavingEndpoints().size());
-
-        ss.onChange(hosts.get(1),
-                    ApplicationState.STATUS,
-                    valueFactory.removingNonlocal(endpointTokens.get(1), removaltoken));
-
-        assertEquals(1, nSink.callCount);
-        assertTrue(tmd.isLeaving(removalhost));
-        assertEquals(1, tmd.getLeavingEndpoints().size());
-    }
-
-    @Test
-    public void testFinishRemoving()
-    {
-        IPartitioner partitioner = StorageService.getPartitioner();
-        VersionedValue.VersionedValueFactory valueFactory = new VersionedValue.VersionedValueFactory(partitioner);
-
-        assertEquals(0, tmd.getLeavingEndpoints().size());
-
-        ss.onChange(hosts.get(1),
-                    ApplicationState.STATUS,
-                    valueFactory.removedNonlocal(endpointTokens.get(1), removaltoken));
-
-        assertFalse(Gossiper.instance.getLiveMembers().contains(removalhost));
-        assertFalse(tmd.isMember(removalhost));
-    }
-
-    class ReplicationSink implements IMessageSink
-    {
-
-        public Message handleMessage(Message msg, InetAddress to)
-        {
-            if (!msg.getVerb().equals(StorageService.Verb.STREAM_REQUEST))
-                return msg;
-
-            StreamUtil.finishStreamRequest(msg, to);
-
-            return null;
-        }
-    }
-
-    class NotificationSink implements IMessageSink
-    {
-        public int callCount = 0;
-
-        public Message handleMessage(Message msg, InetAddress to)
-        {
-            if (msg.getVerb().equals(StorageService.Verb.REPLICATION_FINISHED))
+            finally
             {
-                callCount++;
-                assertEquals(Stage.MISC, msg.getMessageType());
-                // simulate a response from remote server
-                Message response = msg.getReply(FBUtilities.getLocalAddress(), new byte[]{ }, msg.getVersion());
-                MessagingService.instance().sendOneWay(response, FBUtilities.getLocalAddress());
-                return null;
-            }
-            else
-            {
-                return msg;
+                lock_.unlock();
             }
         }
+        else
+        {
+            resolve(key, buffer);
+        }
+    }
+
+    private void resolve(String key, byte[] buffer)
+    {
+        columnFamilies_.put(partitioner_.decorateKey(key), buffer);
+        currentSize_.addAndGet(buffer.length + key.length());
+    }
+
+    public List<DecoratedKey> getSortedKeys()
+    {
+        assert !columnFamilies_.isEmpty();
+        logger_.info("Sorting " + this);
+        List<DecoratedKey> keys = new ArrayList<DecoratedKey>(columnFamilies_.keySet());
+        Collections.sort(keys, partitioner_.getDecoratedKeyComparator());
+        return keys;
+    }
+
+    public SSTableReader writeSortedContents(List<DecoratedKey> sortedKeys) throws IOException
+    {
+        logger_.info("Writing " + this);
+        ColumnFamilyStore cfStore = Table.open(table_).getColumnFamilyStore(cfName_);
+        String path = cfStore.getTempSSTablePath();
+        SSTableWriter writer = new SSTableWriter(path, sortedKeys.size(), StorageService.getPartitioner());
+
+        for (DecoratedKey key : sortedKeys)
+        {
+            byte[] bytes = columnFamilies_.get(key);
+            assert bytes.length > 0;
+            writer.append(key, bytes);
+        }
+        SSTableReader sstable = writer.closeAndOpenReader();
+        logger_.info("Completed flushing " + writer.getFilename());
+        return sstable;
     }
 }

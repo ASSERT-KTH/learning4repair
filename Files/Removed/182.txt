@@ -16,900 +16,492 @@
  * limitations under the License.
  */
 
-package org.apache.cassandra.io;
+package org.apache.cassandra.db.commitlog;
+
+import com.google.common.collect.HashMultimap;
+import com.google.common.collect.Multimap;
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.Config;
+import org.apache.cassandra.config.KSMetaData;
+import org.apache.cassandra.db.ColumnFamily;
+import org.apache.cassandra.db.RowMutation;
+import org.apache.cassandra.db.Table;
+import org.apache.cassandra.io.util.BufferedRandomAccessFile;
+import org.apache.cassandra.io.DeletionService;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.WrappedRunnable;
+import org.apache.cassandra.concurrent.StageManager;
+
+import org.apache.commons.lang.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.*;
-import java.lang.reflect.Method;
-import java.nio.ByteBuffer;
-import java.nio.MappedByteBuffer;
-import java.nio.channels.FileChannel;
-import java.security.AccessController;
-import java.security.PrivilegedAction;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import java.util.Arrays;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.zip.Checksum;
+import java.util.zip.CRC32;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
 
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.utils.BloomFilter;
-import org.apache.cassandra.utils.LogUtil;
-
-import org.apache.log4j.Logger;
-
-/**
- * This class writes key/value pairs seqeuntially to disk. It is
- * also used to read sequentially from disk. However one could
- * jump to random positions to read data from the file. This class
- * also has many implementations of the IFileWriter and IFileReader
- * interfaces which are exposed through factory methods.
- * <p/>
- * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com ) & Karthik Ranganathan ( kranganathan@facebook.com )
+/*
+ * Commit Log tracks every write operation into the system. The aim
+ * of the commit log is to be able to successfully recover data that was
+ * not stored to disk via the Memtable. Every Commit Log maintains a
+ * header represented by the abstraction CommitLogHeader. The header
+ * contains a bit array and an array of longs and both the arrays are
+ * of size, #column families for the Table, the Commit Log represents.
+ *
+ * Whenever a ColumnFamily is written to, for the first time its bit flag
+ * is set to one in the CommitLogHeader. When it is flushed to disk by the
+ * Memtable its corresponding bit in the header is set to zero. This helps
+ * track which CommitLogs can be thrown away as a result of Memtable flushes.
+ * Additionally, when a ColumnFamily is flushed and written to disk, its
+ * entry in the array of longs is updated with the offset in the Commit Log
+ * file where it was written. This helps speed up recovery since we can seek
+ * to these offsets and start processing the commit log.
+ *
+ * Every Commit Log is rolled over everytime it reaches its threshold in size;
+ * the new log inherits the "dirty" bits from the old.
+ *
+ * Over time there could be a number of commit logs that would be generated.
+ * To allow cleaning up non-active commit logs, whenever we flush a column family and update its bit flag in
+ * the active CL, we take the dirty bit array and bitwise & it with the headers of the older logs.
+ * If the result is 0, then it is safe to remove the older file.  (Since the new CL
+ * inherited the old's dirty bitflags, getting a zero for any given bit in the anding
+ * means that either the CF was clean in the old CL or it has been flushed since the
+ * switch in the new.)
  */
-
-public class SequenceFile
+public class CommitLog
 {
-    public static abstract class AbstractWriter implements IFileWriter
+    private static volatile int SEGMENT_SIZE = 128*1024*1024; // roll after log gets this big
+
+    static final Logger logger = LoggerFactory.getLogger(CommitLog.class);
+
+    public static CommitLog instance()
     {
-        protected String filename_;
-
-        AbstractWriter(String filename)
-        {
-            filename_ = filename;
-        }
-
-        public String getFileName()
-        {
-            return filename_;
-        }
-
-        public long lastModified()
-        {
-            File file = new File(filename_);
-            return file.lastModified();
-        }
+        return CLHandle.instance;
     }
 
-    public static class Writer extends AbstractWriter
+    private static class CLHandle
     {
-        protected RandomAccessFile file_;
-
-        Writer(String filename) throws IOException
-        {
-            super(filename);
-            init(filename);
-        }
-
-        Writer(String filename, int size) throws IOException
-        {
-            super(filename);
-            init(filename, size);
-        }
-
-        protected void init(String filename) throws IOException
-        {
-            File file = new File(filename);
-            if (!file.exists())
-            {
-                file.createNewFile();
-            }
-            file_ = new RandomAccessFile(file, "rw");
-        }
-
-        protected void init(String filename, int size) throws IOException
-        {
-            init(filename);
-        }
-
-        public long getCurrentPosition() throws IOException
-        {
-            return file_.getFilePointer();
-        }
-
-        public void seek(long position) throws IOException
-        {
-            file_.seek(position);
-        }
-
-        public void append(DataOutputBuffer buffer) throws IOException
-        {
-            file_.write(buffer.getData(), 0, buffer.getLength());
-        }
-
-        public void append(DataOutputBuffer keyBuffer, DataOutputBuffer buffer) throws IOException
-        {
-            int keyBufLength = keyBuffer.getLength();
-            if (keyBuffer == null || keyBufLength == 0)
-                throw new IllegalArgumentException("Key cannot be NULL or of zero length.");
-
-            file_.writeInt(keyBufLength);
-            file_.write(keyBuffer.getData(), 0, keyBufLength);
-
-            int length = buffer.getLength();
-            file_.writeInt(length);
-            file_.write(buffer.getData(), 0, length);
-        }
-
-        public void append(String key, DataOutputBuffer buffer) throws IOException
-        {
-            if (key == null)
-                throw new IllegalArgumentException("Key cannot be NULL.");
-
-            file_.writeUTF(key);
-            int length = buffer.getLength();
-            file_.writeInt(length);
-            file_.write(buffer.getData(), 0, length);
-        }
-
-        public void append(String key, byte[] value) throws IOException
-        {
-            if (key == null)
-                throw new IllegalArgumentException("Key cannot be NULL.");
-
-            file_.writeUTF(key);
-            file_.writeInt(value.length);
-            file_.write(value);
-        }
-
-        public void append(String key, long value) throws IOException
-        {
-            if (key == null)
-                throw new IllegalArgumentException("Key cannot be NULL.");
-
-            file_.writeUTF(key);
-            file_.writeLong(value);
-        }
-
-        /**
-         * Be extremely careful while using this API. This currently
-         * used to write the commit log header in the commit logs.
-         * If not used carefully it could completely screw up reads
-         * of other key/value pairs that are written.
-         *
-         * @param bytes the bytes to write
-         */
-        public long writeDirect(byte[] bytes) throws IOException
-        {
-            file_.write(bytes);
-            return file_.getFilePointer();
-        }
-
-        public void writeLong(long value) throws IOException
-        {
-            file_.writeLong(value);
-        }
-
-        public void close() throws IOException
-        {
-            file_.getChannel().force(true);
-            file_.close();
-        }
-
-        public void close(byte[] footer, int size) throws IOException
-        {
-            file_.writeUTF(SequenceFile.marker_);
-            file_.writeInt(size);
-            file_.write(footer, 0, size);
-        }
-
-        public String getFileName()
-        {
-            return filename_;
-        }
-
-        public long getFileSize() throws IOException
-        {
-            return file_.length();
-        }
+        public static final CommitLog instance = new CommitLog();
     }
 
-    public static class BufferWriter extends Writer
+    private final Deque<CommitLogSegment> segments = new ArrayDeque<CommitLogSegment>();
+
+    public static void setSegmentSize(int size)
     {
-
-        BufferWriter(String filename, int size) throws IOException
-        {
-            super(filename, size);
-        }
-
-        @Override
-        protected void init(String filename) throws IOException
-        {
-            init(filename, 0);
-        }
-
-        @Override
-        protected void init(String filename, int size) throws IOException
-        {
-            File file = new File(filename);
-            file_ = new BufferedRandomAccessFile(file, "rw", size);
-            if (!file.exists())
-            {
-                file.createNewFile();
-            }
-        }
+        SEGMENT_SIZE = size;
     }
 
+    public int getSegmentCount()
+    {
+        return segments.size();
+    }
+
+    private final ICommitLogExecutorService executor;
 
     /**
-     *  This is a reader that finds the block for a starting column and returns
-     *  blocks before/after it for each next call. This function assumes that
-     *  the CF is sorted by name and exploits the name index.
-     */
-    public static class ColumnGroupReader extends BufferReader
+     * param @ table - name of table for which we are maintaining
+     *                 this commit log.
+     * param @ recoverymode - is commit log being instantiated in
+     *                        in recovery mode.
+    */
+    private CommitLog()
     {
-        private String key_;
-        private String cfName_;
-        private String cfType_;
-        private int indexType_;
-        private boolean isAscending_;
-
-        private List<IndexHelper.ColumnIndexInfo> columnIndexList_;
-        private long columnStartPosition_;
-        private int curRangeIndex_;
-        private int allColumnsSize_;
-        private int localDeletionTime_;
-        private long markedForDeleteAt_;
-
-        ColumnGroupReader(String filename, String key, String cfName, String startColumn, boolean isAscending, long position) throws IOException
+        // all old segments are recovered and deleted before CommitLog is instantiated.
+        // All we need to do is create a new one.
+        segments.add(new CommitLogSegment());
+        
+        if (DatabaseDescriptor.getCommitLogSync() == Config.CommitLogSync.periodic)
         {
-            super(filename, 128 * 1024);
-            this.cfName_ = cfName;
-            this.key_ = key;
-            this.isAscending_ = isAscending;
-            init(startColumn, position);
-        }
-
-        /**
-         *   Build a list of index entries ready for search.
-         */
-        private List<IndexHelper.ColumnIndexInfo> getFullColumnIndexList(List<IndexHelper.ColumnIndexInfo> columnIndexList, int totalNumCols)
-        {
-            if (columnIndexList.size() == 0)
+            executor = new PeriodicCommitLogExecutorService();
+            final Callable syncer = new Callable()
             {
-                /* if there is no column index, add an index entry that covers the full space. */
-                return Arrays.asList(new IndexHelper.ColumnIndexInfo[]{new IndexHelper.ColumnNameIndexInfo("", 0, totalNumCols)});
-            }
-
-            List<IndexHelper.ColumnIndexInfo> fullColIndexList = new ArrayList<IndexHelper.ColumnIndexInfo>();
-            int accumulatededCols = 0;
-            for (IndexHelper.ColumnIndexInfo colPosInfo : columnIndexList)
-                accumulatededCols += colPosInfo.count();
-            int remainingCols = totalNumCols - accumulatededCols;
-
-            fullColIndexList.add(new IndexHelper.ColumnNameIndexInfo("", 0, columnIndexList.get(0).count()));
-            for (int i = 0; i < columnIndexList.size() - 1; i++)
-            {
-                IndexHelper.ColumnNameIndexInfo colPosInfo = (IndexHelper.ColumnNameIndexInfo)columnIndexList.get(i);
-                fullColIndexList.add(new IndexHelper.ColumnNameIndexInfo(colPosInfo.name(),
-                                                                         colPosInfo.position(),
-                                                                         columnIndexList.get(i + 1).count()));
-            }
-            String columnName = ((IndexHelper.ColumnNameIndexInfo)columnIndexList.get(columnIndexList.size() - 1)).name();
-            fullColIndexList.add(new IndexHelper.ColumnNameIndexInfo(columnName,
-                                                                     columnIndexList.get(columnIndexList.size() - 1).position(),
-                                                                     remainingCols));
-            return fullColIndexList;
-        }
-
-        private void init(String startColumn, long position) throws IOException
-        {
-            String keyInDisk = null;
-            if (seekTo(position) >= 0)
-                keyInDisk = file_.readUTF();
-
-            if ( keyInDisk != null && keyInDisk.equals(key_))
-            {
-                /* read off the size of this row */
-                int dataSize = file_.readInt();
-                /* skip the bloomfilter */
-                int totalBytesRead = IndexHelper.skipBloomFilter(file_);
-                /* read off the index flag, it has to be true */
-                boolean hasColumnIndexes = file_.readBoolean();
-                totalBytesRead += 1;
-
-                /* read the index */
-                List<IndexHelper.ColumnIndexInfo> colIndexList = new ArrayList<IndexHelper.ColumnIndexInfo>();
-                if (hasColumnIndexes)
-                    totalBytesRead += IndexHelper.deserializeIndex(getTableName(), cfName_, file_, colIndexList);
-
-                /* need to do two things here.
-                 * 1. move the file pointer to the beginning of the list of stored columns
-                 * 2. calculate the size of all columns */
-                String cfName = file_.readUTF();
-                cfType_ = file_.readUTF();
-                indexType_ = file_.readInt();
-                localDeletionTime_ = file_.readInt();
-                markedForDeleteAt_ = file_.readLong();
-                int totalNumCols = file_.readInt();
-                allColumnsSize_ = dataSize - (totalBytesRead + 2 * utfPrefix_ + cfName.length() + cfType_.length() + 4 + 4 + 8 + 4);
-
-                columnStartPosition_ = file_.getFilePointer();
-                columnIndexList_ = getFullColumnIndexList(colIndexList, totalNumCols);
-
-                int index = Collections.binarySearch(columnIndexList_, new IndexHelper.ColumnNameIndexInfo(startColumn));
-                curRangeIndex_ = index < 0 ? (++index) * (-1) - 1 : index;
-            }
-            else
-            {
-                /* no keys found in this file because of a false positive in BF */
-                curRangeIndex_ = -1;
-                columnIndexList_ = new ArrayList<IndexHelper.ColumnIndexInfo>();
-            }
-        }
-
-        private boolean getBlockFromCurIndex(DataOutputBuffer bufOut) throws IOException
-        {
-            if (curRangeIndex_ < 0 || curRangeIndex_ >= columnIndexList_.size())
-                return false;
-            IndexHelper.ColumnIndexInfo curColPostion = columnIndexList_.get(curRangeIndex_);
-            long start = curColPostion.position();
-            long end = curRangeIndex_ < columnIndexList_.size() - 1
-                       ? columnIndexList_.get(curRangeIndex_+1).position()
-                       : allColumnsSize_;
-
-            /* seek to the correct offset to the data, and calculate the data size */
-            file_.seek(columnStartPosition_ + start);
-            long dataSize = end - start;
-
-            bufOut.reset();
-            // write CF info
-            bufOut.writeUTF(cfName_);
-            bufOut.writeUTF(cfType_);
-            bufOut.writeInt(indexType_);
-            bufOut.writeInt(localDeletionTime_);
-            bufOut.writeLong(markedForDeleteAt_);
-            // now write the columns
-            bufOut.writeInt(curColPostion.count());
-            bufOut.write(file_, (int)dataSize);
-            return true;
-        }
-
-        public boolean getNextBlock(DataOutputBuffer outBuf) throws IOException
-        {
-            boolean result = getBlockFromCurIndex(outBuf);
-            if (isAscending_)
-                curRangeIndex_++;
-            else
-                curRangeIndex_--;
-            return result;
-        }
-    }
-
-    public static abstract class AbstractReader implements IFileReader
-    {
-        private static final short utfPrefix_ = 2;
-        protected RandomAccessFile file_;
-        protected String filename_;
-
-        AbstractReader(String filename)
-        {
-            filename_ = filename;
-        }
-
-        String getTableName()
-        {
-            return SSTable.parseTableName(filename_);
-        }
-
-        public String getFileName()
-        {
-            return filename_;
-        }
-
-        long seekTo(long position) throws IOException
-        {
-            if (position >= 0)
-                seek(position);
-            return position;
-        }
-
-        /**
-         * Defreeze the bloom filter.
-         *
-         * @return bloom filter summarizing the column information
-         * @throws IOException
-         */
-        private BloomFilter defreezeBloomFilter() throws IOException
-        {
-            int size = file_.readInt();
-            byte[] bytes = new byte[size];
-            file_.readFully(bytes);
-            DataInputBuffer bufIn = new DataInputBuffer();
-            bufIn.reset(bytes, bytes.length);
-            BloomFilter bf = BloomFilter.serializer().deserialize(bufIn);
-            return bf;
-        }
-
-        /**
-         * Reads the column name indexes if present. If the
-         * indexes are based on time then skip over them.
-         *
-         * @param cfName
-         * @return
-         */
-        private int handleColumnNameIndexes(String cfName, List<IndexHelper.ColumnIndexInfo> columnIndexList) throws IOException
-        {
-            /* check if we have an index */
-            boolean hasColumnIndexes = file_.readBoolean();
-            int totalBytesRead = 1;
-            /* if we do then deserialize the index */
-            if (hasColumnIndexes)
-            {
-                String tableName = getTableName();
-                if (DatabaseDescriptor.isNameSortingEnabled(tableName, cfName))
+                public Object call() throws Exception
                 {
-                    /* read the index */
-                    totalBytesRead += IndexHelper.deserializeIndex(tableName, cfName, file_, columnIndexList);
+                    sync();
+                    return null;
                 }
-                else
-                {
-                    totalBytesRead += IndexHelper.skipIndex(file_);
-                }
-            }
-            return totalBytesRead;
-        }
+            };
 
-        /**
-         * Reads the column name indexes if present. If the
-         * indexes are based on time then skip over them.
-         *
-         * @param cfName
-         * @return
-         */
-        private int handleColumnTimeIndexes(String cfName, List<IndexHelper.ColumnIndexInfo> columnIndexList) throws IOException
-        {
-            /* check if we have an index */
-            boolean hasColumnIndexes = file_.readBoolean();
-            int totalBytesRead = 1;
-            /* if we do then deserialize the index */
-            if (hasColumnIndexes)
+            new Thread(new Runnable()
             {
-                if (DatabaseDescriptor.isTimeSortingEnabled(null, cfName))
+                public void run()
                 {
-                    /* read the index */
-                    totalBytesRead += IndexHelper.deserializeIndex(getTableName(), cfName, file_, columnIndexList);
-                }
-                else
-                {
-                    totalBytesRead += IndexHelper.skipIndex(file_);
-                }
-            }
-            return totalBytesRead;
-        }
-
-        /**
-         * This method dumps the next key/value into the DataOuputStream
-         * passed in. Always use this method to query for application
-         * specific data as it will have indexes.
-         *
-         * @param key       key we are interested in.
-         * @param bufOut    DataOutputStream that needs to be filled.
-         * @param columnFamilyName name of the columnFamily
-         * @param columnNames columnNames we are interested in
-         * OR
-         * @param timeRange time range we are interested in
-         * @param position
-         * @return number of bytes that were read.
-         * @throws IOException
-         */
-        public long next(String key, DataOutputBuffer bufOut, String columnFamilyName, List<String> columnNames, IndexHelper.TimeRange timeRange, long position) throws IOException
-        {
-            assert !columnFamilyName.contains(":");
-            assert timeRange == null || columnNames == null; // at most one may be non-null
-
-            long bytesRead = -1L;
-            if (isEOF() || seekTo(position) < 0)
-                return bytesRead;
-
-            /* note the position where the key starts */
-            long startPosition = file_.getFilePointer();
-            String keyInDisk = file_.readUTF();
-            if (keyInDisk != null)
-            {
-                /*
-                 * If key on disk is greater than requested key
-                 * we can bail out since we exploit the property
-                 * of the SSTable format.
-                */
-                if (keyInDisk.compareTo(key) > 0)
-                    return bytesRead;
-
-                /*
-                 * If we found the key then we populate the buffer that
-                 * is passed in. If not then we skip over this key and
-                 * position ourselves to read the next one.
-                */
-                if (keyInDisk.equals(key))
-                {
-                    if (timeRange == null) {
-                        readColumns(key, bufOut, columnFamilyName, columnNames);
-                    } else {
-                        readTimeRange(key, bufOut, columnFamilyName, timeRange);
+                    while (true)
+                    {
+                        try
+                        {
+                            executor.submit(syncer).get();
+                            Thread.sleep(DatabaseDescriptor.getCommitLogSyncPeriod());
+                        }
+                        catch (InterruptedException e)
+                        {
+                            throw new AssertionError(e);
+                        }
+                        catch (ExecutionException e)
+                        {
+                            throw new RuntimeException(e);
+                        }
                     }
                 }
-                else
+            }, "PERIODIC-COMMIT-LOG-SYNCER").start();
+        }
+        else
+        {
+            executor = new BatchCommitLogExecutorService();
+        }
+    }
+
+    public static void recover() throws IOException
+    {
+        String directory = DatabaseDescriptor.getLogFileLocation();
+        File file = new File(directory);
+        File[] files = file.listFiles(new FilenameFilter()
+        {
+            public boolean accept(File dir, String name)
+            {
+                return CommitLogSegment.possibleCommitLogFile(name);
+            }
+        });
+        if (files.length == 0)
+            return;
+
+        Arrays.sort(files, new FileUtils.FileComparator());
+        logger.info("Replaying " + StringUtils.join(files, ", "));
+        recover(files);
+        FileUtils.delete(files);
+        logger.info("Log replay complete");
+    }
+
+    public static void recover(File[] clogs) throws IOException
+    {
+        Set<Table> tablesRecovered = new HashSet<Table>();
+        final AtomicInteger counter = new AtomicInteger(0);
+        for (File file : clogs)
+        {
+            int bufferSize = (int)Math.min(file.length(), 32 * 1024 * 1024);
+            BufferedRandomAccessFile reader = new BufferedRandomAccessFile(file.getAbsolutePath(), "r", bufferSize);
+            final CommitLogHeader clHeader = CommitLogHeader.readCommitLogHeader(reader);
+            final Map<Pair<String, String>, Integer> cfIdMap = clHeader.getCfIdMap();
+            /* seek to the lowest position where any CF has non-flushed data */
+            int lowPos = CommitLogHeader.getLowestPosition(clHeader);
+            if (lowPos == 0)
+                break;
+
+            reader.seek(lowPos);
+            if (logger.isDebugEnabled())
+                logger.debug("Replaying " + file + " starting at " + lowPos);
+
+            /* read the logs populate RowMutation and apply */
+            while (!reader.isEOF())
+            {
+                if (logger.isDebugEnabled())
+                    logger.debug("Reading mutation at " + reader.getFilePointer());
+
+                long claimedCRC32;
+                byte[] bytes;
+                try
                 {
-                    /* skip over data portion */
-                    int dataSize = file_.readInt();
-                    file_.seek(dataSize + file_.getFilePointer());
+                    bytes = new byte[reader.readInt()]; // readInt can throw EOFException too
+                    reader.readFully(bytes);
+                    claimedCRC32 = reader.readLong();
+                }
+                catch (EOFException e)
+                {
+                    // last CL entry didn't get completely written.  that's ok.
+                    break;
                 }
 
-                long endPosition = file_.getFilePointer();
-                bytesRead = endPosition - startPosition;
-            }
-
-            return bytesRead;
-        }
-
-        private void readTimeRange(String key, DataOutputBuffer bufOut, String columnFamilyName, IndexHelper.TimeRange timeRange)
-                throws IOException
-        {
-            int dataSize = file_.readInt();
-
-            /* write the key into buffer */
-            bufOut.writeUTF(key);
-
-            int bytesSkipped = IndexHelper.skipBloomFilter(file_);
-            /*
-             * read the correct number of bytes for the column family and
-             * write data into buffer. Substract from dataSize the bloom
-             * filter size.
-            */
-            dataSize -= bytesSkipped;
-            List<IndexHelper.ColumnIndexInfo> columnIndexList = new ArrayList<IndexHelper.ColumnIndexInfo>();
-            /* Read the times indexes if present */
-            int totalBytesRead = handleColumnTimeIndexes(columnFamilyName, columnIndexList);
-            dataSize -= totalBytesRead;
-
-            /* read the column family name */
-            String cfName = file_.readUTF();
-            dataSize -= (utfPrefix_ + cfName.length());
-
-            String cfType = file_.readUTF();
-            dataSize -= (utfPrefix_ + cfType.length());
-
-            int indexType = file_.readInt();
-            dataSize -= 4;
-
-            /* read local deletion time */
-            int localDeletionTime = file_.readInt();
-            dataSize -=4;
-
-            /* read if this cf is marked for delete */
-            long markedForDeleteAt = file_.readLong();
-            dataSize -= 8;
-
-            /* read the total number of columns */
-            int totalNumCols = file_.readInt();
-            dataSize -= 4;
-
-            /* get the column range we have to read */
-            IndexHelper.ColumnRange columnRange = IndexHelper.getColumnRangeFromTimeIndex(timeRange, columnIndexList, dataSize, totalNumCols);
-
-            Coordinate coordinate = columnRange.coordinate();
-            /* seek to the correct offset to the data, and calculate the data size */
-            file_.skipBytes((int) coordinate.start_);
-            dataSize = (int) (coordinate.end_ - coordinate.start_);
-
-            // returned data size
-            bufOut.writeInt(dataSize + utfPrefix_ * 2 + cfName.length() + cfType.length() + 4 + 4 + 8 + 4);
-            // echo back the CF data we read
-            bufOut.writeUTF(cfName);
-            bufOut.writeUTF(cfType);
-            bufOut.writeInt(indexType);
-            bufOut.writeInt(localDeletionTime);
-            bufOut.writeLong(markedForDeleteAt);
-            /* write number of columns */
-            bufOut.writeInt(columnRange.count());
-            /* now write the columns */
-            bufOut.write(file_, dataSize);
-        }
-
-        private void readColumns(String key, DataOutputBuffer bufOut, String columnFamilyName, List<String> cNames)
-                throws IOException
-        {
-            int dataSize = file_.readInt();
-
-            /* write the key into buffer */
-            bufOut.writeUTF(key);
-
-            /* if we need to read the all the columns do not read the column indexes */
-            if (cNames == null || cNames.size() == 0)
-            {
-                int bytesSkipped = IndexHelper.skipBloomFilterAndIndex(file_);
-                /*
-                       * read the correct number of bytes for the column family and
-                       * write data into buffer
-                      */
-                dataSize -= bytesSkipped;
-                /* write the data size */
-                bufOut.writeInt(dataSize);
-                /* write the data into buffer, except the boolean we have read */
-                bufOut.write(file_, dataSize);
-            }
-            else
-            {
-                /* Read the bloom filter summarizing the columns */
-                long preBfPos = file_.getFilePointer();
-                BloomFilter bf = defreezeBloomFilter();
-                long postBfPos = file_.getFilePointer();
-                dataSize -= (postBfPos - preBfPos);
-
-                List<IndexHelper.ColumnIndexInfo> columnIndexList = new ArrayList<IndexHelper.ColumnIndexInfo>();
-                /* read the column name indexes if present */
-                int totalBytesRead = handleColumnNameIndexes(columnFamilyName, columnIndexList);
-                dataSize -= totalBytesRead;
-
-                /* read the column family name */
-                String cfName = file_.readUTF();
-                dataSize -= (utfPrefix_ + cfName.length());
-
-                String cfType = file_.readUTF();
-                dataSize -= (utfPrefix_ + cfType.length());
-
-                int indexType = file_.readInt();
-                dataSize -= 4;
-
-                /* read local deletion time */
-                int localDeletionTime = file_.readInt();
-                dataSize -=4;
-
-                /* read if this cf is marked for delete */
-                long markedForDeleteAt = file_.readLong();
-                dataSize -= 8;
-
-                /* read the total number of columns */
-                int totalNumCols = file_.readInt();
-                dataSize -= 4;
-
-                // TODO: this is name sorted - but eventually this should be sorted by the same criteria as the col index
-                /* sort the required list of columns */
-                cNames = new ArrayList<String>(cNames);
-                Collections.sort(cNames);
-                /* get the various column ranges we have to read */
-                List<IndexHelper.ColumnRange> columnRanges = IndexHelper.getMultiColumnRangesFromNameIndex(cNames, columnIndexList, dataSize, totalNumCols);
-
-                /* calculate the data size */
-                int numColsReturned = 0;
-                int dataSizeReturned = 0;
-                for (IndexHelper.ColumnRange columnRange : columnRanges)
+                ByteArrayInputStream bufIn = new ByteArrayInputStream(bytes);
+                Checksum checksum = new CRC32();
+                checksum.update(bytes, 0, bytes.length);
+                if (claimedCRC32 != checksum.getValue())
                 {
-                    numColsReturned += columnRange.count();
-                    Coordinate coordinate = columnRange.coordinate();
-                    dataSizeReturned += coordinate.end_ - coordinate.start_;
+                    // this part of the log must not have been fsynced.  probably the rest is bad too,
+                    // but just in case there is no harm in trying them.
+                    continue;
                 }
 
-                // returned data size
-                bufOut.writeInt(dataSizeReturned + utfPrefix_ * 2 + cfName.length() + cfType.length() + 4 + 4 + 8 + 4);
-                // echo back the CF data we read
-                bufOut.writeUTF(cfName);
-                bufOut.writeUTF(cfType);
-                bufOut.writeInt(indexType);
-                bufOut.writeInt(localDeletionTime);
-                bufOut.writeLong(markedForDeleteAt);
-                /* write number of columns */
-                bufOut.writeInt(numColsReturned);
-                int prevPosition = 0;
-                /* now write all the columns we are required to write */
-                for (IndexHelper.ColumnRange columnRange : columnRanges)
+                /* deserialize the commit log entry */
+                final RowMutation rm = RowMutation.serializer().deserialize(new DataInputStream(bufIn));
+                if (logger.isDebugEnabled())
+                    logger.debug(String.format("replaying mutation for %s.%s: %s",
+                                                rm.getTable(),
+                                                rm.key(),
+                                                "{" + StringUtils.join(rm.getColumnFamilies(), ", ") + "}"));
+                final Table table = Table.open(rm.getTable());
+                tablesRecovered.add(table);
+                final Collection<ColumnFamily> columnFamilies = new ArrayList<ColumnFamily>(rm.getColumnFamilies());
+                final long entryLocation = reader.getFilePointer();
+                Runnable runnable = new WrappedRunnable()
                 {
-                    /* seek to the correct offset to the data */
-                    Coordinate coordinate = columnRange.coordinate();
-                    file_.skipBytes((int) (coordinate.start_ - prevPosition));
-                    bufOut.write(file_, (int) (coordinate.end_ - coordinate.start_));
-                    prevPosition = (int) coordinate.end_;
-                }
+                    public void runMayThrow() throws IOException
+                    {
+                        RowMutation newRm = new RowMutation(rm.getTable(), rm.key());
+                        
+                        // Rebuild the row mutation, omitting column families that a) have already been flushed,
+                        // b) are part of a cf that was dropped. Keep in mind that the cf.name() is suspect. do every
+                        // thing based on the cfid instead.
+                        for (ColumnFamily columnFamily : columnFamilies)
+                        {
+                            // make sure to use the current name of the cf (null means its been dropped).
+                            String currentName = CFMetaData.getCurrentName(columnFamily.id());
+                            if (currentName == null)
+                                continue;
+                            else if (!currentName.equals(columnFamily.name()))
+                                columnFamily.rename(currentName);
+                            
+                            if (clHeader.isDirty(columnFamily.id()) && entryLocation >= clHeader.getPosition(columnFamily.id()))
+                                newRm.add(columnFamily);
+                        }
+                        if (!newRm.isEmpty())
+                        {
+                            Table.open(newRm.getTable()).apply(newRm, null, false);
+                        }
+                        counter.decrementAndGet();
+                    }
+                };
+                counter.incrementAndGet();
+                StageManager.getStage(StageManager.MUTATION_STAGE).submit(runnable);
             }
+            reader.close();
         }
 
-        /**
-         * This method dumps the next key/value into the DataOuputStream
-         * passed in.
-         *
-         * @param bufOut DataOutputStream that needs to be filled.
-         * @return total number of bytes read/considered
-         */
-        public long next(DataOutputBuffer bufOut) throws IOException
+        // wait for all the writes to finish on the mutation stage
+        while (counter.get() > 0)
         {
-            long bytesRead = -1L;
-            if (isEOF())
-                return bytesRead;
-
-            long startPosition = file_.getFilePointer();
-            String key = file_.readUTF();
-            if (key != null)
+            try
             {
-                /* write the key into buffer */
-                bufOut.writeUTF(key);
-                int dataSize = file_.readInt();
-                /* write data size into buffer */
-                bufOut.writeInt(dataSize);
-                /* write the data into buffer */
-                bufOut.write(file_, dataSize);
-                long endPosition = file_.getFilePointer();
-                bytesRead = endPosition - startPosition;
+                Thread.sleep(10);
             }
+            catch (InterruptedException e)
+            {
+                throw new AssertionError(e);
+            }
+        }
 
-            /*
-             * If we have read the bloom filter in the data
-             * file we know we are at the end of the file
-             * and no further key processing is required. So
-             * we return -1 indicating we are at the end of
-             * the file.
-            */
-            if (key.equals(SequenceFile.marker_))
-                bytesRead = -1L;
-            return bytesRead;
+        // flush replayed tables
+        List<Future<?>> futures = new ArrayList<Future<?>>();
+        for (Table table : tablesRecovered)
+        {
+            futures.addAll(table.flush());
+        }
+        // wait for flushes to finish
+        for (Future<?> future : futures)
+        {
+            try
+            {
+                future.get();
+            }
+            catch (Exception e)
+            {
+                throw new RuntimeException(e);
+            }
         }
     }
 
-    public static class Reader extends AbstractReader
+    private CommitLogSegment currentSegment()
     {
-        Reader(String filename) throws IOException
+        return segments.getLast();
+    }
+    
+    public CommitLogSegment.CommitLogContext getContext()
+    {
+        Callable<CommitLogSegment.CommitLogContext> task = new Callable<CommitLogSegment.CommitLogContext>()
         {
-            super(filename);
-            init(filename);
+            public CommitLogSegment.CommitLogContext call() throws Exception
+            {
+                return currentSegment().getContext();
+            }
+        };
+        try
+        {
+            return executor.submit(task).get();
         }
-
-        protected void init(String filename) throws IOException
+        catch (InterruptedException e)
         {
-            file_ = new RandomAccessFile(filename, "r");
+            throw new RuntimeException(e);
         }
-
-        public long getEOF() throws IOException
+        catch (ExecutionException e)
         {
-            return file_.length();
-        }
-
-        public long getCurrentPosition() throws IOException
-        {
-            return file_.getFilePointer();
-        }
-
-        public boolean isHealthyFileDescriptor() throws IOException
-        {
-            return file_.getFD().valid();
-        }
-
-        public void seek(long position) throws IOException
-        {
-            file_.seek(position);
-        }
-
-        public boolean isEOF() throws IOException
-        {
-            return (getCurrentPosition() == getEOF());
-        }
-
-        /**
-         * Be extremely careful while using this API. This currently
-         * used to read the commit log header from the commit logs.
-         * Treat this as an internal API.
-         *
-         * @param bytes read from the buffer into the this array
-         */
-        public void readDirect(byte[] bytes) throws IOException
-        {
-            file_.readFully(bytes);
-        }
-
-        public long readLong() throws IOException
-        {
-            return file_.readLong();
-        }
-
-        public void close() throws IOException
-        {
-            file_.close();
+            throw new RuntimeException(e);
         }
     }
 
-    public static class BufferReader extends Reader
+    /*
+     * Adds the specified row to the commit log. This method will reset the
+     * file offset to what it is before the start of the operation in case
+     * of any problems. This way we can assume that the subsequent commit log
+     * entry will override the garbage left over by the previous write.
+    */
+    public void add(RowMutation rowMutation, Object serializedRow) throws IOException
     {
-        private int size_;
+        executor.add(new LogRecordAdder(rowMutation, serializedRow));
+    }
 
-        BufferReader(String filename, int size) throws IOException
+    /*
+     * This is called on Memtable flush to add to the commit log
+     * a token indicating that this column family has been flushed.
+     * The bit flag associated with this column family is set in the
+     * header and this is used to decide if the log file can be deleted.
+    */
+    public void discardCompletedSegments(final int cfId, final CommitLogSegment.CommitLogContext context) throws IOException
+    {
+        Callable task = new Callable()
         {
-            super(filename);
-            size_ = size;
-        }
-
-        protected void init(String filename) throws IOException
+            public Object call() throws IOException
+            {
+                discardCompletedSegmentsInternal(context, cfId);
+                return null;
+            }
+        };
+        try
         {
-            file_ = new BufferedRandomAccessFile(filename, "r", size_);
+            executor.submit(task).get();
         }
-    }
-
-    private static Logger logger_ = Logger.getLogger(SequenceFile.class);
-    public static final short utfPrefix_ = 2;
-    public static final String marker_ = "Bloom-Filter";
-
-    public static IFileWriter writer(String filename) throws IOException
-    {
-        return new Writer(filename);
-    }
-
-    public static IFileWriter bufferedWriter(String filename, int size) throws IOException
-    {
-        return new BufferWriter(filename, size);
-    }
-
-    public static IFileReader reader(String filename) throws IOException
-    {
-        return new Reader(filename);
-    }
-
-    public static IFileReader bufferedReader(String filename, int size) throws IOException
-    {
-        return new BufferReader(filename, size);
+        catch (InterruptedException e)
+        {
+            throw new RuntimeException(e);
+        }
+        catch (ExecutionException e)
+        {
+            throw new RuntimeException(e);
+        }
     }
 
     /**
-     * Efficiently writes a UTF8 string to the buffer.
-     * Assuming all Strings that are passed in have length
-     * that can be represented as a short i.e length of the
-     * string is <= 65535
+     * Delete log segments whose contents have been turned into SSTables. NOT threadsafe.
      *
-     * @param buffer buffer to write the serialize version into
-     * @param str    string to serialize
-     */
-    protected static void writeUTF(ByteBuffer buffer, String str)
+     * param @ context The commitLog context .
+     * param @ id id of the columnFamily being flushed to disk.
+     *
+    */
+    private void discardCompletedSegmentsInternal(CommitLogSegment.CommitLogContext context, int id) throws IOException
     {
-        int strlen = str.length();
-        int utflen = 0;
-        int c, count = 0;
+        if (logger.isDebugEnabled())
+            logger.debug("discard completed log segments for " + context + ", column family " + id + ".");
 
-        /* use charAt instead of copying String to char array */
-        for (int i = 0; i < strlen; i++)
+        /*
+         * log replay assumes that we only have to look at entries past the last
+         * flush position, so verify that this flush happens after the last. See CASSANDRA-936
+        */
+        assert context.position >= context.getSegment().getHeader().getPosition(id)
+               : "discard at " + context + " is not after last flush at " + context.getSegment().getHeader().getPosition(id);
+        /*
+         * Loop through all the commit log files in the history. Now process
+         * all files that are older than the one in the context. For each of
+         * these files the header needs to modified by resetting the dirty
+         * bit corresponding to the flushed CF.
+        */
+        Iterator<CommitLogSegment> iter = segments.iterator();
+        while (iter.hasNext())
         {
-            c = str.charAt(i);
-            if ((c >= 0x0001) && (c <= 0x007F))
+            CommitLogSegment segment = iter.next();
+            CommitLogHeader header = segment.getHeader();
+            if (segment.equals(context.getSegment()))
             {
-                utflen++;
-            }
-            else if (c > 0x07FF)
-            {
-                utflen += 3;
-            }
-            else
-            {
-                utflen += 2;
-            }
-        }
-
-        byte[] bytearr = new byte[utflen + 2];
-        bytearr[count++] = (byte) ((utflen >>> 8) & 0xFF);
-        bytearr[count++] = (byte) ((utflen >>> 0) & 0xFF);
-
-        int i = 0;
-        for (i = 0; i < strlen; i++)
-        {
-            c = str.charAt(i);
-            if (!((c >= 0x0001) && (c <= 0x007F)))
+                // we can't just mark the segment where the flush happened clean,
+                // since there may have been writes to it between when the flush
+                // started and when it finished. so mark the flush position as
+                // the replay point for this CF, instead.
+                if (logger.isDebugEnabled())
+                    logger.debug("Marking replay position " + context.position + " on commit log " + segment);
+                header.turnOn(id, context.position);
+                segment.writeHeader();
                 break;
-            bytearr[count++] = (byte) c;
-        }
-
-        for (; i < strlen; i++)
-        {
-            c = str.charAt(i);
-            if ((c >= 0x0001) && (c <= 0x007F))
-            {
-                bytearr[count++] = (byte) c;
-
             }
-            else if (c > 0x07FF)
+
+            header.turnOff(id);
+            if (header.isSafeToDelete())
             {
-                bytearr[count++] = (byte) (0xE0 | ((c >> 12) & 0x0F));
-                bytearr[count++] = (byte) (0x80 | ((c >> 6) & 0x3F));
-                bytearr[count++] = (byte) (0x80 | ((c >> 0) & 0x3F));
+                logger.info("Discarding obsolete commit log:" + segment);
+                segment.close();
+                DeletionService.submitDelete(segment.getPath());
+                // usually this will be the first (remaining) segment, but not always, if segment A contains
+                // writes to a CF that is unflushed but is followed by segment B whose CFs are all flushed.
+                iter.remove();
             }
             else
             {
-                bytearr[count++] = (byte) (0xC0 | ((c >> 6) & 0x1F));
-                bytearr[count++] = (byte) (0x80 | ((c >> 0) & 0x3F));
+                if (logger.isDebugEnabled())
+                    logger.debug("Not safe to delete commit log " + segment + "; dirty is " + header.dirtyString());
+                segment.writeHeader();
             }
         }
-        buffer.put(bytearr, 0, utflen + 2);
+    }
+    
+    public void forceNewSegment()
+    {
+        Callable task = new Callable()
+        {
+            public Object call() throws Exception
+            {
+                sync();
+                segments.add(new CommitLogSegment());
+                return null;
+            }
+        };
+        try
+        {
+            executor.submit(task).get();
+        }
+        catch (InterruptedException e)
+        {
+            throw new RuntimeException(e);
+        }
+        catch (ExecutionException e)
+        {
+            throw new RuntimeException(e);
+        }
     }
 
+    void sync() throws IOException
+    {
+        currentSegment().sync();
+    }
+
+    // TODO this should be a Runnable since it doesn't actually return anything, but it's difficult to do that
+    // without breaking the fragile CheaterFutureTask in BatchCLES.
+    class LogRecordAdder implements Callable, Runnable
+    {
+        final RowMutation rowMutation;
+        final Object serializedRow;
+
+        LogRecordAdder(RowMutation rm, Object serializedRow)
+        {
+            this.rowMutation = rm;
+            this.serializedRow = serializedRow;
+        }
+
+        public void run()
+        {
+            try
+            {
+                currentSegment().write(rowMutation, serializedRow);
+                // roll log if necessary
+                if (currentSegment().length() >= SEGMENT_SIZE)
+                {
+                    sync();
+                    segments.add(new CommitLogSegment());
+                }
+            }
+            catch (IOException e)
+            {
+                throw new IOError(e);
+            }
+        }
+
+        public Object call() throws Exception
+        {
+            run();
+            return null;
+        }
+    }
 }

@@ -1,6 +1,6 @@
-void startDocument() {
+public Map<String, Pair<Integer, Collection<SearchGroup<BytesRef>>>> transformToNative(NamedList<NamedList> shardResponse, Sort groupSort, Sort sortWithinGroup, String shard) {
 
-package org.apache.lucene.index;
+package org.apache.solr.search.grouping.distributed.shardresultserializer;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,169 +19,111 @@ package org.apache.lucene.index;
  * limitations under the License.
  */
 
-import java.io.IOException;
-import java.util.Map;
-
-import org.apache.lucene.codecs.TermVectorsWriter;
-import org.apache.lucene.store.FlushInfo;
-import org.apache.lucene.store.IOContext;
-import org.apache.lucene.util.ArrayUtil;
+import org.apache.lucene.search.Sort;
+import org.apache.lucene.search.grouping.SearchGroup;
 import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.IOUtils;
-import org.apache.lucene.util.RamUsageEstimator;
+import org.apache.lucene.util.CharsRef;
+import org.apache.lucene.util.UnicodeUtil;
+import org.apache.solr.common.util.NamedList;
+import org.apache.solr.schema.FieldType;
+import org.apache.solr.schema.SchemaField;
+import org.apache.solr.search.SolrIndexSearcher;
+import org.apache.solr.search.grouping.Command;
+import org.apache.solr.search.grouping.distributed.command.Pair;
+import org.apache.solr.search.grouping.distributed.command.SearchGroupsFieldCommand;
 
-final class TermVectorsConsumer extends TermsHashConsumer {
+import java.io.IOException;
+import java.util.*;
 
-  TermVectorsWriter writer;
-  final DocumentsWriterPerThread docWriter;
-  int freeCount;
-  int lastDocID;
+/**
+ * Implementation for transforming {@link SearchGroup} into a {@link NamedList} structure and visa versa.
+ */
+public class SearchGroupsResultTransformer implements ShardResultTransformer<List<Command>, Map<String, Pair<Integer, Collection<SearchGroup<BytesRef>>>>> {
 
-  final DocumentsWriterPerThread.DocState docState;
-  final BytesRef flushTerm = new BytesRef();
+  private final SolrIndexSearcher searcher;
 
-  // Used by perField when serializing the term vectors
-  final ByteSliceReader vectorSliceReaderPos = new ByteSliceReader();
-  final ByteSliceReader vectorSliceReaderOff = new ByteSliceReader();
-  boolean hasVectors;
-
-  public TermVectorsConsumer(DocumentsWriterPerThread docWriter) {
-    this.docWriter = docWriter;
-    docState = docWriter.docState;
+  public SearchGroupsResultTransformer(SolrIndexSearcher searcher) {
+    this.searcher = searcher;
   }
 
-  @Override
-  void flush(Map<String, TermsHashConsumerPerField> fieldsToFlush, final SegmentWriteState state) throws IOException {
-    if (writer != null) {
-      int numDocs = state.segmentInfo.getDocCount();
-      // At least one doc in this run had term vectors enabled
-      try {
-        fill(numDocs);
-        assert state.segmentInfo != null;
-        writer.finish(state.fieldInfos, numDocs);
-      } finally {
-        IOUtils.close(writer);
-        writer = null;
-
-        lastDocID = 0;
-        hasVectors = false;
+  /**
+   * {@inheritDoc}
+   */
+  public NamedList transform(List<Command> data) throws IOException {
+    NamedList<NamedList> result = new NamedList<NamedList>();
+    for (Command command : data) {
+      final NamedList<Object> commandResult = new NamedList<Object>();
+      if (SearchGroupsFieldCommand.class.isInstance(command)) {
+        SearchGroupsFieldCommand fieldCommand = (SearchGroupsFieldCommand) command;
+        Pair<Integer, Collection<SearchGroup<BytesRef>>> pair = fieldCommand.result();
+        Integer groupedCount = pair.getA();
+        Collection<SearchGroup<BytesRef>> searchGroups = pair.getB();
+        if (searchGroups != null) {
+          commandResult.add("topGroups", serializeSearchGroup(searchGroups, fieldCommand.getGroupSort()));
+        }
+        if (groupedCount != null) {
+          commandResult.add("groupCount", groupedCount);
+        }
+      } else {
+        continue;
       }
+
+      result.add(command.getKey(), commandResult);
+    }
+    return result;
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  public Map<String, Pair<Integer, Collection<SearchGroup<BytesRef>>>> transformToNative(NamedList<NamedList> shardResponse, Sort groupSort, Sort sortWithinGroup, String shard) throws IOException {
+    Map<String, Pair<Integer, Collection<SearchGroup<BytesRef>>>> result = new HashMap<String, Pair<Integer, Collection<SearchGroup<BytesRef>>>>();
+    for (Map.Entry<String, NamedList> command : shardResponse) {
+      List<SearchGroup<BytesRef>> searchGroups = new ArrayList<SearchGroup<BytesRef>>();
+      NamedList topGroupsAndGroupCount = command.getValue();
+      @SuppressWarnings("unchecked")
+      NamedList<List<Comparable>> rawSearchGroups = (NamedList<List<Comparable>>) topGroupsAndGroupCount.get("topGroups");
+      if (rawSearchGroups != null) {
+        for (Map.Entry<String, List<Comparable>> rawSearchGroup : rawSearchGroups){
+          SearchGroup<BytesRef> searchGroup = new SearchGroup<BytesRef>();
+          searchGroup.groupValue = rawSearchGroup.getKey() != null ? new BytesRef(rawSearchGroup.getKey()) : null;
+          searchGroup.sortValues = rawSearchGroup.getValue().toArray(new Comparable[rawSearchGroup.getValue().size()]);
+          searchGroups.add(searchGroup);
+        }
+      }
+
+      Integer groupCount = (Integer) topGroupsAndGroupCount.get("groupCount");
+      result.put(command.getKey(), new Pair<Integer, Collection<SearchGroup<BytesRef>>>(groupCount, searchGroups));
+    }
+    return result;
+  }
+
+  private NamedList serializeSearchGroup(Collection<SearchGroup<BytesRef>> data, Sort groupSort) {
+    NamedList<Comparable[]> result = new NamedList<Comparable[]>();
+    CharsRef spare = new CharsRef();
+
+    for (SearchGroup<BytesRef> searchGroup : data) {
+      Comparable[] convertedSortValues = new Comparable[searchGroup.sortValues.length];
+      for (int i = 0; i < searchGroup.sortValues.length; i++) {
+        Comparable sortValue = (Comparable) searchGroup.sortValues[i];
+        SchemaField field = groupSort.getSort()[i].getField() != null ? searcher.getSchema().getFieldOrNull(groupSort.getSort()[i].getField()) : null;
+        if (field != null) {
+          FieldType fieldType = field.getType();
+          if (sortValue instanceof BytesRef) {
+            UnicodeUtil.UTF8toUTF16((BytesRef)sortValue, spare);
+            String indexedValue = spare.toString();
+            sortValue = (Comparable) fieldType.toObject(field.createField(fieldType.indexedToReadable(indexedValue), 0.0f));
+          } else if (sortValue instanceof String) {
+            sortValue = (Comparable) fieldType.toObject(field.createField(fieldType.indexedToReadable((String) sortValue), 0.0f));
+          }
+        }
+        convertedSortValues[i] = sortValue;
+      }
+      String groupValue = searchGroup.groupValue != null ? searchGroup.groupValue.utf8ToString() : null;
+      result.add(groupValue, convertedSortValues);
     }
 
-    for (final TermsHashConsumerPerField field : fieldsToFlush.values() ) {
-      TermVectorsConsumerPerField perField = (TermVectorsConsumerPerField) field;
-      perField.termsHashPerField.reset();
-      perField.shrinkHash();
-    }
-  }
-
-  /** Fills in no-term-vectors for all docs we haven't seen
-   *  since the last doc that had term vectors. */
-  void fill(int docID) throws IOException {
-    while(lastDocID < docID) {
-      writer.startDocument(0);
-      lastDocID++;
-    }
-  }
-
-  private final void initTermVectorsWriter() throws IOException {
-    if (writer == null) {
-      IOContext context = new IOContext(new FlushInfo(docWriter.getNumDocsInRAM(), docWriter.bytesUsed()));
-      writer = docWriter.codec.termVectorsFormat().vectorsWriter(docWriter.directory, docWriter.getSegmentInfo(), context);
-      lastDocID = 0;
-    }
-  }
-
-  @Override
-  void finishDocument(TermsHash termsHash) throws IOException {
-
-    assert docWriter.writer.testPoint("TermVectorsTermsWriter.finishDocument start");
-
-    if (!hasVectors) {
-      return;
-    }
-
-    initTermVectorsWriter();
-
-    fill(docState.docID);
-
-    // Append term vectors to the real outputs:
-    writer.startDocument(numVectorFields);
-    for (int i = 0; i < numVectorFields; i++) {
-      perFields[i].finishDocument();
-    }
-
-    assert lastDocID == docState.docID: "lastDocID=" + lastDocID + " docState.docID=" + docState.docID;
-
-    lastDocID++;
-
-    termsHash.reset();
-    reset();
-    assert docWriter.writer.testPoint("TermVectorsTermsWriter.finishDocument end");
-  }
-
-  @Override
-  public void abort() {
-    hasVectors = false;
-
-    if (writer != null) {
-      writer.abort();
-      writer = null;
-    }
-
-    lastDocID = 0;
-
-    reset();
-  }
-
-  int numVectorFields;
-
-  TermVectorsConsumerPerField[] perFields;
-
-  void reset() {
-    numVectorFields = 0;
-    perFields = new TermVectorsConsumerPerField[1];
-  }
-
-  @Override
-  public TermsHashConsumerPerField addField(TermsHashPerField termsHashPerField, FieldInfo fieldInfo) {
-    return new TermVectorsConsumerPerField(termsHashPerField, this, fieldInfo);
-  }
-
-  void addFieldToFlush(TermVectorsConsumerPerField fieldToFlush) {
-    if (numVectorFields == perFields.length) {
-      int newSize = ArrayUtil.oversize(numVectorFields + 1, RamUsageEstimator.NUM_BYTES_OBJECT_REF);
-      TermVectorsConsumerPerField[] newArray = new TermVectorsConsumerPerField[newSize];
-      System.arraycopy(perFields, 0, newArray, 0, numVectorFields);
-      perFields = newArray;
-    }
-
-    perFields[numVectorFields++] = fieldToFlush;
-  }
-
-  @Override
-  void startDocument() throws IOException {
-    assert clearLastVectorFieldName();
-    reset();
-  }
-
-  // Called only by assert
-  final boolean clearLastVectorFieldName() {
-    lastVectorFieldName = null;
-    return true;
-  }
-
-  // Called only by assert
-  String lastVectorFieldName;
-  final boolean vectorFieldsInOrder(FieldInfo fi) {
-    try {
-      if (lastVectorFieldName != null)
-        return lastVectorFieldName.compareTo(fi.name) < 0;
-      else
-        return true;
-    } finally {
-      lastVectorFieldName = fi.name;
-    }
+    return result;
   }
 
 }

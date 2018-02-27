@@ -1,13 +1,12 @@
-return "filtered("+query.toString(s)+")";
-
-package org.apache.lucene.search;
+FuzzyKMeansDriver.main(args);
 
 /**
- * Copyright 2004 The Apache Software Foundation
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,107 +17,223 @@ package org.apache.lucene.search;
  * limitations under the License.
  */
 
-import org.apache.lucene.index.IndexReader;
-import java.io.IOException;
-import java.util.BitSet;
+package org.apache.mahout.clustering.fuzzykmeans;
 
+import java.util.List;
 
-/**
- * A query that applies a filter to the results of another query.
- *
- * <p>Note: the bits are retrieved from the filter each time this
- * query is used in a search - use a CachingWrapperFilter to avoid
- * regenerating the bits every time.
- *
- * <p>Created: Apr 20, 2004 8:58:29 AM
- *
- * @author  Tim Jones
- * @since   1.4
- * @version $Id$
- * @see     CachingWrapperFilter
- */
-public class FilteredQuery
-extends Query {
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.DataInputBuffer;
+import org.apache.hadoop.io.DataOutputBuffer;
+import org.apache.hadoop.io.SequenceFile;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.util.ToolRunner;
+import org.apache.mahout.clustering.ClusterObservations;
+import org.apache.mahout.clustering.ClusteringTestUtils;
+import org.apache.mahout.clustering.kmeans.TestKmeansClustering;
+import org.apache.mahout.common.HadoopUtil;
+import org.apache.mahout.common.MahoutTestCase;
+import org.apache.mahout.common.commandline.DefaultOptionCreator;
+import org.apache.mahout.common.distance.DistanceMeasure;
+import org.apache.mahout.common.distance.EuclideanDistanceMeasure;
+import org.apache.mahout.math.DenseVector;
+import org.apache.mahout.math.Vector;
+import org.apache.mahout.math.VectorWritable;
+import org.junit.Before;
+import org.junit.Test;
 
-  Query query;
-  Filter filter;
+import com.google.common.io.Closeables;
 
-  /**
-   * Constructs a new query which applies a filter to the results of the original query.
-   * Filter.bits() will be called every time this query is used in a search.
-   * @param query  Query to be filtered, cannot be <code>null</code>.
-   * @param filter Filter to apply to query results, cannot be <code>null</code>.
-   */
-  public FilteredQuery (Query query, Filter filter) {
-    this.query = query;
-    this.filter = filter;
+public final class TestFuzzyKmeansClustering extends MahoutTestCase {
+
+  private FileSystem fs;
+  private final DistanceMeasure measure = new EuclideanDistanceMeasure();
+
+  @Override
+  @Before
+  public void setUp() throws Exception {
+    super.setUp();
+    Configuration conf = new Configuration();
+    fs = FileSystem.get(conf);
   }
 
-  /**
-   * Returns a Weight that applies the filter to the enclosed query's Weight.
-   * This is accomplished by overriding the Scorer returned by the Weight.
-   */
-  protected Weight createWeight (final Searcher searcher) {
-    final Weight weight = query.createWeight (searcher);
-    return new Weight() {
+  private static double round(double val, int places) {
+    long factor = (long) Math.pow(10, places);
 
-      // pass these methods through to enclosed query's weight
-      public float getValue() { return weight.getValue(); }
-      public float sumOfSquaredWeights() throws IOException { return weight.sumOfSquaredWeights(); }
-      public void normalize (float v) { weight.normalize(v); }
-      public Explanation explain (IndexReader ir, int i) throws IOException { return weight.explain (ir, i); }
+    // Shift the decimal the correct number of places
+    // to the right.
+    val *= factor;
 
-      // return this query
-      public Query getQuery() { return FilteredQuery.this; }
+    // Round to the nearest integer.
+    long tmp = Math.round(val);
 
-      // return a scorer that overrides the enclosed query's score if
-      // the given hit has been filtered out.
-      public Scorer scorer (IndexReader indexReader) throws IOException {
-        final Scorer scorer = weight.scorer (indexReader);
-        final BitSet bitset = filter.bits (indexReader);
-        return new Scorer (query.getSimilarity (searcher)) {
+    // Shift the decimal the correct number of places
+    // back to the left.
+    return (double) tmp / factor;
+  }
 
-          // pass these methods through to the enclosed scorer
-          public boolean next() throws IOException { return scorer.next(); }
-          public int doc() { return scorer.doc(); }
-          public boolean skipTo (int i) throws IOException { return scorer.skipTo(i); }
+  private static Vector tweakValue(Vector point) {
+    return point.plus(0.1);
+  }
 
-          // if the document has been filtered out, set score to 0.0
-          public float score() throws IOException {
-            return (bitset.get(scorer.doc())) ? scorer.score() : 0.0f;
-          }
+  @Test
+  public void testFuzzyKMeansSeqJob() throws Exception {
+    List<VectorWritable> points = TestKmeansClustering.getPointsWritable(TestKmeansClustering.REFERENCE);
 
-          // add an explanation about whether the document was filtered
-          public Explanation explain (int i) throws IOException {
-            Explanation exp = scorer.explain (i);
-            if (bitset.get(i))
-              exp.setDescription ("allowed by filter: "+exp.getDescription());
-            else
-              exp.setDescription ("removed by filter: "+exp.getDescription());
-            return exp;
-          }
-        };
+    Path pointsPath = getTestTempDirPath("points");
+    Path clustersPath = getTestTempDirPath("clusters");
+    Configuration conf = new Configuration();
+    ClusteringTestUtils.writePointsToFile(points, new Path(pointsPath, "file1"), fs, conf);
+
+    for (int k = 0; k < points.size(); k++) {
+      System.out.println("testKFuzzyKMeansMRJob k= " + k);
+      // pick k initial cluster centers at random
+      SequenceFile.Writer writer = new SequenceFile.Writer(fs,
+                                                           conf,
+                                                           new Path(clustersPath, "part-00000"),
+                                                           Text.class,
+                                                           SoftCluster.class);
+      try {
+        for (int i = 0; i < k + 1; i++) {
+          Vector vec = tweakValue(points.get(i).get());
+          SoftCluster cluster = new SoftCluster(vec, i, measure);
+          /* add the center so the centroid will be correct upon output */
+          cluster.observe(cluster.getCenter(), 1);
+          // writer.write(cluster.getIdentifier() + '\t' + SoftCluster.formatCluster(cluster) + '\n');
+          writer.append(new Text(cluster.getIdentifier()), cluster);
+        }
+      } finally {
+        Closeables.closeQuietly(writer);
       }
-    };
-  }
 
-  /** Prints a user-readable version of this query. */
-  public String toString (String s) {
-    return "filtered("+query.toString()+")";
-  }
-
-  /** Returns true iff <code>o</code> is equal to this. */
-  public boolean equals(Object o) {
-    if (o instanceof FilteredQuery) {
-      FilteredQuery fq = (FilteredQuery) o;
-      return (query.equals(fq.query) && filter.equals(fq.filter));
+      // now run the Job using the run() command line options.
+      Path output = getTestTempDirPath("output");
+      /*      FuzzyKMeansDriver.runJob(pointsPath,
+                                     clustersPath,
+                                     output,
+                                     EuclideanDistanceMeasure.class.getName(),
+                                     0.001,
+                                     2,
+                                     k + 1,
+                                     2,
+                                     false,
+                                     true,
+                                     0);
+      */
+      String[] args = {
+          optKey(DefaultOptionCreator.INPUT_OPTION), pointsPath.toString(),
+          optKey(DefaultOptionCreator.CLUSTERS_IN_OPTION),
+          clustersPath.toString(),
+          optKey(DefaultOptionCreator.OUTPUT_OPTION),
+          output.toString(),
+          optKey(DefaultOptionCreator.DISTANCE_MEASURE_OPTION),
+          EuclideanDistanceMeasure.class.getName(),
+          optKey(DefaultOptionCreator.CONVERGENCE_DELTA_OPTION),
+          "0.001",
+          optKey(DefaultOptionCreator.MAX_ITERATIONS_OPTION),
+          "2",
+          optKey(FuzzyKMeansDriver.M_OPTION),
+          "2.0",
+          optKey(DefaultOptionCreator.CLUSTERING_OPTION),
+          optKey(DefaultOptionCreator.EMIT_MOST_LIKELY_OPTION),
+          optKey(DefaultOptionCreator.OVERWRITE_OPTION),
+          optKey(DefaultOptionCreator.METHOD_OPTION),
+          DefaultOptionCreator.SEQUENTIAL_METHOD
+      };
+      new FuzzyKMeansDriver().run(args);
+      long count = HadoopUtil.countRecords(new Path(output, "clusteredPoints/part-m-0"), conf);
+      assertTrue(count > 0);
     }
-    return false;
+
   }
 
-  /** Returns a hash code value for this object. */
-  public int hashCode() {
-    return query.hashCode() ^ filter.hashCode();
+  @Test
+  public void testFuzzyKMeansMRJob() throws Exception {
+    List<VectorWritable> points = TestKmeansClustering.getPointsWritable(TestKmeansClustering.REFERENCE);
+
+    Path pointsPath = getTestTempDirPath("points");
+    Path clustersPath = getTestTempDirPath("clusters");
+    Configuration conf = new Configuration();
+    ClusteringTestUtils.writePointsToFile(points, new Path(pointsPath, "file1"), fs, conf);
+
+    for (int k = 0; k < points.size(); k++) {
+      System.out.println("testKFuzzyKMeansMRJob k= " + k);
+      // pick k initial cluster centers at random
+      SequenceFile.Writer writer = new SequenceFile.Writer(fs,
+                                                           conf,
+                                                           new Path(clustersPath, "part-00000"),
+                                                           Text.class,
+                                                           SoftCluster.class);
+      try {
+        for (int i = 0; i < k + 1; i++) {
+          Vector vec = tweakValue(points.get(i).get());
+
+          SoftCluster cluster = new SoftCluster(vec, i, measure);
+          /* add the center so the centroid will be correct upon output */
+          cluster.observe(cluster.getCenter(), 1);
+          // writer.write(cluster.getIdentifier() + '\t' + SoftCluster.formatCluster(cluster) + '\n');
+          writer.append(new Text(cluster.getIdentifier()), cluster);
+
+        }
+      } finally {
+        Closeables.closeQuietly(writer);
+      }
+
+      // now run the Job using the run() command line options.
+      Path output = getTestTempDirPath("output");
+      /*      FuzzyKMeansDriver.runJob(pointsPath,
+                                     clustersPath,
+                                     output,
+                                     EuclideanDistanceMeasure.class.getName(),
+                                     0.001,
+                                     2,
+                                     k + 1,
+                                     2,
+                                     false,
+                                     true,
+                                     0);
+      */
+      String[] args = {
+          optKey(DefaultOptionCreator.INPUT_OPTION),
+          pointsPath.toString(),
+          optKey(DefaultOptionCreator.CLUSTERS_IN_OPTION),
+          clustersPath.toString(),
+          optKey(DefaultOptionCreator.OUTPUT_OPTION),
+          output.toString(),
+          optKey(DefaultOptionCreator.DISTANCE_MEASURE_OPTION),
+          EuclideanDistanceMeasure.class.getName(),
+          optKey(DefaultOptionCreator.CONVERGENCE_DELTA_OPTION),
+          "0.001",
+          optKey(DefaultOptionCreator.MAX_ITERATIONS_OPTION),
+          "2",
+          optKey(FuzzyKMeansDriver.M_OPTION),
+          "2.0",
+          optKey(DefaultOptionCreator.CLUSTERING_OPTION),
+          optKey(DefaultOptionCreator.EMIT_MOST_LIKELY_OPTION),
+          optKey(DefaultOptionCreator.OVERWRITE_OPTION)
+      };
+      ToolRunner.run(new Configuration(), new FuzzyKMeansDriver(), args);
+      long count = HadoopUtil.countRecords(new Path(output, "clusteredPoints/part-m-00000"), conf);
+      assertTrue(count > 0);
+    }
+
   }
+
+  @Test
+  public void testClusterObservationsSerialization() throws Exception {
+    double[] data = { 1.1, 2.2, 3.3 };
+    Vector vector = new DenseVector(data);
+    ClusterObservations reference = new ClusterObservations(1, 2.0, vector, vector);
+    DataOutputBuffer out = new DataOutputBuffer();
+    reference.write(out);
+    ClusterObservations info = new ClusterObservations();
+    DataInputBuffer in = new DataInputBuffer();
+    in.reset(out.getData(), out.getLength());
+    info.readFields(in);
+    assertEquals("probability", reference.getS0(), info.getS0(), EPSILON);
+    assertEquals("point total", reference.getS1(), info.getS1());
+    assertEquals("combiner", reference.getCombinerState(), info.getCombinerState());
+  }
+
 }
- No newline at end of file

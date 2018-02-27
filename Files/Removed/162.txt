@@ -1,4 +1,6 @@
-/**
+package org.apache.solr.update;
+
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -15,154 +17,393 @@
  * limitations under the License.
  */
 
-package org.apache.solr.analysis;
-
 import java.io.IOException;
-import java.io.Reader;
+import java.net.ConnectException;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
-import org.apache.lucene.analysis.Token;
-import org.apache.lucene.analysis.Tokenizer;
+import org.apache.solr.client.solrj.SolrServer;
+import org.apache.solr.client.solrj.SolrServerException;
+import org.apache.solr.client.solrj.impl.HttpSolrServer;
+import org.apache.solr.client.solrj.impl.HttpSolrServer.RemoteSolrException;
+import org.apache.solr.client.solrj.request.AbstractUpdateRequest;
+import org.apache.solr.client.solrj.request.UpdateRequest;
 import org.apache.solr.common.SolrException;
+import org.apache.solr.common.SolrException.ErrorCode;
+import org.apache.solr.common.cloud.ZkCoreNodeProps;
+import org.apache.solr.common.cloud.ZkStateReader;
+import org.apache.solr.common.params.ModifiableSolrParams;
+import org.apache.solr.common.util.NamedList;
+import org.apache.solr.core.Diagnostics;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 
-/**
- * This tokenizer uses regex pattern matching to construct distinct tokens
- * for the input stream.  It takes two arguments:  "pattern" and "group".
- * <p/>
- * <ul>
- * <li>"pattern" is the regular expression.</li>
- * <li>"group" says which group to extract into tokens.</li>
- *  </ul>
- * <p>
- * group=-1 (the default) is equivalent to "split".  In this case, the tokens will
- * be equivalent to the output from (without empty tokens):
- * {@link String#split(java.lang.String)}
- * </p>
- * <p>
- * Using group >= 0 selects the matching group as the token.  For example, if you have:<br/>
- * <pre>
- *  pattern = \'([^\']+)\'
- *  group = 0
- *  input = aaa 'bbb' 'ccc'
- *</pre>
- * the output will be two tokens: 'bbb' and 'ccc' (including the ' marks).  With the same input
- * but using group=1, the output would be: bbb and ccc (no ' marks)
- * </p>
- * <p>NOTE: This Tokenizer does not output tokens that are of zero length.</p>
- *
- * @see PatternTokenizer
- * @since solr1.2
- * @version $Id:$
- */
-public class PatternTokenizerFactory extends BaseTokenizerFactory 
-{
-  public static final String PATTERN = "pattern";
-  public static final String GROUP = "group";
- 
-  protected Map<String,String> args;
-  protected Pattern pattern;
-  protected int group;
+public class SolrCmdDistributor {
+  private static final int MAX_RETRIES_ON_FORWARD = 15;
+  public static Logger log = LoggerFactory.getLogger(SolrCmdDistributor.class);
   
-  /**
-   * Require a configured pattern
-   */
-  @Override
-  public void init(Map<String,String> args) 
-  {
-    this.args = args;
-    String regex = args.get( PATTERN );
-    if( regex == null ) {
-      throw new SolrException( SolrException.ErrorCode.SERVER_ERROR, "missing required argument: "+PATTERN );
-    }
-    int flags = 0; // TODO? -- read flags from config CASE_INSENSITIVE, etc
-    pattern = Pattern.compile( regex, flags );
-    
-    group = -1;  // use 'split'
-    String g = args.get( GROUP );
-    if( g != null ) {
-      try {
-        group = Integer.parseInt( g );
-      }
-      catch( Exception ex ) {
-        throw new SolrException( SolrException.ErrorCode.SERVER_ERROR, "invalid group argument: "+g );
-      }
-    }
+  private StreamingSolrServers servers;
+  
+  private List<Error> allErrors = new ArrayList<Error>();
+  private List<Error> errors = new ArrayList<Error>();
+  
+  public static interface AbortCheck {
+    public boolean abortCheck();
   }
   
-  /**
-   * Split the input using configured pattern
-   */
-  public Tokenizer create(final Reader in) {
+  public SolrCmdDistributor(UpdateShardHandler updateShardHandler) {
+    servers = new StreamingSolrServers(updateShardHandler);
+  }
+  
+  public void finish() {
     try {
-      return new PatternTokenizer(in, pattern, group);
-    } catch( IOException ex ) {
-      throw new SolrException( SolrException.ErrorCode.SERVER_ERROR, ex );
+      servers.blockUntilFinished();
+      doRetriesIfNeeded();
+    } finally {
+      servers.shutdown();
     }
   }
-  
-  /**
-   * This behaves just like String.split( ), but returns a list of Tokens
-   * rather then an array of strings
-   * NOTE: This method is not used in 1.4.
-   * @deprecated
-   */
-  @Deprecated
-  public static List<Token> split( Matcher matcher, String input )
-  {
-    int index = 0;
-    int lastNonEmptySize = Integer.MAX_VALUE;
-    ArrayList<Token> matchList = new ArrayList<Token>();
 
-    // Add segments before each match found
-    while(matcher.find()) {
-      String match = input.subSequence(index, matcher.start()).toString();
-      matchList.add( new Token( match, index, matcher.start()) );
-      index = matcher.end();
-      if( match.length() > 0 ) {
-        lastNonEmptySize = matchList.size();
-      }
-    }
+  private void doRetriesIfNeeded() {
+    // NOTE: retries will be forwards to a single url
+    
+    List<Error> errors = new ArrayList<Error>(this.errors);
+    errors.addAll(servers.getErrors());
+    List<Error> resubmitList = new ArrayList<Error>();
 
-    // If no match is found, return the full string
-    if (index == 0) {
-      matchList.add( new Token( input, 0, input.length()) );
-    }
-    else { 
-      String match = input.subSequence(index, input.length()).toString();
-      matchList.add( new Token( match, index, input.length()) );
-      if( match.length() > 0 ) {
-        lastNonEmptySize = matchList.size();
+    for (Error err : errors) {
+      try {
+        String oldNodeUrl = err.req.node.getUrl();
+        
+        // if there is a retry url, we want to retry...
+        boolean isRetry = err.req.node.checkRetry();
+        
+        boolean doRetry = false;
+        int rspCode = err.statusCode;
+        
+        if (testing_errorHook != null) Diagnostics.call(testing_errorHook,
+            err.e);
+        
+        // this can happen in certain situations such as shutdown
+        if (isRetry) {
+          if (rspCode == 404 || rspCode == 403 || rspCode == 503
+              || rspCode == 500) {
+            doRetry = true;
+          }
+          
+          // if its a connect exception, lets try again
+          if (err.e instanceof ConnectException) {
+            doRetry = true;
+          } else if (err.e instanceof SolrServerException) {
+            if (((SolrServerException) err.e).getRootCause() instanceof ConnectException) {
+              doRetry = true;
+            }
+          } else if (err.e instanceof RemoteSolrException) {
+            Exception cause = (RemoteSolrException) err.e.getCause();
+            if (cause != null && cause instanceof ConnectException) {
+              doRetry = true;
+            }
+          }
+          if (err.req.retries < MAX_RETRIES_ON_FORWARD && doRetry) {
+            err.req.retries++;
+            
+            SolrException.log(SolrCmdDistributor.log, "forwarding update to "
+                + oldNodeUrl + " failed - retrying ... retries: "
+                + err.req.retries);
+            try {
+              Thread.sleep(500);
+            } catch (InterruptedException e) {
+              Thread.currentThread().interrupt();
+              log.warn(null, e);
+            }
+            
+            resubmitList.add(err);
+          } else {
+            allErrors.add(err);
+          }
+        } else {
+          allErrors.add(err);
+        }
+      } catch (Exception e) {
+        // continue on
+        log.error("Unexpected Error while doing request retries", e);
       }
     }
     
-    // Don't use trailing empty strings.  This behavior matches String.split();
-    if( lastNonEmptySize < matchList.size() ) {
-      return matchList.subList( 0, lastNonEmptySize );
+    servers.clearErrors();
+    this.errors.clear();
+    for (Error err : resubmitList) {
+      submit(err.req);
     }
-    return matchList;
+    
+    if (resubmitList.size() > 0) {
+      servers.blockUntilFinished();
+      doRetriesIfNeeded();
+    }
   }
   
-  /**
-   * Create tokens from the matches in a matcher 
-   * NOTE: This method is not used in 1.4.
-   * @deprecated
-   */
-  @Deprecated
-  public static List<Token> group( Matcher matcher, String input, int group )
-  {
-    ArrayList<Token> matchList = new ArrayList<Token>();
-    while(matcher.find()) {
-      Token t = new Token( 
-        matcher.group(group), 
-        matcher.start(group), 
-        matcher.end(group) );
-      matchList.add( t );
+  public void distribDelete(DeleteUpdateCommand cmd, List<Node> nodes, ModifiableSolrParams params) throws IOException {
+    distribDelete(cmd, nodes, params, false);
+  }
+  
+  public void distribDelete(DeleteUpdateCommand cmd, List<Node> nodes, ModifiableSolrParams params, boolean sync) throws IOException {
+    
+    for (Node node : nodes) {
+      UpdateRequest uReq = new UpdateRequest();
+      uReq.setParams(params);
+      if (cmd.isDeleteById()) {
+        uReq.deleteById(cmd.getId(), cmd.getVersion());
+      } else {
+        uReq.deleteByQuery(cmd.query);
+      }
+      
+      submit(new Req(node, uReq, sync));
     }
-    return matchList;
+  }
+  
+  public void distribAdd(AddUpdateCommand cmd, List<Node> nodes, ModifiableSolrParams params) throws IOException {
+    distribAdd(cmd, nodes, params, false);
+  }
+  
+  public void distribAdd(AddUpdateCommand cmd, List<Node> nodes, ModifiableSolrParams params, boolean synchronous) throws IOException {
+
+    for (Node node : nodes) {
+      UpdateRequest uReq = new UpdateRequest();
+      uReq.setParams(params);
+      uReq.add(cmd.solrDoc, cmd.commitWithin, cmd.overwrite);
+      submit(new Req(node, uReq, synchronous));
+    }
+    
+  }
+
+  public void distribCommit(CommitUpdateCommand cmd, List<Node> nodes,
+      ModifiableSolrParams params) throws IOException {
+    
+    // we need to do any retries before commit...
+    servers.blockUntilFinished();
+    doRetriesIfNeeded();
+    
+    UpdateRequest uReq = new UpdateRequest();
+    uReq.setParams(params);
+    
+    addCommit(uReq, cmd);
+    
+    log.debug("Distrib commit to:" + nodes + " params:" + params);
+    
+    for (Node node : nodes) {
+      submit(new Req(node, uReq, false));
+    }
+    
+  }
+  
+  void addCommit(UpdateRequest ureq, CommitUpdateCommand cmd) {
+    if (cmd == null) return;
+    ureq.setAction(cmd.optimize ? AbstractUpdateRequest.ACTION.OPTIMIZE
+        : AbstractUpdateRequest.ACTION.COMMIT, false, cmd.waitSearcher, cmd.maxOptimizeSegments, cmd.softCommit, cmd.expungeDeletes);
+  }
+
+  private void submit(Req req) {
+    if (req.synchronous) {
+      servers.blockUntilFinished();
+      doRetriesIfNeeded();
+      
+      HttpSolrServer server = new HttpSolrServer(req.node.getUrl(),
+          servers.getHttpClient());
+      try {
+        server.request(req.uReq);
+      } catch (Exception e) {
+        throw new SolrException(ErrorCode.SERVER_ERROR, "Failed synchronous update on shard " + req.node + " update: " + req.uReq , e);
+      } finally {
+        server.shutdown();
+      }
+      
+      return;
+    }
+    
+    try {
+      SolrServer solrServer = servers.getSolrServer(req);
+      NamedList<Object> rsp = solrServer.request(req.uReq);
+    } catch (Exception e) {
+      SolrException.log(log, e);
+      Error error = new Error();
+      error.e = e;
+      error.req = req;
+      if (e instanceof SolrException) {
+        error.statusCode = ((SolrException) e).code();
+      }
+      errors.add(error);
+    }
+  }
+  
+  public static class Req {
+    public Node node;
+    public UpdateRequest uReq;
+    public int retries;
+    public boolean synchronous;
+    
+    public Req(Node node, UpdateRequest uReq, boolean synchronous) {
+      this.node = node;
+      this.uReq = uReq;
+      this.synchronous = synchronous;
+    }
+  }
+    
+
+  public static Diagnostics.Callable testing_errorHook;  // called on error when forwarding request.  Currently data=[this, Request]
+
+  
+  public static class Response {
+    public List<Error> errors = new ArrayList<Error>();
+  }
+  
+  public static class Error {
+    public Exception e;
+    public int statusCode;
+    public Req req;
+  }
+  
+  public static abstract class Node {
+    public abstract String getUrl();
+    public abstract boolean checkRetry();
+    public abstract String getCoreName();
+    public abstract String getBaseUrl();
+    public abstract ZkCoreNodeProps getNodeProps();
+  }
+
+  public static class StdNode extends Node {
+    protected ZkCoreNodeProps nodeProps;
+
+    public StdNode(ZkCoreNodeProps nodeProps) {
+      this.nodeProps = nodeProps;
+    }
+    
+    @Override
+    public String getUrl() {
+      return nodeProps.getCoreUrl();
+    }
+    
+    @Override
+    public String toString() {
+      return this.getClass().getSimpleName() + ": " + nodeProps.getCoreUrl();
+    }
+
+    @Override
+    public boolean checkRetry() {
+      return false;
+    }
+
+    @Override
+    public String getBaseUrl() {
+      return nodeProps.getBaseUrl();
+    }
+
+    @Override
+    public String getCoreName() {
+      return nodeProps.getCoreName();
+    }
+
+    @Override
+    public int hashCode() {
+      final int prime = 31;
+      int result = 1;
+      String baseUrl = nodeProps.getBaseUrl();
+      String coreName = nodeProps.getCoreName();
+      String url = nodeProps.getCoreUrl();
+      result = prime * result + ((baseUrl == null) ? 0 : baseUrl.hashCode());
+      result = prime * result + ((coreName == null) ? 0 : coreName.hashCode());
+      result = prime * result + ((url == null) ? 0 : url.hashCode());
+      return result;
+    }
+
+    @Override
+    public boolean equals(Object obj) {
+      if (this == obj) return true;
+      if (obj == null) return false;
+      if (getClass() != obj.getClass()) return false;
+      StdNode other = (StdNode) obj;
+      String baseUrl = nodeProps.getBaseUrl();
+      String coreName = nodeProps.getCoreName();
+      String url = nodeProps.getCoreUrl();
+      if (baseUrl == null) {
+        if (other.nodeProps.getBaseUrl() != null) return false;
+      } else if (!baseUrl.equals(other.nodeProps.getBaseUrl())) return false;
+      if (coreName == null) {
+        if (other.nodeProps.getCoreName() != null) return false;
+      } else if (!coreName.equals(other.nodeProps.getCoreName())) return false;
+      if (url == null) {
+        if (other.nodeProps.getCoreUrl() != null) return false;
+      } else if (!url.equals(other.nodeProps.getCoreUrl())) return false;
+      return true;
+    }
+
+    @Override
+    public ZkCoreNodeProps getNodeProps() {
+      return nodeProps;
+    }
+  }
+  
+  // RetryNodes are used in the case of 'forward to leader' where we want
+  // to try the latest leader on a fail in the case the leader just went down.
+  public static class RetryNode extends StdNode {
+    
+    private ZkStateReader zkStateReader;
+    private String collection;
+    private String shardId;
+    
+    public RetryNode(ZkCoreNodeProps nodeProps, ZkStateReader zkStateReader, String collection, String shardId) {
+      super(nodeProps);
+      this.zkStateReader = zkStateReader;
+      this.collection = collection;
+      this.shardId = shardId;
+    }
+
+    @Override
+    public boolean checkRetry() {
+      ZkCoreNodeProps leaderProps;
+      try {
+        leaderProps = new ZkCoreNodeProps(zkStateReader.getLeaderRetry(
+            collection, shardId));
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        return false;
+      } catch (Exception e) {
+        // we retry with same info
+        log.warn(null, e);
+        return true;
+      }
+      
+      this.nodeProps = leaderProps;
+      
+      return true;
+    }
+
+    @Override
+    public int hashCode() {
+      final int prime = 31;
+      int result = super.hashCode();
+      result = prime * result
+          + ((collection == null) ? 0 : collection.hashCode());
+      result = prime * result + ((shardId == null) ? 0 : shardId.hashCode());
+      return result;
+    }
+
+    @Override
+    public boolean equals(Object obj) {
+      if (this == obj) return true;
+      if (!super.equals(obj)) return false;
+      if (getClass() != obj.getClass()) return false;
+      RetryNode other = (RetryNode) obj;
+      if (nodeProps.getCoreUrl() == null) {
+        if (other.nodeProps.getCoreUrl() != null) return false;
+      } else if (!nodeProps.getCoreUrl().equals(other.nodeProps.getCoreUrl())) return false;
+
+      return true;
+    }
+  }
+
+  public List<Error> getErrors() {
+    return allErrors;
   }
 }
+

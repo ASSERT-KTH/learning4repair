@@ -1,6 +1,6 @@
-w.shutdown();
+iw.shutdown();
 
-package org.apache.lucene.search;
+package org.apache.lucene.index;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,440 +19,130 @@ package org.apache.lucene.search;
  * limitations under the License.
  */
 
-import org.apache.lucene.document.Field;
-import org.apache.lucene.util.LuceneTestCase;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CountDownLatch;
+
+import org.apache.lucene.analysis.MockAnalyzer;
 import org.apache.lucene.document.Document;
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.RandomIndexWriter;
-import org.apache.lucene.index.StoredDocument;
-import org.apache.lucene.index.Term;
-import org.apache.lucene.search.similarities.DefaultSimilarity;
-import org.apache.lucene.search.similarities.Similarity;
+import org.apache.lucene.document.Field;
 import org.apache.lucene.store.Directory;
-import org.junit.AfterClass;
-import org.junit.BeforeClass;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.LuceneTestCase.SuppressCodecs;
+import org.apache.lucene.util.LuceneTestCase;
+import org.apache.lucene.util.TestUtil;
+import org.apache.lucene.util.TestUtil;
 
-import java.text.DecimalFormat;
-import java.text.DecimalFormatSymbols;
-import java.util.Locale;
-import java.util.Random;
-
-/** Test that BooleanQuery.setMinimumNumberShouldMatch works.
+/**
+ * Simple test that adds numeric terms, where each term has the 
+ * docFreq of its integer value, and checks that the docFreq is correct. 
  */
-public class TestBooleanMinShouldMatch extends LuceneTestCase {
+@SuppressCodecs({"Direct", "Memory"}) // at night this makes like 200k/300k docs and will make Direct's heart beat!
+public class TestBagOfPostings extends LuceneTestCase {
+  public void test() throws Exception {
+    List<String> postingsList = new ArrayList<>();
+    int numTerms = atLeast(300);
+    final int maxTermsPerDoc = TestUtil.nextInt(random(), 10, 20);
 
-    private static Directory index;
-    private static IndexReader r;
-    private static IndexSearcher s;
+    boolean isSimpleText = "SimpleText".equals(TestUtil.getPostingsFormat("field"));
 
-    @BeforeClass
-    public static void beforeClass() throws Exception {
-        String[] data = new String [] {
-            "A 1 2 3 4 5 6",
-            "Z       4 5 6",
-            null,
-            "B   2   4 5 6",
-            "Y     3   5 6",
-            null,
-            "C     3     6",
-            "X       4 5 6"
-        };
+    IndexWriterConfig iwc = newIndexWriterConfig(random(), TEST_VERSION_CURRENT, new MockAnalyzer(random()));
 
-        index = newDirectory();
-        RandomIndexWriter w = new RandomIndexWriter(random(), index);
+    if ((isSimpleText || iwc.getMergePolicy() instanceof MockRandomMergePolicy) && (TEST_NIGHTLY || RANDOM_MULTIPLIER > 1)) {
+      // Otherwise test can take way too long (> 2 hours)
+      numTerms /= 2;
+    }
 
-        for (int i = 0; i < data.length; i++) {
-            Document doc = new Document();
-            doc.add(newStringField("id", String.valueOf(i), Field.Store.YES));//Field.Keyword("id",String.valueOf(i)));
-            doc.add(newStringField("all", "all", Field.Store.YES));//Field.Keyword("all","all"));
-            if (null != data[i]) {
-                doc.add(newTextField("data", data[i], Field.Store.YES));//Field.Text("data",data[i]));
+    if (VERBOSE) {
+      System.out.println("maxTermsPerDoc=" + maxTermsPerDoc);
+      System.out.println("numTerms=" + numTerms);
+    }
+
+    for (int i = 0; i < numTerms; i++) {
+      String term = Integer.toString(i);
+      for (int j = 0; j < i; j++) {
+        postingsList.add(term);
+      }
+    }
+    Collections.shuffle(postingsList, random());
+
+    final ConcurrentLinkedQueue<String> postings = new ConcurrentLinkedQueue<>(postingsList);
+
+    Directory dir = newFSDirectory(createTempDir("bagofpostings"));
+    final RandomIndexWriter iw = new RandomIndexWriter(random(), dir, iwc);
+
+    int threadCount = TestUtil.nextInt(random(), 1, 5);
+    if (VERBOSE) {
+      System.out.println("config: " + iw.w.getConfig());
+      System.out.println("threadCount=" + threadCount);
+    }
+
+    Thread[] threads = new Thread[threadCount];
+    final CountDownLatch startingGun = new CountDownLatch(1);
+
+    for(int threadID=0;threadID<threadCount;threadID++) {
+      threads[threadID] = new Thread() {
+          @Override
+          public void run() {
+            try {
+              Document document = new Document();
+              Field field = newTextField("field", "", Field.Store.NO);
+              document.add(field);
+              startingGun.await();
+              while (!postings.isEmpty()) {
+                StringBuilder text = new StringBuilder();
+                Set<String> visited = new HashSet<>();
+                for (int i = 0; i < maxTermsPerDoc; i++) {
+                  String token = postings.poll();
+                  if (token == null) {
+                    break;
+                  }
+                  if (visited.contains(token)) {
+                    // Put it back:
+                    postings.add(token);
+                    break;
+                  }
+                  text.append(' ');
+                  text.append(token);
+                  visited.add(token);
+                }
+                field.setStringValue(text.toString());
+                iw.addDocument(document);
+              }
+            } catch (Exception e) {
+              throw new RuntimeException(e);
             }
-            w.addDocument(doc);
-        }
-
-        r = w.getReader();
-        s = newSearcher(r);
-        w.close();
-//System.out.println("Set up " + getName());
+          }
+        };
+      threads[threadID].start();
+    }
+    startingGun.countDown();
+    for(Thread t : threads) {
+      t.join();
     }
     
-    @AfterClass
-    public static void afterClass() throws Exception {
-      s = null;
-      r.close();
-      r = null;
-      index.close();
-      index = null;
+    iw.forceMerge(1);
+    DirectoryReader ir = iw.getReader();
+    assertEquals(1, ir.leaves().size());
+    AtomicReader air = ir.leaves().get(0).reader();
+    Terms terms = air.terms("field");
+    // numTerms-1 because there cannot be a term 0 with 0 postings:
+    assertEquals(numTerms-1, terms.size());
+    TermsEnum termsEnum = terms.iterator(null);
+    BytesRef term;
+    while ((term = termsEnum.next()) != null) {
+      int value = Integer.parseInt(term.utf8ToString());
+      assertEquals(value, termsEnum.docFreq());
+      // don't really need to check more than this, as CheckIndex
+      // will verify that docFreq == actual number of documents seen
+      // from a docsAndPositionsEnum.
     }
-
-
-    public void verifyNrHits(Query q, int expected) throws Exception {
-        // bs1
-        ScoreDoc[] h = s.search(q, null, 1000).scoreDocs;
-        if (expected != h.length) {
-            printHits(getTestName(), h, s);
-        }
-        assertEquals("result count", expected, h.length);
-        //System.out.println("TEST: now check");
-        // bs2
-        TopScoreDocCollector collector = TopScoreDocCollector.create(1000, true);
-        s.search(q, collector);
-        ScoreDoc[] h2 = collector.topDocs().scoreDocs;
-        if (expected != h2.length) {
-          printHits(getTestName(), h2, s);
-        }
-        assertEquals("result count (bs2)", expected, h2.length);
-
-        QueryUtils.check(random(), q,s);
-    }
-
-    public void testAllOptional() throws Exception {
-
-        BooleanQuery q = new BooleanQuery();
-        for (int i = 1; i <=4; i++) {
-            q.add(new TermQuery(new Term("data",""+i)), BooleanClause.Occur.SHOULD);//false, false);
-        }
-        q.setMinimumNumberShouldMatch(2); // match at least two of 4
-        verifyNrHits(q, 2);
-    }
-
-    public void testOneReqAndSomeOptional() throws Exception {
-
-        /* one required, some optional */
-        BooleanQuery q = new BooleanQuery();
-        q.add(new TermQuery(new Term("all", "all" )), BooleanClause.Occur.MUST);//true,  false);
-        q.add(new TermQuery(new Term("data", "5"  )), BooleanClause.Occur.SHOULD);//false, false);
-        q.add(new TermQuery(new Term("data", "4"  )), BooleanClause.Occur.SHOULD);//false, false);
-        q.add(new TermQuery(new Term("data", "3"  )), BooleanClause.Occur.SHOULD);//false, false);
-
-        q.setMinimumNumberShouldMatch(2); // 2 of 3 optional 
-
-        verifyNrHits(q, 5);
-    }
-
-    public void testSomeReqAndSomeOptional() throws Exception {
-
-        /* two required, some optional */
-        BooleanQuery q = new BooleanQuery();
-        q.add(new TermQuery(new Term("all", "all" )), BooleanClause.Occur.MUST);//true,  false);
-        q.add(new TermQuery(new Term("data", "6"  )), BooleanClause.Occur.MUST);//true,  false);
-        q.add(new TermQuery(new Term("data", "5"  )), BooleanClause.Occur.SHOULD);//false, false);
-        q.add(new TermQuery(new Term("data", "4"  )), BooleanClause.Occur.SHOULD);//false, false);
-        q.add(new TermQuery(new Term("data", "3"  )), BooleanClause.Occur.SHOULD);//false, false);
-
-        q.setMinimumNumberShouldMatch(2); // 2 of 3 optional 
-
-        verifyNrHits(q, 5);
-    }
-
-    public void testOneProhibAndSomeOptional() throws Exception {
-
-        /* one prohibited, some optional */
-        BooleanQuery q = new BooleanQuery();
-        q.add(new TermQuery(new Term("data", "1"  )), BooleanClause.Occur.SHOULD);//false, false);
-        q.add(new TermQuery(new Term("data", "2"  )), BooleanClause.Occur.SHOULD);//false, false);
-        q.add(new TermQuery(new Term("data", "3"  )), BooleanClause.Occur.MUST_NOT);//false, true );
-        q.add(new TermQuery(new Term("data", "4"  )), BooleanClause.Occur.SHOULD);//false, false);
-
-        q.setMinimumNumberShouldMatch(2); // 2 of 3 optional 
-
-        verifyNrHits(q, 1);
-    }
-
-    public void testSomeProhibAndSomeOptional() throws Exception {
-
-        /* two prohibited, some optional */
-        BooleanQuery q = new BooleanQuery();
-        q.add(new TermQuery(new Term("data", "1"  )), BooleanClause.Occur.SHOULD);//false, false);
-        q.add(new TermQuery(new Term("data", "2"  )), BooleanClause.Occur.SHOULD);//false, false);
-        q.add(new TermQuery(new Term("data", "3"  )), BooleanClause.Occur.MUST_NOT);//false, true );
-        q.add(new TermQuery(new Term("data", "4"  )), BooleanClause.Occur.SHOULD);//false, false);
-        q.add(new TermQuery(new Term("data", "C"  )), BooleanClause.Occur.MUST_NOT);//false, true );
-
-        q.setMinimumNumberShouldMatch(2); // 2 of 3 optional 
-
-        verifyNrHits(q, 1);
-    }
-
-    public void testOneReqOneProhibAndSomeOptional() throws Exception {
-
-        /* one required, one prohibited, some optional */
-        BooleanQuery q = new BooleanQuery();
-        q.add(new TermQuery(new Term("data", "6"  )), BooleanClause.Occur.MUST);// true,  false);
-        q.add(new TermQuery(new Term("data", "5"  )), BooleanClause.Occur.SHOULD);//false, false);
-        q.add(new TermQuery(new Term("data", "4"  )), BooleanClause.Occur.SHOULD);//false, false);
-        q.add(new TermQuery(new Term("data", "3"  )), BooleanClause.Occur.MUST_NOT);//false, true );
-        q.add(new TermQuery(new Term("data", "2"  )), BooleanClause.Occur.SHOULD);//false, false);
-        q.add(new TermQuery(new Term("data", "1"  )), BooleanClause.Occur.SHOULD);//false, false);
-
-        q.setMinimumNumberShouldMatch(3); // 3 of 4 optional 
-
-        verifyNrHits(q, 1);
-    }
-
-    public void testSomeReqOneProhibAndSomeOptional() throws Exception {
-
-        /* two required, one prohibited, some optional */
-        BooleanQuery q = new BooleanQuery();
-        q.add(new TermQuery(new Term("all",  "all")), BooleanClause.Occur.MUST);//true,  false);
-        q.add(new TermQuery(new Term("data", "6"  )), BooleanClause.Occur.MUST);//true,  false);
-        q.add(new TermQuery(new Term("data", "5"  )), BooleanClause.Occur.SHOULD);//false, false);
-        q.add(new TermQuery(new Term("data", "4"  )), BooleanClause.Occur.SHOULD);//false, false);
-        q.add(new TermQuery(new Term("data", "3"  )), BooleanClause.Occur.MUST_NOT);//false, true );
-        q.add(new TermQuery(new Term("data", "2"  )), BooleanClause.Occur.SHOULD);//false, false);
-        q.add(new TermQuery(new Term("data", "1"  )), BooleanClause.Occur.SHOULD);//false, false);
-
-        q.setMinimumNumberShouldMatch(3); // 3 of 4 optional 
-
-        verifyNrHits(q, 1);
-    }
-
-    public void testOneReqSomeProhibAndSomeOptional() throws Exception {
-
-        /* one required, two prohibited, some optional */
-        BooleanQuery q = new BooleanQuery();
-        q.add(new TermQuery(new Term("data", "6"  )), BooleanClause.Occur.MUST);//true,  false);
-        q.add(new TermQuery(new Term("data", "5"  )), BooleanClause.Occur.SHOULD);//false, false);
-        q.add(new TermQuery(new Term("data", "4"  )), BooleanClause.Occur.SHOULD);//false, false);
-        q.add(new TermQuery(new Term("data", "3"  )), BooleanClause.Occur.MUST_NOT);//false, true );
-        q.add(new TermQuery(new Term("data", "2"  )), BooleanClause.Occur.SHOULD);//false, false);
-        q.add(new TermQuery(new Term("data", "1"  )), BooleanClause.Occur.SHOULD);//false, false);
-        q.add(new TermQuery(new Term("data", "C"  )), BooleanClause.Occur.MUST_NOT);//false, true );
-
-        q.setMinimumNumberShouldMatch(3); // 3 of 4 optional 
-
-        verifyNrHits(q, 1);
-    }
-
-    public void testSomeReqSomeProhibAndSomeOptional() throws Exception {
-
-        /* two required, two prohibited, some optional */
-        BooleanQuery q = new BooleanQuery();
-        q.add(new TermQuery(new Term("all",  "all")), BooleanClause.Occur.MUST);//true,  false);
-        q.add(new TermQuery(new Term("data", "6"  )), BooleanClause.Occur.MUST);//true,  false);
-        q.add(new TermQuery(new Term("data", "5"  )), BooleanClause.Occur.SHOULD);//false, false);
-        q.add(new TermQuery(new Term("data", "4"  )), BooleanClause.Occur.SHOULD);//false, false);
-        q.add(new TermQuery(new Term("data", "3"  )), BooleanClause.Occur.MUST_NOT);//false, true );
-        q.add(new TermQuery(new Term("data", "2"  )), BooleanClause.Occur.SHOULD);//false, false);
-        q.add(new TermQuery(new Term("data", "1"  )), BooleanClause.Occur.SHOULD);//false, false);
-        q.add(new TermQuery(new Term("data", "C"  )), BooleanClause.Occur.MUST_NOT);//false, true );
-
-        q.setMinimumNumberShouldMatch(3); // 3 of 4 optional 
-
-        verifyNrHits(q, 1);
-    }
-
-    public void testMinHigherThenNumOptional() throws Exception {
-
-        /* two required, two prohibited, some optional */
-        BooleanQuery q = new BooleanQuery();
-        q.add(new TermQuery(new Term("all",  "all")), BooleanClause.Occur.MUST);//true,  false);
-        q.add(new TermQuery(new Term("data", "6"  )), BooleanClause.Occur.MUST);//true,  false);
-        q.add(new TermQuery(new Term("data", "5"  )), BooleanClause.Occur.SHOULD);//false, false);
-        q.add(new TermQuery(new Term("data", "4"  )), BooleanClause.Occur.SHOULD);//false, false);
-        q.add(new TermQuery(new Term("data", "3"  )), BooleanClause.Occur.MUST_NOT);//false, true );
-        q.add(new TermQuery(new Term("data", "2"  )), BooleanClause.Occur.SHOULD);//false, false);
-        q.add(new TermQuery(new Term("data", "1"  )), BooleanClause.Occur.SHOULD);//false, false);
-        q.add(new TermQuery(new Term("data", "C"  )), BooleanClause.Occur.MUST_NOT);//false, true );
-
-        q.setMinimumNumberShouldMatch(90); // 90 of 4 optional ?!?!?!
-
-        verifyNrHits(q, 0);
-    }
-
-    public void testMinEqualToNumOptional() throws Exception {
-
-        /* two required, two optional */
-        BooleanQuery q = new BooleanQuery();
-        q.add(new TermQuery(new Term("all", "all" )), BooleanClause.Occur.SHOULD);//false, false);
-        q.add(new TermQuery(new Term("data", "6"  )), BooleanClause.Occur.MUST);//true,  false);
-        q.add(new TermQuery(new Term("data", "3"  )), BooleanClause.Occur.MUST);//true,  false);
-        q.add(new TermQuery(new Term("data", "2"  )), BooleanClause.Occur.SHOULD);//false, false);
-
-        q.setMinimumNumberShouldMatch(2); // 2 of 2 optional 
-
-        verifyNrHits(q, 1);
-    }
-
-    public void testOneOptionalEqualToMin() throws Exception {
-
-        /* two required, one optional */
-        BooleanQuery q = new BooleanQuery();
-        q.add(new TermQuery(new Term("all", "all" )), BooleanClause.Occur.MUST);//true,  false);
-        q.add(new TermQuery(new Term("data", "3"  )), BooleanClause.Occur.SHOULD);//false, false);
-        q.add(new TermQuery(new Term("data", "2"  )), BooleanClause.Occur.MUST);//true,  false);
-
-        q.setMinimumNumberShouldMatch(1); // 1 of 1 optional 
-
-        verifyNrHits(q, 1);
-    }
-
-    public void testNoOptionalButMin() throws Exception {
-
-        /* two required, no optional */
-        BooleanQuery q = new BooleanQuery();
-        q.add(new TermQuery(new Term("all", "all" )), BooleanClause.Occur.MUST);//true,  false);
-        q.add(new TermQuery(new Term("data", "2"  )), BooleanClause.Occur.MUST);//true,  false);
-
-        q.setMinimumNumberShouldMatch(1); // 1 of 0 optional 
-
-        verifyNrHits(q, 0);
-    }
-
-    public void testNoOptionalButMin2() throws Exception {
-
-        /* one required, no optional */
-        BooleanQuery q = new BooleanQuery();
-        q.add(new TermQuery(new Term("all", "all" )), BooleanClause.Occur.MUST);//true,  false);
-
-        q.setMinimumNumberShouldMatch(1); // 1 of 0 optional 
-
-        verifyNrHits(q, 0);
-    }
-
-    public void testRandomQueries() throws Exception {
-      final String field="data";
-      final String[] vals = {"1","2","3","4","5","6","A","Z","B","Y","Z","X","foo"};
-      int maxLev=4;
-
-      // callback object to set a random setMinimumNumberShouldMatch
-      TestBoolean2.Callback minNrCB = new TestBoolean2.Callback() {
-        @Override
-        public void postCreate(BooleanQuery q) {
-          BooleanClause[] c =q.getClauses();
-          int opt=0;
-          for (int i=0; i<c.length;i++) {
-            if (c[i].getOccur() == BooleanClause.Occur.SHOULD) opt++;
-          }
-          q.setMinimumNumberShouldMatch(random().nextInt(opt+2));
-          if (random().nextBoolean()) {
-            // also add a random negation
-            Term randomTerm = new Term(field, vals[random().nextInt(vals.length)]);
-            q.add(new TermQuery(randomTerm), BooleanClause.Occur.MUST_NOT);
-          }
-        }
-      };
-
-
-
-      // increase number of iterations for more complete testing      
-      int num = atLeast(20);
-      for (int i=0; i<num; i++) {
-        int lev = random().nextInt(maxLev);
-        final long seed = random().nextLong();
-        BooleanQuery q1 = TestBoolean2.randBoolQuery(new Random(seed), true, lev, field, vals, null);
-        // BooleanQuery q2 = TestBoolean2.randBoolQuery(new Random(seed), lev, field, vals, minNrCB);
-        BooleanQuery q2 = TestBoolean2.randBoolQuery(new Random(seed), true, lev, field, vals, null);
-        // only set minimumNumberShouldMatch on the top level query since setting
-        // at a lower level can change the score.
-        minNrCB.postCreate(q2);
-
-        // Can't use Hits because normalized scores will mess things
-        // up.  The non-sorting version of search() that returns TopDocs
-        // will not normalize scores.
-        TopDocs top1 = s.search(q1,null,100);
-        TopDocs top2 = s.search(q2,null,100);
-        if (i < 100) {
-          QueryUtils.check(random(), q1,s);
-          QueryUtils.check(random(), q2,s);
-        }
-        assertSubsetOfSameScores(q2, top1, top2);
-      }
-      // System.out.println("Total hits:"+tot);
-    }
-    
-    private void assertSubsetOfSameScores(Query q, TopDocs top1, TopDocs top2) {
-      // The constrained query
-      // should be a subset to the unconstrained query.
-      if (top2.totalHits > top1.totalHits) {
-        fail("Constrained results not a subset:\n"
-                      + CheckHits.topdocsString(top1,0,0)
-                      + CheckHits.topdocsString(top2,0,0)
-                      + "for query:" + q.toString());
-      }
-
-      for (int hit=0; hit<top2.totalHits; hit++) {
-        int id = top2.scoreDocs[hit].doc;
-        float score = top2.scoreDocs[hit].score;
-        boolean found=false;
-        // find this doc in other hits
-        for (int other=0; other<top1.totalHits; other++) {
-          if (top1.scoreDocs[other].doc == id) {
-            found=true;
-            float otherScore = top1.scoreDocs[other].score;
-            // check if scores match
-            assertEquals("Doc " + id + " scores don't match\n"
-                + CheckHits.topdocsString(top1,0,0)
-                + CheckHits.topdocsString(top2,0,0)
-                + "for query:" + q.toString(),
-                score, otherScore, CheckHits.explainToleranceDelta(score, otherScore));
-          }
-        }
-
-        // check if subset
-        if (!found) fail("Doc " + id + " not found\n"
-              + CheckHits.topdocsString(top1,0,0)
-              + CheckHits.topdocsString(top2,0,0)
-              + "for query:" + q.toString());
-      }
-    }
-
-    public void testRewriteCoord1() throws Exception {
-      final Similarity oldSimilarity = s.getSimilarity();
-      try {
-        s.setSimilarity(new DefaultSimilarity() {
-          @Override
-          public float coord(int overlap, int maxOverlap) {
-            return overlap / ((float)maxOverlap + 1);
-          }
-        });
-        BooleanQuery q1 = new BooleanQuery();
-        q1.add(new TermQuery(new Term("data", "1")), BooleanClause.Occur.SHOULD);
-        BooleanQuery q2 = new BooleanQuery();
-        q2.add(new TermQuery(new Term("data", "1")), BooleanClause.Occur.SHOULD);
-        q2.setMinimumNumberShouldMatch(1);
-        TopDocs top1 = s.search(q1,null,100);
-        TopDocs top2 = s.search(q2,null,100);
-        assertSubsetOfSameScores(q2, top1, top2);
-      } finally {
-        s.setSimilarity(oldSimilarity);
-      }
-    }
-    
-    public void testRewriteNegate() throws Exception {
-      final Similarity oldSimilarity = s.getSimilarity();
-      try {
-        s.setSimilarity(new DefaultSimilarity() {
-          @Override
-          public float coord(int overlap, int maxOverlap) {
-            return overlap / ((float)maxOverlap + 1);
-          }
-        });
-        BooleanQuery q1 = new BooleanQuery();
-        q1.add(new TermQuery(new Term("data", "1")), BooleanClause.Occur.SHOULD);
-        BooleanQuery q2 = new BooleanQuery();
-        q2.add(new TermQuery(new Term("data", "1")), BooleanClause.Occur.SHOULD);
-        q2.add(new TermQuery(new Term("data", "Z")), BooleanClause.Occur.MUST_NOT);
-        TopDocs top1 = s.search(q1,null,100);
-        TopDocs top2 = s.search(q2,null,100);
-        assertSubsetOfSameScores(q2, top1, top2);
-      } finally {
-        s.setSimilarity(oldSimilarity);
-      }
-    }
-
-    protected void printHits(String test, ScoreDoc[] h, IndexSearcher searcher) throws Exception {
-
-        System.err.println("------- " + test + " -------");
-
-        DecimalFormat f = new DecimalFormat("0.000000", DecimalFormatSymbols.getInstance(Locale.ROOT));
-
-        for (int i = 0; i < h.length; i++) {
-            StoredDocument d = searcher.doc(h[i].doc);
-            float score = h[i].score;
-            System.err.println("#" + i + ": " + f.format(score) + " - " +
-                               d.get("id") + " - " + d.get("data"));
-        }
-    }
+    ir.close();
+    iw.close();
+    dir.close();
+  }
 }

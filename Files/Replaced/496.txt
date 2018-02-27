@@ -1,7 +1,6 @@
-public void work(double units) {
+void add( Query query, IndexReader reader ) {
 
-package org.apache.lucene.index;
-
+package org.apache.lucene.search.vectorhighlight;
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
@@ -19,239 +18,413 @@ package org.apache.lucene.index;
  * limitations under the License.
  */
 
+import java.io.IOException;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
-import org.apache.lucene.index.PayloadProcessorProvider.PayloadProcessor;
-import org.apache.lucene.index.PayloadProcessorProvider.ReaderPayloadProcessor;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.util.Bits;
-import org.apache.lucene.util.InfoStream;
-import org.apache.lucene.util.packed.PackedInts;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.search.BooleanClause;
+import org.apache.lucene.search.BooleanQuery;
+import org.apache.lucene.search.DisjunctionMaxQuery;
+import org.apache.lucene.search.MultiTermQuery;
+import org.apache.lucene.search.PhraseQuery;
+import org.apache.lucene.search.Query;
+import org.apache.lucene.search.TermQuery;
+import org.apache.lucene.search.vectorhighlight.FieldTermStack.TermInfo;
 
-/** Holds common state used during segment merging
- *
- * @lucene.experimental */
-public class MergeState {
+/**
+ * FieldQuery breaks down query object into terms/phrases and keeps
+ * them in a QueryPhraseMap structure.
+ */
+public class FieldQuery {
 
-  public static class IndexReaderAndLiveDocs {
-    public final AtomicReader reader;
-    public final Bits liveDocs;
-    public final int numDeletedDocs;
+  final boolean fieldMatch;
 
-    public IndexReaderAndLiveDocs(AtomicReader reader, Bits liveDocs, int numDeletedDocs) {
-      this.reader = reader;
-      this.liveDocs = liveDocs;
-      this.numDeletedDocs = numDeletedDocs;
-    }
-  }
+  // fieldMatch==true,  Map<fieldName,QueryPhraseMap>
+  // fieldMatch==false, Map<null,QueryPhraseMap>
+  Map<String, QueryPhraseMap> rootMaps = new HashMap<String, QueryPhraseMap>();
 
-  public static abstract class DocMap {
-    private final Bits liveDocs;
+  // fieldMatch==true,  Map<fieldName,setOfTermsInQueries>
+  // fieldMatch==false, Map<null,setOfTermsInQueries>
+  Map<String, Set<String>> termSetMap = new HashMap<String, Set<String>>();
 
-    protected DocMap(Bits liveDocs) {
-      this.liveDocs = liveDocs;
-    }
+  int termOrPhraseNumber; // used for colored tag support
 
-    public static DocMap build(IndexReaderAndLiveDocs reader) {
-      final int maxDoc = reader.reader.maxDoc();
-      final int numDeletes = reader.numDeletedDocs;
-      final int numDocs = maxDoc - numDeletes;
-      assert reader.liveDocs != null || numDeletes == 0;
-      if (numDeletes == 0) {
-        return new NoDelDocMap(maxDoc);
-      } else if (numDeletes < numDocs) {
-        return buildDelCountDocmap(maxDoc, numDeletes, reader.liveDocs, PackedInts.COMPACT);
-      } else {
-        return buildDirectDocMap(maxDoc, numDocs, reader.liveDocs, PackedInts.COMPACT);
-      }
-    }
+  // The maximum number of different matching terms accumulated from any one MultiTermQuery
+  private static final int MAX_MTQ_TERMS = 1024;
 
-    static DocMap buildDelCountDocmap(int maxDoc, int numDeletes, Bits liveDocs, float acceptableOverheadRatio) {
-      PackedInts.Mutable numDeletesSoFar = PackedInts.getMutable(maxDoc,
-          PackedInts.bitsRequired(numDeletes), acceptableOverheadRatio);
-      int del = 0;
-      for (int i = 0; i < maxDoc; ++i) {
-        if (!liveDocs.get(i)) {
-          ++del;
-        }
-        numDeletesSoFar.set(i, del);
-      }
-      assert del == numDeletes : "del=" + del + ", numdeletes=" + numDeletes;
-      return new DelCountDocMap(liveDocs, numDeletesSoFar);
-    }
+  FieldQuery( Query query, IndexReader reader, boolean phraseHighlight, boolean fieldMatch ) throws IOException {
+    this.fieldMatch = fieldMatch;
+    Set<Query> flatQueries = new LinkedHashSet<Query>();
+    flatten( query, reader, flatQueries );
+    saveTerms( flatQueries, reader );
+    Collection<Query> expandQueries = expand( flatQueries );
 
-    static DocMap buildDirectDocMap(int maxDoc, int numDocs, Bits liveDocs, float acceptableOverheadRatio) {
-      PackedInts.Mutable docIds = PackedInts.getMutable(maxDoc,
-          PackedInts.bitsRequired(Math.max(0, numDocs - 1)), acceptableOverheadRatio);
-      int del = 0;
-      for (int i = 0; i < maxDoc; ++i) {
-        if (liveDocs.get(i)) {
-          docIds.set(i, i - del);
-        } else {
-          ++del;
+    for( Query flatQuery : expandQueries ){
+      QueryPhraseMap rootMap = getRootMap( flatQuery );
+      rootMap.add( flatQuery, reader );
+      if( !phraseHighlight && flatQuery instanceof PhraseQuery ){
+        PhraseQuery pq = (PhraseQuery)flatQuery;
+        if( pq.getTerms().length > 1 ){
+          for( Term term : pq.getTerms() )
+            rootMap.addTerm( term, flatQuery.getBoost() );
         }
       }
-      assert numDocs + del == maxDoc : "maxDoc=" + maxDoc + ", del=" + del + ", numDocs=" + numDocs;
-      return new DirectDocMap(liveDocs, docIds, del);
     }
+  }
+  
+  /** For backwards compatibility you can initialize FieldQuery without
+   * an IndexReader, which is only required to support MultiTermQuery
+   */
+  FieldQuery( Query query, boolean phraseHighlight, boolean fieldMatch ) throws IOException {
+    this (query, null, phraseHighlight, fieldMatch);
+  }
 
-    public int get(int docId) {
-      if (liveDocs == null || liveDocs.get(docId)) {
-        return remap(docId);
-      } else {
-        return -1;
+  void flatten( Query sourceQuery, IndexReader reader, Collection<Query> flatQueries ) throws IOException{
+    if( sourceQuery instanceof BooleanQuery ){
+      BooleanQuery bq = (BooleanQuery)sourceQuery;
+      for( BooleanClause clause : bq.getClauses() ){
+        if( !clause.isProhibited() )
+          flatten( clause.getQuery(), reader, flatQueries );
       }
     }
-
-    public abstract int remap(int docId);
-
-    public abstract int maxDoc();
-
-    public final int numDocs() {
-      return maxDoc() - numDeletedDocs();
-    }
-
-    public abstract int numDeletedDocs();
-
-    public boolean hasDeletions() {
-      return numDeletedDocs() > 0;
-    }
-
-  }
-
-  private static class NoDelDocMap extends DocMap {
-
-    private final int maxDoc;
-
-    private NoDelDocMap(int maxDoc) {
-      super(null);
-      this.maxDoc = maxDoc;
-    }
-
-    @Override
-    public int remap(int docId) {
-      return docId;
-    }
-
-    @Override
-    public int maxDoc() {
-      return maxDoc;
-    }
-
-    @Override
-    public int numDeletedDocs() {
-      return 0;
-    }
-  }
-
-  private static class DirectDocMap extends DocMap {
-
-    private final PackedInts.Mutable docIds;
-    private final int numDeletedDocs;
-
-    private DirectDocMap(Bits liveDocs, PackedInts.Mutable docIds, int numDeletedDocs) {
-      super(liveDocs);
-      this.docIds = docIds;
-      this.numDeletedDocs = numDeletedDocs;
-    }
-
-    @Override
-    public int remap(int docId) {
-      return (int) docIds.get(docId);
-    }
-
-    @Override
-    public int maxDoc() {
-      return docIds.size();
-    }
-
-    @Override
-    public int numDeletedDocs() {
-      return numDeletedDocs;
-    }
-  }
-
-  private static class DelCountDocMap extends DocMap {
-
-    private final PackedInts.Mutable numDeletesSoFar;
-
-    private DelCountDocMap(Bits liveDocs, PackedInts.Mutable numDeletesSoFar) {
-      super(liveDocs);
-      this.numDeletesSoFar = numDeletesSoFar;
-    }
-
-    @Override
-    public int remap(int docId) {
-      return docId - (int) numDeletesSoFar.get(docId);
-    }
-
-    @Override
-    public int maxDoc() {
-      return numDeletesSoFar.size();
-    }
-
-    @Override
-    public int numDeletedDocs() {
-      final int maxDoc = maxDoc();
-      return (int) numDeletesSoFar.get(maxDoc - 1);
-    }
-  }
-
-  public SegmentInfo segmentInfo;
-  public FieldInfos fieldInfos;
-  public List<IndexReaderAndLiveDocs> readers;        // Readers & liveDocs being merged
-  public DocMap[] docMaps;                            // Maps docIDs around deletions
-  public int[] docBase;                               // New docID base per reader
-  public CheckAbort checkAbort;
-  public InfoStream infoStream;
-
-  // Updated per field;
-  public FieldInfo fieldInfo;
-  
-  // Used to process payloads
-  // TODO: this is a FactoryFactory here basically
-  // and we could make a codec(wrapper) to do all of this privately so IW is uninvolved
-  public PayloadProcessorProvider payloadProcessorProvider;
-  public ReaderPayloadProcessor[] readerPayloadProcessor;
-  public PayloadProcessor[] currentPayloadProcessor;
-
-  // TODO: get rid of this? it tells you which segments are 'aligned' (e.g. for bulk merging)
-  // but is this really so expensive to compute again in different components, versus once in SM?
-  public SegmentReader[] matchingSegmentReaders;
-  public int matchedCount;
-  
-  public static class CheckAbort {
-    private double workCount;
-    private final MergePolicy.OneMerge merge;
-    private final Directory dir;
-    public CheckAbort(MergePolicy.OneMerge merge, Directory dir) {
-      this.merge = merge;
-      this.dir = dir;
-    }
-
-    /**
-     * Records the fact that roughly units amount of work
-     * have been done since this method was last called.
-     * When adding time-consuming code into SegmentMerger,
-     * you should test different values for units to ensure
-     * that the time in between calls to merge.checkAborted
-     * is up to ~ 1 second.
-     */
-    public void work(double units) throws MergePolicy.MergeAbortedException {
-      workCount += units;
-      if (workCount >= 10000.0) {
-        merge.checkAborted(dir);
-        workCount = 0;
+    else if( sourceQuery instanceof DisjunctionMaxQuery ){
+      DisjunctionMaxQuery dmq = (DisjunctionMaxQuery)sourceQuery;
+      for( Query query : dmq ){
+        flatten( query, reader, flatQueries );
       }
+    }
+    else if( sourceQuery instanceof TermQuery ){
+      if( !flatQueries.contains( sourceQuery ) )
+        flatQueries.add( sourceQuery );
+    }
+    else if (sourceQuery instanceof MultiTermQuery && reader != null) {
+      MultiTermQuery copy = (MultiTermQuery) sourceQuery.clone();
+      copy.setRewriteMethod(new MultiTermQuery.TopTermsScoringBooleanQueryRewrite(MAX_MTQ_TERMS));
+      BooleanQuery mtqTerms = (BooleanQuery) copy.rewrite(reader);
+      flatten(mtqTerms, reader, flatQueries);
+    }
+    else if( sourceQuery instanceof PhraseQuery ){
+      if( !flatQueries.contains( sourceQuery ) ){
+        PhraseQuery pq = (PhraseQuery)sourceQuery;
+        if( pq.getTerms().length > 1 )
+          flatQueries.add( pq );
+        else if( pq.getTerms().length == 1 ){
+          flatQueries.add( new TermQuery( pq.getTerms()[0] ) );
+        }
+      }
+    }
+    // else discard queries
+  }
+  
+  /*
+   * Create expandQueries from flatQueries.
+   * 
+   * expandQueries := flatQueries + overlapped phrase queries
+   * 
+   * ex1) flatQueries={a,b,c}
+   *      => expandQueries={a,b,c}
+   * ex2) flatQueries={a,"b c","c d"}
+   *      => expandQueries={a,"b c","c d","b c d"}
+   */
+  Collection<Query> expand( Collection<Query> flatQueries ){
+    Set<Query> expandQueries = new LinkedHashSet<Query>();
+    for( Iterator<Query> i = flatQueries.iterator(); i.hasNext(); ){
+      Query query = i.next();
+      i.remove();
+      expandQueries.add( query );
+      if( !( query instanceof PhraseQuery ) ) continue;
+      for( Iterator<Query> j = flatQueries.iterator(); j.hasNext(); ){
+        Query qj = j.next();
+        if( !( qj instanceof PhraseQuery ) ) continue;
+        checkOverlap( expandQueries, (PhraseQuery)query, (PhraseQuery)qj );
+      }
+    }
+    return expandQueries;
+  }
+
+  /*
+   * Check if PhraseQuery A and B have overlapped part.
+   * 
+   * ex1) A="a b", B="b c" => overlap; expandQueries={"a b c"}
+   * ex2) A="b c", B="a b" => overlap; expandQueries={"a b c"}
+   * ex3) A="a b", B="c d" => no overlap; expandQueries={}
+   */
+  private void checkOverlap( Collection<Query> expandQueries, PhraseQuery a, PhraseQuery b ){
+    if( a.getSlop() != b.getSlop() ) return;
+    Term[] ats = a.getTerms();
+    Term[] bts = b.getTerms();
+    if( fieldMatch && !ats[0].field().equals( bts[0].field() ) ) return;
+    checkOverlap( expandQueries, ats, bts, a.getSlop(), a.getBoost() );
+    checkOverlap( expandQueries, bts, ats, b.getSlop(), b.getBoost() );
+  }
+
+  /*
+   * Check if src and dest have overlapped part and if it is, create PhraseQueries and add expandQueries.
+   * 
+   * ex1) src="a b", dest="c d"       => no overlap
+   * ex2) src="a b", dest="a b c"     => no overlap
+   * ex3) src="a b", dest="b c"       => overlap; expandQueries={"a b c"}
+   * ex4) src="a b c", dest="b c d"   => overlap; expandQueries={"a b c d"}
+   * ex5) src="a b c", dest="b c"     => no overlap
+   * ex6) src="a b c", dest="b"       => no overlap
+   * ex7) src="a a a a", dest="a a a" => overlap;
+   *                                     expandQueries={"a a a a a","a a a a a a"}
+   * ex8) src="a b c d", dest="b c"   => no overlap
+   */
+  private void checkOverlap( Collection<Query> expandQueries, Term[] src, Term[] dest, int slop, float boost ){
+    // beginning from 1 (not 0) is safe because that the PhraseQuery has multiple terms
+    // is guaranteed in flatten() method (if PhraseQuery has only one term, flatten()
+    // converts PhraseQuery to TermQuery)
+    for( int i = 1; i < src.length; i++ ){
+      boolean overlap = true;
+      for( int j = i; j < src.length; j++ ){
+        if( ( j - i ) < dest.length && !src[j].text().equals( dest[j-i].text() ) ){
+          overlap = false;
+          break;
+        }
+      }
+      if( overlap && src.length - i < dest.length ){
+        PhraseQuery pq = new PhraseQuery();
+        for( Term srcTerm : src )
+          pq.add( srcTerm );
+        for( int k = src.length - i; k < dest.length; k++ ){
+          pq.add( new Term( src[0].field(), dest[k].text() ) );
+        }
+        pq.setSlop( slop );
+        pq.setBoost( boost );
+        if(!expandQueries.contains( pq ) )
+          expandQueries.add( pq );
+      }
+    }
+  }
+  
+  QueryPhraseMap getRootMap( Query query ){
+    String key = getKey( query );
+    QueryPhraseMap map = rootMaps.get( key );
+    if( map == null ){
+      map = new QueryPhraseMap( this );
+      rootMaps.put( key, map );
+    }
+    return map;
+  }
+  
+  /*
+   * Return 'key' string. 'key' is the field name of the Query.
+   * If not fieldMatch, 'key' will be null.
+   */
+  private String getKey( Query query ){
+    if( !fieldMatch ) return null;
+    if( query instanceof TermQuery )
+      return ((TermQuery)query).getTerm().field();
+    else if ( query instanceof PhraseQuery ){
+      PhraseQuery pq = (PhraseQuery)query;
+      Term[] terms = pq.getTerms();
+      return terms[0].field();
+    }
+    else if (query instanceof MultiTermQuery) {
+      return ((MultiTermQuery)query).getField();
+    }
+    else
+      throw new RuntimeException( "query \"" + query.toString() + "\" must be flatten first." );
+  }
+
+  /*
+   * Save the set of terms in the queries to termSetMap.
+   * 
+   * ex1) q=name:john
+   *      - fieldMatch==true
+   *          termSetMap=Map<"name",Set<"john">>
+   *      - fieldMatch==false
+   *          termSetMap=Map<null,Set<"john">>
+   *          
+   * ex2) q=name:john title:manager
+   *      - fieldMatch==true
+   *          termSetMap=Map<"name",Set<"john">,
+   *                         "title",Set<"manager">>
+   *      - fieldMatch==false
+   *          termSetMap=Map<null,Set<"john","manager">>
+   *          
+   * ex3) q=name:"john lennon"
+   *      - fieldMatch==true
+   *          termSetMap=Map<"name",Set<"john","lennon">>
+   *      - fieldMatch==false
+   *          termSetMap=Map<null,Set<"john","lennon">>
+   */
+    void saveTerms( Collection<Query> flatQueries, IndexReader reader ) throws IOException{
+    for( Query query : flatQueries ){
+      Set<String> termSet = getTermSet( query );
+      if( query instanceof TermQuery )
+        termSet.add( ((TermQuery)query).getTerm().text() );
+      else if( query instanceof PhraseQuery ){
+        for( Term term : ((PhraseQuery)query).getTerms() )
+          termSet.add( term.text() );
+      }
+      else if (query instanceof MultiTermQuery && reader != null) {
+        BooleanQuery mtqTerms = (BooleanQuery) query.rewrite(reader);
+        for (BooleanClause clause : mtqTerms.getClauses()) {
+          termSet.add (((TermQuery) clause.getQuery()).getTerm().text());
+        }
+      }
+      else
+        throw new RuntimeException( "query \"" + query.toString() + "\" must be flatten first." );
+    }
+  }
+  
+  private Set<String> getTermSet( Query query ){
+    String key = getKey( query );
+    Set<String> set = termSetMap.get( key );
+    if( set == null ){
+      set = new HashSet<String>();
+      termSetMap.put( key, set );
+    }
+    return set;
+  }
+  
+  Set<String> getTermSet( String field ){
+    return termSetMap.get( fieldMatch ? field : null );
+  }
+
+  /**
+   * 
+   * @param fieldName
+   * @param term
+   * @return QueryPhraseMap
+   */
+  public QueryPhraseMap getFieldTermMap( String fieldName, String term ){
+    QueryPhraseMap rootMap = getRootMap( fieldName );
+    return rootMap == null ? null : rootMap.subMap.get( term );
+  }
+
+  /**
+   * 
+   * @param fieldName
+   * @param phraseCandidate
+   * @return QueryPhraseMap
+   */
+  public QueryPhraseMap searchPhrase( String fieldName, final List<TermInfo> phraseCandidate ){
+    QueryPhraseMap root = getRootMap( fieldName );
+    if( root == null ) return null;
+    return root.searchPhrase( phraseCandidate );
+  }
+  
+  private QueryPhraseMap getRootMap( String fieldName ){
+    return rootMaps.get( fieldMatch ? fieldName : null );
+  }
+  
+  int nextTermOrPhraseNumber(){
+    return termOrPhraseNumber++;
+  }
+  
+  public static class QueryPhraseMap {
+
+    boolean terminal;
+    int slop;   // valid if terminal == true and phraseHighlight == true
+    float boost;  // valid if terminal == true
+    int termOrPhraseNumber;   // valid if terminal == true
+    FieldQuery fieldQuery;
+    Map<String, QueryPhraseMap> subMap = new HashMap<String, QueryPhraseMap>();
+    
+    public QueryPhraseMap( FieldQuery fieldQuery ){
+      this.fieldQuery = fieldQuery;
+    }
+
+    void addTerm( Term term, float boost ){
+      QueryPhraseMap map = getOrNewMap( subMap, term.text() );
+      map.markTerminal( boost );
     }
     
-    /** If you use this: IW.close(false) cannot abort your merge!
-     * @lucene.internal */
-    static final MergeState.CheckAbort NONE = new MergeState.CheckAbort(null, null) {
-      @Override
-      public void work(double units) throws MergePolicy.MergeAbortedException {
-        // do nothing
+    private QueryPhraseMap getOrNewMap( Map<String, QueryPhraseMap> subMap, String term ){
+      QueryPhraseMap map = subMap.get( term );
+      if( map == null ){
+        map = new QueryPhraseMap( fieldQuery );
+        subMap.put( term, map );
       }
-    };
+      return map;
+    }
+
+      void add( Query query, IndexReader reader ) throws IOException {
+      if( query instanceof TermQuery ){
+        addTerm( ((TermQuery)query).getTerm(), query.getBoost() );
+      }
+      else if( query instanceof PhraseQuery ){
+        PhraseQuery pq = (PhraseQuery)query;
+        Term[] terms = pq.getTerms();
+        Map<String, QueryPhraseMap> map = subMap;
+        QueryPhraseMap qpm = null;
+        for( Term term : terms ){
+          qpm = getOrNewMap( map, term.text() );
+          map = qpm.subMap;
+        }
+        qpm.markTerminal( pq.getSlop(), pq.getBoost() );
+      }
+      else
+        throw new RuntimeException( "query \"" + query.toString() + "\" must be flatten first." );
+    }
+    
+    public QueryPhraseMap getTermMap( String term ){
+      return subMap.get( term );
+    }
+    
+    private void markTerminal( float boost ){
+      markTerminal( 0, boost );
+    }
+    
+    private void markTerminal( int slop, float boost ){
+      this.terminal = true;
+      this.slop = slop;
+      this.boost = boost;
+      this.termOrPhraseNumber = fieldQuery.nextTermOrPhraseNumber();
+    }
+    
+    public boolean isTerminal(){
+      return terminal;
+    }
+    
+    public int getSlop(){
+      return slop;
+    }
+    
+    public float getBoost(){
+      return boost;
+    }
+    
+    public int getTermOrPhraseNumber(){
+      return termOrPhraseNumber;
+    }
+    
+    public QueryPhraseMap searchPhrase( final List<TermInfo> phraseCandidate ){
+      QueryPhraseMap currMap = this;
+      for( TermInfo ti : phraseCandidate ){
+        currMap = currMap.subMap.get( ti.getText() );
+        if( currMap == null ) return null;
+      }
+      return currMap.isValidTermOrPhrase( phraseCandidate ) ? currMap : null;
+    }
+    
+    public boolean isValidTermOrPhrase( final List<TermInfo> phraseCandidate ){
+      // check terminal
+      if( !terminal ) return false;
+
+      // if the candidate is a term, it is valid
+      if( phraseCandidate.size() == 1 ) return true;
+
+      // else check whether the candidate is valid phrase
+      // compare position-gaps between terms to slop
+      int pos = phraseCandidate.get( 0 ).getPosition();
+      for( int i = 1; i < phraseCandidate.size(); i++ ){
+        int nextPos = phraseCandidate.get( i ).getPosition();
+        if( Math.abs( nextPos - pos - 1 ) > slop ) return false;
+        pos = nextPos;
+      }
+      return true;
+    }
   }
 }

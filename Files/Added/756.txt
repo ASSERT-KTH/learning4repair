@@ -1,13 +1,14 @@
-import org.apache.cassandra.streaming.FileStreamTask;
+assert offsetDelta >= 0 && offsetLength >= 0 : "startOffset=" + startOffset + ",lastOffset=" + lastOffset + ",endOffset=" + endOffset;
 
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+package org.apache.lucene.codecs.lucene40;
+
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,571 +19,358 @@ import org.apache.cassandra.streaming.FileStreamTask;
  * limitations under the License.
  */
 
-package org.apache.cassandra.net;
+/** Consumes doc & freq, writing them using the current
+ *  index file format */
 
-import java.io.IOError;
 import java.io.IOException;
-import java.lang.management.ManagementFactory;
-import java.net.InetAddress;
-import java.net.InetSocketAddress;
-import java.net.ServerSocket;
-import java.net.Socket;
-import java.nio.ByteBuffer;
-import java.nio.channels.AsynchronousCloseException;
-import java.nio.channels.ServerSocketChannel;
-import java.security.MessageDigest;
-import java.util.*;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-import javax.management.MBeanServer;
-import javax.management.ObjectName;
+import java.util.ArrayList;
+import java.util.List;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.lucene.codecs.PostingsWriterBase;
+import org.apache.lucene.codecs.TermStats;
+import org.apache.lucene.index.CorruptIndexException;
+import org.apache.lucene.index.DocsEnum;
+import org.apache.lucene.index.FieldInfo.IndexOptions;
+import org.apache.lucene.index.FieldInfo;
+import org.apache.lucene.index.IndexFileNames;
+import org.apache.lucene.index.SegmentWriteState;
+import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.store.RAMOutputStream;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.CodecUtil;
+import org.apache.lucene.util.IOUtils;
 
-import org.apache.cassandra.concurrent.JMXEnabledThreadPoolExecutor;
-import org.apache.cassandra.concurrent.StageManager;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.io.util.DataOutputBuffer;
-import org.apache.cassandra.net.io.SerializerType;
-import org.apache.cassandra.net.sink.SinkManager;
-import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.streaming.StreamHeader;
-import org.apache.cassandra.utils.ExpiringMap;
-import org.apache.cassandra.utils.GuidGenerator;
-import org.apache.cassandra.utils.SimpleCondition;
-import org.cliffc.high_scale_lib.NonBlockingHashMap;
+/**
+ * Concrete class that writes the 4.0 frq/prx postings format.
+ * 
+ * @see Lucene40PostingsFormat
+ * @lucene.experimental 
+ */
+public final class Lucene40PostingsWriter extends PostingsWriterBase {
+  final static String TERMS_CODEC = "Lucene40PostingsWriterTerms";
+  final static String FRQ_CODEC = "Lucene40PostingsWriterFrq";
+  final static String PRX_CODEC = "Lucene40PostingsWriterPrx";
 
-public class MessagingService implements MessagingServiceMBean
-{
-    private static int version_ = 1;
-    //TODO: make this parameter dynamic somehow.  Not sure if config is appropriate.
-    private static SerializerType serializerType_ = SerializerType.BINARY;
+  //private static boolean DEBUG = BlockTreeTermsWriter.DEBUG;
+  
+  // Increment version to change it:
+  final static int VERSION_START = 0;
+  final static int VERSION_CURRENT = VERSION_START;
 
-    /** we preface every message with this number so the recipient can validate the sender is sane */
-    public static final int PROTOCOL_MAGIC = 0xCA552DFA;
+  final IndexOutput freqOut;
+  final IndexOutput proxOut;
+  final Lucene40SkipListWriter skipListWriter;
+  /** Expert: The fraction of TermDocs entries stored in skip tables,
+   * used to accelerate {@link DocsEnum#advance(int)}.  Larger values result in
+   * smaller indexes, greater acceleration, but fewer accelerable cases, while
+   * smaller values result in bigger indexes, less acceleration and more
+   * accelerable cases. More detailed experiments would be useful here. */
+  static final int DEFAULT_SKIP_INTERVAL = 16;
+  final int skipInterval;
+  
+  /**
+   * Expert: minimum docFreq to write any skip data at all
+   */
+  final int skipMinimum;
 
-    /* This records all the results mapped by message Id */
-    private static ExpiringMap<String, IAsyncCallback> callbackMap_;
-    private static ExpiringMap<String, IAsyncResult> taskCompletionMap_;
-    
-    /* Lookup table for registering message handlers based on the verb. */
-    private static Map<StorageService.Verb, IVerbHandler> verbHandlers_;
+  /** Expert: The maximum number of skip levels. Smaller values result in 
+   * slightly smaller indexes, but slower skipping in big posting lists.
+   */
+  final int maxSkipLevels = 10;
+  final int totalNumDocs;
+  IndexOutput termsOut;
 
-    /* Thread pool to handle messaging write activities */
-    private static ExecutorService streamExecutor_;
-    
-    private static NonBlockingHashMap<InetAddress, OutboundTcpConnectionPool> connectionManagers_ = new NonBlockingHashMap<InetAddress, OutboundTcpConnectionPool>();
-    
-    private static Logger logger_ = LoggerFactory.getLogger(MessagingService.class);
-    private static int LOG_DROPPED_INTERVAL_IN_MS = 1000;
+  IndexOptions indexOptions;
+  boolean storePayloads;
+  boolean storeOffsets;
+  // Starts a new term
+  long freqStart;
+  long proxStart;
+  FieldInfo fieldInfo;
+  int lastPayloadLength;
+  int lastOffsetLength;
+  int lastPosition;
+  int lastOffset;
 
-    public static final MessagingService instance = new MessagingService();
+  // private String segment;
 
-    private SocketThread socketThread;
-    private SimpleCondition listenGate;
-    private static AtomicInteger droppedMessages = new AtomicInteger();
-
-    public Object clone() throws CloneNotSupportedException
-    {
-        //Prevents the singleton from being cloned
-        throw new CloneNotSupportedException();
+  public Lucene40PostingsWriter(SegmentWriteState state) throws IOException {
+    this(state, DEFAULT_SKIP_INTERVAL);
+  }
+  
+  public Lucene40PostingsWriter(SegmentWriteState state, int skipInterval) throws IOException {
+    super();
+    this.skipInterval = skipInterval;
+    this.skipMinimum = skipInterval; /* set to the same for now */
+    // this.segment = state.segmentName;
+    String fileName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, Lucene40PostingsFormat.FREQ_EXTENSION);
+    freqOut = state.directory.createOutput(fileName, state.context);
+    boolean success = false;
+    IndexOutput proxOut = null;
+    try {
+      CodecUtil.writeHeader(freqOut, FRQ_CODEC, VERSION_CURRENT);
+      // TODO: this is a best effort, if one of these fields has no postings
+      // then we make an empty prx file, same as if we are wrapped in 
+      // per-field postingsformat. maybe... we shouldn't
+      // bother w/ this opto?  just create empty prx file...?
+      if (state.fieldInfos.hasProx()) {
+        // At least one field does not omit TF, so create the
+        // prox file
+        fileName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, Lucene40PostingsFormat.PROX_EXTENSION);
+        proxOut = state.directory.createOutput(fileName, state.context);
+        CodecUtil.writeHeader(proxOut, PRX_CODEC, VERSION_CURRENT);
+      } else {
+        // Every field omits TF so we will write no prox file
+        proxOut = null;
+      }
+      this.proxOut = proxOut;
+      success = true;
+    } finally {
+      if (!success) {
+        IOUtils.closeWhileHandlingException(freqOut, proxOut);
+      }
     }
 
-    protected MessagingService()
-    {
-        listenGate = new SimpleCondition();
-        verbHandlers_ = new EnumMap<StorageService.Verb, IVerbHandler>(StorageService.Verb.class);
-        /*
-         * Leave callbacks in the cachetable long enough that any related messages will arrive
-         * before the callback is evicted from the table. The concurrency level is set at 128
-         * which is the sum of the threads in the pool that adds shit into the table and the 
-         * pool that retrives the callback from here.
-        */
-        callbackMap_ = new ExpiringMap<String, IAsyncCallback>((long) (1.1 * DatabaseDescriptor.getRpcTimeout()));
-        taskCompletionMap_ = new ExpiringMap<String, IAsyncResult>((long) (1.1 * DatabaseDescriptor.getRpcTimeout()));
+    totalNumDocs = state.segmentInfo.getDocCount();
 
-        streamExecutor_ = new JMXEnabledThreadPoolExecutor("MESSAGE-STREAMING-POOL");
-        TimerTask logDropped = new TimerTask()
-        {
-            public void run()
-            {
-                logDroppedMessages();
-            }
-        };
-        Timer timer = new Timer("DroppedMessagesLogger");
-        timer.schedule(logDropped, LOG_DROPPED_INTERVAL_IN_MS, LOG_DROPPED_INTERVAL_IN_MS);
+    skipListWriter = new Lucene40SkipListWriter(skipInterval,
+                                               maxSkipLevels,
+                                               totalNumDocs,
+                                               freqOut,
+                                               proxOut);
+  }
 
-        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
-        try
-        {
-            mbs.registerMBean(this, new ObjectName("org.apache.cassandra.concurrent:type=MESSAGING-SERVICE-POOL"));
-        }
-        catch (Exception e)
-        {
-            throw new RuntimeException(e);
-        }
+  @Override
+  public void start(IndexOutput termsOut) throws IOException {
+    this.termsOut = termsOut;
+    CodecUtil.writeHeader(termsOut, TERMS_CODEC, VERSION_CURRENT);
+    termsOut.writeInt(skipInterval);                // write skipInterval
+    termsOut.writeInt(maxSkipLevels);               // write maxSkipLevels
+    termsOut.writeInt(skipMinimum);                 // write skipMinimum
+  }
+
+  @Override
+  public void startTerm() {
+    freqStart = freqOut.getFilePointer();
+    //if (DEBUG) System.out.println("SPW: startTerm freqOut.fp=" + freqStart);
+    if (proxOut != null) {
+      proxStart = proxOut.getFilePointer();
     }
+    // force first payload to write its length
+    lastPayloadLength = -1;
+    // force first offset to write its length
+    lastOffsetLength = -1;
+    skipListWriter.resetSkip();
+  }
 
-    public byte[] hash(String type, byte data[])
-    {
-        byte result[];
-        try
-        {
-            MessageDigest messageDigest = MessageDigest.getInstance(type);
-            result = messageDigest.digest(data);
-        }
-        catch (Exception e)
-        {
-            throw new RuntimeException(e);
-        }
-        return result;
+  // Currently, this instance is re-used across fields, so
+  // our parent calls setField whenever the field changes
+  @Override
+  public void setField(FieldInfo fieldInfo) {
+    //System.out.println("SPW: setField");
+    /*
+    if (BlockTreeTermsWriter.DEBUG && fieldInfo.name.equals("id")) {
+      DEBUG = true;
+    } else {
+      DEBUG = false;
     }
-
-    /** called from gossiper when it notices a node is not responding. */
-    public void convict(InetAddress ep)
-    {
-        logger_.debug("Resetting pool for " + ep);
-        getConnectionPool(ep).reset();
-    }
-
-    /**
-     * Listen on the specified port.
-     * @param localEp InetAddress whose port to listen on.
-     */
-    public void listen(InetAddress localEp) throws IOException
-    {        
-        ServerSocketChannel serverChannel = ServerSocketChannel.open();
-        final ServerSocket ss = serverChannel.socket();
-        ss.setReuseAddress(true);
-        ss.bind(new InetSocketAddress(localEp, DatabaseDescriptor.getStoragePort()));
-        socketThread = new SocketThread(ss, "ACCEPT-" + localEp);
-        socketThread.start();
-        listenGate.signalAll();
-    }
-
-    public void waitUntilListening()
-    {
-        try
-        {
-            listenGate.await();
-        }
-        catch (InterruptedException ie)
-        {
-            logger_.debug("await interrupted");
-        }
-    }
-
-    public static OutboundTcpConnectionPool getConnectionPool(InetAddress to)
-    {
-        OutboundTcpConnectionPool cp = connectionManagers_.get(to);
-        if (cp == null)
-        {
-            connectionManagers_.putIfAbsent(to, new OutboundTcpConnectionPool(to));
-            cp = connectionManagers_.get(to);
-        }
-        return cp;
-    }
-
-    public static OutboundTcpConnection getConnection(InetAddress to, Message msg)
-    {
-        return getConnectionPool(to).getConnection(msg);
-    }
-        
-    /**
-     * Register a verb and the corresponding verb handler with the
-     * Messaging Service.
-     * @param verb
-     * @param verbHandler handler for the specified verb
-     */
-    public void registerVerbHandlers(StorageService.Verb verb, IVerbHandler verbHandler)
-    {
-    	assert !verbHandlers_.containsKey(verb);
-    	verbHandlers_.put(verb, verbHandler);
-    }
-        
-    /**
-     * This method returns the verb handler associated with the registered
-     * verb. If no handler has been registered then null is returned.
-     * @param type for which the verb handler is sought
-     * @return a reference to IVerbHandler which is the handler for the specified verb
-     */
-    public IVerbHandler getVerbHandler(StorageService.Verb type)
-    {
-        return verbHandlers_.get(type);
-    }
-
-    /**
-     * Send a message to a given endpoint.
-     * @param message message to be sent.
-     * @param to endpoint to which the message needs to be sent
-     * @return an reference to an IAsyncResult which can be queried for the
-     * response
-     */
-    public String sendRR(Message message, InetAddress[] to, IAsyncCallback cb)
-    {
-        String messageId = message.getMessageId();
-        addCallback(cb, messageId);
-        for (InetAddress endpoint : to)
-        {
-            sendOneWay(message, endpoint);
-        }
-        return messageId;
-    }
-
-    public void addCallback(IAsyncCallback cb, String messageId)
-    {
-        callbackMap_.put(messageId, cb);
-    }
-
-    /**
-     * Send a message to a given endpoint. This method specifies a callback
-     * which is invoked with the actual response.
-     * @param message message to be sent.
-     * @param to endpoint to which the message needs to be sent
-     * @param cb callback interface which is used to pass the responses or
-     *           suggest that a timeout occurred to the invoker of the send().
-     *           suggest that a timeout occurred to the invoker of the send().
-     * @return an reference to message id used to match with the result
-     */
-    public String sendRR(Message message, InetAddress to, IAsyncCallback cb)
-    {        
-        String messageId = message.getMessageId();
-        addCallback(cb, messageId);
-        sendOneWay(message, to);
-        return messageId;
-    }
-
-    /**
-     * Send a message to a given endpoint. The ith element in the <code>messages</code>
-     * array is sent to the ith element in the <code>to</code> array.This method assumes
-     * there is a one-one mapping between the <code>messages</code> array and
-     * the <code>to</code> array. Otherwise an  IllegalArgumentException will be thrown.
-     * This method also informs the MessagingService to wait for at least
-     * <code>howManyResults</code> responses to determine success of failure.
-     * @param messages messages to be sent.
-     * @param to endpoints to which the message needs to be sent
-     * @param cb callback interface which is used to pass the responses or
-     *           suggest that a timeout occured to the invoker of the send().
-     * @return an reference to message id used to match with the result
-     */
-    public String sendRR(Message[] messages, InetAddress[] to, IAsyncCallback cb)
-    {
-        if ( messages.length != to.length )
-        {
-            throw new IllegalArgumentException("Number of messages and the number of endpoints need to be same.");
-        }
-        String groupId = GuidGenerator.guid();
-        addCallback(cb, groupId);
-        for ( int i = 0; i < messages.length; ++i )
-        {
-            messages[i].setMessageId(groupId);
-            sendOneWay(messages[i], to[i]);
-        }
-        return groupId;
-    } 
-    
-    /**
-     * Send a message to a given endpoint. This method adheres to the fire and forget
-     * style messaging.
-     * @param message messages to be sent.
-     * @param to endpoint to which the message needs to be sent
-     */
-    public void sendOneWay(Message message, InetAddress to)
-    {
-        // do local deliveries
-        if ( message.getFrom().equals(to) )
-        {
-            MessagingService.receive(message);
-            return;
-        }
-
-        // message sinks are a testing hook
-        Message processedMessage = SinkManager.processClientMessageSink(message);
-        if (processedMessage == null)
-        {
-            return;
-        }
-
-        // get pooled connection (really, connection queue)
-        OutboundTcpConnection connection = getConnection(to, message);
-
-        // pack message with header in a bytebuffer
-        byte[] data;
-        try
-        {
-            DataOutputBuffer buffer = new DataOutputBuffer();
-            Message.serializer().serialize(message, buffer);
-            data = buffer.getData();
-        }
-        catch (IOException e)
-        {
-            throw new RuntimeException(e);
-        }
-        assert data.length > 0;
-        ByteBuffer buffer = packIt(data , false);
-
-        // write it
-        connection.write(buffer);
-    }
-    
-    public IAsyncResult sendRR(Message message, InetAddress to)
-    {
-        IAsyncResult iar = new AsyncResult();
-        taskCompletionMap_.put(message.getMessageId(), iar);
-        sendOneWay(message, to);
-        return iar;
-    }
-    
-    /**
-     * Stream a file from source to destination. This is highly optimized
-     * to not hold any of the contents of the file in memory.
-     * @param header Header contains file to stream and other metadata.
-     * @param to endpoint to which we need to stream the file.
     */
+    this.fieldInfo = fieldInfo;
+    indexOptions = fieldInfo.getIndexOptions();
+    
+    storeOffsets = indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) >= 0;        
+    storePayloads = fieldInfo.hasPayloads();
+    //System.out.println("  set init blockFreqStart=" + freqStart);
+    //System.out.println("  set init blockProxStart=" + proxStart);
+  }
 
-    public void stream(StreamHeader header, InetAddress to)
-    {
-        /* Streaming asynchronously on streamExector_ threads. */
-        streamExecutor_.execute(new FileStreamTask(header, to));
+  int lastDocID;
+  int df;
+  
+  /** Adds a new doc in this term.  If this returns null
+   *  then we just skip consuming positions/payloads. */
+  @Override
+  public void startDoc(int docID, int termDocFreq) throws IOException {
+    // if (DEBUG) System.out.println("SPW:   startDoc seg=" + segment + " docID=" + docID + " tf=" + termDocFreq + " freqOut.fp=" + freqOut.getFilePointer());
+
+    final int delta = docID - lastDocID;
+    
+    if (docID < 0 || (df > 0 && delta <= 0)) {
+      throw new CorruptIndexException("docs out of order (" + docID + " <= " + lastDocID + " ) (freqOut: " + freqOut + ")");
+    }
+
+    if ((++df % skipInterval) == 0) {
+      skipListWriter.setSkipData(lastDocID, storePayloads, lastPayloadLength, storeOffsets, lastOffsetLength);
+      skipListWriter.bufferSkip(df);
+    }
+
+    assert docID < totalNumDocs: "docID=" + docID + " totalNumDocs=" + totalNumDocs;
+
+    lastDocID = docID;
+    if (indexOptions == IndexOptions.DOCS_ONLY) {
+      freqOut.writeVInt(delta);
+    } else if (1 == termDocFreq) {
+      freqOut.writeVInt((delta<<1) | 1);
+    } else {
+      freqOut.writeVInt(delta<<1);
+      freqOut.writeVInt(termDocFreq);
+    }
+
+    lastPosition = 0;
+    lastOffset = 0;
+  }
+
+  /** Add a new position & payload */
+  @Override
+  public void addPosition(int position, BytesRef payload, int startOffset, int endOffset) throws IOException {
+    //if (DEBUG) System.out.println("SPW:     addPos pos=" + position + " payload=" + (payload == null ? "null" : (payload.length + " bytes")) + " proxFP=" + proxOut.getFilePointer());
+    assert indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) >= 0 : "invalid indexOptions: " + indexOptions;
+    assert proxOut != null;
+
+    final int delta = position - lastPosition;
+    
+    assert delta >= 0: "position=" + position + " lastPosition=" + lastPosition;            // not quite right (if pos=0 is repeated twice we don't catch it)
+
+    lastPosition = position;
+
+    int payloadLength = 0;
+
+    if (storePayloads) {
+      payloadLength = payload == null ? 0 : payload.length;
+
+      if (payloadLength != lastPayloadLength) {
+        lastPayloadLength = payloadLength;
+        proxOut.writeVInt((delta<<1)|1);
+        proxOut.writeVInt(payloadLength);
+      } else {
+        proxOut.writeVInt(delta << 1);
+      }
+    } else {
+      proxOut.writeVInt(delta);
     }
     
-    /** blocks until the processing pools are empty and done. */
-    public static void waitFor() throws InterruptedException
-    {
-        while (!streamExecutor_.isTerminated())
-            streamExecutor_.awaitTermination(5, TimeUnit.SECONDS);
-    }
-
-    public static void shutdown()
-    {
-        logger_.info("Shutting down MessageService...");
-
-        try
-        {
-            instance.socketThread.close();
-        }
-        catch (IOException e)
-        {
-            throw new IOError(e);
-        }
-
-        streamExecutor_.shutdownNow();
-
-        /* shut down the cachetables */
-        taskCompletionMap_.shutdown();
-        callbackMap_.shutdown();
-
-        logger_.info("Shutdown complete (no further commands will be processed)");
-    }
-
-    public static void receive(Message message)
-    {
-        message = SinkManager.processServerMessageSink(message);
-
-        Runnable runnable = new MessageDeliveryTask(message);
-        ExecutorService stage = StageManager.getStage(message.getMessageType());
-        assert stage != null;
-        stage.execute(runnable);
-    }
-
-    public static IAsyncCallback getRegisteredCallback(String key)
-    {
-        return callbackMap_.get(key);
+    if (storeOffsets) {
+      // don't use startOffset - lastEndOffset, because this creates lots of negative vints for synonyms,
+      // and the numbers aren't that much smaller anyways.
+      int offsetDelta = startOffset - lastOffset;
+      int offsetLength = endOffset - startOffset;
+      if (offsetLength != lastOffsetLength) {
+        proxOut.writeVInt(offsetDelta << 1 | 1);
+        proxOut.writeVInt(offsetLength);
+      } else {
+        proxOut.writeVInt(offsetDelta << 1);
+      }
+      lastOffset = startOffset;
+      lastOffsetLength = offsetLength;
     }
     
-    public static void removeRegisteredCallback(String key)
-    {
-        callbackMap_.remove(key);
+    if (payloadLength > 0) {
+      proxOut.writeBytes(payload.bytes, payload.offset, payloadLength);
     }
-    
-    public static IAsyncResult getAsyncResult(String key)
-    {
-        return taskCompletionMap_.remove(key);
+  }
+
+  @Override
+  public void finishDoc() {
+  }
+
+  private static class PendingTerm {
+    public final long freqStart;
+    public final long proxStart;
+    public final int skipOffset;
+
+    public PendingTerm(long freqStart, long proxStart, int skipOffset) {
+      this.freqStart = freqStart;
+      this.proxStart = proxStart;
+      this.skipOffset = skipOffset;
+    }
+  }
+
+  private final List<PendingTerm> pendingTerms = new ArrayList<PendingTerm>();
+
+  /** Called when we are done adding docs to this term */
+  @Override
+  public void finishTerm(TermStats stats) throws IOException {
+
+    // if (DEBUG) System.out.println("SPW: finishTerm seg=" + segment + " freqStart=" + freqStart);
+    assert stats.docFreq > 0;
+
+    // TODO: wasteful we are counting this (counting # docs
+    // for this term) in two places?
+    assert stats.docFreq == df;
+
+    final int skipOffset;
+    if (df >= skipMinimum) {
+      skipOffset = (int) (skipListWriter.writeSkip(freqOut)-freqStart);
+    } else {
+      skipOffset = -1;
     }
 
-    public static long getRegisteredCallbackAge(String key)
-    {
-        return callbackMap_.getAge(key);
+    pendingTerms.add(new PendingTerm(freqStart, proxStart, skipOffset));
+
+    lastDocID = 0;
+    df = 0;
+  }
+
+  private final RAMOutputStream bytesWriter = new RAMOutputStream();
+
+  @Override
+  public void flushTermsBlock(int start, int count) throws IOException {
+    //if (DEBUG) System.out.println("SPW: flushTermsBlock start=" + start + " count=" + count + " left=" + (pendingTerms.size()-count) + " pendingTerms.size()=" + pendingTerms.size());
+
+    if (count == 0) {
+      termsOut.writeByte((byte) 0);
+      return;
     }
 
-    public static long getAsyncResultAge(String key)
-    {
-        return taskCompletionMap_.getAge(key);
+    assert start <= pendingTerms.size();
+    assert count <= start;
+
+    final int limit = pendingTerms.size() - start + count;
+    final PendingTerm firstTerm = pendingTerms.get(limit - count);
+    // First term in block is abs coded:
+    bytesWriter.writeVLong(firstTerm.freqStart);
+
+    if (firstTerm.skipOffset != -1) {
+      assert firstTerm.skipOffset > 0;
+      bytesWriter.writeVInt(firstTerm.skipOffset);
+    }
+    if (indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) >= 0) {
+      bytesWriter.writeVLong(firstTerm.proxStart);
+    }
+    long lastFreqStart = firstTerm.freqStart;
+    long lastProxStart = firstTerm.proxStart;
+    for(int idx=limit-count+1; idx<limit; idx++) {
+      final PendingTerm term = pendingTerms.get(idx);
+      //if (DEBUG) System.out.println("  write term freqStart=" + term.freqStart);
+      // The rest of the terms term are delta coded:
+      bytesWriter.writeVLong(term.freqStart - lastFreqStart);
+      lastFreqStart = term.freqStart;
+      if (term.skipOffset != -1) {
+        assert term.skipOffset > 0;
+        bytesWriter.writeVInt(term.skipOffset);
+      }
+      if (indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) >= 0) {
+        bytesWriter.writeVLong(term.proxStart - lastProxStart);
+        lastProxStart = term.proxStart;
+      }
     }
 
-    public static void validateMagic(int magic) throws IOException
-    {
-        if (magic != PROTOCOL_MAGIC)
-            throw new IOException("invalid protocol header");
-    }
+    termsOut.writeVInt((int) bytesWriter.getFilePointer());
+    bytesWriter.writeTo(termsOut);
+    bytesWriter.reset();
 
-    public static int getBits(int x, int p, int n)
-    {
-        return x >>> (p + 1) - n & ~(-1 << n);
-    }
-        
-    public static ByteBuffer packIt(byte[] bytes, boolean compress)
-    {
-        /*
-             Setting up the protocol header. This is 4 bytes long
-             represented as an integer. The first 2 bits indicate
-             the serializer type. The 3rd bit indicates if compression
-             is turned on or off. It is turned off by default. The 4th
-             bit indicates if we are in streaming mode. It is turned off
-             by default. The 5th-8th bits are reserved for future use.
-             The next 8 bits indicate a version number. Remaining 15 bits 
-             are not used currently.            
-        */
-        int header = 0;
-        // Setting up the serializer bit
-        header |= serializerType_.ordinal();
-        // set compression bit.
-        if (compress)
-            header |= 4;
-        // Setting up the version bit
-        header |= (version_ << 8);
+    // Remove the terms we just wrote:
+    pendingTerms.subList(limit-count, limit).clear();
+  }
 
-        ByteBuffer buffer = ByteBuffer.allocate(4 + 4 + 4 + bytes.length);
-        buffer.putInt(PROTOCOL_MAGIC);
-        buffer.putInt(header);
-        buffer.putInt(bytes.length);
-        buffer.put(bytes);
-        buffer.flip();
-        return buffer;
+  @Override
+  public void close() throws IOException {
+    try {
+      freqOut.close();
+    } finally {
+      if (proxOut != null) {
+        proxOut.close();
+      }
     }
-        
-    public static ByteBuffer constructStreamHeader(StreamHeader streamHeader, boolean compress)
-    {
-        /* 
-        Setting up the protocol header. This is 4 bytes long
-        represented as an integer. The first 2 bits indicate
-        the serializer type. The 3rd bit indicates if compression
-        is turned on or off. It is turned off by default. The 4th
-        bit indicates if we are in streaming mode. It is turned off
-        by default. The following 4 bits are reserved for future use. 
-        The next 8 bits indicate a version number. Remaining 15 bits 
-        are not used currently.            
-        */
-        int header = 0;
-        // Setting up the serializer bit
-        header |= serializerType_.ordinal();
-        // set compression bit.
-        if ( compress )
-            header |= 4;
-        // set streaming bit
-        header |= 8;
-        // Setting up the version bit
-        header |= (version_ << 8);
-        /* Finished the protocol header setup */
-
-        /* Adding the StreamHeader which contains the session Id along
-         * with the pendingfile info for the stream.
-         * | Session Id | Pending File Size | Pending File | Bool more files |
-         * | No. of Pending files | Pending Files ... |
-         */
-        byte[] bytes;
-        try
-        {
-            DataOutputBuffer buffer = new DataOutputBuffer();
-            StreamHeader.serializer().serialize(streamHeader, buffer);
-            bytes = buffer.getData();
-        }
-        catch (IOException e)
-        {
-            throw new RuntimeException(e);
-        }
-        assert bytes.length > 0;
-
-        ByteBuffer buffer = ByteBuffer.allocate(4 + 4 + 4 + bytes.length);
-        buffer.putInt(PROTOCOL_MAGIC);
-        buffer.putInt(header);
-        buffer.putInt(bytes.length);
-        buffer.put(bytes);
-        buffer.flip();
-        return buffer;
-    }
-
-    public static int incrementDroppedMessages()
-    {
-        return droppedMessages.incrementAndGet();
-    }
-               
-    private static void logDroppedMessages()
-    {
-        if (droppedMessages.get() > 0)
-            logger_.warn("Dropped " + droppedMessages + " messages in the last " + LOG_DROPPED_INTERVAL_IN_MS + "ms");
-        droppedMessages.set(0);
-    }
-
-    private class SocketThread extends Thread
-    {
-        private final ServerSocket server;
-        
-        SocketThread(ServerSocket server, String name)
-        {
-            super(name);
-            this.server = server;
-        }
-
-        public void run()
-        {
-            while (true)
-            {
-                try
-                {
-                    Socket socket = server.accept();
-                    new IncomingTcpConnection(socket).start();
-                }
-                catch (AsynchronousCloseException e)
-                {
-                    // this happens when another thread calls close().
-                    logger_.info("MessagingService shutting down server thread.");
-                    break;
-                }
-                catch (IOException e)
-                {
-                    throw new RuntimeException(e);
-                }
-            }
-        }
-        
-        void close() throws IOException
-        {
-            server.close();
-        }
-    }
-
-    public Map<String, Integer> getCommandPendingTasks()
-    {
-        Map<String, Integer> pendingTasks = new HashMap<String, Integer>();
-        for (Map.Entry<InetAddress, OutboundTcpConnectionPool> entry : connectionManagers_.entrySet())
-            pendingTasks.put(entry.getKey().getHostAddress(), entry.getValue().cmdCon.getPendingMessages());
-        return pendingTasks;
-    }
-
-    public Map<String, Long> getCommandCompletedTasks()
-    {
-        Map<String, Long> completedTasks = new HashMap<String, Long>();
-        for (Map.Entry<InetAddress, OutboundTcpConnectionPool> entry : connectionManagers_.entrySet())
-            completedTasks.put(entry.getKey().getHostAddress(), entry.getValue().cmdCon.getCompletedMesssages());
-        return completedTasks;
-    }
-
-    public Map<String, Integer> getResponsePendingTasks()
-    {
-        Map<String, Integer> pendingTasks = new HashMap<String, Integer>();
-        for (Map.Entry<InetAddress, OutboundTcpConnectionPool> entry : connectionManagers_.entrySet())
-            pendingTasks.put(entry.getKey().getHostAddress(), entry.getValue().ackCon.getPendingMessages());
-        return pendingTasks;
-    }
-
-    public Map<String, Long> getResponseCompletedTasks()
-    {
-        Map<String, Long> completedTasks = new HashMap<String, Long>();
-        for (Map.Entry<InetAddress, OutboundTcpConnectionPool> entry : connectionManagers_.entrySet())
-            completedTasks.put(entry.getKey().getHostAddress(), entry.getValue().ackCon.getCompletedMesssages());
-        return completedTasks;
-    }
+  }
 }

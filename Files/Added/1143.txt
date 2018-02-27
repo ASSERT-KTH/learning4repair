@@ -20,491 +20,361 @@ package org.apache.lucene.search;
  */
 
 import java.io.IOException;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Set;
 
 import org.apache.lucene.index.AtomicReaderContext;
+import org.apache.lucene.index.DocsAndPositionsEnum;
 import org.apache.lucene.index.DocsEnum;
 import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.AtomicReader;
+import org.apache.lucene.index.IndexReaderContext;
 import org.apache.lucene.index.Term;
+import org.apache.lucene.index.TermContext;
+import org.apache.lucene.index.TermState;
+import org.apache.lucene.index.Terms;
 import org.apache.lucene.index.TermsEnum;
-import org.apache.lucene.search.BooleanClause.Occur;
-import org.apache.lucene.search.ConjunctionTermScorer.DocsAndFreqs;
-import org.apache.lucene.search.TermQuery.TermWeight;
+import org.apache.lucene.search.similarities.Similarity.SloppySimScorer;
 import org.apache.lucene.search.similarities.Similarity;
-import org.apache.lucene.search.similarities.Similarity.ExactSimScorer;
+import org.apache.lucene.util.ArrayUtil;
 import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.ToStringUtils;
 
-/** A Query that matches documents matching boolean combinations of other
-  * queries, e.g. {@link TermQuery}s, {@link PhraseQuery}s or other
-  * BooleanQuerys.
-  */
-public class BooleanQuery extends Query implements Iterable<BooleanClause> {
+/** A Query that matches documents containing a particular sequence of terms.
+ * A PhraseQuery is built by QueryParser for input like <code>"new york"</code>.
+ * 
+ * <p>This query may be combined with other terms or queries with a {@link BooleanQuery}.
+ */
+public class PhraseQuery extends Query {
+  private String field;
+  private ArrayList<Term> terms = new ArrayList<Term>(4);
+  private ArrayList<Integer> positions = new ArrayList<Integer>(4);
+  private int maxPosition = 0;
+  private int slop = 0;
 
-  private static int maxClauseCount = 1024;
+  /** Constructs an empty phrase query. */
+  public PhraseQuery() {}
 
-  /** Thrown when an attempt is made to add more than {@link
-   * #getMaxClauseCount()} clauses. This typically happens if
-   * a PrefixQuery, FuzzyQuery, WildcardQuery, or TermRangeQuery 
-   * is expanded to many terms during search. 
-   */
-  public static class TooManyClauses extends RuntimeException {
-    public TooManyClauses() {
-      super("maxClauseCount is set to " + maxClauseCount);
-    }
-  }
+  /** Sets the number of other words permitted between words in query phrase.
+    If zero, then this is an exact phrase search.  For larger values this works
+    like a <code>WITHIN</code> or <code>NEAR</code> operator.
 
-  /** Return the maximum number of clauses permitted, 1024 by default.
-   * Attempts to add more than the permitted number of clauses cause {@link
-   * TooManyClauses} to be thrown.
-   * @see #setMaxClauseCount(int)
-   */
-  public static int getMaxClauseCount() { return maxClauseCount; }
+    <p>The slop is in fact an edit-distance, where the units correspond to
+    moves of terms in the query phrase out of position.  For example, to switch
+    the order of two words requires two moves (the first move places the words
+    atop one another), so to permit re-orderings of phrases, the slop must be
+    at least two.
 
-  /** 
-   * Set the maximum number of clauses permitted per BooleanQuery.
-   * Default value is 1024.
-   */
-  public static void setMaxClauseCount(int maxClauseCount) {
-    if (maxClauseCount < 1)
-      throw new IllegalArgumentException("maxClauseCount must be >= 1");
-    BooleanQuery.maxClauseCount = maxClauseCount;
-  }
+    <p>More exact matches are scored higher than sloppier matches, thus search
+    results are sorted by exactness.
 
-  private ArrayList<BooleanClause> clauses = new ArrayList<BooleanClause>();
-  private final boolean disableCoord;
-
-  /** Constructs an empty boolean query. */
-  public BooleanQuery() {
-    disableCoord = false;
-  }
-
-  /** Constructs an empty boolean query.
-   *
-   * {@link Similarity#coord(int,int)} may be disabled in scoring, as
-   * appropriate. For example, this score factor does not make sense for most
-   * automatically generated queries, like {@link WildcardQuery} and {@link
-   * FuzzyQuery}.
-   *
-   * @param disableCoord disables {@link Similarity#coord(int,int)} in scoring.
-   */
-  public BooleanQuery(boolean disableCoord) {
-    this.disableCoord = disableCoord;
-  }
-
-  /** Returns true iff {@link Similarity#coord(int,int)} is disabled in
-   * scoring for this query instance.
-   * @see #BooleanQuery(boolean)
-   */
-  public boolean isCoordDisabled() { return disableCoord; }
+    <p>The slop is zero by default, requiring exact matches.*/
+  public void setSlop(int s) { slop = s; }
+  /** Returns the slop.  See setSlop(). */
+  public int getSlop() { return slop; }
 
   /**
-   * Specifies a minimum number of the optional BooleanClauses
-   * which must be satisfied.
-   *
-   * <p>
-   * By default no optional clauses are necessary for a match
-   * (unless there are no required clauses).  If this method is used,
-   * then the specified number of clauses is required.
-   * </p>
-   * <p>
-   * Use of this method is totally independent of specifying that
-   * any specific clauses are required (or prohibited).  This number will
-   * only be compared against the number of matching optional clauses.
-   * </p>
-   *
-   * @param min the number of optional clauses that must match
+   * Adds a term to the end of the query phrase.
+   * The relative position of the term is the one immediately after the last term added.
    */
-  public void setMinimumNumberShouldMatch(int min) {
-    this.minNrShouldMatch = min;
+  public void add(Term term) {
+    int position = 0;
+    if(positions.size() > 0)
+        position = positions.get(positions.size()-1).intValue() + 1;
+
+    add(term, position);
   }
-  protected int minNrShouldMatch = 0;
 
   /**
-   * Gets the minimum number of the optional BooleanClauses
-   * which must be satisfied.
+   * Adds a term to the end of the query phrase.
+   * The relative position of the term within the phrase is specified explicitly.
+   * This allows e.g. phrases with more than one term at the same position
+   * or phrases with gaps (e.g. in connection with stopwords).
+   * 
    */
-  public int getMinimumNumberShouldMatch() {
-    return minNrShouldMatch;
+  public void add(Term term, int position) {
+    if (terms.size() == 0) {
+      field = term.field();
+    } else if (!term.field().equals(field)) {
+      throw new IllegalArgumentException("All phrase terms must be in the same field: " + term);
+    }
+
+    terms.add(term);
+    positions.add(Integer.valueOf(position));
+    if (position > maxPosition) maxPosition = position;
   }
 
-  /** Adds a clause to a boolean query.
-   *
-   * @throws TooManyClauses if the new number of clauses exceeds the maximum clause number
-   * @see #getMaxClauseCount()
-   */
-  public void add(Query query, BooleanClause.Occur occur) {
-    add(new BooleanClause(query, occur));
+  /** Returns the set of terms in this phrase. */
+  public Term[] getTerms() {
+    return terms.toArray(new Term[0]);
   }
-
-  /** Adds a clause to a boolean query.
-   * @throws TooManyClauses if the new number of clauses exceeds the maximum clause number
-   * @see #getMaxClauseCount()
-   */
-  public void add(BooleanClause clause) {
-    if (clauses.size() >= maxClauseCount)
-      throw new TooManyClauses();
-
-    clauses.add(clause);
-  }
-
-  /** Returns the set of clauses in this query. */
-  public BooleanClause[] getClauses() {
-    return clauses.toArray(new BooleanClause[clauses.size()]);
-  }
-
-  /** Returns the list of clauses in this query. */
-  public List<BooleanClause> clauses() { return clauses; }
-
-  /** Returns an iterator on the clauses in this query. It implements the {@link Iterable} interface to
-   * make it possible to do:
-   * <pre class="prettyprint">for (BooleanClause clause : booleanQuery) {}</pre>
-   */
-  public final Iterator<BooleanClause> iterator() { return clauses().iterator(); }
 
   /**
-   * Expert: the Weight for BooleanQuery, used to
-   * normalize, score and explain these queries.
-   *
-   * <p>NOTE: this API and implementation is subject to
-   * change suddenly in the next release.</p>
+   * Returns the relative positions of terms in this phrase.
    */
-  protected class BooleanWeight extends Weight {
-    /** The Similarity implementation. */
-    protected Similarity similarity;
-    protected ArrayList<Weight> weights;
-    protected int maxCoord;  // num optional + num required
-    private final boolean disableCoord;
-    private final boolean termConjunction;
-
-    public BooleanWeight(IndexSearcher searcher, boolean disableCoord)
-      throws IOException {
-      this.similarity = searcher.getSimilarity();
-      this.disableCoord = disableCoord;
-      weights = new ArrayList<Weight>(clauses.size());
-      boolean termConjunction = clauses.isEmpty() || minNrShouldMatch != 0 ? false : true;
-      for (int i = 0 ; i < clauses.size(); i++) {
-        BooleanClause c = clauses.get(i);
-        Weight w = c.getQuery().createWeight(searcher);
-        if (!(c.isRequired() && (w instanceof TermWeight))) {
-          termConjunction = false;
-        }
-        weights.add(w);
-        if (!c.isProhibited()) maxCoord++;
-      }
-      this.termConjunction = termConjunction;
-    }
-
-    @Override
-    public Query getQuery() { return BooleanQuery.this; }
-
-    @Override
-    public float getValueForNormalization() throws IOException {
-      float sum = 0.0f;
-      for (int i = 0 ; i < weights.size(); i++) {
-        // call sumOfSquaredWeights for all clauses in case of side effects
-        float s = weights.get(i).getValueForNormalization();         // sum sub weights
-        if (!clauses.get(i).isProhibited())
-          // only add to sum for non-prohibited clauses
-          sum += s;
-      }
-
-      sum *= getBoost() * getBoost();             // boost each sub-weight
-
-      return sum ;
-    }
-
-    public float coord(int overlap, int maxOverlap) {
-      // LUCENE-4300: in most cases of maxOverlap=1, BQ rewrites itself away,
-      // so coord() is not applied. But when BQ cannot optimize itself away
-      // for a single clause (minNrShouldMatch, prohibited clauses, etc), its
-      // important not to apply coord(1,1) for consistency, it might not be 1.0F
-      return maxOverlap == 1 ? 1F : similarity.coord(overlap, maxOverlap);
-    }
-
-    @Override
-    public void normalize(float norm, float topLevelBoost) {
-      topLevelBoost *= getBoost();                         // incorporate boost
-      for (Weight w : weights) {
-        // normalize all clauses, (even if prohibited in case of side affects)
-        w.normalize(norm, topLevelBoost);
-      }
-    }
-
-    @Override
-    public Explanation explain(AtomicReaderContext context, int doc)
-      throws IOException {
-      final int minShouldMatch =
-        BooleanQuery.this.getMinimumNumberShouldMatch();
-      ComplexExplanation sumExpl = new ComplexExplanation();
-      sumExpl.setDescription("sum of:");
-      int coord = 0;
-      float sum = 0.0f;
-      boolean fail = false;
-      int shouldMatchCount = 0;
-      Iterator<BooleanClause> cIter = clauses.iterator();
-      for (Iterator<Weight> wIter = weights.iterator(); wIter.hasNext();) {
-        Weight w = wIter.next();
-        BooleanClause c = cIter.next();
-        if (w.scorer(context, true, true, context.reader().getLiveDocs()) == null) {
-          if (c.isRequired()) {
-            fail = true;
-            Explanation r = new Explanation(0.0f, "no match on required clause (" + c.getQuery().toString() + ")");
-            sumExpl.addDetail(r);
-          }
-          continue;
-        }
-        Explanation e = w.explain(context, doc);
-        if (e.isMatch()) {
-          if (!c.isProhibited()) {
-            sumExpl.addDetail(e);
-            sum += e.getValue();
-            coord++;
-          } else {
-            Explanation r =
-              new Explanation(0.0f, "match on prohibited clause (" + c.getQuery().toString() + ")");
-            r.addDetail(e);
-            sumExpl.addDetail(r);
-            fail = true;
-          }
-          if (c.getOccur() == Occur.SHOULD)
-            shouldMatchCount++;
-        } else if (c.isRequired()) {
-          Explanation r = new Explanation(0.0f, "no match on required clause (" + c.getQuery().toString() + ")");
-          r.addDetail(e);
-          sumExpl.addDetail(r);
-          fail = true;
-        }
-      }
-      if (fail) {
-        sumExpl.setMatch(Boolean.FALSE);
-        sumExpl.setValue(0.0f);
-        sumExpl.setDescription
-          ("Failure to meet condition(s) of required/prohibited clause(s)");
-        return sumExpl;
-      } else if (shouldMatchCount < minShouldMatch) {
-        sumExpl.setMatch(Boolean.FALSE);
-        sumExpl.setValue(0.0f);
-        sumExpl.setDescription("Failure to match minimum number "+
-                               "of optional clauses: " + minShouldMatch);
-        return sumExpl;
-      }
-      
-      sumExpl.setMatch(0 < coord ? Boolean.TRUE : Boolean.FALSE);
-      sumExpl.setValue(sum);
-      
-      final float coordFactor = disableCoord ? 1.0f : coord(coord, maxCoord);
-      if (coordFactor == 1.0f) {
-        return sumExpl;                             // eliminate wrapper
-      } else {
-        ComplexExplanation result = new ComplexExplanation(sumExpl.isMatch(),
-                                                           sum*coordFactor,
-                                                           "product of:");
-        result.addDetail(sumExpl);
-        result.addDetail(new Explanation(coordFactor,
-                                         "coord("+coord+"/"+maxCoord+")"));
-        return result;
-      }
-    }
-
-    @Override
-    public Scorer scorer(AtomicReaderContext context, boolean scoreDocsInOrder,
-        boolean topScorer, Bits acceptDocs)
-        throws IOException {
-      if (termConjunction) {
-        // specialized scorer for term conjunctions
-        return createConjunctionTermScorer(context, acceptDocs);
-      }
-      List<Scorer> required = new ArrayList<Scorer>();
-      List<Scorer> prohibited = new ArrayList<Scorer>();
-      List<Scorer> optional = new ArrayList<Scorer>();
-      Iterator<BooleanClause> cIter = clauses.iterator();
-      for (Weight w  : weights) {
-        BooleanClause c =  cIter.next();
-        Scorer subScorer = w.scorer(context, true, false, acceptDocs);
-        if (subScorer == null) {
-          if (c.isRequired()) {
-            return null;
-          }
-        } else if (c.isRequired()) {
-          required.add(subScorer);
-        } else if (c.isProhibited()) {
-          prohibited.add(subScorer);
-        } else {
-          optional.add(subScorer);
-        }
-      }
-
-      // NOTE: we could also use BooleanScorer, if we knew
-      // this BooleanQuery was embedded in another
-      // BooleanQuery that was also using BooleanScorer (ie,
-      // BooleanScorer can nest).  But this is hard to
-      // detect and we never do so today... (ie, we only
-      // return BooleanScorer for topScorer):
-
-      // Check if we can return a BooleanScorer
-      if (!scoreDocsInOrder && topScorer && required.size() == 0) {
-        return new BooleanScorer(this, disableCoord, minNrShouldMatch, optional, prohibited, maxCoord);
-      }
-      
-      if (required.size() == 0 && optional.size() == 0) {
-        // no required and optional clauses.
-        return null;
-      } else if (optional.size() < minNrShouldMatch) {
-        // either >1 req scorer, or there are 0 req scorers and at least 1
-        // optional scorer. Therefore if there are not enough optional scorers
-        // no documents will be matched by the query
-        return null;
-      }
-      
-      // Return a BooleanScorer2
-      return new BooleanScorer2(this, disableCoord, minNrShouldMatch, required, prohibited, optional, maxCoord);
-    }
-
-    private Scorer createConjunctionTermScorer(AtomicReaderContext context, Bits acceptDocs)
-        throws IOException {
-
-      // TODO: fix scorer API to specify "needsScores" up
-      // front, so we can do match-only if caller doesn't
-      // needs scores
-
-      final DocsAndFreqs[] docsAndFreqs = new DocsAndFreqs[weights.size()];
-      for (int i = 0; i < docsAndFreqs.length; i++) {
-        final TermWeight weight = (TermWeight) weights.get(i);
-        final Scorer scorer = weight.scorer(context, true, false, acceptDocs);
-        if (scorer == null) {
-          return null;
-        } else {
-          assert scorer instanceof TermScorer;
-          docsAndFreqs[i] = new DocsAndFreqs((TermScorer) scorer);
-        }
-      }
-      return new ConjunctionTermScorer(this, disableCoord ? 1.0f : coord(
-          docsAndFreqs.length, docsAndFreqs.length), docsAndFreqs);
-    }
-    
-    @Override
-    public boolean scoresDocsOutOfOrder() {
-      for (BooleanClause c : clauses) {
-        if (c.isRequired()) {
-          return false; // BS2 (in-order) will be used by scorer()
-        }
-      }
-      
-      // scorer() will return an out-of-order scorer if requested.
-      return true;
-    }
-    
-  }
-
-  @Override
-  public Weight createWeight(IndexSearcher searcher) throws IOException {
-    return new BooleanWeight(searcher, disableCoord);
+  public int[] getPositions() {
+      int[] result = new int[positions.size()];
+      for(int i = 0; i < positions.size(); i++)
+          result[i] = positions.get(i).intValue();
+      return result;
   }
 
   @Override
   public Query rewrite(IndexReader reader) throws IOException {
-    if (minNrShouldMatch == 0 && clauses.size() == 1) {                    // optimize 1-clause queries
-      BooleanClause c = clauses.get(0);
-      if (!c.isProhibited()) {  // just return clause
-
-        Query query = c.getQuery().rewrite(reader);    // rewrite first
-
-        if (getBoost() != 1.0f) {                 // incorporate boost
-          if (query == c.getQuery()) {                   // if rewrite was no-op
-            query = query.clone();         // then clone before boost
-          }
-          // Since the BooleanQuery only has 1 clause, the BooleanQuery will be
-          // written out. Therefore the rewritten Query's boost must incorporate both
-          // the clause's boost, and the boost of the BooleanQuery itself
-          query.setBoost(getBoost() * query.getBoost());
-        }
-
-        return query;
-      }
-    }
-
-    BooleanQuery clone = null;                    // recursively rewrite
-    for (int i = 0 ; i < clauses.size(); i++) {
-      BooleanClause c = clauses.get(i);
-      Query query = c.getQuery().rewrite(reader);
-      if (query != c.getQuery()) {                     // clause rewrote: must clone
-        if (clone == null) {
-          // The BooleanQuery clone is lazily initialized so only initialize
-          // it if a rewritten clause differs from the original clause (and hasn't been
-          // initialized already).  If nothing differs, the clone isn't needlessly created
-          clone = this.clone();
-        }
-        clone.clauses.set(i, new BooleanClause(query, c.getOccur()));
-      }
-    }
-    if (clone != null) {
-      return clone;                               // some clauses rewrote
+    if (terms.isEmpty()) {
+      BooleanQuery bq = new BooleanQuery();
+      bq.setBoost(getBoost());
+      return bq;
+    } else if (terms.size() == 1) {
+      TermQuery tq = new TermQuery(terms.get(0));
+      tq.setBoost(getBoost());
+      return tq;
     } else
-      return this;                                // no clauses rewrote
+      return super.rewrite(reader);
   }
 
-  // inherit javadoc
-  @Override
-  public void extractTerms(Set<Term> terms) {
-      for (BooleanClause clause : clauses) {
-          clause.getQuery().extractTerms(terms);
+  static class PostingsAndFreq implements Comparable<PostingsAndFreq> {
+    final DocsAndPositionsEnum postings;
+    final int docFreq;
+    final int position;
+    final Term[] terms;
+    final int nTerms; // for faster comparisons
+
+    public PostingsAndFreq(DocsAndPositionsEnum postings, int docFreq, int position, Term... terms) {
+      this.postings = postings;
+      this.docFreq = docFreq;
+      this.position = position;
+      nTerms = terms==null ? 0 : terms.length;
+      if (nTerms>0) {
+        if (terms.length==1) {
+          this.terms = terms;
+        } else {
+          Term[] terms2 = new Term[terms.length];
+          System.arraycopy(terms, 0, terms2, 0, terms.length);
+          Arrays.sort(terms2);
+          this.terms = terms2;
         }
+      } else {
+        this.terms = null;
+      }
+    }
+
+    public int compareTo(PostingsAndFreq other) {
+      if (docFreq != other.docFreq) {
+        return docFreq - other.docFreq;
+      }
+      if (position != other.position) {
+        return position - other.position;
+      }
+      if (nTerms != other.nTerms) {
+        return nTerms - other.nTerms;
+      }
+      if (nTerms == 0) {
+        return 0;
+      }
+      for (int i=0; i<terms.length; i++) {
+        int res = terms[i].compareTo(other.terms[i]);
+        if (res!=0) return res;
+      }
+      return 0;
+    }
+
+    @Override
+    public int hashCode() {
+      final int prime = 31;
+      int result = 1;
+      result = prime * result + docFreq;
+      result = prime * result + position;
+      for (int i=0; i<nTerms; i++) {
+        result = prime * result + terms[i].hashCode(); 
+      }
+      return result;
+    }
+
+    @Override
+    public boolean equals(Object obj) {
+      if (this == obj) return true;
+      if (obj == null) return false;
+      if (getClass() != obj.getClass()) return false;
+      PostingsAndFreq other = (PostingsAndFreq) obj;
+      if (docFreq != other.docFreq) return false;
+      if (position != other.position) return false;
+      if (terms == null) return other.terms == null;
+      return Arrays.equals(terms, other.terms);
+    }
   }
 
-  @Override @SuppressWarnings("unchecked")
-  public BooleanQuery clone() {
-    BooleanQuery clone = (BooleanQuery)super.clone();
-    clone.clauses = (ArrayList<BooleanClause>) this.clauses.clone();
-    return clone;
+  private class PhraseWeight extends Weight {
+    private final Similarity similarity;
+    private final Similarity.SimWeight stats;
+    private transient TermContext states[];
+
+    public PhraseWeight(IndexSearcher searcher)
+      throws IOException {
+      this.similarity = searcher.getSimilarity();
+      final IndexReaderContext context = searcher.getTopReaderContext();
+      states = new TermContext[terms.size()];
+      TermStatistics termStats[] = new TermStatistics[terms.size()];
+      for (int i = 0; i < terms.size(); i++) {
+        final Term term = terms.get(i);
+        states[i] = TermContext.build(context, term, true);
+        termStats[i] = searcher.termStatistics(term, states[i]);
+      }
+      stats = similarity.computeWeight(getBoost(), searcher.collectionStatistics(field), termStats);
+    }
+
+    @Override
+    public String toString() { return "weight(" + PhraseQuery.this + ")"; }
+
+    @Override
+    public Query getQuery() { return PhraseQuery.this; }
+
+    @Override
+    public float getValueForNormalization() {
+      return stats.getValueForNormalization();
+    }
+
+    @Override
+    public void normalize(float queryNorm, float topLevelBoost) {
+      stats.normalize(queryNorm, topLevelBoost);
+    }
+
+    @Override
+    public Scorer scorer(AtomicReaderContext context, boolean scoreDocsInOrder,
+        boolean topScorer, Bits acceptDocs) throws IOException {
+      assert !terms.isEmpty();
+      final AtomicReader reader = context.reader();
+      final Bits liveDocs = acceptDocs;
+      PostingsAndFreq[] postingsFreqs = new PostingsAndFreq[terms.size()];
+
+      final Terms fieldTerms = reader.terms(field);
+      if (fieldTerms == null) {
+        return null;
+      }
+
+      // Reuse single TermsEnum below:
+      final TermsEnum te = fieldTerms.iterator(null);
+      
+      for (int i = 0; i < terms.size(); i++) {
+        final Term t = terms.get(i);
+        final TermState state = states[i].get(context.ord);
+        if (state == null) { /* term doesnt exist in this segment */
+          assert termNotInReader(reader, t): "no termstate found but term exists in reader";
+          return null;
+        }
+        te.seekExact(t.bytes(), state);
+        DocsAndPositionsEnum postingsEnum = te.docsAndPositions(liveDocs, null, DocsEnum.FLAG_NONE);
+
+        // PhraseQuery on a field that did not index
+        // positions.
+        if (postingsEnum == null) {
+          assert te.seekExact(t.bytes(), false) : "termstate found but no term exists in reader";
+          // term does exist, but has no positions
+          throw new IllegalStateException("field \"" + t.field() + "\" was indexed without position data; cannot run PhraseQuery (term=" + t.text() + ")");
+        }
+        postingsFreqs[i] = new PostingsAndFreq(postingsEnum, te.docFreq(), positions.get(i).intValue(), t);
+      }
+
+      // sort by increasing docFreq order
+      if (slop == 0) {
+        ArrayUtil.mergeSort(postingsFreqs);
+      }
+
+      if (slop == 0) {  // optimize exact case
+        ExactPhraseScorer s = new ExactPhraseScorer(this, postingsFreqs, similarity.exactSimScorer(stats, context));
+        if (s.noDocs) {
+          return null;
+        } else {
+          return s;
+        }
+      } else {
+        return
+          new SloppyPhraseScorer(this, postingsFreqs, slop, similarity.sloppySimScorer(stats, context));
+      }
+    }
+    
+    // only called from assert
+    private boolean termNotInReader(AtomicReader reader, Term term) throws IOException {
+      return reader.docFreq(term) == 0;
+    }
+
+    @Override
+    public Explanation explain(AtomicReaderContext context, int doc) throws IOException {
+      Scorer scorer = scorer(context, true, false, context.reader().getLiveDocs());
+      if (scorer != null) {
+        int newDoc = scorer.advance(doc);
+        if (newDoc == doc) {
+          float freq = slop == 0 ? scorer.freq() : ((SloppyPhraseScorer)scorer).sloppyFreq();
+          SloppySimScorer docScorer = similarity.sloppySimScorer(stats, context);
+          ComplexExplanation result = new ComplexExplanation();
+          result.setDescription("weight("+getQuery()+" in "+doc+") [" + similarity.getClass().getSimpleName() + "], result of:");
+          Explanation scoreExplanation = docScorer.explain(doc, new Explanation(freq, "phraseFreq=" + freq));
+          result.addDetail(scoreExplanation);
+          result.setValue(scoreExplanation.getValue());
+          result.setMatch(true);
+          return result;
+        }
+      }
+      
+      return new ComplexExplanation(false, 0.0f, "no matching term");
+    }
+  }
+
+  @Override
+  public Weight createWeight(IndexSearcher searcher) throws IOException {
+    return new PhraseWeight(searcher);
+  }
+
+  /**
+   * @see org.apache.lucene.search.Query#extractTerms(Set)
+   */
+  @Override
+  public void extractTerms(Set<Term> queryTerms) {
+    queryTerms.addAll(terms);
   }
 
   /** Prints a user-readable version of this query. */
   @Override
-  public String toString(String field) {
+  public String toString(String f) {
     StringBuilder buffer = new StringBuilder();
-    boolean needParens=(getBoost() != 1.0) || (getMinimumNumberShouldMatch()>0) ;
-    if (needParens) {
-      buffer.append("(");
+    if (field != null && !field.equals(f)) {
+      buffer.append(field);
+      buffer.append(":");
     }
 
-    for (int i = 0 ; i < clauses.size(); i++) {
-      BooleanClause c = clauses.get(i);
-      if (c.isProhibited())
-        buffer.append("-");
-      else if (c.isRequired())
-        buffer.append("+");
-
-      Query subQuery = c.getQuery();
-      if (subQuery != null) {
-        if (subQuery instanceof BooleanQuery) {  // wrap sub-bools in parens
-          buffer.append("(");
-          buffer.append(subQuery.toString(field));
-          buffer.append(")");
-        } else {
-          buffer.append(subQuery.toString(field));
-        }
+    buffer.append("\"");
+    String[] pieces = new String[maxPosition + 1];
+    for (int i = 0; i < terms.size(); i++) {
+      int pos = positions.get(i).intValue();
+      String s = pieces[pos];
+      if (s == null) {
+        s = (terms.get(i)).text();
       } else {
-        buffer.append("null");
+        s = s + "|" + (terms.get(i)).text();
       }
+      pieces[pos] = s;
+    }
+    for (int i = 0; i < pieces.length; i++) {
+      if (i > 0) {
+        buffer.append(' ');
+      }
+      String s = pieces[i];
+      if (s == null) {
+        buffer.append('?');
+      } else {
+        buffer.append(s);
+      }
+    }
+    buffer.append("\"");
 
-      if (i != clauses.size()-1)
-        buffer.append(" ");
+    if (slop != 0) {
+      buffer.append("~");
+      buffer.append(slop);
     }
 
-    if (needParens) {
-      buffer.append(")");
-    }
-
-    if (getMinimumNumberShouldMatch()>0) {
-      buffer.append('~');
-      buffer.append(getMinimumNumberShouldMatch());
-    }
-
-    if (getBoost() != 1.0f)
-    {
-      buffer.append(ToStringUtils.boost(getBoost()));
-    }
+    buffer.append(ToStringUtils.boost(getBoost()));
 
     return buffer.toString();
   }
@@ -512,20 +382,22 @@ public class BooleanQuery extends Query implements Iterable<BooleanClause> {
   /** Returns true iff <code>o</code> is equal to this. */
   @Override
   public boolean equals(Object o) {
-    if (!(o instanceof BooleanQuery))
+    if (!(o instanceof PhraseQuery))
       return false;
-    BooleanQuery other = (BooleanQuery)o;
+    PhraseQuery other = (PhraseQuery)o;
     return (this.getBoost() == other.getBoost())
-        && this.clauses.equals(other.clauses)
-        && this.getMinimumNumberShouldMatch() == other.getMinimumNumberShouldMatch()
-        && this.disableCoord == other.disableCoord;
+      && (this.slop == other.slop)
+      &&  this.terms.equals(other.terms)
+      && this.positions.equals(other.positions);
   }
 
   /** Returns a hash code value for this object.*/
   @Override
   public int hashCode() {
-    return Float.floatToIntBits(getBoost()) ^ clauses.hashCode()
-      + getMinimumNumberShouldMatch() + (disableCoord ? 17:0);
+    return Float.floatToIntBits(getBoost())
+      ^ slop
+      ^ terms.hashCode()
+      ^ positions.hashCode();
   }
-  
+
 }

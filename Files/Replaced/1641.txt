@@ -1,13 +1,14 @@
-SSTableReader sstable = new SSTableReader(dataFileName, partitioner);
+zkStateReaderMock.getBaseUrlForNodeName(address);
 
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+package org.apache.solr.cloud;
+
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,488 +19,702 @@ SSTableReader sstable = new SSTableReader(dataFileName, partitioner);
  * limitations under the License.
  */
 
-package org.apache.cassandra.io;
+import org.apache.solr.SolrTestCaseJ4;
+import org.apache.solr.client.solrj.SolrResponse;
+import org.apache.solr.client.solrj.response.QueryResponse;
+import org.apache.solr.cloud.DistributedQueue.QueueEvent;
+import org.apache.solr.cloud.Overseer.LeaderStatus;
+import org.apache.solr.common.cloud.ClusterState;
+import org.apache.solr.common.cloud.SolrZkClient;
+import org.apache.solr.common.cloud.ZkNodeProps;
+import org.apache.solr.common.cloud.ZkStateReader;
+import org.apache.solr.common.params.CoreAdminParams;
+import org.apache.solr.common.params.CoreAdminParams.CoreAdminAction;
+import org.apache.solr.common.params.ModifiableSolrParams;
+import org.apache.solr.common.util.StrUtils;
+import org.apache.solr.handler.component.ShardHandler;
+import org.apache.solr.handler.component.ShardRequest;
+import org.apache.solr.handler.component.ShardResponse;
+import org.apache.zookeeper.CreateMode;
+import org.easymock.Capture;
+import org.easymock.IAnswer;
+import org.eclipse.jetty.util.BlockingArrayQueue;
+import org.junit.After;
+import org.junit.AfterClass;
+import org.junit.Before;
+import org.junit.BeforeClass;
+import org.junit.Test;
 
-import java.io.*;
-import java.util.*;
-import java.lang.ref.ReferenceQueue;
-import java.lang.ref.PhantomReference;
-import java.lang.ref.Reference;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Queue;
+import java.util.Set;
 
-import org.apache.log4j.Logger;
+import static org.easymock.EasyMock.anyBoolean;
+import static org.easymock.EasyMock.anyObject;
+import static org.easymock.EasyMock.capture;
+import static org.easymock.EasyMock.createMock;
+import static org.easymock.EasyMock.expect;
+import static org.easymock.EasyMock.expectLastCall;
+import static org.easymock.EasyMock.getCurrentArguments;
+import static org.easymock.EasyMock.replay;
+import static org.easymock.EasyMock.reset;
+import static org.easymock.EasyMock.verify;
 
-import org.apache.commons.lang.StringUtils;
+public class OverseerCollectionProcessorTest extends SolrTestCaseJ4 {
+  
+  private static final String ADMIN_PATH = "/admin/cores";
+  private static final String COLLECTION_NAME = "mycollection";
+  private static final String CONFIG_NAME = "myconfig";
+  
+  private static DistributedQueue workQueueMock;
+  private static ShardHandler shardHandlerMock;
+  private static ZkStateReader zkStateReaderMock;
+  private static ClusterState clusterStateMock;
+  private static SolrZkClient solrZkClientMock;
+  private final Map zkMap = new HashMap();
+  private final Set collectionsSet = new HashSet();
 
-import org.apache.cassandra.dht.IPartitioner;
-import org.apache.cassandra.dht.Range;
-import org.apache.cassandra.utils.BloomFilter;
-import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.marshal.AbstractType;
-import org.apache.cassandra.io.util.BufferedRandomAccessFile;
+  private OverseerCollectionProcessorToBeTested underTest;
+  
+  private Thread thread;
+  private Queue<QueueEvent> queue = new BlockingArrayQueue<QueueEvent>();
 
-import org.cliffc.high_scale_lib.NonBlockingHashMap;
-import com.google.common.base.Predicate;
-import com.google.common.base.Predicates;
-import com.reardencommerce.kernel.collections.shared.evictable.ConcurrentLinkedHashMap;
-
-/**
- * SSTableReaders are open()ed by Table.onStart; after that they are created by SSTableWriter.renameAndOpen.
- * Do not re-call open() on existing SSTable files; use the references kept by ColumnFamilyStore post-start instead.
- */
-public class SSTableReader extends SSTable implements Comparable<SSTableReader>
-{
-    private static final Logger logger = Logger.getLogger(SSTableReader.class);
-
-    private static final FileSSTableMap openedFiles = new FileSSTableMap();
+  private class OverseerCollectionProcessorToBeTested extends
+      OverseerCollectionProcessor {
     
-    // `finalizers` is required to keep the PhantomReferences alive after the enclosing SSTR is itself
-    // unreferenced.  otherwise they will never get enqueued.
-    private static final Set<Reference<SSTableReader>> finalizers = new HashSet<Reference<SSTableReader>>();
-    private static final ReferenceQueue<SSTableReader> finalizerQueue = new ReferenceQueue<SSTableReader>()
-    {{
-        Runnable runnable = new Runnable()
-        {
-            public void run()
-            {
-                while (true)
-                {
-                    FileDeletingReference r = null;
-                    try
-                    {
-                        r = (FileDeletingReference) finalizerQueue.remove();
-                        finalizers.remove(r);
-                    }
-                    catch (InterruptedException e)
-                    {
-                        throw new RuntimeException(e);
-                    }
-                    try
-                    {
-                        r.cleanup();
-                    }
-                    catch (IOException e)
-                    {
-                        logger.error("Error deleting " + r.path, e);
-                    }
-                }
-            }
-        };
-        new Thread(runnable, "SSTABLE-DELETER").start();
-    }};
-
-    public static int indexInterval()
-    {
-        return INDEX_INTERVAL;
+    private SolrResponse lastProcessMessageResult;
+    
+    public OverseerCollectionProcessorToBeTested(ZkStateReader zkStateReader,
+        String myId, ShardHandler shardHandler, String adminPath,
+        DistributedQueue workQueue) {
+      super(zkStateReader, myId, shardHandler, adminPath, workQueue);
     }
-
-    public static long getApproximateKeyCount()
-    {
-        return getApproximateKeyCount(openedFiles.values());
-    }
-
-    public static long getApproximateKeyCount(Iterable<SSTableReader> sstables)
-    {
-        long count = 0;
-
-        for (SSTableReader sstable : sstables)
-        {
-            int indexKeyCount = sstable.getIndexPositions().size();
-            count = count + (indexKeyCount + 1) * INDEX_INTERVAL;
-            if (logger.isDebugEnabled())
-                logger.debug("index size for bloom filter calc for file  : " + sstable.getFilename() + "   : " + count);
-        }
-
-        return count;
-    }
-
-    /**
-     * Get all indexed keys defined by the two predicates.
-     * @param cfpred A Predicate defining matching column families.
-     * @param dkpred A Predicate defining matching DecoratedKeys.
-     */
-    public static List<DecoratedKey> getIndexedDecoratedKeysFor(Predicate<SSTable> cfpred, Predicate<DecoratedKey> dkpred)
-    {
-        List<DecoratedKey> indexedKeys = new ArrayList<DecoratedKey>();
-        
-        for (SSTableReader sstable : openedFiles.values())
-        {
-            if (!cfpred.apply(sstable))
-                continue;
-            for (KeyPosition kp : sstable.getIndexPositions())
-            {
-                if (dkpred.apply(kp.key))
-                {
-                    indexedKeys.add(kp.key);
-                }
-            }
-        }
-        Collections.sort(indexedKeys);
-
-        return indexedKeys;
-    }
-
-    /**
-     * Get all indexed keys in any SSTable for our primary range.
-     */
-    public static List<DecoratedKey> getIndexedDecoratedKeys()
-    {
-        final Range range = StorageService.instance().getLocalPrimaryRange();
-
-        Predicate<SSTable> cfpred = Predicates.alwaysTrue();
-        return getIndexedDecoratedKeysFor(cfpred,
-                                          new Predicate<DecoratedKey>(){
-            public boolean apply(DecoratedKey dk)
-            {
-               return range.contains(dk.token);
-            }
-        });
-    }
-
-    public static SSTableReader open(String dataFileName) throws IOException
-    {
-        return open(dataFileName, StorageService.getPartitioner(), DatabaseDescriptor.getKeysCachedFraction(parseTableName(dataFileName)));
-    }
-
-    public static SSTableReader open(String dataFileName, IPartitioner partitioner, double cacheFraction) throws IOException
-    {
-        assert partitioner != null;
-        assert openedFiles.get(dataFileName) == null;
-
-        long start = System.currentTimeMillis();
-        SSTableReader sstable = new SSTableReader(dataFileName, partitioner)
-        sstable.loadIndexFile();
-        sstable.loadBloomFilter();
-        if (cacheFraction > 0)
-        {
-            sstable.keyCache = createKeyCache((int)((sstable.getIndexPositions().size() + 1) * INDEX_INTERVAL * cacheFraction));
-        }
-        if (logger.isDebugEnabled())
-            logger.debug("INDEX LOAD TIME for "  + dataFileName + ": " + (System.currentTimeMillis() - start) + " ms.");
-
-        return sstable;
-    }
-
-    FileDeletingReference phantomReference;
-
-    public static ConcurrentLinkedHashMap<DecoratedKey, Long> createKeyCache(int size)
-    {
-        return ConcurrentLinkedHashMap.create(ConcurrentLinkedHashMap.EvictionPolicy.SECOND_CHANCE, size);
-    }
-
-    private ConcurrentLinkedHashMap<DecoratedKey, Long> keyCache;
-
-    SSTableReader(String filename, IPartitioner partitioner, List<KeyPosition> indexPositions, BloomFilter bloomFilter, ConcurrentLinkedHashMap<DecoratedKey, Long> keyCache)
-    {
-        super(filename, partitioner);
-        this.indexPositions = indexPositions;
-        this.bf = bloomFilter;
-        phantomReference = new FileDeletingReference(this, finalizerQueue);
-        finalizers.add(phantomReference);
-        openedFiles.put(filename, this);
-        this.keyCache = keyCache;
-    }
-
-    private SSTableReader(String filename, IPartitioner partitioner)
-    {
-        this(filename, partitioner, null, null, null);
-    }
-
-    public List<KeyPosition> getIndexPositions()
-    {
-        return indexPositions;
-    }
-
-    void loadBloomFilter() throws IOException
-    {
-        DataInputStream stream = new DataInputStream(new FileInputStream(filterFilename()));
-        try
-        {
-            bf = BloomFilter.serializer().deserialize(stream);
-        }
-        finally
-        {
-            stream.close();
-        }
-    }
-
-    void loadIndexFile() throws IOException
-    {
-        BufferedRandomAccessFile input = new BufferedRandomAccessFile(indexFilename(), "r");
-        try
-        {
-            indexPositions = new ArrayList<KeyPosition>();
-
-            int i = 0;
-            long indexSize = input.length();
-            while (true)
-            {
-                long indexPosition = input.getFilePointer();
-                if (indexPosition == indexSize)
-                {
-                    break;
-                }
-                DecoratedKey decoratedKey = partitioner.convertFromDiskFormat(input.readUTF());
-                input.readLong();
-                if (i++ % INDEX_INTERVAL == 0)
-                {
-                    indexPositions.add(new KeyPosition(decoratedKey, indexPosition));
-                }
-            }
-        }
-        finally
-        {
-            input.close();
-        }
-    }
-
-    /** get the position in the index file to start scanning to find the given key (at most indexInterval keys away) */
-    private long getIndexScanPosition(DecoratedKey decoratedKey)
-    {
-        assert indexPositions != null && indexPositions.size() > 0;
-        int index = Collections.binarySearch(indexPositions, new KeyPosition(decoratedKey, -1));
-        if (index < 0)
-        {
-            // binary search gives us the first index _greater_ than the key searched for,
-            // i.e., its insertion position
-            int greaterThan = (index + 1) * -1;
-            if (greaterThan == 0)
-                return -1;
-            return indexPositions.get(greaterThan - 1).position;
-        }
-        else
-        {
-            return indexPositions.get(index).position;
-        }
-    }
-
-    /**
-     * returns the position in the data file to find the given key, or -1 if the key is not present
-     */
-    public long getPosition(DecoratedKey decoratedKey) throws IOException
-    {
-        if (!bf.isPresent(partitioner.convertToDiskFormat(decoratedKey)))
-            return -1;
-        if (keyCache != null)
-        {
-            Long cachedPosition = keyCache.get(decoratedKey);
-            if (cachedPosition != null)
-            {
-                return cachedPosition;
-            }
-        }
-        long start = getIndexScanPosition(decoratedKey);
-        if (start < 0)
-        {
-            return -1;
-        }
-
-        // TODO mmap the index file?
-        BufferedRandomAccessFile input = new BufferedRandomAccessFile(indexFilename(path), "r");
-        input.seek(start);
-        int i = 0;
-        try
-        {
-            do
-            {
-                DecoratedKey indexDecoratedKey;
-                try
-                {
-                    indexDecoratedKey = partitioner.convertFromDiskFormat(input.readUTF());
-                }
-                catch (EOFException e)
-                {
-                    return -1;
-                }
-                long position = input.readLong();
-                int v = indexDecoratedKey.compareTo(decoratedKey);
-                if (v == 0)
-                {
-                    if (keyCache != null)
-                        keyCache.put(decoratedKey, position);
-                    return position;
-                }
-                if (v > 0)
-                    return -1;
-            } while  (++i < INDEX_INTERVAL);
-        }
-        finally
-        {
-            input.close();
-        }
-        return -1;
-    }
-
-    /** like getPosition, but if key is not found will return the location of the first key _greater_ than the desired one, or -1 if no such key exists. */
-    public long getNearestPosition(DecoratedKey decoratedKey) throws IOException
-    {
-        long start = getIndexScanPosition(decoratedKey);
-        if (start < 0)
-        {
-            return 0;
-        }
-        BufferedRandomAccessFile input = new BufferedRandomAccessFile(indexFilename(path), "r");
-        input.seek(start);
-        try
-        {
-            while (true)
-            {
-                DecoratedKey indexDecoratedKey;
-                try
-                {
-                    indexDecoratedKey = partitioner.convertFromDiskFormat(input.readUTF());
-                }
-                catch (EOFException e)
-                {
-                    return -1;
-                }
-                long position = input.readLong();
-                int v = indexDecoratedKey.compareTo(decoratedKey);
-                if (v >= 0)
-                    return position;
-            }
-        }
-        finally
-        {
-            input.close();
-        }
-    }
-
-    public long length()
-    {
-        return new File(path).length();
-    }
-
-    public int compareTo(SSTableReader o)
-    {
-        return ColumnFamilyStore.getGenerationFromFileName(path) - ColumnFamilyStore.getGenerationFromFileName(o.path);
-    }
-
-    public void markCompacted() throws IOException
-    {
-        if (logger.isDebugEnabled())
-            logger.debug("Marking " + path + " compacted");
-        openedFiles.remove(path);
-        new File(compactedFilename()).createNewFile();
-        phantomReference.deleteOnCleanup();
-    }
-
-    /** obviously only for testing */
-    public void forceBloomFilterFailures()
-    {
-        bf = BloomFilter.alwaysMatchingBloomFilter();
-    }
-
-    static void reopenUnsafe() throws IOException // testing only
-    {
-        Collection<SSTableReader> sstables = new ArrayList<SSTableReader>(openedFiles.values());
-        openedFiles.clear();
-        for (SSTableReader sstable : sstables)
-        {
-            SSTableReader.open(sstable.path, sstable.partitioner, 0.01);
-        }
-    }
-
-    public IPartitioner getPartitioner()
-    {
-        return partitioner;
-    }
-
-    public SSTableScanner getScanner(int bufferSize) throws IOException
-    {
-        return new SSTableScanner(this, bufferSize);
-    }
-
-    public AbstractType getColumnComparator()
-    {
-        return DatabaseDescriptor.getComparator(getTableName(), getColumnFamilyName());
-    }
-
-    public ColumnFamily makeColumnFamily()
-    {
-        return ColumnFamily.create(getTableName(), getColumnFamilyName());
-    }
-
-    public ICompactSerializer2<IColumn> getColumnSerializer()
-    {
-        return DatabaseDescriptor.getColumnFamilyType(getTableName(), getColumnFamilyName()).equals("Standard")
-               ? Column.serializer()
-               : SuperColumn.serializer(getColumnComparator());
-    }
-}
-
-class FileSSTableMap
-{
-    private final Map<String, SSTableReader> map = new NonBlockingHashMap<String, SSTableReader>();
-
-    public SSTableReader get(String filename)
-    {
-        try
-        {
-            return map.get(new File(filename).getCanonicalPath());
-        }
-        catch (IOException e)
-        {
-            throw new RuntimeException(e);
-        }
-    }
-
-    public SSTableReader put(String filename, SSTableReader value)
-    {
-        try
-        {
-            return map.put(new File(filename).getCanonicalPath(), value);
-        }
-        catch (IOException e)
-        {
-            throw new RuntimeException(e);
-        }
-    }
-
-    public Collection<SSTableReader> values()
-    {
-        return map.values();
-    }
-
-    public void clear()
-    {
-        map.clear();
-    }
-
-    public void remove(String filename) throws IOException
-    {
-        map.remove(new File(filename).getCanonicalPath());
-    }
-
+    
     @Override
-    public String toString()
-    {
-        return "FileSSTableMap {" + StringUtils.join(map.keySet(), ", ") + "}";
+    protected SolrResponse processMessage(ZkNodeProps message, String operation) {
+      lastProcessMessageResult = super.processMessage(message, operation);
+      log.info("1 : "+System.currentTimeMillis());
+      return lastProcessMessageResult;
     }
-}
-
-class FileDeletingReference extends PhantomReference<SSTableReader>
-{
-    public final String path;
-    private boolean deleteOnCleanup;
-
-    FileDeletingReference(SSTableReader referent, ReferenceQueue<? super SSTableReader> q)
-    {
-        super(referent, q);
-        this.path = referent.path;
+    
+    @Override
+    protected LeaderStatus amILeader() {
+      return LeaderStatus.YES;
     }
-
-    public void deleteOnCleanup()
-    {
-        deleteOnCleanup = true;
-    }
-
-    public void cleanup() throws IOException
-    {
-        if (deleteOnCleanup)
-        {
-            SSTable.delete(path);
+    
+  }
+  
+  @BeforeClass
+  public static void setUpOnce() throws Exception {
+    workQueueMock = createMock(DistributedQueue.class);
+    shardHandlerMock = createMock(ShardHandler.class);
+    zkStateReaderMock = createMock(ZkStateReader.class);
+    clusterStateMock = createMock(ClusterState.class);
+    solrZkClientMock = createMock(SolrZkClient.class);
+  }
+  
+  @AfterClass
+  public static void tearDownOnce() {
+    workQueueMock = null;
+    shardHandlerMock = null;
+    zkStateReaderMock = null;
+    clusterStateMock = null;
+    solrZkClientMock = null;
+  }
+  
+  @Before
+  public void setUp() throws Exception {
+    super.setUp();
+    queue.clear();
+    reset(workQueueMock);
+    reset(workQueueMock);
+    reset(shardHandlerMock);
+    reset(zkStateReaderMock);
+    reset(clusterStateMock);
+    reset(solrZkClientMock);
+    underTest = new OverseerCollectionProcessorToBeTested(zkStateReaderMock,
+        "1234", shardHandlerMock, ADMIN_PATH, workQueueMock);
+    zkMap.clear();
+    collectionsSet.clear();
+  }
+  
+  @After
+  public void tearDown() throws Exception {
+    stopComponentUnderTest();
+    super.tearDown();
+  }
+  
+  protected Set<String> commonMocks(int liveNodesCount) throws Exception {
+    workQueueMock.peek(true);
+    expectLastCall().andAnswer(new IAnswer<Object>() {
+      @Override
+      public Object answer() throws Throwable {
+        Object result;
+        while ((result = queue.peek()) == null) {
+          Thread.sleep(1000);
         }
+        return result;
+      }
+    }).anyTimes();
+    
+    workQueueMock.remove(anyObject(QueueEvent.class));
+    expectLastCall().andAnswer(new IAnswer<Object>() {
+      @Override
+      public Object answer() throws Throwable {
+        queue.remove((QueueEvent) getCurrentArguments()[0]);
+        return null;
+      }
+    }).anyTimes();
+    
+    workQueueMock.poll();
+    expectLastCall().andAnswer(new IAnswer<Object>() {
+      @Override
+      public Object answer() throws Throwable {
+        return queue.poll();
+      }
+    }).anyTimes();
+    
+    zkStateReaderMock.getClusterState();
+    expectLastCall().andAnswer(new IAnswer<Object>() {
+      @Override
+      public Object answer() throws Throwable {
+        return clusterStateMock;
+      }
+    }).anyTimes();
+    
+    zkStateReaderMock.getZkClient();
+    expectLastCall().andAnswer(new IAnswer<Object>() {
+      @Override
+      public Object answer() throws Throwable {
+        return solrZkClientMock;
+      }
+    }).anyTimes();
+    
+    
+    clusterStateMock.getCollections();
+    expectLastCall().andAnswer(new IAnswer<Object>() {
+      @Override
+      public Object answer() throws Throwable {
+        return collectionsSet;
+      }
+    }).anyTimes();
+    final Set<String> liveNodes = new HashSet<String>();
+    for (int i = 0; i < liveNodesCount; i++) {
+      final String address = "localhost:" + (8963 + i) + "_solr";
+      liveNodes.add(address);
+      
+      solrZkClientMock.getBaseUrlForNodeName(address);
+      expectLastCall().andAnswer(new IAnswer<Object>() {
+        @Override
+        public Object answer() throws Throwable {
+          // This works as long as this test does not use a 
+          // webapp context with an underscore in it
+          return address.replaceAll("_", "/");
+        }
+      }).anyTimes();
+      
     }
+    
+    solrZkClientMock.getZkClientTimeout();
+    expectLastCall().andAnswer(new IAnswer<Object>() {
+      @Override
+      public Object answer() throws Throwable {
+        return 30000;
+      }
+    }).anyTimes();
+    
+    clusterStateMock.hasCollection(anyObject(String.class));
+    expectLastCall().andAnswer(new IAnswer<Boolean>() {
+      @Override
+      public Boolean answer() throws Throwable {
+        String key = (String) getCurrentArguments()[0];
+        return collectionsSet.contains(key);
+      }
+    } ).anyTimes();
+
+
+    clusterStateMock.getLiveNodes();
+    expectLastCall().andAnswer(new IAnswer<Object>() {
+      @Override
+      public Object answer() throws Throwable {
+        return liveNodes;
+      }
+    }).anyTimes();
+    solrZkClientMock.create(anyObject(String.class), anyObject(byte[].class), anyObject(CreateMode.class), anyBoolean());
+    expectLastCall().andAnswer(new IAnswer<String>() {
+      @Override
+      public String answer() throws Throwable {
+        String key = (String) getCurrentArguments()[0];
+        zkMap.put(key, null);
+        handleCrateCollMessage((byte[]) getCurrentArguments()[1]);
+        return key;
+      }
+    }).anyTimes();
+
+    solrZkClientMock.create(anyObject(String.class), anyObject(byte[].class), anyObject(List.class),anyObject(CreateMode.class), anyBoolean());
+    expectLastCall().andAnswer(new IAnswer<String>() {
+      @Override
+      public String answer() throws Throwable {
+        String key = (String) getCurrentArguments()[0];
+        zkMap.put(key, null);
+        handleCrateCollMessage((byte[]) getCurrentArguments()[1]);
+        return key;
+      }
+    }).anyTimes();
+
+    solrZkClientMock.makePath(anyObject(String.class), anyObject(byte[].class), anyBoolean());
+    expectLastCall().andAnswer(new IAnswer<String>() {
+      @Override
+      public String answer() throws Throwable {
+        String key = (String) getCurrentArguments()[0];
+        return key;
+      }
+    }).anyTimes();
+
+    solrZkClientMock.exists(anyObject(String.class),anyBoolean());
+    expectLastCall().andAnswer(new IAnswer<Boolean>() {
+      @Override
+      public Boolean answer() throws Throwable {
+        String key = (String) getCurrentArguments()[0];
+        return zkMap.containsKey(key);
+      }
+    }).anyTimes();
+    
+    return liveNodes;
+  }
+
+  private void handleCrateCollMessage(byte[] bytes) {
+    try {
+      ZkNodeProps props = ZkNodeProps.load(bytes);
+      if("createcollection".equals(props.getStr("operation"))){
+        String collName = props.getStr("name") ;
+        if(collName != null) collectionsSet.add(collName);
+      }
+    } catch (Exception e) { }
+  }
+
+  protected void startComponentUnderTest() {
+    thread = new Thread(underTest);
+    thread.start();
+  }
+  
+  protected void stopComponentUnderTest() throws Exception {
+    underTest.close();
+    thread.interrupt();
+    thread.join();
+  }
+  
+  private class SubmitCapture {
+    public Capture<ShardRequest> shardRequestCapture = new Capture<ShardRequest>();
+    public Capture<String> nodeUrlsWithoutProtocolPartCapture = new Capture<String>();
+    public Capture<ModifiableSolrParams> params = new Capture<ModifiableSolrParams>();
+  }
+  
+  protected List<SubmitCapture> mockShardHandlerForCreateJob(
+      Integer numberOfSlices, Integer numberOfReplica) {
+    List<SubmitCapture> submitCaptures = new ArrayList<SubmitCapture>();
+    for (int i = 0; i < (numberOfSlices * numberOfReplica); i++) {
+      SubmitCapture submitCapture = new SubmitCapture();
+      shardHandlerMock.submit(capture(submitCapture.shardRequestCapture),
+          capture(submitCapture.nodeUrlsWithoutProtocolPartCapture),
+          capture(submitCapture.params));
+      expectLastCall();
+      submitCaptures.add(submitCapture);
+      ShardResponse shardResponseWithoutException = new ShardResponse();
+      shardResponseWithoutException.setSolrResponse(new QueryResponse());
+      expect(shardHandlerMock.takeCompletedOrError()).andReturn(
+          shardResponseWithoutException);
+    }
+    expect(shardHandlerMock.takeCompletedOrError()).andReturn(null);
+    return submitCaptures;
+  }
+  
+  protected void issueCreateJob(Integer numberOfSlices,
+      Integer replicationFactor, Integer maxShardsPerNode, List<String> createNodeList, boolean sendCreateNodeList) {
+    ZkNodeProps props;
+    if (sendCreateNodeList) {
+      props = new ZkNodeProps(Overseer.QUEUE_OPERATION,
+          OverseerCollectionProcessor.CREATECOLLECTION,
+          OverseerCollectionProcessor.REPLICATION_FACTOR,
+          replicationFactor.toString(), "name", COLLECTION_NAME,
+          "collection.configName", CONFIG_NAME,
+          OverseerCollectionProcessor.NUM_SLICES, numberOfSlices.toString(),
+          OverseerCollectionProcessor.MAX_SHARDS_PER_NODE,
+          maxShardsPerNode.toString(),
+          OverseerCollectionProcessor.CREATE_NODE_SET,
+          (createNodeList != null)?StrUtils.join(createNodeList, ','):null);
+    } else {
+      props = new ZkNodeProps(Overseer.QUEUE_OPERATION,
+          OverseerCollectionProcessor.CREATECOLLECTION,
+          OverseerCollectionProcessor.REPLICATION_FACTOR,
+          replicationFactor.toString(), "name", COLLECTION_NAME,
+          "collection.configName", CONFIG_NAME,
+          OverseerCollectionProcessor.NUM_SLICES, numberOfSlices.toString(),
+          OverseerCollectionProcessor.MAX_SHARDS_PER_NODE,
+          maxShardsPerNode.toString());
+    }
+    QueueEvent qe = new QueueEvent("id", ZkStateReader.toJSON(props), null);
+    queue.add(qe);
+  }
+  
+  protected void verifySubmitCaptures(List<SubmitCapture> submitCaptures,
+      Integer numberOfSlices, Integer numberOfReplica, Collection<String> createNodes) {
+    List<String> coreNames = new ArrayList<String>();
+    Map<String,Map<String,Integer>> sliceToNodeUrlsWithoutProtocolPartToNumberOfShardsRunningMapMap = new HashMap<String,Map<String,Integer>>();
+    List<String> nodeUrlWithoutProtocolPartForLiveNodes = new ArrayList<String>(
+        createNodes.size());
+    for (String nodeName : createNodes) {
+      String nodeUrlWithoutProtocolPart = nodeName.replaceAll("_", "/");
+      if (nodeUrlWithoutProtocolPart.startsWith("http://")) nodeUrlWithoutProtocolPart = nodeUrlWithoutProtocolPart
+          .substring(7);
+      nodeUrlWithoutProtocolPartForLiveNodes.add(nodeUrlWithoutProtocolPart);
+    }
+    
+    for (SubmitCapture submitCapture : submitCaptures) {
+      ShardRequest shardRequest = submitCapture.shardRequestCapture.getValue();
+      assertEquals(CoreAdminAction.CREATE.toString(),
+          shardRequest.params.get(CoreAdminParams.ACTION));
+      // assertEquals(shardRequest.params, submitCapture.params);
+      String coreName = shardRequest.params.get(CoreAdminParams.NAME);
+      assertFalse("Core with name " + coreName + " created twice",
+          coreNames.contains(coreName));
+      coreNames.add(coreName);
+      assertEquals(CONFIG_NAME,
+          shardRequest.params.get("collection.configName"));
+      assertEquals(COLLECTION_NAME,
+          shardRequest.params.get(CoreAdminParams.COLLECTION));
+      assertEquals(numberOfSlices.toString(),
+          shardRequest.params.get(ZkStateReader.NUM_SHARDS_PROP));
+      assertEquals(ADMIN_PATH, shardRequest.params.get("qt"));
+      assertEquals(1, shardRequest.purpose);
+      assertEquals(1, shardRequest.shards.length);
+      assertEquals(submitCapture.nodeUrlsWithoutProtocolPartCapture.getValue(),
+          shardRequest.shards[0]);
+      assertTrue("Shard " + coreName + " created on wrong node "
+          + shardRequest.shards[0],
+          nodeUrlWithoutProtocolPartForLiveNodes
+              .contains(shardRequest.shards[0]));
+      assertEquals(shardRequest.shards, shardRequest.actualShards);
+      
+      String sliceName = shardRequest.params.get(CoreAdminParams.SHARD);
+      if (!sliceToNodeUrlsWithoutProtocolPartToNumberOfShardsRunningMapMap
+          .containsKey(sliceName)) {
+        sliceToNodeUrlsWithoutProtocolPartToNumberOfShardsRunningMapMap.put(
+            sliceName, new HashMap<String,Integer>());
+      }
+      Map<String,Integer> nodeUrlsWithoutProtocolPartToNumberOfShardsRunningMap = sliceToNodeUrlsWithoutProtocolPartToNumberOfShardsRunningMapMap
+          .get(sliceName);
+      Integer existingCount;
+      nodeUrlsWithoutProtocolPartToNumberOfShardsRunningMap
+          .put(
+              shardRequest.shards[0],
+              ((existingCount = nodeUrlsWithoutProtocolPartToNumberOfShardsRunningMap
+                  .get(shardRequest.shards[0])) == null) ? 1
+                  : (existingCount + 1));
+    }
+    
+    assertEquals(numberOfSlices * numberOfReplica, coreNames.size());
+    for (int i = 1; i <= numberOfSlices; i++) {
+      for (int j = 1; j <= numberOfReplica; j++) {
+        String coreName = COLLECTION_NAME + "_shard" + i + "_replica" + j;
+        assertTrue("Shard " + coreName + " was not created",
+            coreNames.contains(coreName));
+      }
+    }
+    
+    assertEquals(numberOfSlices.intValue(),
+        sliceToNodeUrlsWithoutProtocolPartToNumberOfShardsRunningMapMap.size());
+    for (int i = 1; i <= numberOfSlices; i++) {
+      sliceToNodeUrlsWithoutProtocolPartToNumberOfShardsRunningMapMap.keySet()
+          .contains("shard" + i);
+    }
+    int minShardsPerSlicePerNode = numberOfReplica / createNodes.size();
+    int numberOfNodesSupposedToRunMaxShards = numberOfReplica
+        % createNodes.size();
+    int numberOfNodesSupposedToRunMinShards = createNodes.size()
+        - numberOfNodesSupposedToRunMaxShards;
+    int maxShardsPerSlicePerNode = (minShardsPerSlicePerNode + 1);
+    if (numberOfNodesSupposedToRunMaxShards == 0) {
+      numberOfNodesSupposedToRunMaxShards = numberOfNodesSupposedToRunMinShards;
+      maxShardsPerSlicePerNode = minShardsPerSlicePerNode;
+    }
+    boolean diffBetweenMinAndMaxShardsPerSlicePerNode = (maxShardsPerSlicePerNode != minShardsPerSlicePerNode);
+    
+    for (Entry<String,Map<String,Integer>> sliceToNodeUrlsWithoutProtocolPartToNumberOfShardsRunningMapMapEntry : sliceToNodeUrlsWithoutProtocolPartToNumberOfShardsRunningMapMap
+        .entrySet()) {
+      int numberOfShardsRunning = 0;
+      int numberOfNodesRunningMinShards = 0;
+      int numberOfNodesRunningMaxShards = 0;
+      int numberOfNodesRunningAtLeastOneShard = 0;
+      for (String nodeUrlsWithoutProtocolPart : sliceToNodeUrlsWithoutProtocolPartToNumberOfShardsRunningMapMapEntry
+          .getValue().keySet()) {
+        int numberOfShardsRunningOnThisNode = sliceToNodeUrlsWithoutProtocolPartToNumberOfShardsRunningMapMapEntry
+            .getValue().get(nodeUrlsWithoutProtocolPart);
+        numberOfShardsRunning += numberOfShardsRunningOnThisNode;
+        numberOfNodesRunningAtLeastOneShard++;
+        assertTrue(
+            "Node "
+                + nodeUrlsWithoutProtocolPart
+                + " is running wrong number of shards. Supposed to run "
+                + minShardsPerSlicePerNode
+                + (diffBetweenMinAndMaxShardsPerSlicePerNode ? (" or " + maxShardsPerSlicePerNode)
+                    : ""),
+            (numberOfShardsRunningOnThisNode == minShardsPerSlicePerNode)
+                || (numberOfShardsRunningOnThisNode == maxShardsPerSlicePerNode));
+        if (numberOfShardsRunningOnThisNode == minShardsPerSlicePerNode) numberOfNodesRunningMinShards++;
+        if (numberOfShardsRunningOnThisNode == maxShardsPerSlicePerNode) numberOfNodesRunningMaxShards++;
+      }
+      if (minShardsPerSlicePerNode == 0) numberOfNodesRunningMinShards = (createNodes
+          .size() - numberOfNodesRunningAtLeastOneShard);
+      assertEquals(
+          "Too many shards are running under slice "
+              + sliceToNodeUrlsWithoutProtocolPartToNumberOfShardsRunningMapMapEntry
+                  .getKey(),
+          numberOfReplica.intValue(), numberOfShardsRunning);
+      assertEquals(numberOfNodesSupposedToRunMinShards,
+          numberOfNodesRunningMinShards);
+      assertEquals(numberOfNodesSupposedToRunMaxShards,
+          numberOfNodesRunningMaxShards);
+    }
+  }
+  
+  protected void waitForEmptyQueue(long maxWait) throws Exception {
+    long start = System.currentTimeMillis();
+    while (queue.peek() != null) {
+      if ((System.currentTimeMillis() - start) > maxWait) fail(" Queue not empty within "
+          + maxWait + " ms" + System.currentTimeMillis());
+      Thread.sleep(100);
+    }
+  }
+  
+  protected enum CreateNodeListOptions {
+    SEND,
+    DONT_SEND,
+    SEND_NULL
+  }
+  protected void testTemplate(Integer numberOfNodes, Integer numberOfNodesToCreateOn, CreateNodeListOptions createNodeListOption, Integer replicationFactor,
+      Integer numberOfSlices, Integer maxShardsPerNode,
+      boolean collectionExceptedToBeCreated) throws Exception {
+    assertTrue("Wrong usage of testTemplate. numberOfNodesToCreateOn " + numberOfNodesToCreateOn + " is not allowed to be higher than numberOfNodes " + numberOfNodes, numberOfNodes.intValue() >= numberOfNodesToCreateOn.intValue());
+    assertTrue("Wrong usage of testTemplage. createNodeListOption has to be " + CreateNodeListOptions.SEND + " when numberOfNodes and numberOfNodesToCreateOn are unequal", ((createNodeListOption == CreateNodeListOptions.SEND) || (numberOfNodes.intValue() == numberOfNodesToCreateOn.intValue())));
+    
+    Set<String> liveNodes = commonMocks(numberOfNodes);
+    List<String> createNodeList = new ArrayList<String>();
+    int i = 0;
+    for (String node : liveNodes) {
+      if (i++ < numberOfNodesToCreateOn) {
+        createNodeList.add(node);
+      }
+    }
+    
+    List<SubmitCapture> submitCaptures = null;
+    if (collectionExceptedToBeCreated) {
+      submitCaptures = mockShardHandlerForCreateJob(numberOfSlices,
+          replicationFactor);
+    }
+    
+    replay(workQueueMock);
+    replay(solrZkClientMock);
+    replay(zkStateReaderMock);
+    replay(clusterStateMock);
+    replay(shardHandlerMock);
+
+    log.info("clusterstate " +clusterStateMock.hashCode());
+
+    startComponentUnderTest();
+    
+    issueCreateJob(numberOfSlices, replicationFactor, maxShardsPerNode, (createNodeListOption != CreateNodeListOptions.SEND_NULL)?createNodeList:null, (createNodeListOption != CreateNodeListOptions.DONT_SEND));
+    waitForEmptyQueue(10000);
+    
+    if (collectionExceptedToBeCreated) {
+      assertNotNull(underTest.lastProcessMessageResult.getResponse().toString(), underTest.lastProcessMessageResult);
+    }
+    verify(shardHandlerMock);
+    
+    if (collectionExceptedToBeCreated) {
+      verifySubmitCaptures(submitCaptures, numberOfSlices, replicationFactor,
+          createNodeList);
+    }
+  }
+  
+  @Test
+  public void testNoReplicationEqualNumberOfSlicesPerNode() throws Exception {
+    Integer numberOfNodes = 4;
+    Integer numberOfNodesToCreateOn = 4;
+    CreateNodeListOptions createNodeListOptions = CreateNodeListOptions.DONT_SEND;
+    Integer replicationFactor = 1;
+    Integer numberOfSlices = 8;
+    Integer maxShardsPerNode = 2;
+    testTemplate(numberOfNodes, numberOfNodesToCreateOn, createNodeListOptions, replicationFactor, numberOfSlices,
+        maxShardsPerNode, true);
+  }
+  
+  @Test
+  public void testReplicationEqualNumberOfSlicesPerNode() throws Exception {
+    Integer numberOfNodes = 4;
+    Integer numberOfNodesToCreateOn = 4;
+    CreateNodeListOptions createNodeListOptions = CreateNodeListOptions.DONT_SEND;
+    Integer replicationFactor = 2;
+    Integer numberOfSlices = 4;
+    Integer maxShardsPerNode = 2;
+    testTemplate(numberOfNodes, numberOfNodesToCreateOn, createNodeListOptions, replicationFactor, numberOfSlices,
+        maxShardsPerNode, true);
+  }
+  
+  @Test
+  public void testNoReplicationEqualNumberOfSlicesPerNodeSendCreateNodesEqualToLiveNodes() throws Exception {
+    Integer numberOfNodes = 4;
+    Integer numberOfNodesToCreateOn = 4;
+    CreateNodeListOptions createNodeListOptions = CreateNodeListOptions.SEND;
+    Integer replicationFactor = 1;
+    Integer numberOfSlices = 8;
+    Integer maxShardsPerNode = 2;
+    testTemplate(numberOfNodes, numberOfNodesToCreateOn, createNodeListOptions, replicationFactor, numberOfSlices,
+        maxShardsPerNode, true);
+  }
+  
+  @Test
+  public void testReplicationEqualNumberOfSlicesPerNodeSendCreateNodesEqualToLiveNodes() throws Exception {
+    Integer numberOfNodes = 4;
+    Integer numberOfNodesToCreateOn = 4;
+    CreateNodeListOptions createNodeListOptions = CreateNodeListOptions.SEND;
+    Integer replicationFactor = 2;
+    Integer numberOfSlices = 4;
+    Integer maxShardsPerNode = 2;
+    testTemplate(numberOfNodes, numberOfNodesToCreateOn, createNodeListOptions, replicationFactor, numberOfSlices,
+        maxShardsPerNode, true);
+  }
+  
+  @Test
+  public void testNoReplicationEqualNumberOfSlicesPerNodeSendNullCreateNodes() throws Exception {
+    Integer numberOfNodes = 4;
+    Integer numberOfNodesToCreateOn = 4;
+    CreateNodeListOptions createNodeListOptions = CreateNodeListOptions.SEND_NULL;
+    Integer replicationFactor = 1;
+    Integer numberOfSlices = 8;
+    Integer maxShardsPerNode = 2;
+    testTemplate(numberOfNodes, numberOfNodesToCreateOn, createNodeListOptions, replicationFactor, numberOfSlices,
+        maxShardsPerNode, true);
+  }
+  
+  @Test
+  public void testReplicationEqualNumberOfSlicesPerNodeSendNullCreateNodes() throws Exception {
+    Integer numberOfNodes = 4;
+    Integer numberOfNodesToCreateOn = 4;
+    CreateNodeListOptions createNodeListOptions = CreateNodeListOptions.SEND_NULL;
+    Integer replicationFactor = 2;
+    Integer numberOfSlices = 4;
+    Integer maxShardsPerNode = 2;
+    testTemplate(numberOfNodes, numberOfNodesToCreateOn, createNodeListOptions, replicationFactor, numberOfSlices,
+        maxShardsPerNode, true);
+  }  
+  
+  @Test
+  public void testNoReplicationUnequalNumberOfSlicesPerNode() throws Exception {
+    Integer numberOfNodes = 4;
+    Integer numberOfNodesToCreateOn = 4;
+    CreateNodeListOptions createNodeListOptions = CreateNodeListOptions.DONT_SEND;
+    Integer replicationFactor = 1;
+    Integer numberOfSlices = 6;
+    Integer maxShardsPerNode = 2;
+    testTemplate(numberOfNodes, numberOfNodesToCreateOn, createNodeListOptions, replicationFactor, numberOfSlices,
+        maxShardsPerNode, true);
+  }
+  
+  @Test
+  public void testReplicationUnequalNumberOfSlicesPerNode() throws Exception {
+    Integer numberOfNodes = 4;
+    Integer numberOfNodesToCreateOn = 4;
+    CreateNodeListOptions createNodeListOptions = CreateNodeListOptions.DONT_SEND;
+    Integer replicationFactor = 2;
+    Integer numberOfSlices = 3;
+    Integer maxShardsPerNode = 2;
+    testTemplate(numberOfNodes, numberOfNodesToCreateOn, createNodeListOptions, replicationFactor, numberOfSlices,
+        maxShardsPerNode, true);
+  }
+  
+  @Test
+  public void testNoReplicationCollectionNotCreatedDueToMaxShardsPerNodeLimit()
+      throws Exception {
+    Integer numberOfNodes = 4;
+    Integer numberOfNodesToCreateOn = 4;
+    CreateNodeListOptions createNodeListOptions = CreateNodeListOptions.DONT_SEND;
+    Integer replicationFactor = 1;
+    Integer numberOfSlices = 6;
+    Integer maxShardsPerNode = 1;
+    testTemplate(numberOfNodes, numberOfNodesToCreateOn, createNodeListOptions, replicationFactor, numberOfSlices,
+        maxShardsPerNode, false);
+  }
+  
+  @Test
+  public void testReplicationCollectionNotCreatedDueToMaxShardsPerNodeLimit()
+      throws Exception {
+    Integer numberOfNodes = 4;
+    Integer numberOfNodesToCreateOn = 4;
+    CreateNodeListOptions createNodeListOptions = CreateNodeListOptions.DONT_SEND;
+    Integer replicationFactor = 2;
+    Integer numberOfSlices = 3;
+    Integer maxShardsPerNode = 1;
+    testTemplate(numberOfNodes, numberOfNodesToCreateOn, createNodeListOptions, replicationFactor, numberOfSlices,
+        maxShardsPerNode, false);
+  }
+
+  @Test
+  public void testNoReplicationLimitedNodesToCreateOn()
+      throws Exception {
+    Integer numberOfNodes = 4;
+    Integer numberOfNodesToCreateOn = 2;
+    CreateNodeListOptions createNodeListOptions = CreateNodeListOptions.SEND;
+    Integer replicationFactor = 1;
+    Integer numberOfSlices = 6;
+    Integer maxShardsPerNode = 3;
+    testTemplate(numberOfNodes, numberOfNodesToCreateOn, createNodeListOptions, replicationFactor, numberOfSlices,
+        maxShardsPerNode, true);
+  }
+  
+  @Test
+  public void testReplicationLimitedNodesToCreateOn()
+      throws Exception {
+    Integer numberOfNodes = 4;
+    Integer numberOfNodesToCreateOn = 2;
+    CreateNodeListOptions createNodeListOptions = CreateNodeListOptions.SEND;
+    Integer replicationFactor = 2;
+    Integer numberOfSlices = 3;
+    Integer maxShardsPerNode = 3;
+    testTemplate(numberOfNodes, numberOfNodesToCreateOn, createNodeListOptions, replicationFactor, numberOfSlices,
+        maxShardsPerNode, true);
+  }
+
+  @Test
+  public void testNoReplicationCollectionNotCreatedDueToMaxShardsPerNodeAndNodesToCreateOnLimits()
+      throws Exception {
+    Integer numberOfNodes = 4;
+    Integer numberOfNodesToCreateOn = 3;
+    CreateNodeListOptions createNodeListOptions = CreateNodeListOptions.SEND;
+    Integer replicationFactor = 1;
+    Integer numberOfSlices = 8;
+    Integer maxShardsPerNode = 2;
+    testTemplate(numberOfNodes, numberOfNodesToCreateOn, createNodeListOptions, replicationFactor, numberOfSlices,
+        maxShardsPerNode, false);
+  }
+  
+  @Test
+  public void testReplicationCollectionNotCreatedDueToMaxShardsPerNodeAndNodesToCreateOnLimits()
+      throws Exception {
+    Integer numberOfNodes = 4;
+    Integer numberOfNodesToCreateOn = 3;
+    CreateNodeListOptions createNodeListOptions = CreateNodeListOptions.SEND;
+    Integer replicationFactor = 2;
+    Integer numberOfSlices = 4;
+    Integer maxShardsPerNode = 2;
+    testTemplate(numberOfNodes, numberOfNodesToCreateOn, createNodeListOptions, replicationFactor, numberOfSlices,
+        maxShardsPerNode, false);
+  }
+
 }

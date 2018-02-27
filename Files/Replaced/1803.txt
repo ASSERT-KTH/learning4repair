@@ -1,6 +1,6 @@
-return buildUrl(jetty.getLocalPort(), "/solr");
+StringBuilder sb = new StringBuilder();
 
-package org.apache.solr.handler.dataimport;
+package org.apache.solr.update.processor;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,340 +19,394 @@ package org.apache.solr.handler.dataimport;
  * limitations under the License.
  */
 
-import java.io.File;
-import java.io.IOException;
-import java.net.URL;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Map.Entry;
-
-import org.apache.commons.io.FileUtils;
-import org.apache.http.client.HttpClient;
-import org.apache.solr.client.solrj.SolrServerException;
-import org.apache.solr.client.solrj.embedded.JettySolrRunner;
-import org.apache.solr.client.solrj.impl.HttpSolrServer;
+import org.apache.solr.common.SolrException;
+import org.apache.solr.common.SolrException.ErrorCode;
 import org.apache.solr.common.SolrInputDocument;
-import org.junit.After;
-import org.junit.AfterClass;
-import org.junit.Before;
-import org.junit.BeforeClass;
+import org.apache.solr.common.SolrInputField;
+import org.apache.solr.common.params.SolrParams;
+import org.apache.solr.request.SolrQueryRequest;
+import org.apache.solr.response.SolrQueryResponse;
+import org.apache.solr.schema.IndexSchema;
+import org.apache.solr.schema.SchemaField;
+import org.apache.solr.update.AddUpdateCommand;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.regex.Pattern;
+
+
 /**
- * End-to-end test of SolrEntityProcessor. "Real" test using embedded Solr
+ * Identifies the language of a set of input fields.
+ * Also supports mapping of field names based
+ * on detected language.
+ * <p>
+ * See <a href="http://wiki.apache.org/solr/LanguageDetection">http://wiki.apache.org/solr/LanguageDetection</a>
+ * @since 3.5
+ * @lucene.experimental
  */
-public class TestSolrEntityProcessorEndToEnd extends AbstractDataImportHandlerTestCase {
-  
-  private static Logger LOG = LoggerFactory.getLogger(TestSolrEntityProcessorEndToEnd.class);
-  
-  private static final String SOLR_CONFIG = "dataimport-solrconfig.xml";
-  private static final String SOLR_SCHEMA = "dataimport-schema.xml";
-  private static final String SOURCE_CONF_DIR = "dih" + File.separator + "solr" + File.separator + "collection1" + File.separator + "conf" + File.separator;
-  private static final String ROOT_DIR = "dih" + File.separator + "solr" + File.separator;
+public abstract class LanguageIdentifierUpdateProcessor extends UpdateRequestProcessor implements LangIdParams {
 
-  private static final String DEAD_SOLR_SERVER = "http://[ff01::114]:33332/solr";
-  
-  private static final List<Map<String,Object>> DB_DOCS = new ArrayList<Map<String,Object>>();
-  private static final List<Map<String,Object>> SOLR_DOCS = new ArrayList<Map<String,Object>>();
-  
-  static {
-    // dynamic fields in the destination schema
-    Map<String,Object> dbDoc = new HashMap<String,Object>();
-    dbDoc.put("dbid_s", "1");
-    dbDoc.put("dbdesc_s", "DbDescription");
-    DB_DOCS.add(dbDoc);
+  protected final static Logger log = LoggerFactory
+          .getLogger(LanguageIdentifierUpdateProcessor.class);
 
-    Map<String,Object> solrDoc = new HashMap<String,Object>();
-    solrDoc.put("id", "1");
-    solrDoc.put("desc", "SolrDescription");
-    SOLR_DOCS.add(solrDoc);
-  }
+  protected boolean enabled;
 
-  
-  private SolrInstance instance = null;
-  private JettySolrRunner jetty;
-  
-  private String getDihConfigTagsInnerEntity() {
-    return  "<dataConfig>\r\n"
-        + "  <dataSource type='MockDataSource' />\r\n"
-        + "  <document>\r\n"
-        + "    <entity name='db' query='select * from x'>\r\n"
-        + "      <field column='dbid_s' />\r\n"
-        + "      <field column='dbdesc_s' />\r\n"
-        + "      <entity name='se' processor='SolrEntityProcessor' query='id:${db.dbid_s}'\n"
-        + "     url='" + getSourceUrl() + "' fields='id,desc'>\r\n"
-        + "        <field column='id' />\r\n"
-        + "        <field column='desc' />\r\n" + "      </entity>\r\n"
-        + "    </entity>\r\n" + "  </document>\r\n" + "</dataConfig>\r\n";
-  }
-  
-  private String generateDIHConfig(String options, boolean useDeadServer) {
-    return "<dataConfig>\r\n" + "  <document>\r\n"
-        + "    <entity name='se' processor='SolrEntityProcessor'" + "   url='"
-        + (useDeadServer ? DEAD_SOLR_SERVER : getSourceUrl()) + "' " + options + " />\r\n" + "  </document>\r\n"
-        + "</dataConfig>\r\n";
-  }
-  
-  private String getSourceUrl() {
-    return "http" + (isSSLMode() ? "s" : "") +"://127.0.0.1:" + jetty.getLocalPort() + "/solr";
-  }
-  
-  //TODO: fix this test to close its directories
-  static String savedFactory;
-  @BeforeClass
-  public static void beforeClass() {
-    savedFactory = System.getProperty("solr.DirectoryFactory");
-    System.setProperty("solr.directoryFactory", "solr.StandardDirectoryFactory");
-  }
-  
-  @AfterClass
-  public static void afterClass() {
-    if (savedFactory == null) {
-      System.clearProperty("solr.directoryFactory");
-    } else {
-      System.setProperty("solr.directoryFactory", savedFactory);
-    }
+  protected String[] inputFields = {};
+  protected String[] mapFields = {};
+  protected Pattern mapPattern;
+  protected String mapReplaceStr;
+  protected String langField;
+  protected String langsField; // MultiValued, contains all languages detected
+  protected String docIdField;
+  protected String fallbackValue;
+  protected String[] fallbackFields = {};
+  protected boolean enableMapping;
+  protected boolean mapKeepOrig;
+  protected boolean overwrite;
+  protected boolean mapOverwrite;
+  protected boolean mapIndividual;
+  protected boolean enforceSchema;
+  protected double threshold;
+  protected HashSet<String> langWhitelist;
+  protected HashSet<String> mapIndividualFieldsSet;
+  protected HashSet<String> allMapFieldsSet;
+  protected HashMap<String,String> lcMap;
+  protected HashMap<String,String> mapLcMap;
+  protected IndexSchema schema;
+
+  // Regex patterns
+  protected final Pattern tikaSimilarityPattern = Pattern.compile(".*\\((.*?)\\)");
+  protected final Pattern langPattern = Pattern.compile("\\{lang\\}");
+
+  public LanguageIdentifierUpdateProcessor(SolrQueryRequest req,
+                                           SolrQueryResponse rsp, UpdateRequestProcessor next) {
+    super(next);
+    schema = req.getSchema();
+
+    initParams(req.getParams());
   }
 
-  @Override
-  @Before
-  public void setUp() throws Exception {
-    super.setUp();
-    // destination solr core
-    initCore(SOLR_CONFIG, SOLR_SCHEMA);
-    // data source solr instance
-    instance = new SolrInstance();
-    instance.setUp();
-    jetty = createJetty(instance);
-  }
-  
-  @Override
-  @After
-  public void tearDown() throws Exception {
-    try {
-      deleteCore();
-    } catch (Exception e) {
-      LOG.error("Error deleting core", e);
-    }
-    jetty.stop();
-    instance.tearDown();
-    super.tearDown();
-  }
-  
-  public void testFullImport() {
-    assertQ(req("*:*"), "//result[@numFound='0']");
-    
-    try {
-      addDocumentsToSolr(SOLR_DOCS);
-      runFullImport(generateDIHConfig("query='*:*' rows='2' fl='id,desc' onError='skip'", false));
-    } catch (Exception e) {
-      LOG.error(e.getMessage(), e);
-      fail(e.getMessage());
-    }
-    
-    assertQ(req("*:*"), "//result[@numFound='1']");
-    assertQ(req("id:1"), "//result/doc/str[@name='id'][.='1']",
-        "//result/doc/arr[@name='desc'][.='SolrDescription']");
-  }
-  
-  public void testFullImportFqParam() {
-    assertQ(req("*:*"), "//result[@numFound='0']");
-    
-    try {
-      addDocumentsToSolr(generateSolrDocuments(30));
-      Map<String,String> map = new HashMap<String,String>();
-      map.put("rows", "50");
-      runFullImport(generateDIHConfig("query='*:*' fq='desc:Description1*,desc:Description*2' rows='2'", false), map);
-    } catch (Exception e) {
-      LOG.error(e.getMessage(), e);
-      fail(e.getMessage());
-    }
-    
-    assertQ(req("*:*"), "//result[@numFound='1']");
-    assertQ(req("id:12"), "//result[@numFound='1']", "//result/doc/arr[@name='desc'][.='Description12']");
-  }
-  
-  public void testFullImportFieldsParam() {
-    assertQ(req("*:*"), "//result[@numFound='0']");
-    
-    try {
-      addDocumentsToSolr(generateSolrDocuments(7));
-      runFullImport(generateDIHConfig("query='*:*' fl='id' rows='2'", false));
-    } catch (Exception e) {
-      LOG.error(e.getMessage(), e);
-      fail(e.getMessage());
-    }
-    
-    assertQ(req("*:*"), "//result[@numFound='7']");
-    assertQ(req("id:1"), "//result[@numFound='1']");
-    try {
-      assertQ(req("id:1"), "//result/doc/arr[@name='desc']");
-      fail("The document has a field with name desc");
-    } catch(Exception e) {
-      
-    }
-    
-  }
-  
-  /**
-   * Receive a row from SQL (Mock) and fetch a row from Solr
-   */
-  public void testFullImportInnerEntity() {
-    assertQ(req("*:*"), "//result[@numFound='0']");
-    
-    try {
-      List<Map<String,Object>> DOCS = new ArrayList<Map<String,Object>>(DB_DOCS);
-      Map<String, Object> doc = new HashMap<String, Object>();
-      doc.put("dbid_s", "2");
-      doc.put("dbdesc_s", "DbDescription2");
-      DOCS.add(doc);
-      MockDataSource.setIterator("select * from x", DOCS.iterator());
-
-      DOCS = new ArrayList<Map<String,Object>>(SOLR_DOCS);
-      Map<String,Object> solrDoc = new HashMap<String,Object>();
-      solrDoc.put("id", "2");
-      solrDoc.put("desc", "SolrDescription2");
-      DOCS.add(solrDoc);
-      addDocumentsToSolr(DOCS);
-      runFullImport(getDihConfigTagsInnerEntity());
-    } catch (Exception e) {
-      LOG.error(e.getMessage(), e);
-      fail(e.getMessage());
-    } finally {
-      MockDataSource.clearCache();
-    }
-    
-    assertQ(req("*:*"), "//result[@numFound='2']");
-    assertQ(req("id:1"), "//result/doc/str[@name='id'][.='1']",
-        "//result/doc/str[@name='dbdesc_s'][.='DbDescription']",
-        "//result/doc/str[@name='dbid_s'][.='1']",
-        "//result/doc/arr[@name='desc'][.='SolrDescription']");
-    assertQ(req("id:2"), "//result/doc/str[@name='id'][.='2']",
-        "//result/doc/str[@name='dbdesc_s'][.='DbDescription2']",
-        "//result/doc/str[@name='dbid_s'][.='2']",
-        "//result/doc/arr[@name='desc'][.='SolrDescription2']");
-  }
-  
-  public void testFullImportWrongSolrUrl() {
-    assertQ(req("*:*"), "//result[@numFound='0']");
-    
-    try {
-      runFullImport(generateDIHConfig("query='*:*' rows='2' fl='id,desc' onError='skip'", true /* use dead server */));
-    } catch (Exception e) {
-      LOG.error(e.getMessage(), e);
-      fail(e.getMessage());
-    }
-    
-    assertQ(req("*:*"), "//result[@numFound='0']");
-  }
-  
-  public void testFullImportBadConfig() {
-    assertQ(req("*:*"), "//result[@numFound='0']");
-    
-    try {
-      runFullImport(generateDIHConfig("query='bogus:3' rows='2' fl='id,desc' onError='abort'", false));
-    } catch (Exception e) {
-      LOG.error(e.getMessage(), e);
-      fail(e.getMessage());
-    }
-    
-    assertQ(req("*:*"), "//result[@numFound='0']");
-  }
-    
-  private static List<Map<String,Object>> generateSolrDocuments(int num) {
-    List<Map<String,Object>> docList = new ArrayList<Map<String,Object>>();
-    for (int i = 1; i <= num; i++) {
-      Map<String,Object> map = new HashMap<String,Object>();
-      map.put("id", i);
-      map.put("desc", "Description" + i);
-      docList.add(map);
-    }
-    return docList;
-  }
-  
-  private void addDocumentsToSolr(List<Map<String,Object>> docs) throws SolrServerException, IOException {
-    List<SolrInputDocument> sidl = new ArrayList<SolrInputDocument>();
-    for (Map<String,Object> doc : docs) {
-      SolrInputDocument sd = new SolrInputDocument();
-      for (Entry<String,Object> entry : doc.entrySet()) {
-        sd.addField(entry.getKey(), entry.getValue());
+  private void initParams(SolrParams params) {
+    if (params != null) {
+      // Document-centric langId params
+      setEnabled(params.getBool(LANGUAGE_ID, true));
+      if(params.get(FIELDS_PARAM, "").length() > 0) {
+        inputFields = params.get(FIELDS_PARAM, "").split(",");
       }
-      sidl.add(sd);
+      langField = params.get(LANG_FIELD, DOCID_LANGFIELD_DEFAULT);
+      langsField = params.get(LANGS_FIELD, DOCID_LANGSFIELD_DEFAULT);
+      SchemaField uniqueKeyField = schema.getUniqueKeyField();
+      docIdField = params.get(DOCID_PARAM, uniqueKeyField == null ? DOCID_FIELD_DEFAULT : uniqueKeyField.getName());
+      fallbackValue = params.get(FALLBACK);
+      if(params.get(FALLBACK_FIELDS, "").length() > 0) {
+        fallbackFields = params.get(FALLBACK_FIELDS).split(",");
+      }
+      overwrite = params.getBool(OVERWRITE, false);
+      langWhitelist = new HashSet<String>();
+      threshold = params.getDouble(THRESHOLD, DOCID_THRESHOLD_DEFAULT);
+      if(params.get(LANG_WHITELIST, "").length() > 0) {
+        for(String lang : params.get(LANG_WHITELIST, "").split(",")) {
+          langWhitelist.add(lang);
+        }
+      }
+
+      // Mapping params (field centric)
+      enableMapping = params.getBool(MAP_ENABLE, false);
+      if(params.get(MAP_FL, "").length() > 0) {
+        mapFields = params.get(MAP_FL, "").split(",");
+      } else {
+        mapFields = inputFields;
+      }
+      mapKeepOrig = params.getBool(MAP_KEEP_ORIG, false);
+      mapOverwrite = params.getBool(MAP_OVERWRITE, false);
+      mapIndividual = params.getBool(MAP_INDIVIDUAL, false);
+
+      // Process individual fields
+      String[] mapIndividualFields = {};
+      if(params.get(MAP_INDIVIDUAL_FL, "").length() > 0) {
+        mapIndividualFields = params.get(MAP_INDIVIDUAL_FL, "").split(",");
+      } else {
+        mapIndividualFields = mapFields;
+      }
+      mapIndividualFieldsSet = new HashSet<String>(Arrays.asList(mapIndividualFields));
+      // Compile a union of the lists of fields to map
+      allMapFieldsSet = new HashSet<String>(Arrays.asList(mapFields));
+      if(Arrays.equals(mapFields, mapIndividualFields)) {
+        allMapFieldsSet.addAll(mapIndividualFieldsSet);
+      }
+
+      // Normalize detected langcode onto normalized langcode
+      lcMap = new HashMap<String,String>();
+      if(params.get(LCMAP) != null) {
+        for(String mapping : params.get(LCMAP).split("[, ]")) {
+          String[] keyVal = mapping.split(":");
+          if(keyVal.length == 2) {
+            lcMap.put(keyVal[0], keyVal[1]);
+          } else {
+            log.error("Unsupported format for langid.lcmap: "+mapping+". Skipping this mapping.");
+          }
+        }
+      }
+
+      // Language Code mapping
+      mapLcMap = new HashMap<String,String>();
+      if(params.get(MAP_LCMAP) != null) {
+        for(String mapping : params.get(MAP_LCMAP).split("[, ]")) {
+          String[] keyVal = mapping.split(":");
+          if(keyVal.length == 2) {
+            mapLcMap.put(keyVal[0], keyVal[1]);
+          } else {
+            log.error("Unsupported format for langid.map.lcmap: "+mapping+". Skipping this mapping.");
+          }
+        }
+      }
+      enforceSchema = params.getBool(ENFORCE_SCHEMA, true);
+
+      mapPattern = Pattern.compile(params.get(MAP_PATTERN, MAP_PATTERN_DEFAULT));
+      mapReplaceStr = params.get(MAP_REPLACE, MAP_REPLACE_DEFAULT);
+
+
     }
-    
-    HttpSolrServer solrServer = new HttpSolrServer(getSourceUrl());
-    try {
-      solrServer.setConnectionTimeout(15000);
-      solrServer.setSoTimeout(30000);
-      solrServer.add(sidl);
-      solrServer.commit(true, true);
-    } finally {
-      solrServer.shutdown();
+    log.debug("LangId configured");
+
+
+    if (inputFields.length == 0) {
+      throw new SolrException(ErrorCode.BAD_REQUEST,
+              "Missing or faulty configuration of LanguageIdentifierUpdateProcessor. Input fields must be specified as a comma separated list");
     }
+
   }
-  
-  private static class SolrInstance {
 
-    File homeDir;
-    File confDir;
-    
-    public String getHomeDir() {
-      return homeDir.toString();
+  @Override
+  public void processAdd(AddUpdateCommand cmd) throws IOException {
+    if (isEnabled()) {
+      process(cmd.getSolrInputDocument());
+    } else {
+      log.debug("Processor not enabled, not running");
     }
-    
-    public String getSchemaFile() {
-      return SOURCE_CONF_DIR + "dataimport-schema.xml";
-    }
-    
-    public String getDataDir() {
-      return dataDir.toString();
-    }
-    
-    public String getSolrConfigFile() {
-      return SOURCE_CONF_DIR + "dataimport-solrconfig.xml";
-    }
-
-    public String getSolrXmlFile() {
-      return ROOT_DIR + "solr.xml";
-    }
-
-    public void setUp() throws Exception {
-      
-      File home = new File(TEMP_DIR, getClass().getName() + "-"
-          + System.currentTimeMillis());
-      
-      homeDir = new File(home + "inst");
-      dataDir = new File(homeDir + "/collection1", "data");
-      confDir = new File(homeDir + "/collection1", "conf");
-      
-      homeDir.mkdirs();
-      dataDir.mkdirs();
-      confDir.mkdirs();
-
-      FileUtils.copyFile(getFile(getSolrXmlFile()), new File(homeDir, "solr.xml"));
-      File f = new File(confDir, "solrconfig.xml");
-      FileUtils.copyFile(getFile(getSolrConfigFile()), f);
-      f = new File(confDir, "schema.xml");
-      
-      FileUtils.copyFile(getFile(getSchemaFile()), f);
-      f = new File(confDir, "data-config.xml");
-      FileUtils.copyFile(getFile(SOURCE_CONF_DIR + "dataconfig-contentstream.xml"), f);
-    }
-    
-    public void tearDown() throws Exception {
-      recurseDelete(homeDir);
-    }
-    
+    super.processAdd(cmd);
   }
-  
-  private JettySolrRunner createJetty(SolrInstance instance) throws Exception {
-    System.setProperty("solr.data.dir", instance.getDataDir());
-    JettySolrRunner jetty = new JettySolrRunner(instance.getHomeDir(), "/solr", 0, null, null, true, null, sslConfig);
-    jetty.start();
-    return jetty;
+
+  /**
+   * This is the main, testable process method called from processAdd()
+   * @param doc the SolrInputDocument to work on
+   * @return the modified SolrInputDocument
+   */
+  protected SolrInputDocument process(SolrInputDocument doc) {
+    String docLang = null;
+    HashSet<String> docLangs = new HashSet<String>();
+    String fallbackLang = getFallbackLang(doc, fallbackFields, fallbackValue);
+
+    if(langField == null || !doc.containsKey(langField) || (doc.containsKey(langField) && overwrite)) {
+      String allText = concatFields(doc, inputFields);
+      List<DetectedLanguage> languagelist = detectLanguage(allText);
+      docLang = resolveLanguage(languagelist, fallbackLang);
+      docLangs.add(docLang);
+      log.debug("Detected main document language from fields "+inputFields+": "+docLang);
+
+      if(doc.containsKey(langField) && overwrite) {
+        log.debug("Overwritten old value "+doc.getFieldValue(langField));
+      }
+      if(langField != null && langField.length() != 0) {
+        doc.setField(langField, docLang);
+      }
+    } else {
+      // langField is set, we sanity check it against whitelist and fallback
+      docLang = resolveLanguage((String) doc.getFieldValue(langField), fallbackLang);
+      docLangs.add(docLang);
+      log.debug("Field "+langField+" already contained value "+docLang+", not overwriting.");
+    }
+
+    if(enableMapping) {
+      for (String fieldName : allMapFieldsSet) {
+        if(doc.containsKey(fieldName)) {
+          String fieldLang;
+          if(mapIndividual && mapIndividualFieldsSet.contains(fieldName)) {
+            String text = (String) doc.getFieldValue(fieldName);
+            List<DetectedLanguage> languagelist = detectLanguage(text);
+            fieldLang = resolveLanguage(languagelist, docLang);
+            docLangs.add(fieldLang);
+            log.debug("Mapping field "+fieldName+" using individually detected language "+fieldLang);
+          } else {
+            fieldLang = docLang;
+            log.debug("Mapping field "+fieldName+" using document global language "+fieldLang);
+          }
+          String mappedOutputField = getMappedField(fieldName, fieldLang);
+
+          if (mappedOutputField != null) {
+            log.debug("Mapping field {} to {}", doc.getFieldValue(docIdField), fieldLang);
+            SolrInputField inField = doc.getField(fieldName);
+            doc.setField(mappedOutputField, inField.getValue(), inField.getBoost());
+            if(!mapKeepOrig) {
+              log.debug("Removing old field {}", fieldName);
+              doc.removeField(fieldName);
+            }
+          } else {
+            throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, "Invalid output field mapping for "
+                    + fieldName + " field and language: " + fieldLang);
+          }
+        }
+      }
+    }
+
+    // Set the languages field to an array of all detected languages
+    if(langsField != null && langsField.length() != 0) {
+      doc.setField(langsField, docLangs.toArray());
+    }
+
+    return doc;
   }
-  
+
+  /**
+   * Decides the fallback language, either from content of fallback field or fallback value
+   * @param doc the Solr document
+   * @param fallbackFields an array of strings with field names containing fallback language codes
+   * @param fallbackValue a language code to use in case no fallbackFields are found
+   */
+  private String getFallbackLang(SolrInputDocument doc, String[] fallbackFields, String fallbackValue) {
+    String lang = null;
+    for(String field : fallbackFields) {
+      if(doc.containsKey(field)) {
+        lang = (String) doc.getFieldValue(field);
+        log.debug("Language fallback to field "+field);
+        break;
+      }
+    }
+    if(lang == null) {
+      log.debug("Language fallback to value "+fallbackValue);
+      lang = fallbackValue;
+    }
+    return lang;
+  }
+
+  /*
+   * Concatenates content from multiple fields
+   */
+  protected String concatFields(SolrInputDocument doc, String[] fields) {
+    StringBuffer sb = new StringBuffer();
+    for (String fieldName : inputFields) {
+      log.debug("Appending field "+fieldName);
+      if (doc.containsKey(fieldName)) {
+        Object content = doc.getFieldValue(fieldName);
+        if(content instanceof String) {
+          sb.append((String) doc.getFieldValue(fieldName));
+          sb.append(" ");
+        } else {
+          log.warn("Field "+fieldName+" not a String value, not including in detection");
+        }
+      }
+    }
+    return sb.toString();
+  }
+
+  /**
+   * Detects language(s) from a string.
+   * Classes wishing to implement their own language detection module should override this method.
+   * @param content The content to identify
+   * @return List of detected language(s) according to RFC-3066
+   */
+  protected abstract List<DetectedLanguage> detectLanguage(String content);
+
+  /**
+   * Chooses a language based on the list of candidates detected
+   * @param language language code as a string
+   * @param fallbackLang the language code to use as a fallback
+   * @return a string of the chosen language
+   */
+  protected String resolveLanguage(String language, String fallbackLang) {
+    List<DetectedLanguage> l = new ArrayList<DetectedLanguage>();
+    l.add(new DetectedLanguage(language, 1.0));
+    return resolveLanguage(l, fallbackLang);
+  }
+
+  /**
+   * Chooses a language based on the list of candidates detected
+   * @param languages a List of DetectedLanguages with certainty score
+   * @param fallbackLang the language code to use as a fallback
+   * @return a string of the chosen language
+   */
+  protected String resolveLanguage(List<DetectedLanguage> languages, String fallbackLang) {
+    String langStr;
+    if(languages.size() == 0) {
+      log.debug("No language detected, using fallback {}", fallbackLang);
+      langStr = fallbackLang;
+    } else {
+      DetectedLanguage lang = languages.get(0);
+      String normalizedLang = normalizeLangCode(lang.getLangCode());
+      if(langWhitelist.isEmpty() || langWhitelist.contains(normalizedLang)) {
+        log.debug("Language detected {} with certainty {}", normalizedLang, lang.getCertainty());
+        if(lang.getCertainty() >= threshold) {
+          langStr = normalizedLang;
+        } else {
+          log.debug("Detected language below threshold {}, using fallback {}", threshold, fallbackLang);
+          langStr = fallbackLang;
+        }
+      } else {
+        log.debug("Detected a language not in whitelist ({}), using fallback {}", lang.getLangCode(), fallbackLang);
+        langStr = fallbackLang;
+      }
+    }
+
+    if(langStr == null || langStr.length() == 0) {
+      log.warn("Language resolved to null or empty string. Fallback not configured?");
+      langStr = "";
+    }
+
+    return langStr;
+  }
+
+  /**
+   * Looks up language code in map (langid.lcmap) and returns mapped value
+   * @param langCode the language code string returned from detector
+   * @return the normalized/mapped language code
+   */
+  protected String normalizeLangCode(String langCode) {
+    if (lcMap.containsKey(langCode)) {
+      String lc = lcMap.get(langCode);
+      log.debug("Doing langcode normalization mapping from "+langCode+" to "+lc);
+      return lc;
+    }
+    return langCode;
+  }
+
+  /**
+   * Returns the name of the field to map the current contents into, so that they are properly analyzed.  For instance
+   * if the currentField is "text" and the code is "en", the new field would by default be "text_en".
+   * This method also performs custom regex pattern replace if configured. If enforceSchema=true
+   * and the resulting field name doesn't exist, then null is returned.
+   *
+   * @param currentField The current field name
+   * @param language the language code
+   * @return The new schema field name, based on pattern and replace, or null if illegal
+   */
+  protected String getMappedField(String currentField, String language) {
+    String lc = mapLcMap.containsKey(language) ? mapLcMap.get(language) : language;
+    String newFieldName = langPattern.matcher(mapPattern.matcher(currentField).replaceFirst(mapReplaceStr)).replaceFirst(lc);
+    if(enforceSchema && schema.getFieldOrNull(newFieldName) == null) {
+      log.warn("Unsuccessful field name mapping from {} to {}, field does not exist and enforceSchema=true; skipping mapping.", currentField, newFieldName);
+      return null;
+    } else {
+      log.debug("Doing mapping from "+currentField+" with language "+language+" to field "+newFieldName);
+    }
+    return newFieldName;
+  }
+
+  /**
+   * Tells if this processor is enabled or not
+   * @return true if enabled, else false
+   */
+  public boolean isEnabled() {
+    return enabled;
+  }
+
+  public void setEnabled(boolean enabled) {
+    this.enabled = enabled;
+  }
+
 }

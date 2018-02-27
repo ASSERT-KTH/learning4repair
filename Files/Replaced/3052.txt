@@ -1,4 +1,6 @@
-Parameters params = new Parameters(context.getConfiguration().get("job.parameters", ""));
+((LogMergePolicy) writer.getConfig().getMergePolicy()).setUseCompoundFile(false);
+
+package org.apache.lucene.index;
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -17,76 +19,187 @@ Parameters params = new Parameters(context.getConfiguration().get("job.parameter
  * limitations under the License.
  */
 
-package org.apache.mahout.fpm.pfpgrowth.dataset;
+import java.io.*;
+import java.util.*;
 
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.List;
-import java.util.regex.Pattern;
+import org.apache.lucene.analysis.MockAnalyzer;
+import org.apache.lucene.codecs.Codec;
+import org.apache.lucene.codecs.FieldInfosReader;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.StringField;
+import org.apache.lucene.document.TextField;
+import org.apache.lucene.index.IndexWriterConfig.OpenMode;
+import org.apache.lucene.search.similarities.DefaultSimilarity;
+import org.apache.lucene.store.CompoundFileDirectory;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.IOContext;
+import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.store.MockDirectoryWrapper;
+import org.apache.lucene.util.LuceneTestCase;
 
-import org.apache.hadoop.io.LongWritable;
-import org.apache.hadoop.io.Text;
-import org.apache.hadoop.mapreduce.Mapper;
-import org.apache.mahout.common.Parameters;
-import org.apache.mahout.common.StringTuple;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+/*
+  Verify we can read the pre-2.1 file format, do searches
+  against it, and add documents to it.
+*/
 
-/**
- * Splits the line using a {@link Pattern} and outputs key as given by the groupingFields
- * 
- */
-public class KeyBasedStringTupleMapper extends Mapper<LongWritable,Text,Text,StringTuple> {
+public class TestIndexFileDeleter extends LuceneTestCase {
   
-  private static final Logger log = LoggerFactory.getLogger(KeyBasedStringTupleMapper.class);
-  
-  private Pattern splitter;
-  
-  private int[] selectedFields;
-  
-  private int[] groupingFields;
-  
-  @Override
-  protected void map(LongWritable key, Text value, Context context) throws IOException, InterruptedException {
-    String[] fields = splitter.split(value.toString());
-    if (fields.length != 4) {
-      log.info("{} {}", fields.length, value.toString());
-      context.getCounter("Map", "ERROR").increment(1);
-      return;
+  public void testDeleteLeftoverFiles() throws IOException {
+    MockDirectoryWrapper dir = newDirectory();
+    dir.setPreventDoubleWrite(false);
+
+    LogMergePolicy mergePolicy = newLogMergePolicy(true, 10);
+    mergePolicy.setNoCFSRatio(1); // This test expects all of its segments to be in CFS
+
+    IndexWriter writer = new IndexWriter(
+        dir,
+        newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())).
+            setMaxBufferedDocs(10).
+            setMergePolicy(mergePolicy)
+    );
+
+    int i;
+    for(i=0;i<35;i++) {
+      addDoc(writer, i);
     }
-    Collection<String> oKey = new ArrayList<String>();
-    for (int groupingField : groupingFields) {
-      oKey.add(fields[groupingField]);
-      context.setStatus(fields[groupingField]);
+    mergePolicy.setUseCompoundFile(false);
+    for(;i<45;i++) {
+      addDoc(writer, i);
     }
-    
-    List<String> oValue = new ArrayList<String>();
-    for (int selectedField : selectedFields) {
-      oValue.add(fields[selectedField]);
+    writer.close();
+
+    // Delete one doc so we get a .del file:
+    writer = new IndexWriter(
+        dir,
+        newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())).
+            setMergePolicy(NoMergePolicy.NO_COMPOUND_FILES)
+    );
+    Term searchTerm = new Term("id", "7");
+    writer.deleteDocuments(searchTerm);
+    writer.close();
+
+    // Now, artificially create an extra .del file & extra
+    // .s0 file:
+    String[] files = dir.listAll();
+
+    /*
+    for(int j=0;j<files.length;j++) {
+      System.out.println(j + ": " + files[j]);
     }
+    */
+
+    // TODO: fix this test better
+    String ext = Codec.getDefault().getName().equals("SimpleText") ? ".liv" : ".del";
     
-    context.write(new Text(oKey.toString()), new StringTuple(oValue));
+    // Create a bogus separate del file for a
+    // segment that already has a separate del file: 
+    copyFile(dir, "_0_1" + ext, "_0_2" + ext);
+
+    // Create a bogus separate del file for a
+    // segment that does not yet have a separate del file:
+    copyFile(dir, "_0_1" + ext, "_1_1" + ext);
+
+    // Create a bogus separate del file for a
+    // non-existent segment:
+    copyFile(dir, "_0_1" + ext, "_188_1" + ext);
+
+    // Create a bogus segment file:
+    copyFile(dir, "_0.cfs", "_188.cfs");
+
+    // Create a bogus fnm file when the CFS already exists:
+    copyFile(dir, "_0.cfs", "_0.fnm");
     
+    // Create some old segments file:
+    copyFile(dir, "segments_2", "segments");
+    copyFile(dir, "segments_2", "segments_1");
+
+    // Create a bogus cfs file shadowing a non-cfs segment:
+    
+    // TODO: assert is bogus (relies upon codec-specific filenames)
+    assertTrue(dir.fileExists("_3.fdt") || dir.fileExists("_3.fld"));
+    assertTrue(!dir.fileExists("_3.cfs"));
+    copyFile(dir, "_1.cfs", "_3.cfs");
+    
+    String[] filesPre = dir.listAll();
+
+    // Open & close a writer: it should delete the above 4
+    // files and nothing more:
+    writer = new IndexWriter(dir, newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())).setOpenMode(OpenMode.APPEND));
+    writer.close();
+
+    String[] files2 = dir.listAll();
+    dir.close();
+
+    Arrays.sort(files);
+    Arrays.sort(files2);
+    
+    Set<String> dif = difFiles(files, files2);
+    
+    if (!Arrays.equals(files, files2)) {
+      fail("IndexFileDeleter failed to delete unreferenced extra files: should have deleted " + (filesPre.length-files.length) + " files but only deleted " + (filesPre.length - files2.length) + "; expected files:\n    " + asString(files) + "\n  actual files:\n    " + asString(files2)+"\ndiff: "+dif);
+    }
+  }
+
+  private static Set<String> difFiles(String[] files1, String[] files2) {
+    Set<String> set1 = new HashSet<String>();
+    Set<String> set2 = new HashSet<String>();
+    Set<String> extra = new HashSet<String>();
+    
+    for (int x=0; x < files1.length; x++) {
+      set1.add(files1[x]);
+    }
+    for (int x=0; x < files2.length; x++) {
+      set2.add(files2[x]);
+    }
+    Iterator<String> i1 = set1.iterator();
+    while (i1.hasNext()) {
+      String o = i1.next();
+      if (!set2.contains(o)) {
+        extra.add(o);
+      }
+    }
+    Iterator<String> i2 = set2.iterator();
+    while (i2.hasNext()) {
+      String o = i2.next();
+      if (!set1.contains(o)) {
+        extra.add(o);
+      }
+    }
+    return extra;
   }
   
-  @Override
-  protected void setup(Context context) throws IOException, InterruptedException {
-    super.setup(context);
-    Parameters params = Parameters.fromString(context.getConfiguration().get("job.parameters", ""));
-    splitter = Pattern.compile(params.get("splitPattern", "[ \t]*\t[ \t]*"));
-    
-    int selectedFieldCount = Integer.valueOf(params.get("selectedFieldCount", "0"));
-    selectedFields = new int[selectedFieldCount];
-    for (int i = 0; i < selectedFieldCount; i++) {
-      selectedFields[i] = Integer.valueOf(params.get("field" + i, "0"));
+  private String asString(String[] l) {
+    String s = "";
+    for(int i=0;i<l.length;i++) {
+      if (i > 0) {
+        s += "\n    ";
+      }
+      s += l[i];
     }
-    
-    int groupingFieldCount = Integer.valueOf(params.get("groupingFieldCount", "0"));
-    groupingFields = new int[groupingFieldCount];
-    for (int i = 0; i < groupingFieldCount; i++) {
-      groupingFields[i] = Integer.valueOf(params.get("gfield" + i, "0"));
+    return s;
+  }
+
+  public void copyFile(Directory dir, String src, String dest) throws IOException {
+    IndexInput in = dir.openInput(src, newIOContext(random()));
+    IndexOutput out = dir.createOutput(dest, newIOContext(random()));
+    byte[] b = new byte[1024];
+    long remainder = in.length();
+    while(remainder > 0) {
+      int len = (int) Math.min(b.length, remainder);
+      in.readBytes(b, 0, len);
+      out.writeBytes(b, len);
+      remainder -= len;
     }
-    
+    in.close();
+    out.close();
+  }
+
+  private void addDoc(IndexWriter writer, int id) throws IOException
+  {
+    Document doc = new Document();
+    doc.add(newField("content", "aaa", TextField.TYPE_UNSTORED));
+    doc.add(newField("id", Integer.toString(id), StringField.TYPE_UNSTORED));
+    writer.addDocument(doc);
   }
 }

@@ -1,327 +1,711 @@
-import org.apache.derby.iapi.services.sanity.SanityManager;
-
-/*
-
-   Derby - Class org.apache.derby.impl.io.vfmem.BlockedByteArray
-
-   Licensed to the Apache Software Foundation (ASF) under one or more
-   contributor license agreements.  See the NOTICE file distributed with
-   this work for additional information regarding copyright ownership.
-   The ASF licenses this file to You under the Apache License, Version 2.0
-   (the "License"); you may not use this file except in compliance with
-   the License.  You may obtain a copy of the License at
-
-      http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
-
-*/
-
-package org.apache.derby.impl.io.vfmem;
-
-import org.apache.derby.shared.common.sanity.SanityManager;
+if( docsUpperBound > 0 && docsSinceCommit > docsUpperBound ) {
 
 /**
- * Stores data in blocks, and supports reading/writing data from/into these
- * blocks.
- * <p>
- * The blocked array is expanded and shrunk as required.
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
-public class BlockedByteArray {
 
-    /** Constant for 4 KB. */
-    private static final int _4K = 4*1024;
-    /** Constant for 8 KB. */
-    private static final int _8K = 8*1024;
-    /** Constant for 16 KB. */
-    private static final int _16K = 16*1024;
-    /** Constant for 32 KB. */
-    private static final int _32K = 32*1024;
-    /** The default block size. */
-    private static final int DEFAULT_BLOCKSIZE = _4K;
+/**
+ * @author yonik
+ */
 
-    /** The default number of slots for holding a block of data. */
-    private static final int INITIAL_BLOCK_HOLDER_SIZE = 1024;
-    /**
-     * Minimum number of holder slots to grow with when the block holder array
-     * has to grow to be able to reference all the data arrays.
+package org.apache.solr.update;
+
+import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.TermDocs;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.search.Query;
+
+import java.util.HashMap;
+import java.util.TreeMap;
+import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.logging.Level;
+import java.io.IOException;
+import java.net.URL;
+
+import org.apache.solr.search.SolrIndexSearcher;
+import org.apache.solr.search.QueryParsing;
+import org.apache.solr.util.NamedList;
+import org.apache.solr.util.SimpleOrderedMap;
+import org.apache.solr.core.SolrCore;
+import org.apache.solr.core.SolrConfig;
+import org.apache.solr.core.SolrException;
+
+/**
+ * <code>DirectUpdateHandler2</code> implements an UpdateHandler where documents are added
+ * directly to the main Lucene index as opposed to adding to a separate smaller index.
+ * For this reason, not all combinations to/from pending and committed are supported.
+ * This version supports efficient removal of duplicates on a commit.  It works by maintaining
+ * a related count for every document being added or deleted.  At commit time, for every id with a count,
+ * all but the last "count" docs with that id are deleted.
+ * <p>
+ *
+ * Supported add command parameters:
+ <TABLE BORDER>
+  <TR>
+    <TH>allowDups</TH>
+    <TH>overwritePending</TH>
+    <TH>overwriteCommitted</TH>
+    <TH>efficiency</TH>
+  </TR>
+  <TR>
+        <TD>false</TD>
+        <TD>false</TD>
+        <TD>true</TD>
+
+        <TD>fast</TD>
+  </TR>
+  <TR>
+        <TD>true or false</TD>
+        <TD>true</TD>
+        <TD>true</TD>
+
+        <TD>fast</TD>
+  </TR>
+  <TR>
+        <TD>true</TD>
+        <TD>false</TD>
+        <TD>false</TD>
+        <TD>fastest</TD>
+  </TR>
+
+</TABLE>
+
+ <p>Supported delete commands:
+ <TABLE BORDER>
+  <TR>
+    <TH>command</TH>
+    <TH>fromPending</TH>
+    <TH>fromCommitted</TH>
+    <TH>efficiency</TH>
+  </TR>
+  <TR>
+        <TD>delete</TD>
+        <TD>true</TD>
+        <TD>true</TD>
+        <TD>fast</TD>
+  </TR>
+  <TR>
+        <TD>deleteByQuery</TD>
+        <TD>true</TD>
+        <TD>true</TD>
+        <TD>very slow*</TD>
+  </TR>
+</TABLE>
+
+  <p>* deleteByQuery causes a commit to happen (close current index writer, open new index reader)
+  before it can be processed.  If deleteByQuery functionality is needed, it's best if they can
+  be batched and executed together so they may share the same index reader.
+
+ *
+ * @author yonik
+ * @version $Id$
+ * @since solr 0.9
+ */
+
+public class DirectUpdateHandler2 extends UpdateHandler {
+
+  // stats
+  AtomicLong addCommands = new AtomicLong();
+  AtomicLong addCommandsCumulative = new AtomicLong();
+  AtomicLong deleteByIdCommands= new AtomicLong();
+  AtomicLong deleteByIdCommandsCumulative= new AtomicLong();
+  AtomicLong deleteByQueryCommands= new AtomicLong();
+  AtomicLong deleteByQueryCommandsCumulative= new AtomicLong();
+  AtomicLong commitCommands= new AtomicLong();
+  AtomicLong optimizeCommands= new AtomicLong();
+  AtomicLong numDocsDeleted= new AtomicLong();
+  AtomicLong numDocsPending= new AtomicLong();
+  AtomicLong numErrors = new AtomicLong();
+  AtomicLong numErrorsCumulative = new AtomicLong();
+
+  // tracks when auto-commit should occur
+  protected final CommitTracker tracker;
+
+  // The key is the id, the value (Integer) is the number
+  // of docs to save (delete all except the last "n" added)
+  protected final Map<String,Integer> pset;
+
+  // commonly used constants for the count in the pset
+  protected final static Integer ZERO = 0;
+  protected final static Integer ONE = 1;
+
+  // iwCommit protects internal data and open/close of the IndexWriter and
+  // is a mutex. Any use of the index writer should be protected by iwAccess, 
+  // which admits multiple simultaneous acquisitions.  iwAccess is 
+  // mutually-exclusive with the iwCommit lock.
+  protected final Lock iwAccess, iwCommit;
+
+  protected IndexWriter writer;
+  protected SolrIndexSearcher searcher;
+
+  public DirectUpdateHandler2(SolrCore core) throws IOException {
+    super(core);
+    /* A TreeMap is used to maintain the natural ordering of the document ids,
+       which makes commits more efficient
      */
-    private static final int MIN_HOLDER_GROWTH = 1024;
+    pset = new TreeMap<String,Integer>(); 
 
-    /** References to blocks of data. */
-    private byte[][] blocks;
-    /** The size of a block of data (the allocation unit). */
-    private int blockSize;
-    /** The number of allocated blocks. */
-    private int allocatedBlocks;
-    /** The number of bytes stored in the blocked byte array. */
-    private long length;
+    ReadWriteLock rwl = new ReentrantReadWriteLock();
+    iwAccess = rwl.readLock();
+    iwCommit = rwl.writeLock();
 
-    /**
-     * Creates a new blocked byte array with the default number of slots to
-     * hold byte arrays (blocks).
-     * <p>
-     * No blocks are pre-allocated.
-     *
-     * @see #INITIAL_BLOCK_HOLDER_SIZE
-     */
-    public BlockedByteArray() {
-        blocks = new byte[INITIAL_BLOCK_HOLDER_SIZE][];
+    tracker = new CommitTracker();
+  }
+
+  // must only be called when iwCommit lock held
+  protected void openWriter() throws IOException {
+    if (writer==null) {
+      writer = createMainIndexWriter("DirectUpdateHandler2");
+    }
+  }
+
+  // must only be called when iwCommit lock held
+  protected void closeWriter() throws IOException {
+    try {
+      numDocsPending.set(0);
+      if (writer!=null) writer.close();
+    } finally {
+      // if an exception causes the writelock to not be
+      // released, we could try and delete it here
+      writer=null;
+    }
+  }
+
+  protected void openSearcher() throws IOException {
+    if (searcher==null) {
+      searcher = core.newSearcher("DirectUpdateHandler2");
+    }
+  }
+
+  protected void closeSearcher() throws IOException {
+    try {
+      if (searcher!=null) searcher.close();
+    } finally {
+      // if an exception causes a lock to not be
+      // released, we could try to delete it.
+      searcher=null;
+    }
+  }
+
+  public int addDoc(AddUpdateCommand cmd) throws IOException {
+    addCommands.incrementAndGet();
+    addCommandsCumulative.incrementAndGet();
+    int rc=-1;
+
+    iwAccess.lock();
+    try {
+
+      // We can't using iwCommit to protect internal data here, since it would
+      // block other addDoc calls.  Hence, we synchronize to protect internal
+      // state.  This is safe as all other state-changing operations are
+      // protected with iwCommit (which iwAccess excludes from this block).
+      synchronized (this) {
+        if (!cmd.allowDups && !cmd.overwritePending && !cmd.overwriteCommitted) {
+          throw new SolrException(400,"unsupported param combo:" + cmd);
+          // this would need a reader to implement (to be able to check committed
+          // before adding.)
+          // return addNoOverwriteNoDups(cmd);
+        } else if (!cmd.allowDups && !cmd.overwritePending && cmd.overwriteCommitted) {
+          rc = addConditionally(cmd);
+      } else if (!cmd.allowDups && cmd.overwritePending && !cmd.overwriteCommitted) {
+          throw new SolrException(400,"unsupported param combo:" + cmd);
+        } else if (!cmd.allowDups && cmd.overwritePending && cmd.overwriteCommitted) {
+          rc = overwriteBoth(cmd);
+        } else if (cmd.allowDups && !cmd.overwritePending && !cmd.overwriteCommitted) {
+          rc = allowDups(cmd);
+        } else if (cmd.allowDups && !cmd.overwritePending && cmd.overwriteCommitted) {
+          throw new SolrException(400,"unsupported param combo:" + cmd);
+        } else if (cmd.allowDups && cmd.overwritePending && !cmd.overwriteCommitted) {
+          throw new SolrException(400,"unsupported param combo:" + cmd);
+        } else if (cmd.allowDups && cmd.overwritePending && cmd.overwriteCommitted) {
+          rc = overwriteBoth(cmd);
+        }
+        if (rc == -1)
+          throw new SolrException(400,"unsupported param combo:" + cmd);
+        
+        if (rc == 1) {
+          // adding document -- prep writer
+          closeSearcher();
+          openWriter();
+          tracker.addedDocument();          
+        } else {
+          // exit prematurely
+          return rc;
+        }
+      } // end synchronized block
+
+      // this is the only unsynchronized code in the iwAccess block, which
+      // should account for most of the time
+      assert(rc == 1);
+      writer.addDocument(cmd.doc);
+      
+    } finally {
+      iwAccess.unlock();
+      if (rc!=1) {
+        numErrors.incrementAndGet();
+        numErrorsCumulative.incrementAndGet();
+      } else {
+        numDocsPending.incrementAndGet();
+      }
+    }
+    return rc;
+  }
+
+
+  // could return the number of docs deleted, but is that always possible to know???
+  public void delete(DeleteUpdateCommand cmd) throws IOException {
+    deleteByIdCommands.incrementAndGet();
+    deleteByIdCommandsCumulative.incrementAndGet();
+
+    if (!cmd.fromPending && !cmd.fromCommitted) {
+      numErrors.incrementAndGet();
+      numErrorsCumulative.incrementAndGet();
+      throw new SolrException(400,"meaningless command: " + cmd);
+    }
+    if (!cmd.fromPending || !cmd.fromCommitted) {
+      numErrors.incrementAndGet();
+      numErrorsCumulative.incrementAndGet();
+      throw new SolrException(400,"operation not supported" + cmd);
     }
 
-    /**
-     * Returns the byte at the given position.
-     *
-     * @param pos position to read from
-     * @return A single byte.
-     */
-    public synchronized int read(long pos) {
-        if (pos < length) {
-            int block = (int)(pos / blockSize);
-            int index = (int)(pos % blockSize);
-            return (blocks[block][index] & 0xFF);
-        }
-        return -1;
+    iwCommit.lock();
+    try {
+      pset.put(idFieldType.toInternal(cmd.id), ZERO);
+    } finally { 
+      iwCommit.unlock(); 
     }
+  }
 
-    /**
-     * Reads up to {@code len} bytes.
-     *
-     * @param pos the position to start reading at
-     * @param buf the destination buffer
-     * @param offset offset into the destination buffer
-     * @param len the number of bytes to read
-     * @return The number of bytes read.
-     */
-     public synchronized int read(long pos, byte[] buf, int offset, int len) {
-        // Due to the loop condition below, we have to check the length here.
-        // The check is only required because calling code expects an exception.
-        if (len < 0) {
-            throw new ArrayIndexOutOfBoundsException(len);
-        }
-        // Check for EOF.
-        if (pos >= length) {
-            return -1;
-        }
-        // Adjust the length if required.
-        len = (int)Math.min(len, length - pos);
-        int block = (int)(pos / blockSize);
-        int index = (int)(pos % blockSize);
-        int read = 0;
-        while (read < len) {
-            int toRead = Math.min(len - read, blockSize - index);
-            System.arraycopy(blocks[block], index, buf, offset + read, toRead);
-            read += toRead;
-            block++;
-            index = 0;
-        }
-        return read;
+  // why not return number of docs deleted?
+  // Depending on implementation, we may not be able to immediately determine the num...
+   public void deleteByQuery(DeleteUpdateCommand cmd) throws IOException {
+     deleteByQueryCommands.incrementAndGet();
+     deleteByQueryCommandsCumulative.incrementAndGet();
+
+     if (!cmd.fromPending && !cmd.fromCommitted) {
+       numErrors.incrementAndGet();
+       numErrorsCumulative.incrementAndGet();
+       throw new SolrException(400,"meaningless command: " + cmd);
+     }
+     if (!cmd.fromPending || !cmd.fromCommitted) {
+       numErrors.incrementAndGet();
+       numErrorsCumulative.incrementAndGet();
+       throw new SolrException(400,"operation not supported" + cmd);
      }
 
-    /**
-     * Returns the number of bytes allocated.
-     *
-     * @return Bytes allocated.
-     */
-    public synchronized long length() {
-        return length;
+    boolean madeIt=false;
+    try {
+     Query q = QueryParsing.parseQuery(cmd.query, schema);
+
+     int totDeleted = 0;
+     iwCommit.lock();
+     try {
+       // we need to do much of the commit logic (mainly doing queued
+       // deletes since deleteByQuery can throw off our counts.
+       doDeletions();
+       
+       closeWriter();
+       openSearcher();
+
+       // if we want to count the number of docs that were deleted, then
+       // we need a new instance of the DeleteHitCollector
+       final DeleteHitCollector deleter = new DeleteHitCollector(searcher);
+       searcher.search(q, null, deleter);
+       totDeleted = deleter.deleted;
+     } finally {
+       iwCommit.unlock();
+     }
+
+     if (SolrCore.log.isLoggable(Level.FINE)) {
+       SolrCore.log.fine("docs deleted by query:" + totDeleted);
+     }
+     numDocsDeleted.getAndAdd(totDeleted);
+     madeIt=true;
+    } finally {
+      if (!madeIt) {
+        numErrors.incrementAndGet();
+        numErrorsCumulative.incrementAndGet();
+      }
+    }
+   }
+
+
+  ///////////////////////////////////////////////////////////////////
+  /////////////////// helper method for each add type ///////////////
+  ///////////////////////////////////////////////////////////////////
+
+  // methods return 1 if the document is to be added; 0 otherwise.
+  // methods must be called in synchronized context
+
+  protected int addConditionally(AddUpdateCommand cmd) throws IOException {
+    if (cmd.indexedId ==null) {
+      cmd.indexedId =getIndexedId(cmd.doc);
+    }
+    Integer saveCount = pset.get(cmd.indexedId);
+    if (saveCount!=null && saveCount!=0) {
+      // a doc with this id already exists in the pending set
+      return 0;
+    }
+    pset.put(cmd.indexedId, ONE);
+    return 1;
+  }
+
+
+  // overwrite both pending and committed
+  protected int overwriteBoth(AddUpdateCommand cmd) throws IOException {
+    if (cmd.indexedId ==null) {
+      cmd.indexedId =getIndexedId(cmd.doc);
+    }
+    pset.put(cmd.indexedId, ONE);
+    return 1;
+  }
+
+
+  // add without checking
+  protected int allowDups(AddUpdateCommand cmd) throws IOException {
+    if (cmd.indexedId ==null) {
+      cmd.indexedId =getIndexedIdOptional(cmd.doc);
+    }
+    if (cmd.indexedId != null) {
+      Integer saveCount = pset.get(cmd.indexedId);
+      
+      // if there weren't any docs marked for deletion before, then don't mark
+      // any for deletion now.
+      if (saveCount == null) return 1;
+
+      // If there were docs marked for deletion, then increment the number of
+      // docs to save at the end.
+
+      // the following line is optional, but it saves an allocation in the common case.
+      if (saveCount == ZERO) saveCount=ONE;
+      else saveCount++;
+
+      pset.put(cmd.indexedId, saveCount);
+    }
+    return 1;
+  }
+
+  //
+  // do all needed deletions.
+  // call with iwCommit lock held
+  //
+  protected void doDeletions() throws IOException {
+    int[] docnums = new int[0];
+
+    if (pset.size() > 0) { // optimization: only open searcher if there is something to delete...
+      log.info("DirectUpdateHandler2 deleting and removing dups for " + pset.size() +" ids");
+      int numDeletes=0;
+
+      closeWriter();
+      openSearcher();
+      IndexReader reader = searcher.getReader();
+      TermDocs tdocs = reader.termDocs();
+      String fieldname = idField.getName();
+
+      for (Map.Entry<String,Integer> entry : pset.entrySet()) {
+        String id = entry.getKey();
+        int saveLast = entry.getValue();  // save the last "saveLast" documents
+
+        //expand our array that keeps track of docs if needed.
+        if (docnums==null || saveLast > docnums.length) {
+          docnums = new int[saveLast];
+        }
+
+        // initialize all docnums in the list to -1 (unused)
+        for (int i=0; i<saveLast; i++) {
+          docnums[i] = -1;
+        }
+
+        tdocs.seek(new Term(fieldname,id));
+
+        //
+        // record the docs for this term in the "docnums" array and wrap around
+        // at size "saveLast".  If we reuse a slot in the array, then we delete
+        // the doc that was there from the index.
+        //
+        int pos=0;
+        while (tdocs.next()) {
+          if (saveLast==0) {
+            // special case - delete all the docs as we see them.
+            reader.deleteDocument(tdocs.doc());
+            numDeletes++;
+            continue;
+          }
+
+          int prev=docnums[pos];
+          docnums[pos]=tdocs.doc();
+          if (prev != -1) {
+            reader.deleteDocument(prev);
+            numDeletes++;
+          }
+
+          if (++pos >= saveLast) pos=0;
+        }
+      }
+
+      // should we ever shrink it again, or just clear it?
+      pset.clear();
+      log.info("DirectUpdateHandler2 docs deleted=" + numDeletes);
+      numDocsDeleted.addAndGet(numDeletes);
     }
 
-    /**
-     * Changes the allocated length of the data.
-     * <p>
-     * If the new length is larger than the current length, the blocked byte
-     * array will be extended with new blocks. If the new length is smaller,
-     * existing (allocated) blocks will be removed if possible.
-     *
-     * @param newLength the new length of the allocated data in bytes
-     */
-    public synchronized void setLength(final long newLength) {
-        // If capacity is requested before any writes has taken place.
-        if (blockSize == 0) {
-            checkBlockSize((int)Math.min(Integer.MAX_VALUE, newLength));
-        }
-        final long currentCapacity = (long)allocatedBlocks * blockSize;
-        if (newLength > currentCapacity) {
-            // Allocate more blocks.
-            increaseCapacity(newLength);
-        } else if (newLength < currentCapacity) {
-            if (newLength <= 0L) {
-                // Just clear everything.
-                allocatedBlocks = 0;
-                blocks = new byte[INITIAL_BLOCK_HOLDER_SIZE][];
-            } else {
-                // Nullify the surplus data.
-                int blocksToKeep = (int)(newLength / blockSize) +1;
-                for (int i=blocksToKeep; i <= allocatedBlocks; i++) {
-                    blocks[i] = null;
-                }
-                allocatedBlocks = Math.min(allocatedBlocks, blocksToKeep);
-                // We keep the holder slots around, since the overhead for
-                // doing so is pretty small.
-            }
-        }
-        length = Math.max(0L, newLength);
+  }
+
+
+
+  public void commit(CommitUpdateCommand cmd) throws IOException {
+
+    if (cmd.optimize) {
+      optimizeCommands.incrementAndGet();
+    } else {
+      commitCommands.incrementAndGet();
     }
 
-    /**
-     * Writes the given bytes into the blocked byte array.
-     *
-     * @param pos the position to start writing at
-     * @param buf the source buffer
-     * @param offset the offset into the source buffer
-     * @param len the number of bytes to write
-     * @return The number of bytes written.
-     */
-    public synchronized int writeBytes(final long pos, final byte[] buf,
-                                       int offset, final int len) {
-        // Optimize block size if possible on first write.
-        if (blockSize == 0) {
-            checkBlockSize(len);
-        }
-        // Due to the loop condition below, we have to check the length here.
-        // The check is only required because calling code expects an exception.
-        if (len < 0) {
-            throw new ArrayIndexOutOfBoundsException(len);
-        }
-        // Increase the capacity if required.
-        increaseCapacity(pos + len);
-        // Calculate the block number and the index within this block.
-        int block = (int)(pos / blockSize);
-        int index = (int)(pos % blockSize);
-
-        int written = 0;
-        while (written < len) {
-            int toWrite = Math.min(len - written, blockSize - index);
-            System.arraycopy(buf, offset, blocks[block], index, toWrite);
-            written += toWrite;
-            offset += toWrite;
-            if (written < len) {
-                block++;
-                index = 0;
-            } else {
-                index += toWrite;
-            }
-        }
-
-        // Update the length if we wrote past the previous length.
-        length = Math.max(length, pos + len);
-        return written;
+    Future[] waitSearcher = null;
+    if (cmd.waitSearcher) {
+      waitSearcher = new Future[1];
     }
 
-    /**
-     * Writes the given byte into the blocked byte array.
-     *
-     * @param pos the position to write the byte at
-     * @param b the byte to write
-     * @return {@code 1}, which is the number of bytes written.
-     */
-    public synchronized int writeByte(long pos, byte b) {
-        // Optimize block size if possible on first write.
-        if (blockSize == 0) {
-            checkBlockSize(0);
-        }
-        // Increase the capacity if required.
-        increaseCapacity(pos);
-        // Calculate the block number and the index within this block.
-        int block = (int)(pos / blockSize);
-        int index = (int)(pos % blockSize);
-        blocks[block][index] = b;
-        // Update the length if we wrote past the previous length.
-        length = Math.max(length, pos +1);
-        return 1; // The number of bytes written, always one.
+    boolean error=true;
+    iwCommit.lock();
+    try {
+      log.info("start "+cmd);
+      doDeletions();
+        
+      if (cmd.optimize) {
+        closeSearcher();
+        openWriter(); 
+        writer.optimize();
+      }
+
+      closeSearcher();
+      closeWriter();
+
+      callPostCommitCallbacks();
+      if (cmd.optimize) {
+        callPostOptimizeCallbacks();
+      }
+      // open a new searcher in the sync block to avoid opening it
+      // after a deleteByQuery changed the index, or in between deletes
+      // and adds of another commit being done.
+      core.getSearcher(true,false,waitSearcher);
+
+      // reset commit tracking
+      tracker.didCommit();
+
+      log.info("end_commit_flush");
+
+      error=false;
+    }
+    finally {
+      iwCommit.unlock();
+      addCommands.set(0);
+      deleteByIdCommands.set(0);
+      deleteByQueryCommands.set(0);
+      numErrors.set(error ? 1 : 0);
     }
 
-    /**
-     * Returns an input stream serving the data in the blocked byte array.
-     *
-     * @return An {@code InputStream}-object.
-     */
-    synchronized BlockedByteArrayInputStream getInputStream() {
-        return new BlockedByteArrayInputStream(this, 0L);
+    // if we are supposed to wait for the searcher to be registered, then we should do it
+    // outside of the synchronized block so that other update operations can proceed.
+    if (waitSearcher!=null && waitSearcher[0] != null) {
+       try {
+        waitSearcher[0].get();
+      } catch (InterruptedException e) {
+        SolrException.log(log,e);
+      } catch (ExecutionException e) {
+        SolrException.log(log,e);
+      }
     }
 
-    /**
-     * Returns an output stream writing data into the blocked byte array.
-     *
-     * @param pos initial position of the output stream
-     * @return An {@code OutputStream}-object.
-     */
-    synchronized BlockedByteArrayOutputStream getOutputStream(long pos) {
-        if (pos < 0) {
-            throw new IllegalArgumentException(
-                                        "Position cannot be negative: " + pos);
-        }
-        return new BlockedByteArrayOutputStream(this, pos);
+    return;
+  }
+
+
+  public void close() throws IOException {
+    log.info("closing " + this);
+    iwCommit.lock();
+    try{
+      // cancel any pending operations
+      if( tracker.pending != null ) {
+        tracker.pending.cancel( true );
+        tracker.pending = null;
+      }
+      doDeletions();
+      closeSearcher();
+      closeWriter();
+    } finally {
+      iwCommit.unlock();
+    }
+    log.info("closed " + this);
+  }
+
+  /** Helper class for tracking autoCommit state.
+   *
+   * Note: This is purely an implementation detail of autoCommit and will
+   * definitely change in the future, so the interface should not be
+   * relied-upon
+   *
+   * Note: all access must be synchronized.
+   */
+  class CommitTracker implements Runnable 
+  {  
+    // settings, not final so we can change them in testing
+    int docsUpperBound;
+    long timeUpperBound;
+
+    private final ScheduledExecutorService scheduler =
+       Executors.newScheduledThreadPool(1);
+    private ScheduledFuture pending;
+    
+    // state
+    long docsSinceCommit;    
+    int autoCommitCount= 0;
+    long lastAddedTime = -1;
+    
+    public CommitTracker() {
+      docsSinceCommit = 0;
+      pending = null;
+
+      docsUpperBound = SolrConfig.config.getInt("updateHandler/autoCommit/maxDocs", -1);
+      timeUpperBound = SolrConfig.config.getInt("updateHandler/autoCommit/maxTime", -1);
+
+      SolrCore.log.info("CommitTracker: " + this);
     }
 
-    /**
-     * Releases this array.
+    /** Indicate that documents have been added
      */
-    synchronized void release() {
-        blocks = null;
-        length = allocatedBlocks = -1;
+    public void addedDocument() {
+      docsSinceCommit++;
+      lastAddedTime = System.currentTimeMillis();
+      if( pending == null ) {  // Don't start a new event if one is already waiting 
+        if( timeUpperBound > 0 ) { 
+          pending = scheduler.schedule( this, timeUpperBound, TimeUnit.MILLISECONDS );
+        }
+        else if( docsUpperBound > 0 && (docsSinceCommit > docsUpperBound) ) {
+          // 1/4 second seems fast enough for anyone using maxDocs
+          pending = scheduler.schedule( this, 250, TimeUnit.MILLISECONDS );
+        }
+      }
     }
 
-    /**
-     * Tries to optimize the block size by setting it equal to the the page
-     * size used by the database.
-     * <p>
-     * Since we don't have a way of knowing which page size will be used, wait
-     * to set the block size until the first write request and see how many
-     * bytes are written then.
-     *
-     * @param len the requested number of bytes to be written
-     */
-    private void checkBlockSize(int len) {
-        // Optimize on the block size (if possible).
-        if (len == _4K || len == _8K || len == _16K || len == _32K) {
-            blockSize = len;
-        } else {
-            blockSize = DEFAULT_BLOCKSIZE;
-        }
+    /** Inform tracker that a commit has occurred, cancel any pending commits */
+    public void didCommit() {
+      if( pending != null ) {
+        pending.cancel(false);
+        pending = null; // let it start another one
+      }
+      docsSinceCommit = 0;
     }
 
-    /**
-     * Increases the capacity of this blocked byte array by allocating more
-     * blocks.
-     *
-     * @param lastIndex the index that must fit into the array
-     */
-    //@GuardedBy("this")
-    private void increaseCapacity(long lastIndex) {
-        if (SanityManager.DEBUG) {
-            SanityManager.ASSERT(blockSize > 0, "Invalid/unset block size");
+    /** This is the worker part for the ScheduledFuture **/
+    public synchronized void run() {
+      long started = System.currentTimeMillis();
+      try {
+        CommitUpdateCommand command = new CommitUpdateCommand( false );
+        command.waitFlush = true;
+        command.waitSearcher = true; 
+        commit( command );
+        autoCommitCount++;
+      } 
+      catch (Exception e) {
+        log.severe( "auto commit error..." );
+        e.printStackTrace();
+      }
+      finally {
+        pending = null;
+      }
+
+      // check if docs have been submitted since the commit started
+      if( lastAddedTime > started ) {
+        if( docsSinceCommit > docsUpperBound ) {
+          pending = scheduler.schedule( this, 100, TimeUnit.MILLISECONDS );
         }
-        // Safe-guard to avoid overwriting existing data.
-        if (lastIndex < (long)allocatedBlocks * blockSize) {
-            return;
+        else if( timeUpperBound > 0 ) {
+          pending = scheduler.schedule( this, timeUpperBound, TimeUnit.MILLISECONDS );
         }
-        // Calculate required number of blocks, and create those lacking.
-        // We may allocate one more array than required.
-        final int blocksRequired = (int)((lastIndex) / blockSize) +1;
-        if (blocksRequired > blocks.length) {
-            // Grow the block holder array.
-            // Make sure we have enough slots. Note that we only grow the block
-            // holder array, we don't fill it with data blocks before needed.
-            int growTo = Math.max(
-                    // Grow at least ~33%.
-                    blocks.length + (blocks.length / 3),
-                    // For cases where we need to grow more than 33%.
-                    blocksRequired + MIN_HOLDER_GROWTH);
-            byte[][] tmpBlocks = blocks;
-            blocks = new byte[growTo][];
-            // Copy the data array references.
-            System.arraycopy(tmpBlocks, 0, blocks, 0, allocatedBlocks);
-        }
-        // Allocate new data arrays to accomodate lastIndex bytes.
-        for (int i=allocatedBlocks; i < blocksRequired; i++) {
-            blocks[i] = new byte[blockSize];
-        }
-        allocatedBlocks = blocksRequired;
+      }
     }
+  }
+      
+  
+  /////////////////////////////////////////////////////////////////////
+  // SolrInfoMBean stuff: Statistics and Module Info
+  /////////////////////////////////////////////////////////////////////
+
+  public String getName() {
+    return DirectUpdateHandler2.class.getName();
+  }
+
+  public String getVersion() {
+    return SolrCore.version;
+  }
+
+  public String getDescription() {
+    return "Update handler that efficiently directly updates the on-disk main lucene index";
+  }
+
+  public Category getCategory() {
+    return Category.UPDATEHANDLER;
+  }
+
+  public String getSourceId() {
+    return "$Id$";
+  }
+
+  public String getSource() {
+    return "$URL$";
+  }
+
+  public URL[] getDocs() {
+    return null;
+  }
+
+  public NamedList getStatistics() {
+    NamedList lst = new SimpleOrderedMap();
+    lst.add("commits", commitCommands.get());
+    lst.add("autocommits", tracker.autoCommitCount);
+    lst.add("optimizes", optimizeCommands.get());
+    lst.add("docsPending", numDocsPending.get());
+    // pset.size() not synchronized, but it should be fine to access.
+    lst.add("deletesPending", pset.size());
+    lst.add("adds", addCommands.get());
+    lst.add("deletesById", deleteByIdCommands.get());
+    lst.add("deletesByQuery", deleteByQueryCommands.get());
+    lst.add("errors", numErrors.get());
+    lst.add("cumulative_adds", addCommandsCumulative.get());
+    lst.add("cumulative_deletesById", deleteByIdCommandsCumulative.get());
+    lst.add("cumulative_deletesByQuery", deleteByQueryCommandsCumulative.get());
+    lst.add("cumulative_errors", numErrorsCumulative.get());
+    lst.add("docsDeleted", numDocsDeleted.get());
+    return lst;
+  }
+
+  public String toString() {
+    return "DirectUpdateHandler2" + getStatistics();
+  }
 }

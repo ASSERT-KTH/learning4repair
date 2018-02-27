@@ -1,14 +1,13 @@
-assert field != null;
-
-package org.apache.lucene.codecs;
+cfs.addToCompactedRowStats(rowsize);
 
 /**
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -19,861 +18,617 @@ package org.apache.lucene.codecs;
  * limitations under the License.
  */
 
+package org.apache.cassandra.db;
+
 import java.io.IOException;
-import java.util.Collection;
-import java.util.Comparator;
-import java.util.Iterator;
-import java.util.TreeMap;
+import java.io.File;
+import java.lang.management.ManagementFactory;
+import java.util.*;
+import java.util.Map.Entry;
+import java.util.concurrent.Callable;
+import java.util.concurrent.Future;
+import javax.management.*;
 
-import org.apache.lucene.index.DocsAndPositionsEnum;
-import org.apache.lucene.index.DocsEnum;
-import org.apache.lucene.index.FieldInfo.IndexOptions;
-import org.apache.lucene.index.FieldInfo;
-import org.apache.lucene.index.FieldInfos;
-import org.apache.lucene.index.FieldsEnum;
-import org.apache.lucene.index.IndexFileNames;
-import org.apache.lucene.index.SegmentInfo;
-import org.apache.lucene.index.TermState;
-import org.apache.lucene.index.Terms;
-import org.apache.lucene.index.TermsEnum;
-import org.apache.lucene.store.ByteArrayDataInput;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.IOContext;
-import org.apache.lucene.store.IndexInput;
-import org.apache.lucene.util.ArrayUtil;
-import org.apache.lucene.util.Bits;
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.CodecUtil;
-import org.apache.lucene.util.DoubleBarrelLRUCache;
+import org.apache.log4j.Logger;
 
-/** Handles a terms dict, but decouples all details of
- *  doc/freqs/positions reading to an instance of {@link
- *  PostingsReaderBase}.  This class is reusable for
- *  codecs that use a different format for
- *  docs/freqs/positions (though codecs are also free to
- *  make their own terms dict impl).
- *
- * <p>This class also interacts with an instance of {@link
- * TermsIndexReaderBase}, to abstract away the specific
- * implementation of the terms dict index. 
- * @lucene.experimental */
+import org.apache.cassandra.concurrent.DebuggableThreadPoolExecutor;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.io.*;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.service.AntiEntropyService;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.utils.FBUtilities;
+import org.cliffc.high_scale_lib.NonBlockingHashMap;
 
-public class BlockTermsReader extends FieldsProducer {
-  // Open input to the main terms dict file (_X.tis)
-  private final IndexInput in;
+import java.net.InetAddress;
 
-  // Reads the terms dict entries, to gather state to
-  // produce DocsEnum on demand
-  private final PostingsReaderBase postingsReader;
+import org.apache.commons.lang.StringUtils;
+import org.apache.commons.collections.iterators.FilterIterator;
+import org.apache.commons.collections.iterators.CollatingIterator;
+import org.apache.commons.collections.PredicateUtils;
 
-  private final TreeMap<String,FieldReader> fields = new TreeMap<String,FieldReader>();
+public class CompactionManager implements CompactionManagerMBean
+{
+    public static final String MBEAN_OBJECT_NAME = "org.apache.cassandra.db:type=CompactionManager";
+    private static final Logger logger = Logger.getLogger(CompactionManager.class);
+    public static final CompactionManager instance;
 
-  // Caches the most recently looked-up field + terms:
-  private final DoubleBarrelLRUCache<FieldAndTerm,BlockTermState> termsCache;
+    private int minimumCompactionThreshold = 4; // compact this many sstables min at a time
+    private int maximumCompactionThreshold = 32; // compact this many sstables max at a time
 
-  // Reads the terms index
-  private TermsIndexReaderBase indexReader;
-
-  // keeps the dirStart offset
-  protected long dirOffset;
-
-  // Used as key for the terms cache
-  private static class FieldAndTerm extends DoubleBarrelLRUCache.CloneableKey {
-    String field;
-    BytesRef term;
-
-    public FieldAndTerm() {
-    }
-
-    public FieldAndTerm(FieldAndTerm other) {
-      field = other.field;
-      term = BytesRef.deepCopyOf(other.term);
-    }
-
-    @Override
-    public boolean equals(Object _other) {
-      FieldAndTerm other = (FieldAndTerm) _other;
-      return other.field.equals(field) && term.bytesEquals(other.term);
-    }
-
-    @Override
-    public Object clone() {
-      return new FieldAndTerm(this);
-    }
-
-    @Override
-    public int hashCode() {
-      return field.hashCode() * 31 + term.hashCode();
-    }
-  }
-  
-  // private String segment;
-  
-  public BlockTermsReader(TermsIndexReaderBase indexReader, Directory dir, FieldInfos fieldInfos, String segment, PostingsReaderBase postingsReader, IOContext context,
-                          int termsCacheSize, String segmentSuffix)
-    throws IOException {
-    
-    this.postingsReader = postingsReader;
-    termsCache = new DoubleBarrelLRUCache<FieldAndTerm,BlockTermState>(termsCacheSize);
-
-    // this.segment = segment;
-    in = dir.openInput(IndexFileNames.segmentFileName(segment, segmentSuffix, BlockTermsWriter.TERMS_EXTENSION),
-                       context);
-
-    boolean success = false;
-    try {
-      readHeader(in);
-
-      // Have PostingsReader init itself
-      postingsReader.init(in);
-
-      // Read per-field details
-      seekDir(in, dirOffset);
-
-      final int numFields = in.readVInt();
-      for(int i=0;i<numFields;i++) {
-        final int field = in.readVInt();
-        final long numTerms = in.readVLong();
-        assert numTerms >= 0;
-        final long termsStartPointer = in.readVLong();
-        final FieldInfo fieldInfo = fieldInfos.fieldInfo(field);
-        final long sumTotalTermFreq = fieldInfo.indexOptions == IndexOptions.DOCS_ONLY ? -1 : in.readVLong();
-        final long sumDocFreq = in.readVLong();
-        final int docCount = in.readVInt();
-        assert !fields.containsKey(fieldInfo.name);
-        fields.put(fieldInfo.name, new FieldReader(fieldInfo, numTerms, termsStartPointer, sumTotalTermFreq, sumDocFreq, docCount));
-      }
-      success = true;
-    } finally {
-      if (!success) {
-        in.close();
-      }
-    }
-
-    this.indexReader = indexReader;
-  }
-
-  protected void readHeader(IndexInput input) throws IOException {
-    CodecUtil.checkHeader(input, BlockTermsWriter.CODEC_NAME,
-                          BlockTermsWriter.VERSION_START,
-                          BlockTermsWriter.VERSION_CURRENT);
-    dirOffset = input.readLong();
-  }
-  
-  protected void seekDir(IndexInput input, long dirOffset)
-      throws IOException {
-    input.seek(dirOffset);
-  }
-  
-  @Override
-  public void close() throws IOException {
-    try {
-      try {
-        if (indexReader != null) {
-          indexReader.close();
+    static
+    {
+        instance = new CompactionManager();
+        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+        try
+        {
+            mbs.registerMBean(instance, new ObjectName(MBEAN_OBJECT_NAME));
         }
-      } finally {
-        // null so if an app hangs on to us (ie, we are not
-        // GCable, despite being closed) we still free most
-        // ram
-        indexReader = null;
-        if (in != null) {
-          in.close();
+        catch (Exception e)
+        {
+            throw new RuntimeException(e);
         }
-      }
-    } finally {
-      if (postingsReader != null) {
-        postingsReader.close();
-      }
-    }
-  }
-
-  public static void files(SegmentInfo segmentInfo, String segmentSuffix, Collection<String> files) {
-    files.add(IndexFileNames.segmentFileName(segmentInfo.name, segmentSuffix, BlockTermsWriter.TERMS_EXTENSION));
-  }
-
-  @Override
-  public FieldsEnum iterator() {
-    return new TermFieldsEnum();
-  }
-
-  @Override
-  public Terms terms(String field) throws IOException {
-    return fields.get(field);
-  }
-
-  @Override
-  public int getUniqueFieldCount() {
-    return fields.size();
-  }
-
-  // Iterates through all fields
-  private class TermFieldsEnum extends FieldsEnum {
-    final Iterator<FieldReader> it;
-    FieldReader current;
-
-    TermFieldsEnum() {
-      it = fields.values().iterator();
     }
 
-    @Override
-    public String next() {
-      if (it.hasNext()) {
-        current = it.next();
-        return current.fieldInfo.name;
-      } else {
-        current = null;
-        return null;
-      }
-    }
-    
-    @Override
-    public Terms terms() throws IOException {
-      return current;
-    }
-  }
+    private CompactionExecutor executor = new CompactionExecutor();
+    private Map<ColumnFamilyStore, Integer> estimatedCompactions = new NonBlockingHashMap<ColumnFamilyStore, Integer>();
 
-  private class FieldReader extends Terms {
-    final long numTerms;
-    final FieldInfo fieldInfo;
-    final long termsStartPointer;
-    final long sumTotalTermFreq;
-    final long sumDocFreq;
-    final int docCount;
-
-    FieldReader(FieldInfo fieldInfo, long numTerms, long termsStartPointer, long sumTotalTermFreq, long sumDocFreq, int docCount) {
-      assert numTerms > 0;
-      this.fieldInfo = fieldInfo;
-      this.numTerms = numTerms;
-      this.termsStartPointer = termsStartPointer;
-      this.sumTotalTermFreq = sumTotalTermFreq;
-      this.sumDocFreq = sumDocFreq;
-      this.docCount = docCount;
-    }
-
-    @Override
-    public Comparator<BytesRef> getComparator() {
-      return BytesRef.getUTF8SortedAsUnicodeComparator();
-    }
-
-    @Override
-    public TermsEnum iterator(TermsEnum reuse) throws IOException {
-      return new SegmentTermsEnum();
-    }
-
-    @Override
-    public long getUniqueTermCount() {
-      return numTerms;
-    }
-
-    @Override
-    public long getSumTotalTermFreq() {
-      return sumTotalTermFreq;
-    }
-
-    @Override
-    public long getSumDocFreq() throws IOException {
-      return sumDocFreq;
-    }
-
-    @Override
-    public int getDocCount() throws IOException {
-      return docCount;
-    }
-
-    // Iterates through terms in this field
-    private final class SegmentTermsEnum extends TermsEnum {
-      private final IndexInput in;
-      private final BlockTermState state;
-      private final boolean doOrd;
-      private final FieldAndTerm fieldTerm = new FieldAndTerm();
-      private final TermsIndexReaderBase.FieldIndexEnum indexEnum;
-      private final BytesRef term = new BytesRef();
-
-      /* This is true if indexEnum is "still" seek'd to the index term
-         for the current term. We set it to true on seeking, and then it
-         remains valid until next() is called enough times to load another
-         terms block: */
-      private boolean indexIsCurrent;
-
-      /* True if we've already called .next() on the indexEnum, to "bracket"
-         the current block of terms: */
-      private boolean didIndexNext;
-
-      /* Next index term, bracketing the current block of terms; this is
-         only valid if didIndexNext is true: */
-      private BytesRef nextIndexTerm;
-
-      /* True after seekExact(TermState), do defer seeking.  If the app then
-         calls next() (which is not "typical"), then we'll do the real seek */
-      private boolean seekPending;
-
-      /* How many blocks we've read since last seek.  Once this
-         is >= indexEnum.getDivisor() we set indexIsCurrent to false (since
-         the index can no long bracket seek-within-block). */
-      private int blocksSinceSeek;
-
-      private byte[] termSuffixes;
-      private ByteArrayDataInput termSuffixesReader = new ByteArrayDataInput();
-
-      /* Common prefix used for all terms in this block. */
-      private int termBlockPrefix;
-
-      /* How many terms in current block */
-      private int blockTermCount;
-
-      private byte[] docFreqBytes;
-      private final ByteArrayDataInput freqReader = new ByteArrayDataInput();
-      private int metaDataUpto;
-
-      public SegmentTermsEnum() throws IOException {
-        in = (IndexInput) BlockTermsReader.this.in.clone();
-        in.seek(termsStartPointer);
-        indexEnum = indexReader.getFieldEnum(fieldInfo);
-        doOrd = indexReader.supportsOrd();
-        fieldTerm.field = fieldInfo.name;
-        state = postingsReader.newTermState();
-        state.totalTermFreq = -1;
-        state.ord = -1;
-
-        termSuffixes = new byte[128];
-        docFreqBytes = new byte[64];
-        //System.out.println("BTR.enum init this=" + this + " postingsReader=" + postingsReader);
-      }
-
-      @Override
-      public Comparator<BytesRef> getComparator() {
-        return BytesRef.getUTF8SortedAsUnicodeComparator();
-      }
-
-      // TODO: we may want an alternate mode here which is
-      // "if you are about to return NOT_FOUND I won't use
-      // the terms data from that"; eg FuzzyTermsEnum will
-      // (usually) just immediately call seek again if we
-      // return NOT_FOUND so it's a waste for us to fill in
-      // the term that was actually NOT_FOUND
-      @Override
-      public SeekStatus seekCeil(final BytesRef target, final boolean useCache) throws IOException {
-
-        if (indexEnum == null) {
-          throw new IllegalStateException("terms index was not loaded");
-        }
-   
-        //System.out.println("BTR.seek seg=" + segment + " target=" + fieldInfo.name + ":" + target.utf8ToString() + " " + target + " current=" + term().utf8ToString() + " " + term() + " useCache=" + useCache + " indexIsCurrent=" + indexIsCurrent + " didIndexNext=" + didIndexNext + " seekPending=" + seekPending + " divisor=" + indexReader.getDivisor() + " this="  + this);
-        if (didIndexNext) {
-          if (nextIndexTerm == null) {
-            //System.out.println("  nextIndexTerm=null");
-          } else {
-            //System.out.println("  nextIndexTerm=" + nextIndexTerm.utf8ToString());
-          }
-        }
-
-        // Check cache
-        if (useCache) {
-          fieldTerm.term = target;
-          // TODO: should we differentiate "frozen"
-          // TermState (ie one that was cloned and
-          // cached/returned by termState()) from the
-          // malleable (primary) one?
-          final TermState cachedState = termsCache.get(fieldTerm);
-          if (cachedState != null) {
-            seekPending = true;
-            //System.out.println("  cached!");
-            seekExact(target, cachedState);
-            //System.out.println("  term=" + term.utf8ToString());
-            return SeekStatus.FOUND;
-          }
-        }
-
-        boolean doSeek = true;
-
-        // See if we can avoid seeking, because target term
-        // is after current term but before next index term:
-        if (indexIsCurrent) {
-
-          final int cmp = BytesRef.getUTF8SortedAsUnicodeComparator().compare(term, target);
-
-          if (cmp == 0) {
-            // Already at the requested term
-            return SeekStatus.FOUND;
-          } else if (cmp < 0) {
-
-            // Target term is after current term
-            if (!didIndexNext) {
-              if (indexEnum.next() == -1) {
-                nextIndexTerm = null;
-              } else {
-                nextIndexTerm = indexEnum.term();
-              }
-              //System.out.println("  now do index next() nextIndexTerm=" + (nextIndexTerm == null ? "null" : nextIndexTerm.utf8ToString()));
-              didIndexNext = true;
-            }
-
-            if (nextIndexTerm == null || BytesRef.getUTF8SortedAsUnicodeComparator().compare(target, nextIndexTerm) < 0) {
-              // Optimization: requested term is within the
-              // same term block we are now in; skip seeking
-              // (but do scanning):
-              doSeek = false;
-              //System.out.println("  skip seek: nextIndexTerm=" + (nextIndexTerm == null ? "null" : nextIndexTerm.utf8ToString()));
-            }
-          }
-        }
-
-        if (doSeek) {
-          //System.out.println("  seek");
-
-          // Ask terms index to find biggest indexed term (=
-          // first term in a block) that's <= our text:
-          in.seek(indexEnum.seek(target));
-          boolean result = nextBlock();
-
-          // Block must exist since, at least, the indexed term
-          // is in the block:
-          assert result;
-
-          indexIsCurrent = true;
-          didIndexNext = false;
-          blocksSinceSeek = 0;          
-
-          if (doOrd) {
-            state.ord = indexEnum.ord()-1;
-          }
-
-          term.copyBytes(indexEnum.term());
-          //System.out.println("  seek: term=" + term.utf8ToString());
-        } else {
-          //System.out.println("  skip seek");
-          if (state.termBlockOrd == blockTermCount && !nextBlock()) {
-            indexIsCurrent = false;
-            return SeekStatus.END;
-          }
-        }
-
-        seekPending = false;
-
-        int common = 0;
-
-        // Scan within block.  We could do this by calling
-        // _next() and testing the resulting term, but this
-        // is wasteful.  Instead, we first confirm the
-        // target matches the common prefix of this block,
-        // and then we scan the term bytes directly from the
-        // termSuffixesreader's byte[], saving a copy into
-        // the BytesRef term per term.  Only when we return
-        // do we then copy the bytes into the term.
-
-        while(true) {
-
-          // First, see if target term matches common prefix
-          // in this block:
-          if (common < termBlockPrefix) {
-            final int cmp = (term.bytes[common]&0xFF) - (target.bytes[target.offset + common]&0xFF);
-            if (cmp < 0) {
-
-              // TODO: maybe we should store common prefix
-              // in block header?  (instead of relying on
-              // last term of previous block)
-
-              // Target's prefix is after the common block
-              // prefix, so term cannot be in this block
-              // but it could be in next block.  We
-              // must scan to end-of-block to set common
-              // prefix for next block:
-              if (state.termBlockOrd < blockTermCount) {
-                while(state.termBlockOrd < blockTermCount-1) {
-                  state.termBlockOrd++;
-                  state.ord++;
-                  termSuffixesReader.skipBytes(termSuffixesReader.readVInt());
+    /**
+     * Call this whenever a compaction might be needed on the given columnfamily.
+     * It's okay to over-call (within reason) since the compactions are single-threaded,
+     * and if a call is unnecessary, it will just be no-oped in the bucketing phase.
+     */
+    public Future<Integer> submitMinorIfNeeded(final ColumnFamilyStore cfs)
+    {
+        Callable<Integer> callable = new Callable<Integer>()
+        {
+            public Integer call() throws IOException
+            {
+                if (minimumCompactionThreshold <= 0 || maximumCompactionThreshold <= 0)
+                {
+                    logger.debug("Compaction is currently disabled.");
+                    return 0;
                 }
-                final int suffix = termSuffixesReader.readVInt();
-                term.length = termBlockPrefix + suffix;
-                if (term.bytes.length < term.length) {
-                  term.grow(term.length);
+                logger.debug("Checking to see if compaction of " + cfs.columnFamily_ + " would be useful");
+                Set<List<SSTableReader>> buckets = getBuckets(cfs.getSSTables(), 50L * 1024L * 1024L);
+                updateEstimateFor(cfs, buckets);
+                
+                for (List<SSTableReader> sstables : buckets)
+                {
+                    if (sstables.size() >= minimumCompactionThreshold)
+                    {
+                        // if we have too many to compact all at once, compact older ones first -- this avoids
+                        // re-compacting files we just created.
+                        Collections.sort(sstables);
+                        return doCompaction(cfs, sstables.subList(0, Math.min(sstables.size(), maximumCompactionThreshold)), getDefaultGCBefore());
+                    }
                 }
-                termSuffixesReader.readBytes(term.bytes, termBlockPrefix, suffix);
-              }
-              state.ord++;
-              
-              if (!nextBlock()) {
-                indexIsCurrent = false;
-                return SeekStatus.END;
-              }
-              common = 0;
-
-            } else if (cmp > 0) {
-              // Target's prefix is before the common prefix
-              // of this block, so we position to start of
-              // block and return NOT_FOUND:
-              assert state.termBlockOrd == 0;
-
-              final int suffix = termSuffixesReader.readVInt();
-              term.length = termBlockPrefix + suffix;
-              if (term.bytes.length < term.length) {
-                term.grow(term.length);
-              }
-              termSuffixesReader.readBytes(term.bytes, termBlockPrefix, suffix);
-              return SeekStatus.NOT_FOUND;
-            } else {
-              common++;
+                return 0;
             }
+        };
+        return executor.submit(callable);
+    }
 
-            continue;
-          }
+    private void updateEstimateFor(ColumnFamilyStore cfs, Set<List<SSTableReader>> buckets)
+    {
+        int n = 0;
+        for (List<SSTableReader> sstables : buckets)
+        {
+            if (sstables.size() >= minimumCompactionThreshold)
+            {
+                n += 1 + sstables.size() / (maximumCompactionThreshold - minimumCompactionThreshold);
+            }
+        }
+        estimatedCompactions.put(cfs, n);
+    }
 
-          // Test every term in this block
-          while (true) {
-            state.termBlockOrd++;
-            state.ord++;
+    public Future<Object> submitCleanup(final ColumnFamilyStore cfStore)
+    {
+        Callable<Object> runnable = new Callable<Object>()
+        {
+            public Object call() throws IOException
+            {
+                doCleanupCompaction(cfStore);
+                return this;
+            }
+        };
+        return executor.submit(runnable);
+    }
 
-            final int suffix = termSuffixesReader.readVInt();
-            
-            // We know the prefix matches, so just compare the new suffix:
-            final int termLen = termBlockPrefix + suffix;
-            int bytePos = termSuffixesReader.getPosition();
+    public Future<List<SSTableReader>> submitAnticompaction(final ColumnFamilyStore cfStore, final Collection<Range> ranges, final InetAddress target)
+    {
+        Callable<List<SSTableReader>> callable = new Callable<List<SSTableReader>>()
+        {
+            public List<SSTableReader> call() throws IOException
+            {
+                return doAntiCompaction(cfStore, cfStore.getSSTables(), ranges, target);
+            }
+        };
+        return executor.submit(callable);
+    }
 
-            boolean next = false;
-            final int limit = target.offset + (termLen < target.length ? termLen : target.length);
-            int targetPos = target.offset + termBlockPrefix;
-            while(targetPos < limit) {
-              final int cmp = (termSuffixes[bytePos++]&0xFF) - (target.bytes[targetPos++]&0xFF);
-              if (cmp < 0) {
-                // Current term is still before the target;
-                // keep scanning
-                next = true;
-                break;
-              } else if (cmp > 0) {
-                // Done!  Current term is after target. Stop
-                // here, fill in real term, return NOT_FOUND.
-                term.length = termBlockPrefix + suffix;
-                if (term.bytes.length < term.length) {
-                  term.grow(term.length);
+    public Future submitMajor(final ColumnFamilyStore cfStore)
+    {
+        return submitMajor(cfStore, 0, getDefaultGCBefore());
+    }
+
+    public Future submitMajor(final ColumnFamilyStore cfStore, final long skip, final int gcBefore)
+    {
+        Callable<Object> callable = new Callable<Object>()
+        {
+            public Object call() throws IOException
+            {
+                Collection<SSTableReader> sstables;
+                if (skip > 0)
+                {
+                    sstables = new ArrayList<SSTableReader>();
+                    for (SSTableReader sstable : cfStore.getSSTables())
+                    {
+                        if (sstable.length() < skip * 1024L * 1024L * 1024L)
+                        {
+                            sstables.add(sstable);
+                        }
+                    }
                 }
-                termSuffixesReader.readBytes(term.bytes, termBlockPrefix, suffix);
-                //System.out.println("  NOT_FOUND");
-                return SeekStatus.NOT_FOUND;
-              }
-            }
-
-            if (!next && target.length <= termLen) {
-              term.length = termBlockPrefix + suffix;
-              if (term.bytes.length < term.length) {
-                term.grow(term.length);
-              }
-              termSuffixesReader.readBytes(term.bytes, termBlockPrefix, suffix);
-
-              if (target.length == termLen) {
-                // Done!  Exact match.  Stop here, fill in
-                // real term, return FOUND.
-                //System.out.println("  FOUND");
-
-                if (useCache) {
-                  // Store in cache
-                  decodeMetaData();
-                  //System.out.println("  cache! state=" + state);
-                  termsCache.put(new FieldAndTerm(fieldTerm), (BlockTermState) state.clone());
+                else
+                {
+                    sstables = cfStore.getSSTables();
                 }
 
-                return SeekStatus.FOUND;
-              } else {
-                //System.out.println("  NOT_FOUND");
-                return SeekStatus.NOT_FOUND;
-              }
+                doCompaction(cfStore, sstables, gcBefore);
+                return this;
             }
-
-            if (state.termBlockOrd == blockTermCount) {
-              // Must pre-fill term for next block's common prefix
-              term.length = termBlockPrefix + suffix;
-              if (term.bytes.length < term.length) {
-                term.grow(term.length);
-              }
-              termSuffixesReader.readBytes(term.bytes, termBlockPrefix, suffix);
-              break;
-            } else {
-              termSuffixesReader.skipBytes(suffix);
-            }
-          }
-
-          // The purpose of the terms dict index is to seek
-          // the enum to the closest index term before the
-          // term we are looking for.  So, we should never
-          // cross another index term (besides the first
-          // one) while we are scanning:
-
-          assert indexIsCurrent;
-
-          if (!nextBlock()) {
-            //System.out.println("  END");
-            indexIsCurrent = false;
-            return SeekStatus.END;
-          }
-          common = 0;
-        }
-      }
-
-      @Override
-      public BytesRef next() throws IOException {
-        //System.out.println("BTR.next() seekPending=" + seekPending + " pendingSeekCount=" + state.termBlockOrd);
-
-        // If seek was previously called and the term was cached,
-        // usually caller is just going to pull a D/&PEnum or get
-        // docFreq, etc.  But, if they then call next(),
-        // this method catches up all internal state so next()
-        // works properly:
-        if (seekPending) {
-          assert !indexIsCurrent;
-          in.seek(state.blockFilePointer);
-          final int pendingSeekCount = state.termBlockOrd;
-          boolean result = nextBlock();
-
-          final long savOrd = state.ord;
-
-          // Block must exist since seek(TermState) was called w/ a
-          // TermState previously returned by this enum when positioned
-          // on a real term:
-          assert result;
-
-          while(state.termBlockOrd < pendingSeekCount) {
-            BytesRef nextResult = _next();
-            assert nextResult != null;
-          }
-          seekPending = false;
-          state.ord = savOrd;
-        }
-        return _next();
-      }
-
-      /* Decodes only the term bytes of the next term.  If caller then asks for
-         metadata, ie docFreq, totalTermFreq or pulls a D/&PEnum, we then (lazily)
-         decode all metadata up to the current term. */
-      private BytesRef _next() throws IOException {
-        //System.out.println("BTR._next seg=" + segment + " this=" + this + " termCount=" + state.termBlockOrd + " (vs " + blockTermCount + ")");
-        if (state.termBlockOrd == blockTermCount && !nextBlock()) {
-          //System.out.println("  eof");
-          indexIsCurrent = false;
-          return null;
-        }
-
-        // TODO: cutover to something better for these ints!  simple64?
-        final int suffix = termSuffixesReader.readVInt();
-        //System.out.println("  suffix=" + suffix);
-
-        term.length = termBlockPrefix + suffix;
-        if (term.bytes.length < term.length) {
-          term.grow(term.length);
-        }
-        termSuffixesReader.readBytes(term.bytes, termBlockPrefix, suffix);
-        state.termBlockOrd++;
-
-        // NOTE: meaningless in the non-ord case
-        state.ord++;
-
-        //System.out.println("  return term=" + fieldInfo.name + ":" + term.utf8ToString() + " " + term + " tbOrd=" + state.termBlockOrd);
-        return term;
-      }
-
-      @Override
-      public BytesRef term() {
-        return term;
-      }
-
-      @Override
-      public int docFreq() throws IOException {
-        //System.out.println("BTR.docFreq");
-        decodeMetaData();
-        //System.out.println("  return " + state.docFreq);
-        return state.docFreq;
-      }
-
-      @Override
-      public long totalTermFreq() throws IOException {
-        decodeMetaData();
-        return state.totalTermFreq;
-      }
-
-      @Override
-      public DocsEnum docs(Bits liveDocs, DocsEnum reuse, boolean needsFreqs) throws IOException {
-        //System.out.println("BTR.docs this=" + this);
-        decodeMetaData();
-        //System.out.println("BTR.docs:  state.docFreq=" + state.docFreq);
-        return postingsReader.docs(fieldInfo, state, liveDocs, reuse, needsFreqs);
-      }
-
-      @Override
-      public DocsAndPositionsEnum docsAndPositions(Bits liveDocs, DocsAndPositionsEnum reuse, boolean needsOffsets) throws IOException {
-        if (fieldInfo.indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) < 0) {
-          // Positions were not indexed:
-          return null;
-        }
-
-        if (needsOffsets &&
-            fieldInfo.indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) < 0) {
-          // Offsets were not indexed:
-          return null;
-        }
-
-        decodeMetaData();
-        return postingsReader.docsAndPositions(fieldInfo, state, liveDocs, reuse, needsOffsets);
-      }
-
-      @Override
-      public void seekExact(BytesRef target, TermState otherState) throws IOException {
-        //System.out.println("BTR.seekExact termState target=" + target.utf8ToString() + " " + target + " this=" + this);
-        assert otherState != null && otherState instanceof BlockTermState;
-        assert !doOrd || ((BlockTermState) otherState).ord < numTerms;
-        state.copyFrom(otherState);
-        seekPending = true;
-        indexIsCurrent = false;
-        term.copyBytes(target);
-      }
-      
-      @Override
-      public TermState termState() throws IOException {
-        //System.out.println("BTR.termState this=" + this);
-        decodeMetaData();
-        TermState ts = (TermState) state.clone();
-        //System.out.println("  return ts=" + ts);
-        return ts;
-      }
-
-      @Override
-      public void seekExact(long ord) throws IOException {
-        //System.out.println("BTR.seek by ord ord=" + ord);
-        if (indexEnum == null) {
-          throw new IllegalStateException("terms index was not loaded");
-        }
-
-        assert ord < numTerms;
-
-        // TODO: if ord is in same terms block and
-        // after current ord, we should avoid this seek just
-        // like we do in the seek(BytesRef) case
-        in.seek(indexEnum.seek(ord));
-        boolean result = nextBlock();
-
-        // Block must exist since ord < numTerms:
-        assert result;
-
-        indexIsCurrent = true;
-        didIndexNext = false;
-        blocksSinceSeek = 0;
-        seekPending = false;
-
-        state.ord = indexEnum.ord()-1;
-        assert state.ord >= -1: "ord=" + state.ord;
-        term.copyBytes(indexEnum.term());
-
-        // Now, scan:
-        int left = (int) (ord - state.ord);
-        while(left > 0) {
-          final BytesRef term = _next();
-          assert term != null;
-          left--;
-          assert indexIsCurrent;
-        }
-      }
-
-      @Override
-      public long ord() {
-        if (!doOrd) {
-          throw new UnsupportedOperationException();
-        }
-        return state.ord;
-      }
-
-      /* Does initial decode of next block of terms; this
-         doesn't actually decode the docFreq, totalTermFreq,
-         postings details (frq/prx offset, etc.) metadata;
-         it just loads them as byte[] blobs which are then      
-         decoded on-demand if the metadata is ever requested
-         for any term in this block.  This enables terms-only
-         intensive consumes (eg certain MTQs, respelling) to
-         not pay the price of decoding metadata they won't
-         use. */
-      private boolean nextBlock() throws IOException {
-
-        // TODO: we still lazy-decode the byte[] for each
-        // term (the suffix), but, if we decoded
-        // all N terms up front then seeking could do a fast
-        // bsearch w/in the block...
-
-        //System.out.println("BTR.nextBlock() fp=" + in.getFilePointer() + " this=" + this);
-        state.blockFilePointer = in.getFilePointer();
-        blockTermCount = in.readVInt();
-        //System.out.println("  blockTermCount=" + blockTermCount);
-        if (blockTermCount == 0) {
-          return false;
-        }
-        termBlockPrefix = in.readVInt();
-
-        // term suffixes:
-        int len = in.readVInt();
-        if (termSuffixes.length < len) {
-          termSuffixes = new byte[ArrayUtil.oversize(len, 1)];
-        }
-        //System.out.println("  termSuffixes len=" + len);
-        in.readBytes(termSuffixes, 0, len);
-        termSuffixesReader.reset(termSuffixes, 0, len);
-
-        // docFreq, totalTermFreq
-        len = in.readVInt();
-        if (docFreqBytes.length < len) {
-          docFreqBytes = new byte[ArrayUtil.oversize(len, 1)];
-        }
-        //System.out.println("  freq bytes len=" + len);
-        in.readBytes(docFreqBytes, 0, len);
-        freqReader.reset(docFreqBytes, 0, len);
-        metaDataUpto = 0;
-
-        state.termBlockOrd = 0;
-
-        postingsReader.readTermsBlock(in, fieldInfo, state);
-
-        blocksSinceSeek++;
-        indexIsCurrent = indexIsCurrent && (blocksSinceSeek < indexReader.getDivisor());
-        //System.out.println("  indexIsCurrent=" + indexIsCurrent);
-
-        return true;
-      }
-     
-      private void decodeMetaData() throws IOException {
-        //System.out.println("BTR.decodeMetadata mdUpto=" + metaDataUpto + " vs termCount=" + state.termBlockOrd + " state=" + state);
-        if (!seekPending) {
-          // TODO: cutover to random-access API
-          // here.... really stupid that we have to decode N
-          // wasted term metadata just to get to the N+1th
-          // that we really need...
-
-          // lazily catch up on metadata decode:
-          final int limit = state.termBlockOrd;
-          // We must set/incr state.termCount because
-          // postings impl can look at this
-          state.termBlockOrd = metaDataUpto;
-          // TODO: better API would be "jump straight to term=N"???
-          while (metaDataUpto < limit) {
-            //System.out.println("  decode mdUpto=" + metaDataUpto);
-            // TODO: we could make "tiers" of metadata, ie,
-            // decode docFreq/totalTF but don't decode postings
-            // metadata; this way caller could get
-            // docFreq/totalTF w/o paying decode cost for
-            // postings
-
-            // TODO: if docFreq were bulk decoded we could
-            // just skipN here:
-            state.docFreq = freqReader.readVInt();
-            //System.out.println("    dF=" + state.docFreq);
-            if (fieldInfo.indexOptions != IndexOptions.DOCS_ONLY) {
-              state.totalTermFreq = state.docFreq + freqReader.readVLong();
-              //System.out.println("    totTF=" + state.totalTermFreq);
-            }
-
-            postingsReader.nextTerm(fieldInfo, state);
-            metaDataUpto++;
-            state.termBlockOrd++;
-          }
-        } else {
-          //System.out.println("  skip! seekPending");
-        }
-      }
+        };
+        return executor.submit(callable);
     }
-  }
+
+    public Future submitReadonly(final ColumnFamilyStore cfStore, final InetAddress initiator)
+    {
+        Callable<Object> callable = new Callable<Object>()
+        {
+            public Object call() throws IOException
+            {
+                doReadonlyCompaction(cfStore, initiator);
+                return this;
+            }
+        };
+        return executor.submit(callable);
+    }
+
+    /**
+     * Gets the minimum number of sstables in queue before compaction kicks off
+     */
+    public int getMinimumCompactionThreshold()
+    {
+        return minimumCompactionThreshold;
+    }
+
+    /**
+     * Sets the minimum number of sstables in queue before compaction kicks off
+     */
+    public void setMinimumCompactionThreshold(int threshold)
+    {
+        minimumCompactionThreshold = threshold;
+    }
+
+    /**
+     * Gets the maximum number of sstables in queue before compaction kicks off
+     */
+    public int getMaximumCompactionThreshold()
+    {
+        return maximumCompactionThreshold;
+    }
+
+    /**
+     * Sets the maximum number of sstables in queue before compaction kicks off
+     */
+    public void setMaximumCompactionThreshold(int threshold)
+    {
+        maximumCompactionThreshold = threshold;
+    }
+
+    public void disableAutoCompaction()
+    {
+        minimumCompactionThreshold = 0;
+        maximumCompactionThreshold = 0;
+    }
+
+    /**
+     * For internal use and testing only.  The rest of the system should go through the submit* methods,
+     * which are properly serialized.
+     */
+    int doCompaction(ColumnFamilyStore cfs, Collection<SSTableReader> sstables, int gcBefore) throws IOException
+    {
+        // The collection of sstables passed may be empty (but not null); even if
+        // it is not empty, it may compact down to nothing if all rows are deleted.
+        Table table = cfs.getTable();
+        if (DatabaseDescriptor.isSnapshotBeforeCompaction())
+            table.snapshot("compact-" + cfs.columnFamily_);
+        logger.info("Compacting [" + StringUtils.join(sstables, ",") + "]");
+        String compactionFileLocation = table.getDataFileLocation(cfs.getExpectedCompactedFileSize(sstables));
+        // If the compaction file path is null that means we have no space left for this compaction.
+        // try again w/o the largest one.
+        List<SSTableReader> smallerSSTables = new ArrayList<SSTableReader>(sstables);
+        while (compactionFileLocation == null && smallerSSTables.size() > 1)
+        {
+            logger.warn("insufficient space to compact all requested files " + StringUtils.join(smallerSSTables, ", "));
+            smallerSSTables.remove(cfs.getMaxSizeFile(smallerSSTables));
+            compactionFileLocation = table.getDataFileLocation(cfs.getExpectedCompactedFileSize(smallerSSTables));
+        }
+        if (compactionFileLocation == null)
+        {
+            logger.error("insufficient space to compact even the two smallest files, aborting");
+            return 0;
+        }
+        sstables = smallerSSTables;
+
+        // new sstables from flush can be added during a compaction, but only the compaction can remove them,
+        // so in our single-threaded compaction world this is a valid way of determining if we're compacting
+        // all the sstables (that existed when we started)
+        boolean major = cfs.isCompleteSSTables(sstables);
+
+        long startTime = System.currentTimeMillis();
+        long totalkeysWritten = 0;
+
+        // TODO the int cast here is potentially buggy
+        int expectedBloomFilterSize = Math.max(SSTableReader.indexInterval(), (int)SSTableReader.getApproximateKeyCount(sstables));
+        if (logger.isDebugEnabled())
+          logger.debug("Expected bloom filter size : " + expectedBloomFilterSize);
+
+        SSTableWriter writer;
+        CompactionIterator ci = new CompactionIterator(sstables, gcBefore, major); // retain a handle so we can call close()
+        Iterator<CompactionIterator.CompactedRow> nni = new FilterIterator(ci, PredicateUtils.notNullPredicate());
+        executor.beginCompaction(cfs, ci);
+
+        try
+        {
+            if (!nni.hasNext())
+            {
+                // don't mark compacted in the finally block, since if there _is_ nondeleted data,
+                // we need to sync it (via closeAndOpen) first, so there is no period during which
+                // a crash could cause data loss.
+                cfs.markCompacted(sstables);
+                return 0;
+            }
+
+            String newFilename = new File(compactionFileLocation, cfs.getTempSSTableFileName()).getAbsolutePath();
+            writer = new SSTableWriter(newFilename, expectedBloomFilterSize, StorageService.getPartitioner());
+
+            // validate the CF as we iterate over it
+            AntiEntropyService.IValidator validator = AntiEntropyService.instance.getValidator(table.name, cfs.getColumnFamilyName(), null, major);
+            validator.prepare();
+            while (nni.hasNext())
+            {
+                CompactionIterator.CompactedRow row = nni.next();
+                long prevpos = writer.getFilePointer();
+
+                writer.append(row.key, row.buffer);
+                validator.add(row);
+                totalkeysWritten++;
+
+                long rowsize = writer.getFilePointer() - prevpos;
+                if (rowsize > DatabaseDescriptor.getRowWarningThreshold())
+                    logger.warn("Large row " + row.key.key + " in " + cfs.getColumnFamilyName() + " " + rowsize + " bytes");
+            }
+            validator.complete();
+        }
+        finally
+        {
+            ci.close();
+        }
+
+        SSTableReader ssTable = writer.closeAndOpenReader();
+        cfs.replaceCompactedSSTables(sstables, Arrays.asList(ssTable));
+        submitMinorIfNeeded(cfs);
+
+        String format = "Compacted to %s.  %d/%d bytes for %d keys.  Time: %dms.";
+        long dTime = System.currentTimeMillis() - startTime;
+        logger.info(String.format(format, writer.getFilename(), SSTable.getTotalBytes(sstables), ssTable.length(), totalkeysWritten, dTime));
+        return sstables.size();
+    }
+
+    /**
+     * This function is used to do the anti compaction process , it spits out the file which has keys that belong to a given range
+     * If the target is not specified it spits out the file as a compacted file with the unecessary ranges wiped out.
+     *
+     * @param cfs
+     * @param sstables
+     * @param ranges
+     * @param target
+     * @return
+     * @throws java.io.IOException
+     */
+    private List<SSTableReader> doAntiCompaction(ColumnFamilyStore cfs, Collection<SSTableReader> sstables, Collection<Range> ranges, InetAddress target)
+            throws IOException
+    {
+        Table table = cfs.getTable();
+        logger.info("AntiCompacting [" + StringUtils.join(sstables, ",") + "]");
+        // Calculate the expected compacted filesize
+        long expectedRangeFileSize = cfs.getExpectedCompactedFileSize(sstables) / 2;
+        String compactionFileLocation = table.getDataFileLocation(expectedRangeFileSize);
+        if (compactionFileLocation == null)
+        {
+            throw new UnsupportedOperationException("disk full");
+        }
+        if (target != null)
+        {
+            // compacting for streaming: send to subdirectory
+            compactionFileLocation = compactionFileLocation + File.separator + DatabaseDescriptor.STREAMING_SUBDIR;
+        }
+        List<SSTableReader> results = new ArrayList<SSTableReader>();
+
+        long startTime = System.currentTimeMillis();
+        long totalkeysWritten = 0;
+
+        int expectedBloomFilterSize = Math.max(SSTableReader.indexInterval(), (int)(SSTableReader.getApproximateKeyCount(sstables) / 2));
+        if (logger.isDebugEnabled())
+          logger.debug("Expected bloom filter size : " + expectedBloomFilterSize);
+
+        SSTableWriter writer = null;
+        CompactionIterator ci = new AntiCompactionIterator(sstables, ranges, getDefaultGCBefore(), cfs.isCompleteSSTables(sstables));
+        Iterator<CompactionIterator.CompactedRow> nni = new FilterIterator(ci, PredicateUtils.notNullPredicate());
+        executor.beginCompaction(cfs, ci);
+
+        try
+        {
+            if (!nni.hasNext())
+            {
+                return results;
+            }
+
+            while (nni.hasNext())
+            {
+                CompactionIterator.CompactedRow row = nni.next();
+                if (writer == null)
+                {
+                    FileUtils.createDirectory(compactionFileLocation);
+                    String newFilename = new File(compactionFileLocation, cfs.getTempSSTableFileName()).getAbsolutePath();
+                    writer = new SSTableWriter(newFilename, expectedBloomFilterSize, StorageService.getPartitioner());
+                }
+                writer.append(row.key, row.buffer);
+                totalkeysWritten++;
+            }
+        }
+        finally
+        {
+            ci.close();
+        }
+
+        if (writer != null)
+        {
+            results.add(writer.closeAndOpenReader());
+            String format = "AntiCompacted to %s.  %d/%d bytes for %d keys.  Time: %dms.";
+            long dTime = System.currentTimeMillis() - startTime;
+            logger.info(String.format(format, writer.getFilename(), SSTable.getTotalBytes(sstables), results.get(0).length(), totalkeysWritten, dTime));
+        }
+
+        return results;
+    }
+
+    /**
+     * This function goes over each file and removes the keys that the node is not responsible for
+     * and only keeps keys that this node is responsible for.
+     *
+     * @throws IOException
+     */
+    private void doCleanupCompaction(ColumnFamilyStore cfs) throws IOException
+    {
+        Collection<SSTableReader> originalSSTables = cfs.getSSTables();
+        List<SSTableReader> sstables = doAntiCompaction(cfs, originalSSTables, StorageService.instance.getLocalRanges(cfs.getTable().name), null);
+        if (!sstables.isEmpty())
+        {
+            cfs.replaceCompactedSSTables(originalSSTables, sstables);
+        }
+    }
+
+    /**
+     * Performs a readonly "compaction" of all sstables in order to validate complete rows,
+     * but without writing the merge result
+     */
+    private void doReadonlyCompaction(ColumnFamilyStore cfs, InetAddress initiator) throws IOException
+    {
+        Collection<SSTableReader> sstables = cfs.getSSTables();
+        CompactionIterator ci = new CompactionIterator(sstables, getDefaultGCBefore(), true);
+        executor.beginCompaction(cfs, ci);
+        try
+        {
+            Iterator<CompactionIterator.CompactedRow> nni = new FilterIterator(ci, PredicateUtils.notNullPredicate());
+
+            // validate the CF as we iterate over it
+            AntiEntropyService.IValidator validator = AntiEntropyService.instance.getValidator(cfs.getTable().name, cfs.getColumnFamilyName(), initiator, true);
+            validator.prepare();
+            while (nni.hasNext())
+            {
+                CompactionIterator.CompactedRow row = nni.next();
+                validator.add(row);
+            }
+            validator.complete();
+        }
+        finally
+        {
+            ci.close();
+        }
+    }
+
+    /*
+    * Group files of similar size into buckets.
+    */
+    static Set<List<SSTableReader>> getBuckets(Iterable<SSTableReader> files, long min)
+    {
+        Map<List<SSTableReader>, Long> buckets = new HashMap<List<SSTableReader>, Long>();
+        for (SSTableReader sstable : files)
+        {
+            long size = sstable.length();
+
+            boolean bFound = false;
+            // look for a bucket containing similar-sized files:
+            // group in the same bucket if it's w/in 50% of the average for this bucket,
+            // or this file and the bucket are all considered "small" (less than `min`)
+            for (Entry<List<SSTableReader>, Long> entry : buckets.entrySet())
+            {
+                List<SSTableReader> bucket = entry.getKey();
+                long averageSize = entry.getValue();
+                if ((size > averageSize / 2 && size < 3 * averageSize / 2)
+                    || (size < min && averageSize < min))
+                {
+                    // remove and re-add because adding changes the hash
+                    buckets.remove(bucket);
+                    long totalSize = bucket.size() * averageSize;
+                    averageSize = (totalSize + size) / (bucket.size() + 1);
+                    bucket.add(sstable);
+                    buckets.put(bucket, averageSize);
+                    bFound = true;
+                    break;
+                }
+            }
+            // no similar bucket found; put it in a new one
+            if (!bFound)
+            {
+                ArrayList<SSTableReader> bucket = new ArrayList<SSTableReader>();
+                bucket.add(sstable);
+                buckets.put(bucket, size);
+            }
+        }
+
+        return buckets.keySet();
+    }
+
+    public static int getDefaultGCBefore()
+    {
+        return (int)(System.currentTimeMillis() / 1000) - DatabaseDescriptor.getGcGraceInSeconds();
+    }
+
+    private static class AntiCompactionIterator extends CompactionIterator
+    {
+        private Set<SSTableScanner> scanners;
+
+        public AntiCompactionIterator(Collection<SSTableReader> sstables, Collection<Range> ranges, int gcBefore, boolean isMajor)
+                throws IOException
+        {
+            super(getCollatedRangeIterator(sstables, ranges), gcBefore, isMajor);
+        }
+
+        private static Iterator getCollatedRangeIterator(Collection<SSTableReader> sstables, final Collection<Range> ranges)
+                throws IOException
+        {
+            org.apache.commons.collections.Predicate rangesPredicate = new org.apache.commons.collections.Predicate()
+            {
+                public boolean evaluate(Object row)
+                {
+                    return Range.isTokenInRanges(((IteratingRow)row).getKey().token, ranges);
+                }
+            };
+            CollatingIterator iter = FBUtilities.<IteratingRow>getCollatingIterator();
+            for (SSTableReader sstable : sstables)
+            {
+                SSTableScanner scanner = sstable.getScanner(FILE_BUFFER_SIZE);
+                iter.addIterator(new FilterIterator(scanner, rangesPredicate));
+            }
+            return iter;
+        }
+
+        public Iterable<SSTableScanner> getScanners()
+        {
+            if (scanners == null)
+            {
+                scanners = new HashSet<SSTableScanner>();
+                for (Object o : ((CollatingIterator)source).getIterators())
+                {
+                    scanners.add((SSTableScanner)((FilterIterator)o).getIterator());
+                }
+            }
+            return scanners;
+        }
+    }
+
+    public void checkAllColumnFamilies() throws IOException
+    {
+        // perform estimates
+        for (final ColumnFamilyStore cfs : ColumnFamilyStore.all())
+        {
+            Runnable runnable = new Runnable()
+            {
+                public void run ()
+                {
+                    logger.debug("Estimating compactions for " + cfs.columnFamily_);
+                    final Set<List<SSTableReader>> buckets = getBuckets(cfs.getSSTables(), 50L * 1024L * 1024L);
+                    updateEstimateFor(cfs, buckets);
+                }
+            };
+            executor.submit(runnable);
+        }
+
+        // actually schedule compactions.  done in a second pass so all the estimates occur before we
+        // bog down the executor in actual compactions.
+        for (ColumnFamilyStore cfs : ColumnFamilyStore.all())
+        {
+            submitMinorIfNeeded(cfs);
+        }
+    }
+
+    private class CompactionExecutor extends DebuggableThreadPoolExecutor
+    {
+        private volatile ColumnFamilyStore cfs;
+        private volatile CompactionIterator ci;
+
+        public CompactionExecutor()
+        {
+            super("COMPACTION-POOL");
+        }
+
+        @Override
+        public void afterExecute(Runnable r, Throwable t)
+        {
+            super.afterExecute(r, t);
+            cfs = null;
+            ci = null;
+        }
+
+        void beginCompaction(ColumnFamilyStore cfs, CompactionIterator ci)
+        {
+            this.cfs = cfs;
+            this.ci = ci;
+        }
+
+        public String getColumnFamilyName()
+        {
+            return cfs == null ? null : cfs.getColumnFamilyName();
+        }
+
+        public Long getBytesTotal()
+        {
+            return ci == null ? null : ci.getTotalBytes();
+        }
+
+        public Long getBytesCompleted()
+        {
+            return ci == null ? null : ci.getBytesRead();
+        }
+    }
+
+    public String getColumnFamilyInProgress()
+    {
+        return executor.getColumnFamilyName();
+    }
+
+    public Long getBytesTotalInProgress()
+    {
+        return executor.getBytesTotal();
+    }
+
+    public Long getBytesCompacted()
+    {
+        return executor.getBytesCompleted();
+    }
+
+    public int getPendingTasks()
+    {
+        int n = 0;
+        for (Integer i : estimatedCompactions.values())
+        {
+            n += i;
+        }
+        return n;
+    }
 }

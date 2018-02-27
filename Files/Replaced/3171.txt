@@ -1,289 +1,216 @@
-public final long	modifiedRowCount() { return rowCount + RowUtil.getRowCountBase(); }
+public void end() {
+
+package org.apache.lucene.analysis.icu.segmentation;
 
 /*
-
-   Derby - Class org.apache.derby.impl.sql.execute.DMLWriteResultSet
-
-   Licensed to the Apache Software Foundation (ASF) under one or more
-   contributor license agreements.  See the NOTICE file distributed with
-   this work for additional information regarding copyright ownership.
-   The ASF licenses this file to you under the Apache License, Version 2.0
-   (the "License"); you may not use this file except in compliance with
-   the License.  You may obtain a copy of the License at
-
-      http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
-
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
-package org.apache.derby.impl.sql.execute;
+import java.io.IOException;
+import java.io.Reader;
 
-import java.io.InputStream;
+import org.apache.lucene.analysis.Tokenizer;
+import org.apache.lucene.analysis.icu.tokenattributes.ScriptAttribute;
+import org.apache.lucene.analysis.tokenattributes.OffsetAttribute;
+import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
+import org.apache.lucene.analysis.tokenattributes.TypeAttribute;
 
-import org.apache.derby.iapi.types.DataValueDescriptor;
-import org.apache.derby.iapi.sql.execute.NoPutResultSet;
-import org.apache.derby.iapi.services.io.StreamStorable;
-import org.apache.derby.iapi.sql.execute.ExecRow;
-import org.apache.derby.iapi.sql.execute.ConstantAction;
-import org.apache.derby.iapi.sql.execute.ExecutionContext;
-import org.apache.derby.iapi.error.StandardException;
-import org.apache.derby.iapi.sql.Activation;
-import org.apache.derby.iapi.sql.conn.LanguageConnectionContext;
-
-import org.apache.derby.iapi.store.access.DynamicCompiledOpenConglomInfo;
-import org.apache.derby.iapi.store.access.StaticCompiledOpenConglomInfo;
-import org.apache.derby.iapi.store.access.TransactionController;
-
-import org.apache.derby.catalog.UUID;
-import org.apache.derby.iapi.services.io.FormatableBitSet;
-import org.apache.derby.iapi.services.sanity.SanityManager;
-import org.apache.derby.iapi.transaction.TransactionControl;
+import com.ibm.icu.lang.UCharacter;
+import com.ibm.icu.text.BreakIterator;
 
 /**
- * For INSERT/UPDATE/DELETE impls.  Used to tag them.
+ * Breaks text into words according to UAX #29: Unicode Text Segmentation
+ * (http://www.unicode.org/reports/tr29/)
+ * <p>
+ * Words are broken across script boundaries, then segmented according to
+ * the BreakIterator and typing provided by the {@link ICUTokenizerConfig}
+ * </p>
+ * @see ICUTokenizerConfig
+ * @lucene.experimental
  */
-abstract class DMLWriteResultSet extends NoRowsResultSetImpl 
-{
-	protected WriteCursorConstantAction constantAction;
-	protected int[] baseRowReadMap;
-	protected int[] streamStorableHeapColIds;
-	protected ExecRow	deferredSparseRow;
-	protected DynamicCompiledOpenConglomInfo heapDCOCI;
-	protected DynamicCompiledOpenConglomInfo[] indexDCOCIs;
-	private boolean needToObjectifyStream;
+public final class ICUTokenizer extends Tokenizer {
+  private static final int IOBUFFER = 4096;
+  private final char buffer[] = new char[IOBUFFER];
+  /** true length of text in the buffer */
+  private int length = 0; 
+  /** length in buffer that can be evaluated safely, up to a safe end point */
+  private int usableLength = 0; 
+  /** accumulated offset of previous buffers for this reader, for offsetAtt */
+  private int offset = 0; 
 
+  private final CompositeBreakIterator breaker; /* tokenizes a char[] of text */
+  private final ICUTokenizerConfig config;
+  private final OffsetAttribute offsetAtt = addAttribute(OffsetAttribute.class);
+  private final CharTermAttribute termAtt = addAttribute(CharTermAttribute.class);
+  private final TypeAttribute typeAtt = addAttribute(TypeAttribute.class);
+  private final ScriptAttribute scriptAtt = addAttribute(ScriptAttribute.class);
 
-	public long rowCount;
+  /**
+   * Construct a new ICUTokenizer that breaks text into words from the given
+   * Reader.
+   * <p>
+   * The default script-specific handling is used.
+   * 
+   * @param input Reader containing text to tokenize.
+   * @see DefaultICUTokenizerConfig
+   */
+  public ICUTokenizer(Reader input) {
+    this(input, new DefaultICUTokenizerConfig());
+  }
 
+  /**
+   * Construct a new ICUTokenizer that breaks text into words from the given
+   * Reader, using a tailored BreakIterator configuration.
+   *
+   * @param input Reader containing text to tokenize.
+   * @param config Tailored BreakIterator configuration 
+   */
+  public ICUTokenizer(Reader input, ICUTokenizerConfig config) {
+    super(input);
+    this.config = config;
+    breaker = new CompositeBreakIterator(config);
+  }
 
-	/**
-	 * Constructor
-	 *
- 	 * @param activation		an activation
-	 *
- 	 * @exception StandardException on error
-	 */
-	DMLWriteResultSet(Activation activation)
-		throws StandardException
-	{
-		this(activation, activation.getConstantAction());
-	}
-	DMLWriteResultSet(Activation activation, ConstantAction constantAction)
-		throws StandardException
-	{
-		super(activation);
+  @Override
+  public boolean incrementToken() throws IOException {
+    clearAttributes();
+    if (length == 0)
+      refill();
+    while (!incrementTokenBuffer()) {
+      refill();
+      if (length <= 0) // no more bytes to read;
+        return false;
+    }
+    return true;
+  }
+  
+  @Override
+  public void reset() throws IOException {
+    super.reset();
+    breaker.setText(buffer, 0, 0);
+    length = usableLength = offset = 0;
+  }
 
-		this.constantAction = (WriteCursorConstantAction) constantAction;
-		baseRowReadMap = this.constantAction.getBaseRowReadMap();
-		streamStorableHeapColIds = this.constantAction.getStreamStorableHeapColIds();
+  @Override
+  public void reset(Reader input) throws IOException {
+    super.reset(input);
+    reset();
+  }
+  
+  @Override
+  public void end() throws IOException {
+    final int finalOffset = (length < 0) ? offset : offset + length;
+    offsetAtt.setOffset(correctOffset(finalOffset), correctOffset(finalOffset));
+  }  
 
-		TransactionController tc = activation.getTransactionController();
+  /*
+   * This tokenizes text based upon the longest matching rule, and because of 
+   * this, isn't friendly to a Reader.
+   * 
+   * Text is read from the input stream in 4kB chunks. Within a 4kB chunk of
+   * text, the last unambiguous break point is found (in this implementation:
+   * white space character) Any remaining characters represent possible partial
+   * words, so are appended to the front of the next chunk.
+   * 
+   * There is the possibility that there are no unambiguous break points within
+   * an entire 4kB chunk of text (binary data). So there is a maximum word limit
+   * of 4kB since it will not try to grow the buffer in this case.
+   */
 
-		// Special handling for updatable VTIs
-		if (! (constantAction instanceof UpdatableVTIConstantAction))
-		{
-			heapDCOCI = tc.getDynamicCompiledConglomInfo(this.constantAction.conglomId);
-			if (this.constantAction.indexCIDS.length != 0)
-			{
-				indexDCOCIs = new DynamicCompiledOpenConglomInfo[this.constantAction.indexCIDS.length];
-				for (int index = 0; index < this.constantAction.indexCIDS.length; index++)
-				{
-					indexDCOCIs[index] = tc.getDynamicCompiledConglomInfo(
-												this.constantAction.indexCIDS[index]);
-				}
-			}
-		}
+  /**
+   * Returns the last unambiguous break position in the text.
+   * 
+   * @return position of character, or -1 if one does not exist
+   */
+  private int findSafeEnd() {
+    for (int i = length - 1; i >= 0; i--)
+      if (UCharacter.isWhitespace(buffer[i]))
+        return i + 1;
+    return -1;
+  }
 
-		/* We only need to objectify the streams here if they are exposed to the users through the
-		 * trigger context.  For "before" trigger, we could just return the stream wrapped in
-		 * RememberBytesInputStream to the user and reset it after usage, but this wouldn't work
-		 * because the user may get the stream in trigger action and do something with it in parallel
-		 * with the store doing insert.  We could also delay the materializing until the stream is
-		 * fetched in before trigger but that would complicate the code.  For "after" trigger, we have
-		 * to materialize it here because store only keeps a page's amount for each round.  For other
-		 * reasons of "deferred" operations we don't need to objectify here.  Simply going through a
-		 * temp table (either in memory part or spilled to disk) is fine for the stream, unless a
-		 * same stream appears in two rows in the temp table, which could happen for an "update", in
-		 * which case we do the objectifying in UpdateResultSet.  Beetle 4896.  Related bug entries:
-		 * 2432, 3383.
-		 */
-		needToObjectifyStream = (this.constantAction.getTriggerInfo() != null);
-	}
-
-	public final long	modifiedRowCount() { return rowCount + RowUtil.rowCountBase; }
-
-
-	/**
-	 * Get next row from the source result set.
-	 * 
-	 * @param source		SourceResultSet
-	 * Also look at Track#2432/change 12433
-	 */
-	protected ExecRow getNextRowCore(NoPutResultSet source)
-		throws StandardException
-	{
-		ExecRow row = source.getNextRowCore();
-		if (needToObjectifyStream)
-		{
-			/* 
-			   See comments in the constructor. We also need to load the column
-			   if it is part of an index on an insert but that is done in
-			   insertResultSet#normalInsertCore or IRS#changedRow
-			*/
-			objectifyStreams(row);
-		}
-		return row;
-	}
-
-	private void objectifyStreams(ExecRow row) throws StandardException 
-	{
-		// if the column is a streamStorable, we need to materialize the object
-		// therefore, the object can be used to multiple rows.
-		if ((row != null) && (streamStorableHeapColIds != null))
-		{
-			for (int ix=0; ix < streamStorableHeapColIds.length; ix++)
-			{
-				int heapIx = streamStorableHeapColIds[ix];
-				int readIx = (baseRowReadMap == null) ?
-					heapIx :
-					baseRowReadMap[heapIx];
-
-				DataValueDescriptor col = row.getColumn(readIx+1);
-				
-				// Derby-4779
-				if ( col != null ) {
-					InputStream stream = ((StreamStorable)col).returnStream();
-					((StreamStorable)col).loadStream();
-
-					// DERBY-3238
-					// fix up any duplicate streams, for instance in the case of an update with a trigger,
-					// all the columns are read as update columns even if they are not updated, so 
-					// the update column will still have a reference to the original stream.
-					// If we knew from this context that this was an update and we knew the number
-					// of columns in the base table we would be able to calculate exactly the offset to 
-					// check, but we don't have that information from this context.
-					// If DERBY-1482 is fixed, perhaps this code can be removed.
-
-					if (stream != null)
-						for (int i = 1; i <= row.nColumns(); i++)
-						{
-							DataValueDescriptor c = row.getColumn(i);
-							if (c instanceof StreamStorable)
-								if (((StreamStorable)c).returnStream() == stream)
-									row.setColumn(i, col.cloneValue(false));
-						}
-					}
-				}
-			}
-	}
-
-	/**
-	 * For deferred update, get a deferred sparse row based on the
-	 * deferred non-sparse row. Share the underlying columns. If there
-	 * is no column bit map, make them the same row.
-	 *
-	 * @exception StandardException		Thrown on error
-	 */
-	protected ExecRow makeDeferredSparseRow(
-							ExecRow deferredBaseRow,
-							FormatableBitSet baseRowReadList,
-							LanguageConnectionContext lcc)
-				throws StandardException
-	{
-		ExecRow deferredSparseRow;
-
-		if (baseRowReadList == null)
-		{
-			/* No sparse row */
-			deferredSparseRow = deferredBaseRow;
-		}
-		else
-		{
-			/*
-			** We need to do a fetch doing a partial row
-			** read.  We need to shift our 1-based bit
-			** set to a zero based bit set like the store
-			** expects.
-			*/
-			deferredSparseRow =
-				RowUtil.getEmptyValueRow(
-								baseRowReadList.getLength() - 1,
-								lcc);
-			/*
-			** getColumn(), setColumn(), and baseRowReadList are
-			** one-based.
-			*/
-			int fromPosition = 1;
-			for (int i = 1; i <= deferredSparseRow.nColumns(); i++)
-			{
-				if (baseRowReadList.isSet(i))
-				{
-					deferredSparseRow.setColumn(
-						i,
-						deferredBaseRow.getColumn(fromPosition++)
-						);
-				}
-			}
-		}
-
-		return deferredSparseRow;
-	}
-
-    /**
-     * Decode the update lock mode.
-     * <p>
-     * The value for update lock mode is in the second most significant byte for
-     * TransactionControl.SERIALIZABLE_ISOLATION_LEVEL isolation level. Otherwise
-     * (REPEATABLE READ, READ COMMITTED, and READ UNCOMMITTED) the lock mode is
-     * located in the least significant byte.
-     * <p>
-     * This is done to override the optimizer choice to provide maximum 
-     * concurrency of record level locking except in SERIALIZABLE where table
-     * level locking is required in heap scans for correctness.
-     *
-     * @param lockMode the compiled encoded lock mode for this query
-     * @return the lock mode (record or table) to use to open the result set
-     * @see org.apache.derby.impl.sql.compile.FromBaseTable#updateTargetLockMode
-     */
-    int decodeLockMode(int lockMode) {
-
-        if (SanityManager.DEBUG) {
-            // we want to decode lock mode when the result set is opened, not
-            // in the constructor
-            SanityManager.ASSERT(!isClosed());
-        }
-
-        if ((lockMode >>> 16) == 0) {
-            return lockMode;
-        }
-
-        // Note that isolation level encoding from getCurrentIsolationLevel()
-        // returns TransactionControl.*ISOLATION_LEVEL constants, not
-        // TransactionController.ISOLATION* constants.
-
-        int isolationLevel = lcc.getCurrentIsolationLevel();
-
-        if (isolationLevel == TransactionControl.SERIALIZABLE_ISOLATION_LEVEL) {
-            return lockMode >>> 16;
-        }
-
-        return lockMode & 0xff;
+  /**
+   * Refill the buffer, accumulating the offset and setting usableLength to the
+   * last unambiguous break position
+   * 
+   * @throws IOException
+   */
+  private void refill() throws IOException {
+    offset += usableLength;
+    int leftover = length - usableLength;
+    System.arraycopy(buffer, usableLength, buffer, 0, leftover);
+    int requested = buffer.length - leftover;
+    int returned = read(input, buffer, leftover, requested);
+    length = returned + leftover;
+    if (returned < requested) /* reader has been emptied, process the rest */
+      usableLength = length;
+    else { /* still more data to be read, find a safe-stopping place */
+      usableLength = findSafeEnd();
+      if (usableLength < 0)
+        usableLength = length; /*
+                                * more than IOBUFFER of text without space,
+                                * gonna possibly truncate tokens
+                                */
     }
 
-	/**
-	 * get the index name given the conglomerate id of the index.
-	 * 
-	 * @param indexCID		conglomerate ID of the index.
-	 * 
-	 * @return index name of given index.
-	 */
-	String getIndexNameFromCID(long indexCID)
-	{
-		return this.constantAction.getIndexNameFromCID(indexCID);
-	}
+    breaker.setText(buffer, 0, Math.max(0, usableLength));
+  }
+
+  // TODO: refactor to a shared readFully somewhere
+  // (NGramTokenizer does this too):
+  /** commons-io's readFully, but without bugs if offset != 0 */
+  private static int read(Reader input, char[] buffer, int offset, int length) throws IOException {
+    assert length >= 0 : "length must not be negative: " + length;
+ 
+    int remaining = length;
+    while ( remaining > 0 ) {
+      int location = length - remaining;
+      int count = input.read( buffer, offset + location, remaining );
+      if ( -1 == count ) { // EOF
+        break;
+      }
+      remaining -= count;
+    }
+    return length - remaining;
+  }
+
+  /*
+   * return true if there is a token from the buffer, or null if it is
+   * exhausted.
+   */
+  private boolean incrementTokenBuffer() {
+    int start = breaker.current();
+    if (start == BreakIterator.DONE)
+      return false; // BreakIterator exhausted
+
+    // find the next set of boundaries, skipping over non-tokens (rule status 0)
+    int end = breaker.next();
+    while (start != BreakIterator.DONE && breaker.getRuleStatus() == 0) {
+      start = end;
+      end = breaker.next();
+    }
+
+    if (start == BreakIterator.DONE)
+      return false; // BreakIterator exhausted
+
+    termAtt.copyBuffer(buffer, start, end - start);
+    offsetAtt.setOffset(correctOffset(offset + start), correctOffset(offset + end));
+    typeAtt.setType(config.getType(breaker.getScriptCode(), breaker.getRuleStatus()));
+    scriptAtt.setCode(breaker.getScriptCode());
+
+    return true;
+  }
 }

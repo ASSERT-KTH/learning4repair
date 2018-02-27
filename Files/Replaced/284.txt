@@ -1,641 +1,371 @@
-return new BigDecimal(Double.toString(((Number) value).doubleValue()));
+public static final int RING_DELAY = 30 * 1000; // delay after which we assume ring has stablized
 
+package org.apache.cassandra.io;
 /*
-
-   Derby - Class org.apache.derby.iapi.types.UserType
-
-   Copyright 1999, 2004 The Apache Software Foundation or its licensors, as applicable.
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-      http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
-
+ * 
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ * 
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ * 
  */
 
-package org.apache.derby.iapi.types;
 
-import org.apache.derby.catalog.TypeDescriptor;
-
-import org.apache.derby.iapi.reference.SQLState;
-
-import org.apache.derby.iapi.services.io.ArrayInputStream;
-
-import org.apache.derby.iapi.services.loader.ClassFactory;
-import org.apache.derby.iapi.services.loader.ClassInspector;
-import org.apache.derby.iapi.services.sanity.SanityManager;
-import org.apache.derby.iapi.services.io.StoredFormatIds;
-
-import org.apache.derby.iapi.error.StandardException;
-
-import org.apache.derby.iapi.types.DataTypeDescriptor;
-import org.apache.derby.iapi.types.DataValueDescriptor;
-import org.apache.derby.iapi.types.TypeId;
-
-import org.apache.derby.iapi.types.DataValueDescriptor;
-import org.apache.derby.iapi.types.BooleanDataValue;
-import org.apache.derby.iapi.types.DataValueDescriptor;
-import org.apache.derby.iapi.types.NumberDataValue;
-import org.apache.derby.iapi.types.UserDataValue;
-
-import org.apache.derby.iapi.types.Orderable;
-import org.apache.derby.iapi.types.*;
-
-import org.apache.derby.iapi.services.cache.ClassSize;
-
-import java.sql.Date;
-import java.sql.Time;
-import java.sql.Timestamp;
-import java.sql.Types;
-import java.math.BigDecimal;
-
-import java.io.ObjectOutput;
-import java.io.ObjectInput;
+import java.net.InetAddress;
+import java.util.*;
 import java.io.IOException;
+import java.io.File;
+import java.io.IOError;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
 
-import java.sql.ResultSet;
-import java.sql.SQLException;
+import org.apache.log4j.Logger;
+import org.apache.commons.lang.StringUtils;
 
-import java.util.Calendar;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.StreamInitiateMessage;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.Table;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.net.io.StreamContextManager;
+import org.apache.cassandra.net.io.IStreamComplete;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.net.IVerbHandler;
+import org.apache.cassandra.service.StreamManager;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.LogUtil;
 
-
-/**
- * This contains an instance of a user-defined type, that is, a java object.
- *
- */
-
-public class UserType extends DataType
-						implements UserDataValue
+public class Streaming
 {
-	private Object	value;
+    private static Logger logger = Logger.getLogger(Streaming.class);
+    private static String TABLE_NAME = "STREAMING-TABLE-NAME";
+    public static final long RING_DELAY = 30 * 1000; // delay after which we assume ring has stablized
 
-	/*
-	** DataValueDescriptor interface
-	** (mostly implemented in DataType)
-	*/
-
-    private static final int BASE_MEMORY_USAGE = ClassSize.estimateBaseFromCatalog( UserType.class);
-
-    public int estimateMemoryUsage()
+    /**
+     * Split out files for all tables on disk locally for each range and then stream them to the target endpoint.
+    */
+    public static void transferRanges(InetAddress target, Collection<Range> ranges, Runnable callback)
     {
-        int sz = BASE_MEMORY_USAGE;
-        if( null != value)
+        assert ranges.size() > 0;
+
+        if (logger.isDebugEnabled())
+            logger.debug("Beginning transfer process to " + target + " for ranges " + StringUtils.join(ranges, ", "));
+
+        /*
+         * (1) dump all the memtables to disk.
+         * (2) anticompaction -- split out the keys in the range specified
+         * (3) transfer the data.
+        */
+        List<String> tables = DatabaseDescriptor.getTables();
+        for (String tName : tables)
         {
-            // Probably an underestimate. Examining each field value would be expensive
-            // and would produce an overestimate when fields reference shared objects
-            sz += ClassSize.estimateAndCatalogBase( value.getClass());
+            try
+            {
+                Table table = Table.open(tName);
+                if (logger.isDebugEnabled())
+                  logger.debug("Flushing memtables ...");
+                for (Future f : table.flush())
+                {
+                    try
+                    {
+                        f.get();
+                    }
+                    catch (InterruptedException e)
+                    {
+                        throw new RuntimeException(e);
+                    }
+                    catch (ExecutionException e)
+                    {
+                        throw new RuntimeException(e);
+                    }
+                }
+                if (logger.isDebugEnabled())
+                  logger.debug("Performing anticompaction ...");
+                /* Get the list of files that need to be streamed */
+                transferSSTables(target, table.forceAntiCompaction(ranges, target), tName); // SSTR GC deletes the file when done
+            }
+            catch (IOException e)
+            {
+                throw new IOError(e);
+            }
         }
-        
-        return sz;
-    } // end of estimateMemoryUsage
-
-	public String getString()
-	{
-		if (! isNull())
-		{
-			return value.toString();
-
-		}
-		else
-		{
-			return null;
-		}
-	}
-
-	/**
-	 * @exception StandardException thrown on failure to convert
-	 */
-	public boolean getBoolean() throws StandardException
-	{
-		if (! isNull())
-			if (value instanceof Boolean) return ((Boolean)value).booleanValue();
-		return super.getBoolean();
-	}
-
-	/**
-	 * @exception StandardException thrown on failure to convert
-	 */
-	public byte getByte() throws StandardException
-	{
-		if (! isNull())
-			// REMIND: check for overflow and truncation
-			if (value instanceof Number) return ((Number)value).byteValue();
-		return super.getByte();
-	}
-
-	/**
-	 * @exception StandardException thrown on failure to convert
-	 */
-	public short getShort() throws StandardException
-	{
-		if (! isNull())
-			// REMIND: check for overflow and truncation
-			if (value instanceof Number) return ((Number)value).shortValue();
-		return super.getShort();
-	}
-
-	/**
-	 * @exception StandardException thrown on failure to convert
-	 */
-	public int getInt() throws StandardException
-	{
-		if (! isNull())
-			// REMIND: check for overflow and truncation
-			if (value instanceof Number) return ((Number)value).intValue();
-		return super.getInt();
-	}
-
-	/**
-	 * @exception StandardException thrown on failure to convert
-	 */
-
-	public long getLong() throws StandardException
-	{
-		if (! isNull())
-			// REMIND: check for overflow and truncation
-			if (value instanceof Number) return ((Number)value).longValue();
-		return super.getLong();
-	}
-
-
-	/**
-	 * @exception StandardException thrown on failure to convert
-	 */
-	public float getFloat() throws StandardException
-	{
-		if (! isNull())
-			// REMIND: check for overflow
-			if (value instanceof Number) return ((Number)value).floatValue();
-		return super.getFloat();
-	}
-
-
-	/**
-	 * @exception StandardException thrown on failure to convert
-	 */
-	public double getDouble() throws StandardException
-	{
-		if (! isNull())
-			// REMIND: check for overflow
-			if (value instanceof Number) return ((Number)value).doubleValue();
-		return super.getDouble();
-	}
-
-	/**
-	 * @exception StandardException thrown on failure to convert
-	 */
-	public BigDecimal getBigDecimal() throws StandardException
-	{
-		if (! isNull()) {
-			if (value instanceof BigDecimal) return ((BigDecimal)value);
-
-			if (value instanceof Number)
-				return new BigDecimal(((Number) value).doubleValue());
-		}
-		return super.getBigDecimal();
-	}
-
-	/**
-	 * @exception StandardException thrown on failure to convert
-	 */
-	public byte[] getBytes() throws StandardException
-	{
-		if (! isNull())
-			if (value instanceof byte[]) return ((byte[])value);
-		return super.getBytes();
-	}
-
-	/**
-
-		@exception StandardException thrown on failure
-	 */
-	public Date	getDate( Calendar cal) throws StandardException
-	{
-		if (! isNull())
-		{
-			if (value instanceof Date) 
-				return ((Date)value);
-			else if (value instanceof Timestamp)
-				return (new SQLTimestamp((Timestamp)value).getDate(cal));
-		}
-		return super.getDate(cal);
-	}
-
-	/**
-		@exception StandardException thrown on failure
-	 */
-	public Time	getTime( Calendar cal) throws StandardException
-	{
-		if (! isNull())
-		{
-			if (value instanceof Time) 
-				return ((Time)value);
-			else if (value instanceof Timestamp)
-				return (new SQLTimestamp((Timestamp)value).getTime(cal));
-		}
-		return super.getTime(cal);
-	}
-
-	/**
-		@exception StandardException thrown on failure
-	 */
-	public Timestamp	getTimestamp( Calendar cal) throws StandardException
-	{
-		if (! isNull())
-		{
-			if (value instanceof Timestamp) 
-				return ((Timestamp)value);
-			else if (value instanceof Date)
-				return (new SQLDate((Date)value).getTimestamp(cal));
-			else if (value instanceof Time)
-				return (new SQLTime((Time)value).getTimestamp(cal));
-		}
-		return super.getTimestamp(cal);
-	}
-
-	public Object getObject()
-	{
-		return value;
-	}
-
-	/**
-	* @see DataValueDescriptor#setObjectForCast
-	*
-	* @exception StandardException thrown on failure
-	*
-	* @return me
-	*/
-	public void setObjectForCast(Object theValue, boolean instanceOfResultType, String resultTypeClassName)
-		throws StandardException
-	{
-		/* This check is a performance problem.  We need to it though
-		 * to catch ClassCastExceptions.
-		 */
-		/* Is the object of the right type? (only do the check if value is non-null */
-		if (theValue != null)
-		{
-			if ( ! instanceOfResultType)
-			{
-				throw StandardException.newException(SQLState.LANG_DATA_TYPE_SET_MISMATCH, 
-								getTypeName(), resultTypeClassName);
-			}
-		}
-
-		setValue(theValue);
-	}
-		
-	public int getLength()
-	{
-		return TypeDescriptor.MAXIMUM_WIDTH_UNKNOWN;
-	}
-
-	/* this is for DataType's error generator */
-	public String getTypeName()
-	{
-
-		return isNull() ? "JAVA_OBJECT" : ClassInspector.readableClassName(value.getClass());
-	}
-
-	/*
-	 * Storable interface, implies Externalizable, TypedFormat
-	 */
-
-	/**
-		Return my format identifier.
-
-		@see org.apache.derby.iapi.services.io.TypedFormat#getTypeFormatId
-	*/
-	public int getTypeFormatId() {
-		return StoredFormatIds.SQL_USERTYPE_ID_V3;
-	}
-
-	/** 
-		@exception IOException error writing data
-
-	*/
-	public void writeExternal(ObjectOutput out) throws IOException {
-
-		if (SanityManager.DEBUG)
-			SanityManager.ASSERT(!isNull(), "writeExternal() is not supposed to be called for null values.");
-
-			out.writeObject(value);
-	}
-
-	/**
-	 * @see java.io.Externalizable#readExternal
-	 *
-	 * @exception IOException	Thrown on error reading the object
-	 * @exception ClassNotFoundException	Thrown if the class of the object
-	 *										is not found
-	 */
-	public void readExternal(ObjectInput in) 
-        throws IOException, ClassNotFoundException
-	{
-		/* RESOLVE: Sanity check for right class */
-		value = in.readObject();
-	}
-	public void readExternalFromArray(ArrayInputStream in) 
-        throws IOException, ClassNotFoundException
-	{
-		/* RESOLVE: Sanity check for right class */
-		value = in.readObject();
-	}
-
-	/*
-	 * DataValueDescriptor interface
-	 */
-
-	/** @see DataValueDescriptor#getClone */
-	public DataValueDescriptor getClone()
-	{
-		// Call constructor with all of our info
-		return new UserType(value);
-	}
-
-	/**
-	 * @see DataValueDescriptor#getNewNull
-	 */
-	public DataValueDescriptor getNewNull()
-	{
-		return new UserType();
-	}
-	/**
-	 * @see org.apache.derby.iapi.services.io.Storable#restoreToNull
-	 *
-	 */
-
-	public void restoreToNull()
-	{
-		value = null;
-	}
-
-	/*
-	 * DataValueDescriptor interface
-	 */
-
-	/** 
-	 * @see DataValueDescriptor#setValueFromResultSet 
-	 *
-	 * @exception SQLException		Thrown on error
-	 */
-	public void setValueFromResultSet(ResultSet resultSet, int colNumber,
-									  boolean isNullable)
-		throws SQLException
-	{
-			value = resultSet.getObject(colNumber);
-	}
-
-	/**
-	 * Orderable interface
-	 *
-	 *
-	 * @see org.apache.derby.iapi.types.Orderable
-	 *
-	 * @exception StandardException thrown on failure
-	 */
-	public int compare(DataValueDescriptor other)
-		throws StandardException
-	{
-		/* Use compare method from dominant type, negating result
-		 * to reflect flipping of sides.
-		 */
-		if (typePrecedence() < other.typePrecedence())
-		{
-			return - (other.compare(this));
-		}
-
-		boolean thisNull, otherNull;
-
-		thisNull = this.isNull();
-		otherNull = other.isNull();
-
-		/*
-		 * thisNull otherNull	return
-		 *	T		T		 	0	(this == other)
-		 *	F		T		 	-1 	(this < other)
-		 *	T		F		 	1	(this > other)
-		 */
-		if (thisNull || otherNull)
-		{
-			if (!thisNull)		// otherNull must be true
-				return -1;
-			if (!otherNull)		// thisNull must be true
-				return 1;
-			return 0;
-		}
-
-		/*
-			Neither are null compare them 
-		 */
-
-		int comparison;
-
-		try
-		{
-			comparison = ((java.lang.Comparable) value).compareTo(other.getObject());
-		}
-		catch (ClassCastException cce)
-		{
-			throw StandardException.newException(SQLState.LANG_INVALID_COMPARE_TO, 
-						getTypeName(),
-						ClassInspector.readableClassName(other.getObject().getClass()));
-		}
-		/*
-		** compareTo() can return any negative number if less than, and
-		** any positive number if greater than.  Change to -1, 0, 1.
-		*/
-		if (comparison < 0)
-			comparison = -1;
-		else if (comparison > 0)
-			comparison = 1;
-
-		return comparison;
-	}
-
-	/**
-		@exception StandardException thrown on error
-	 */
-	public boolean compare(int op,
-						   DataValueDescriptor other,
-						   boolean orderedNulls,
-						   boolean unknownRV)
-		throws StandardException
-	{
-		if (!orderedNulls)		// nulls are unordered
-		{
-			if (this.isNull() || other.isNull())
-				return unknownRV;
-		}
-
-		/* For usertypes and equal do some special processing when
-		 * neither value is null.  (Superclass will handle comparison
-		 * if either value is null.)
-		 */
-		if ( (op == ORDER_OP_EQUALS) &&
-			(! this.isNull()) && (! other.isNull()) ) 
-		{
-			// if this object implements java.lang.Comparable (JDK1.2)
-			// then we let the compareTo method handle equality
-			// if it doesn't then we use the equals() method
-			Object o = getObject();
-
-			if (!(o instanceof java.lang.Comparable)) 
-			{
-				return o.equals(other.getObject());
-			}
-		}
-		
-
-		/* Do the comparison */
-		return super.compare(op, other, orderedNulls, unknownRV);
-	}
-
-	/*
-	** Class interface
-	*/
-
-	/*
-	** Constructors
-	*/
-
-	/** no-arg constructor required by Formattable */
-	public UserType() { }
-
-	public UserType(Object value)
-	{
-		this.value = value;
-	}
-	/**
-	 * @see UserDataValue#setValue
-	 *
-	 */
-	public void setValue(Object value)
-	{
-		this.value = value;
-	}
-	protected void setFrom(DataValueDescriptor theValue) throws StandardException {
-
-		setValue(theValue.getObject());
-	}
-
-	/**
-	 * @see UserDataValue#setValue
-	 *
-	 */
-	public void setBigDecimal(Number theValue)
-	{
-		// needed to allow serializable BigDecimal
-		setValue((Object) theValue);
-	}
-
-	public void setValue(String theValue)
-	{
-		if (theValue == null)
-		{
-			value = null;
-		}
-		else
-		{
-			// Higher levels must have performed type checking for us.
-			value = theValue;
-		}
-	}
-
-	/*
-	** SQL Operators
-	*/
-
-	/**
-	 * The = operator as called from the language module, as opposed to
-	 * the storage module.
-	 *
-	 * @param left			The value on the left side of the =
-	 * @param right			The value on the right side of the =
-	 *
-	 * @return	A SQL boolean value telling whether the two parameters are equal
-	 *
-	 * @exception StandardException		Thrown on error
-	 */
-
-	public BooleanDataValue equals(DataValueDescriptor left,
-							DataValueDescriptor right)
-			throws StandardException
-	{
-		return SQLBoolean.truthValue(left,
-									 right,
-									 left.compare(ORDER_OP_EQUALS, right, true, false));
-	}
-
-	/**
-	 * The <> operator as called from the language module, as opposed to
-	 * the storage module.
-	 *
-	 * @param left			The value on the left side of the <>
-	 * @param right			The value on the right side of the <>
-	 *
-	 * @return	A SQL boolean value telling whether the two parameters
-	 *			are not equal
-	 *
-	 * @exception StandardException		Thrown on error
-	 */
-
-	public BooleanDataValue notEquals(DataValueDescriptor left,
-							DataValueDescriptor right)
-			throws StandardException
-	{
-		return SQLBoolean.truthValue(left,
-									 right,
-									 !left.compare(ORDER_OP_EQUALS, right, true, false));
-	}
-
-
-
-	/*
-	** String display of value
-	*/
-
-	public String toString()
-	{
-		if (isNull())
-		{
-			return "NULL";
-		}
-		else
-		{
-			return value.toString();
-		}
-	}
-
-	/*
-	 * Hash code
-	 */
-	public int hashCode()
-	{
-		if (isNull())
-			return 0;
-		return value.hashCode();
-	}
-
-	/** @see DataValueDescriptor#typePrecedence */
-	public int	typePrecedence()
-	{
-		return TypeId.USER_PRECEDENCE;
-	}
-
-	/**
-	 * Check if the value is null.  
-	 *
-	 * @return Whether or not value is logically null.
-	 */
-	public final boolean isNull()
-	{
-		return (value == null);
-	}
+        if (callback != null)
+            callback.run();
+    }
+
+    /**
+     * Transfers a group of sstables from a single table to the target endpoint
+     * and then marks them as ready for local deletion.
+     */
+    public static void transferSSTables(InetAddress target, List<SSTableReader> sstables, String table) throws IOException
+    {
+        StreamContextManager.StreamContext[] streamContexts = new StreamContextManager.StreamContext[SSTable.FILES_ON_DISK * sstables.size()];
+        int i = 0;
+        for (SSTableReader sstable : sstables)
+        {
+            for (String filename : sstable.getAllFilenames())
+            {
+                File file = new File(filename);
+                streamContexts[i++] = new StreamContextManager.StreamContext(file.getAbsolutePath(), file.length(), table);
+            }
+        }
+        if (logger.isDebugEnabled())
+          logger.debug("Stream context metadata " + StringUtils.join(streamContexts, ", "));
+
+        StreamManager.instance(target).addFilesToStream(streamContexts);
+        StreamInitiateMessage biMessage = new StreamInitiateMessage(streamContexts);
+        Message message = StreamInitiateMessage.makeStreamInitiateMessage(biMessage);
+        message.addHeader(Streaming.TABLE_NAME, table.getBytes());
+        if (logger.isDebugEnabled())
+          logger.debug("Sending a stream initiate message to " + target + " ...");
+        MessagingService.instance().sendOneWay(message, target);
+
+        if (streamContexts.length > 0)
+        {
+            logger.info("Waiting for transfer to " + target + " to complete");
+            StreamManager.instance(target).waitForStreamCompletion();
+            // (StreamManager will delete the streamed file on completion.)
+            logger.info("Done with transfer to " + target);
+        }
+    }
+
+    /**
+     * Request ranges to be transferred
+     */
+    public static void requestRanges(InetAddress source, Collection<Range> ranges)
+    {
+        StreamRequestMetadata streamRequestMetadata = new StreamRequestMetadata(FBUtilities.getLocalAddress(), ranges);
+        Message message = StreamRequestMessage.makeStreamRequestMessage(new StreamRequestMessage(streamRequestMetadata));
+        MessagingService.instance().sendOneWay(message, source);
+    }
+
+    public static class StreamInitiateVerbHandler implements IVerbHandler
+    {
+        /*
+         * Here we handle the StreamInitiateMessage. Here we get the
+         * array of StreamContexts. We get file names for the column
+         * families associated with the files and replace them with the
+         * file names as obtained from the column family store on the
+         * receiving end.
+        */
+        public void doVerb(Message message)
+        {
+            byte[] body = message.getMessageBody();
+            DataInputBuffer bufIn = new DataInputBuffer();
+            bufIn.reset(body, body.length);
+            if (logger.isDebugEnabled())
+                logger.debug(String.format("StreamInitiateVerbeHandler.doVerb %s %s %s", message.getVerb(), message.getMessageId(), message.getMessageType()));
+
+            try
+            {
+                StreamInitiateMessage biMsg = StreamInitiateMessage.serializer().deserialize(bufIn);
+                StreamContextManager.StreamContext[] streamContexts = biMsg.getStreamContext();
+
+                if (streamContexts.length == 0)
+                {
+                    if (logger.isDebugEnabled())
+                        logger.debug("no data needed from " + message.getFrom());
+                    if (StorageService.instance().isBootstrapMode())
+                        StorageService.instance().removeBootstrapSource(message.getFrom(), new String(message.getHeader(Streaming.TABLE_NAME)));
+                    return;
+                }
+
+                Map<String, String> fileNames = getNewNames(streamContexts);
+                Map<String, String> pathNames = new HashMap<String, String>();
+                for (String ssName : fileNames.keySet())
+                    pathNames.put(ssName, DatabaseDescriptor.getNextAvailableDataLocation());
+                /*
+                 * For each of stream context's in the incoming message
+                 * generate the new file names and store the new file names
+                 * in the StreamContextManager.
+                */
+                for (StreamContextManager.StreamContext streamContext : streamContexts )
+                {
+                    StreamContextManager.StreamStatus streamStatus = new StreamContextManager.StreamStatus(streamContext.getTargetFile(), streamContext.getExpectedBytes() );
+                    String file = getNewFileNameFromOldContextAndNames(fileNames, pathNames, streamContext);
+
+                    if (logger.isDebugEnabled())
+                      logger.debug("Received Data from  : " + message.getFrom() + " " + streamContext.getTargetFile() + " " + file);
+                    streamContext.setTargetFile(file);
+                    addStreamContext(message.getFrom(), streamContext, streamStatus);
+                }
+
+                StreamContextManager.registerStreamCompletionHandler(message.getFrom(), new StreamCompletionHandler());
+                if (logger.isDebugEnabled())
+                  logger.debug("Sending a stream initiate done message ...");
+                Message doneMessage = new Message(FBUtilities.getLocalAddress(), "", StorageService.streamInitiateDoneVerbHandler_, new byte[0] );
+                MessagingService.instance().sendOneWay(doneMessage, message.getFrom());
+            }
+            catch (IOException ex)
+            {
+                throw new IOError(ex);
+            }
+        }
+
+        public String getNewFileNameFromOldContextAndNames(Map<String, String> fileNames,
+                                                           Map<String, String> pathNames,
+                StreamContextManager.StreamContext streamContext)
+        {
+            File sourceFile = new File( streamContext.getTargetFile() );
+            String[] piece = FBUtilities.strip(sourceFile.getName(), "-");
+            String cfName = piece[0];
+            String ssTableNum = piece[1];
+            String typeOfFile = piece[2];
+
+            String newFileNameExpanded = fileNames.get(streamContext.getTable() + "-" + cfName + "-" + ssTableNum);
+            String path = pathNames.get(streamContext.getTable() + "-" + cfName + "-" + ssTableNum);
+            //Drop type (Data.db) from new FileName
+            String newFileName = newFileNameExpanded.replace("Data.db", typeOfFile);
+            return path + File.separator + streamContext.getTable() + File.separator + newFileName;
+        }
+
+        // todo: this method needs to be private, or package at the very least for easy unit testing.
+        public Map<String, String> getNewNames(StreamContextManager.StreamContext[] streamContexts) throws IOException
+        {
+            /*
+             * Mapping for each file with unique CF-i ---> new file name. For eg.
+             * for a file with name <CF>-<i>-Data.db there is a corresponding
+             * <CF>-<i>-Index.db. We maintain a mapping from <CF>-<i> to a newly
+             * generated file name.
+            */
+            Map<String, String> fileNames = new HashMap<String, String>();
+            /* Get the distinct entries from StreamContexts i.e have one entry per Data/Index/Filter file set */
+            Set<String> distinctEntries = new HashSet<String>();
+            for ( StreamContextManager.StreamContext streamContext : streamContexts )
+            {
+                String[] pieces = FBUtilities.strip(new File(streamContext.getTargetFile()).getName(), "-");
+                distinctEntries.add(streamContext.getTable() + "-" + pieces[0] + "-" + pieces[1] );
+            }
+
+            /* Generate unique file names per entry */
+            for ( String distinctEntry : distinctEntries )
+            {
+                String tableName;
+                String[] pieces = FBUtilities.strip(distinctEntry, "-");
+                tableName = pieces[0];
+                Table table = Table.open( tableName );
+
+                ColumnFamilyStore cfStore = table.getColumnFamilyStore(pieces[1]);
+                if (logger.isDebugEnabled())
+                  logger.debug("Generating file name for " + distinctEntry + " ...");
+                fileNames.put(distinctEntry, cfStore.getTempSSTableFileName());
+            }
+
+            return fileNames;
+        }
+
+        private void addStreamContext(InetAddress host, StreamContextManager.StreamContext streamContext, StreamContextManager.StreamStatus streamStatus)
+        {
+            if (logger.isDebugEnabled())
+              logger.debug("Adding stream context " + streamContext + " for " + host + " ...");
+            StreamContextManager.addStreamContext(host, streamContext, streamStatus);
+        }
+    }
+
+    public static class StreamInitiateDoneVerbHandler implements IVerbHandler
+    {
+        public void doVerb(Message message)
+        {
+            if (logger.isDebugEnabled())
+              logger.debug("Received a stream initiate done message ...");
+            StreamManager.instance(message.getFrom()).start();
+        }
+    }
+
+    /**
+     * This is the callback handler that is invoked when we have
+     * completely received a single file from a remote host.
+     *
+     * TODO if we move this into CFS we could make addSSTables private, improving encapsulation.
+    */
+    private static class StreamCompletionHandler implements IStreamComplete
+    {
+        public void onStreamCompletion(InetAddress host, StreamContextManager.StreamContext streamContext, StreamContextManager.StreamStatus streamStatus) throws IOException
+        {
+            /* Parse the stream context and the file to the list of SSTables in the associated Column Family Store. */
+            if (streamContext.getTargetFile().contains("-Data.db"))
+            {
+                String tableName = streamContext.getTable();
+                File file = new File( streamContext.getTargetFile() );
+                String fileName = file.getName();
+                String [] temp = fileName.split("-");
+
+                //Open the file to see if all parts are now here
+                try
+                {
+                    SSTableReader sstable = SSTableWriter.renameAndOpen(streamContext.getTargetFile());
+                    //TODO add a sanity check that this sstable has all its parts and is ok
+                    Table.open(tableName).getColumnFamilyStore(temp[0]).addSSTable(sstable);
+                    logger.info("Streaming added " + sstable.getFilename());
+                }
+                catch (IOException e)
+                {
+                    throw new RuntimeException("Not able to add streamed file " + streamContext.getTargetFile(), e);
+                }
+            }
+
+            if (logger.isDebugEnabled())
+              logger.debug("Sending a streaming finished message with " + streamStatus + " to " + host);
+            /* Send a StreamStatusMessage object which may require the source node to re-stream certain files. */
+            StreamContextManager.StreamStatusMessage streamStatusMessage = new StreamContextManager.StreamStatusMessage(streamStatus);
+            Message message = StreamContextManager.StreamStatusMessage.makeStreamStatusMessage(streamStatusMessage);
+            MessagingService.instance().sendOneWay(message, host);
+
+            /* If we're done with everything for this host, remove from bootstrap sources */
+            if (StreamContextManager.isDone(host) && StorageService.instance().isBootstrapMode())
+            {
+                StorageService.instance().removeBootstrapSource(host, streamContext.getTable());
+            }
+        }
+    }
+
+    public static class StreamFinishedVerbHandler implements IVerbHandler
+    {
+        public void doVerb(Message message)
+        {
+            byte[] body = message.getMessageBody();
+            DataInputBuffer bufIn = new DataInputBuffer();
+            bufIn.reset(body, body.length);
+
+            try
+            {
+                StreamContextManager.StreamStatusMessage streamStatusMessage = StreamContextManager.StreamStatusMessage.serializer().deserialize(bufIn);
+                StreamContextManager.StreamStatus streamStatus = streamStatusMessage.getStreamStatus();
+
+                switch (streamStatus.getAction())
+                {
+                    case DELETE:
+                        StreamManager.instance(message.getFrom()).finish(streamStatus.getFile());
+                        break;
+
+                    case STREAM:
+                        if (logger.isDebugEnabled())
+                            logger.debug("Need to re-stream file " + streamStatus.getFile());
+                        StreamManager.instance(message.getFrom()).repeat();
+                        break;
+
+                    default:
+                        break;
+                }
+            }
+            catch (IOException ex)
+            {
+                throw new IOError(ex);
+            }
+        }
+    }
 }

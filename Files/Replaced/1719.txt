@@ -1,4 +1,4 @@
-IResponseResolver<Row> readResponseResolver = new ReadResponseResolver(table_, replicas_.size());
+byte[] body = message.getMessageBody();
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one
@@ -18,177 +18,70 @@ IResponseResolver<Row> readResponseResolver = new ReadResponseResolver(table_, r
  * limitations under the License.
  */
 
-package org.apache.cassandra.service;
+package org.apache.cassandra.tools;
 
-import java.io.ByteArrayInputStream;
-import java.io.DataInputStream;
 import java.io.IOException;
-import java.net.InetAddress;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.List;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.Map;
+import java.util.Set;
 
-import org.apache.commons.lang.StringUtils;
+import org.apache.log4j.Logger;
 
-import org.apache.cassandra.cache.ICacheExpungeHook;
-import org.apache.cassandra.concurrent.StageManager;
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.db.ColumnFamily;
-import org.apache.cassandra.db.ReadCommand;
-import org.apache.cassandra.db.ReadResponse;
-import org.apache.cassandra.db.Row;
-import org.apache.cassandra.io.util.DataOutputBuffer;
-import org.apache.cassandra.net.IAsyncCallback;
+import org.apache.cassandra.io.DataInputBuffer;
+import org.apache.cassandra.net.EndPoint;
+import org.apache.cassandra.net.IVerbHandler;
 import org.apache.cassandra.net.Message;
 import org.apache.cassandra.net.MessagingService;
-import org.apache.cassandra.utils.ExpiringMap;
-import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.LogUtil;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+/**
+ * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
+ */
 
-
-class ConsistencyChecker implements Runnable
+public class MembershipCleanerVerbHandler implements IVerbHandler
 {
-    private static Logger logger_ = LoggerFactory.getLogger(ConsistencyChecker.class);
-    private static ExpiringMap<String, String> readRepairTable_ = new ExpiringMap<String, String>(DatabaseDescriptor.getRpcTimeout());
+    private static Logger logger_ = Logger.getLogger(MembershipCleanerVerbHandler.class);
 
-    private final String table_;
-    private final Row row_;
-    protected final List<InetAddress> replicas_;
-    private final ReadCommand readCommand_;
-
-    public ConsistencyChecker(String table, Row row, List<InetAddress> endpoints, ReadCommand readCommand)
+    public void doVerb(Message message)
     {
-        table_ = table;
-        row_ = row;
-        replicas_ = endpoints;
-        readCommand_ = readCommand;
-    }
-
-    public void run()
-	{
-        ReadCommand readCommandDigestOnly = constructReadMessage(true);
-		try
-		{
-			Message message = readCommandDigestOnly.makeReadMessage();
-            if (logger_.isDebugEnabled())
-              logger_.debug("Reading consistency digest for " + readCommand_.key + " from " + message.getMessageId() + "@[" + StringUtils.join(replicas_, ", ") + "]");
-
-            MessagingService.instance.addCallback(new DigestResponseHandler(), message.getMessageId());
-            for (InetAddress endpoint : replicas_)
-            {
-                if (!endpoint.equals(FBUtilities.getLocalAddress()))
-                    MessagingService.instance.sendOneWay(message, endpoint);
-            }
-		}
-		catch (IOException ex)
-		{
-			throw new RuntimeException(ex);
-		}
-	}
-
-    private ReadCommand constructReadMessage(boolean isDigestQuery)
-    {
-        ReadCommand readCommand = readCommand_.copy();
-        readCommand.setDigestQuery(isDigestQuery);
-        return readCommand;
-    }
-
-    class DigestResponseHandler implements IAsyncCallback
-	{
-        private boolean repairInvoked;
-
-		public synchronized void response(Message response)
-		{
-            if (repairInvoked)
-                return;
-
-            try
-            {
-                byte[] body = response.getMessageBody();
-                ByteArrayInputStream bufIn = new ByteArrayInputStream(body);
-                ReadResponse result = ReadResponse.serializer().deserialize(new DataInputStream(bufIn));
-                byte[] digest = result.digest();
-
-                if (!Arrays.equals(ColumnFamily.digest(row_.cf), digest))
-                {
-                    IResponseResolver<Row> readResponseResolver = new ReadResponseResolver(table_);
-                    IAsyncCallback responseHandler;
-                    if (replicas_.contains(FBUtilities.getLocalAddress()))
-                        responseHandler = new DataRepairHandler(row_, replicas_.size(), readResponseResolver);
-                    else
-                        responseHandler = new DataRepairHandler(replicas_.size(), readResponseResolver);
-
-                    ReadCommand readCommand = constructReadMessage(false);
-                    Message message = readCommand.makeReadMessage();
-                    if (logger_.isDebugEnabled())
-                      logger_.debug("Performing read repair for " + readCommand_.key + " to " + message.getMessageId() + "@[" + StringUtils.join(replicas_, ", ") + "]");
-                    MessagingService.instance.addCallback(responseHandler, message.getMessageId());
-                    for (InetAddress endpoint : replicas_)
-                    {
-                        if (!endpoint.equals(FBUtilities.getLocalAddress()))
-                            MessagingService.instance.sendOneWay(message, endpoint);
-                    }
-
-                    repairInvoked = true;
-                }
-            }
-            catch (Exception e)
-            {
-                throw new RuntimeException("Error handling responses for " + row_, e);
-            }
-        }
-    }
-
-	static class DataRepairHandler implements IAsyncCallback, ICacheExpungeHook<String, String>
-	{
-		private final Collection<Message> responses_ = new LinkedBlockingQueue<Message>();
-		private final IResponseResolver<Row> readResponseResolver_;
-		private final int majority_;
-		
-		DataRepairHandler(int responseCount, IResponseResolver<Row> readResponseResolver)
-		{
-			readResponseResolver_ = readResponseResolver;
-			majority_ = (responseCount / 2) + 1;  
-		}
-
-        public DataRepairHandler(Row localRow, int responseCount, IResponseResolver<Row> readResponseResolver) throws IOException
+        byte[] body = (byte[])message.getMessageBody()[0];
+        
+        try
         {
-            this(responseCount, readResponseResolver);
-            // wrap localRow in a response Message so it doesn't need to be special-cased in the resolver
-            ReadResponse readResponse = new ReadResponse(localRow);
-            DataOutputBuffer out = new DataOutputBuffer();
-            ReadResponse.serializer().serialize(readResponse, out);
-            byte[] bytes = new byte[out.getLength()];
-            System.arraycopy(out.getData(), 0, bytes, 0, bytes.length);
-            responses_.add(new Message(FBUtilities.getLocalAddress(), StageManager.RESPONSE_STAGE, StorageService.Verb.READ_RESPONSE, bytes));
+            DataInputBuffer bufIn = new DataInputBuffer();
+            bufIn.reset(body, body.length);
+            /* Deserialize to get the token for this endpoint. */
+            MembershipCleaner.MembershipCleanerMessage mcMessage = MembershipCleaner.MembershipCleanerMessage.serializer().deserialize(bufIn);
+            
+            String target = mcMessage.getTarget();
+            logger_.info("Removing the node [" + target + "] from membership");
+            EndPoint targetEndPoint = new EndPoint(target, DatabaseDescriptor.getControlPort());
+            /* Remove the token related information for this endpoint */
+            StorageService.instance().removeTokenState(targetEndPoint);
+            
+            /* Get the headers for this message */
+            Map<String, byte[]> headers = message.getHeaders();
+            headers.remove( StorageService.getLocalStorageEndPoint().getHost() );
+            logger_.debug("Number of nodes in the header " + headers.size());
+            Set<String> nodes = headers.keySet();
+            
+            for ( String node : nodes )
+            {            
+                logger_.debug("Processing node " + node);
+                byte[] bytes = headers.remove(node);
+                /* Send a message to this node to alter its membership state. */
+                EndPoint targetNode = new EndPoint(node, DatabaseDescriptor.getStoragePort());                
+                
+                logger_.debug("Sending a membership clean message to " + targetNode);
+                MessagingService.getMessagingInstance().sendOneWay(message, targetNode);
+                break;
+            }                        
         }
-
-        // synchronized so the " == majority" is safe
-		public synchronized void response(Message message)
-		{
-			if (logger_.isDebugEnabled())
-			  logger_.debug("Received responses in DataRepairHandler : " + message.toString());
-			responses_.add(message);
-            if (responses_.size() == majority_)
-            {
-                String messageId = message.getMessageId();
-                readRepairTable_.put(messageId, messageId, this);
-            }
-        }
-
-		public void callMe(String key, String value)
-		{
-            try
-			{
-				readResponseResolver_.resolve(responses_);
-            }
-            catch (Exception ex)
-            {
-                throw new RuntimeException(ex);
-            }
+        catch( IOException ex )
+        {
+            logger_.debug(LogUtil.throwableToString(ex));
         }
     }
+
 }

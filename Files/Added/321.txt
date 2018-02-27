@@ -1,6 +1,6 @@
-updateAliases();
+ts.reset();
 
-package org.apache.solr.common.cloud;
+package org.apache.lucene.analysis.synonym;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,543 +19,270 @@ package org.apache.solr.common.cloud;
  * limitations under the License.
  */
 
+import org.apache.lucene.analysis.TokenStream;
+import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
+import org.apache.lucene.analysis.util.*;
+
+import java.io.File;
 import java.io.IOException;
+import java.io.Reader;
+import java.io.StringReader;
 import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HashSet;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Map.Entry;
-import java.util.Set;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 
-import org.noggit.CharArr;
-import org.noggit.JSONParser;
-import org.noggit.JSONWriter;
-import org.noggit.ObjectBuilder;
-import org.apache.solr.common.SolrException;
-import org.apache.solr.common.SolrException.ErrorCode;
-import org.apache.solr.common.util.ByteUtils;
-import org.apache.zookeeper.KeeperException;
-import org.apache.zookeeper.WatchedEvent;
-import org.apache.zookeeper.Watcher;
-import org.apache.zookeeper.Watcher.Event.EventType;
-import org.apache.zookeeper.data.Stat;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-public class ZkStateReader {
-  private static Logger log = LoggerFactory.getLogger(ZkStateReader.class);
+/**
+ * Factory for {@link SlowSynonymFilter} (only used with luceneMatchVersion < 3.4)
+ * <pre class="prettyprint" >
+ * &lt;fieldType name="text_synonym" class="solr.TextField" positionIncrementGap="100"&gt;
+ *   &lt;analyzer&gt;
+ *     &lt;tokenizer class="solr.WhitespaceTokenizerFactory"/&gt;
+ *     &lt;filter class="solr.SynonymFilterFactory" synonyms="synonyms.txt" ignoreCase="false"
+ *             expand="true" tokenizerFactory="solr.WhitespaceTokenizerFactory"/&gt;
+ *   &lt;/analyzer&gt;
+ * &lt;/fieldType&gt;</pre>
+ * @deprecated (3.4) use {@link SynonymFilterFactory} instead. only for precise index backwards compatibility. this factory will be removed in Lucene 5.0
+ */
+@Deprecated
+final class SlowSynonymFilterFactory extends TokenFilterFactory implements ResourceLoaderAware {
+  private final String synonyms;
+  private final boolean ignoreCase;
+  private final boolean expand;
+  private final String tf;
   
-  public static final String BASE_URL_PROP = "base_url";
-  public static final String NODE_NAME_PROP = "node_name";
-  public static final String CORE_NODE_NAME_PROP = "core_node_name";
-  public static final String ROLES_PROP = "roles";
-  public static final String STATE_PROP = "state";
-  public static final String CORE_NAME_PROP = "core";
-  public static final String COLLECTION_PROP = "collection";
-  public static final String SHARD_ID_PROP = "shard";
-  public static final String NUM_SHARDS_PROP = "numShards";
-  public static final String LEADER_PROP = "leader";
-  
-  public static final String COLLECTIONS_ZKNODE = "/collections";
-  public static final String LIVE_NODES_ZKNODE = "/live_nodes";
-  public static final String ALIASES = "/aliases.json";
-  public static final String CLUSTER_STATE = "/clusterstate.json";
-  
-  public static final String RECOVERING = "recovering";
-  public static final String RECOVERY_FAILED = "recovery_failed";
-  public static final String ACTIVE = "active";
-  public static final String DOWN = "down";
-  public static final String SYNC = "sync";
-  
-  private volatile ClusterState clusterState;
+  public SlowSynonymFilterFactory(Map<String,String> args) {
+    super(args);
+    synonyms = require(args, "synonyms");
+    ignoreCase = getBoolean(args, "ignoreCase", false);
+    expand = getBoolean(args, "expand", true);
 
-  private static final long SOLRCLOUD_UPDATE_DELAY = Long.parseLong(System.getProperty("solrcloud.update.delay", "5000"));
-
-  public static final String LEADER_ELECT_ZKNODE = "/leader_elect";
-
-  public static final String SHARD_LEADERS_ZKNODE = "leaders";
-
-
-
-  
-  //
-  // convenience methods... should these go somewhere else?
-  //
-  public static byte[] toJSON(Object o) {
-    CharArr out = new CharArr();
-    new JSONWriter(out, 2).write(o); // indentation by default
-    return toUTF8(out);
-  }
-
-  public static byte[] toUTF8(CharArr out) {
-    byte[] arr = new byte[out.size() << 2]; // is 4x the real worst-case upper-bound?
-    int nBytes = ByteUtils.UTF16toUTF8(out, 0, out.size(), arr, 0);
-    return Arrays.copyOf(arr, nBytes);
-  }
-
-  public static Object fromJSON(byte[] utf8) {
-    // convert directly from bytes to chars
-    // and parse directly from that instead of going through
-    // intermediate strings or readers
-    CharArr chars = new CharArr();
-    ByteUtils.UTF8toUTF16(utf8, 0, utf8.length, chars);
-    JSONParser parser = new JSONParser(chars.getArray(), chars.getStart(), chars.length());
-    try {
-      return ObjectBuilder.getVal(parser);
-    } catch (IOException e) {
-      throw new RuntimeException(e); // should never happen w/o using real IO
-    }
-  }
-
-
-  private static class ZKTF implements ThreadFactory {
-    private static ThreadGroup tg = new ThreadGroup("ZkStateReader");
-    @Override
-    public Thread newThread(Runnable r) {
-      Thread td = new Thread(tg, r);
-      td.setDaemon(true);
-      return td;
-    }
-  }
-  private ScheduledExecutorService updateCloudExecutor = Executors.newScheduledThreadPool(1, new ZKTF());
-
-  private boolean clusterStateUpdateScheduled;
-
-  private SolrZkClient zkClient;
-  
-  private boolean closeClient = false;
-
-  private ZkCmdExecutor cmdExecutor;
-
-  private Aliases aliases = new Aliases();
-
-  private volatile boolean closed = false;
-
-  public ZkStateReader(SolrZkClient zkClient) {
-    this.zkClient = zkClient;
-    initZkCmdExecutor(zkClient.getZkClientTimeout());
-  }
-
-  public ZkStateReader(String zkServerAddress, int zkClientTimeout, int zkClientConnectTimeout) throws InterruptedException, TimeoutException, IOException {
-    closeClient = true;
-    initZkCmdExecutor(zkClientTimeout);
-    zkClient = new SolrZkClient(zkServerAddress, zkClientTimeout, zkClientConnectTimeout,
-        // on reconnect, reload cloud info
-        new OnReconnect() {
-
-          @Override
-          public void command() {
-            try {
-              ZkStateReader.this.createClusterStateWatchersAndUpdate();
-            } catch (KeeperException e) {
-              log.error("", e);
-              throw new ZooKeeperException(SolrException.ErrorCode.SERVER_ERROR,
-                  "", e);
-            } catch (InterruptedException e) {
-              // Restore the interrupted status
-              Thread.currentThread().interrupt();
-              log.error("", e);
-              throw new ZooKeeperException(SolrException.ErrorCode.SERVER_ERROR,
-                  "", e);
-            } 
-
-          }
-        });
-  }
-  
-  private void initZkCmdExecutor(int zkClientTimeout) {
-    // we must retry at least as long as the session timeout
-    cmdExecutor = new ZkCmdExecutor(zkClientTimeout);
-  }
-  
-  // load and publish a new CollectionInfo
-  public void updateClusterState(boolean immediate) throws KeeperException, InterruptedException {
-    updateClusterState(immediate, false);
-  }
-  
-  // load and publish a new CollectionInfo
-  public void updateLiveNodes() throws KeeperException, InterruptedException {
-    updateClusterState(true, true);
-  }
-  
-  public Aliases getAliases() {
-    return aliases;
-  }
-  
-  public synchronized void createClusterStateWatchersAndUpdate() throws KeeperException,
-      InterruptedException {
-    // We need to fetch the current cluster state and the set of live nodes
-    
-    synchronized (getUpdateLock()) {
-      cmdExecutor.ensureExists(CLUSTER_STATE, zkClient);
-      cmdExecutor.ensureExists(ALIASES, zkClient);
-      
-      log.info("Updating cluster state from ZooKeeper... ");
-      
-      zkClient.exists(CLUSTER_STATE, new Watcher() {
-        
-        @Override
-        public void process(WatchedEvent event) {
-          // session events are not change events,
-          // and do not remove the watcher
-          if (EventType.None.equals(event.getType())) {
-            return;
-          }
-          log.info("A cluster state change: {}, has occurred - updating... (live nodes size: {})", (event) , ZkStateReader.this.clusterState == null ? 0 : ZkStateReader.this.clusterState.getLiveNodes().size());
-          try {
-            
-            // delayed approach
-            // ZkStateReader.this.updateClusterState(false, false);
-            synchronized (ZkStateReader.this.getUpdateLock()) {
-              // remake watch
-              final Watcher thisWatch = this;
-              Stat stat = new Stat();
-              byte[] data = zkClient.getData(CLUSTER_STATE, thisWatch, stat ,
-                  true);
-              List<String> liveNodes = zkClient.getChildren(
-                  LIVE_NODES_ZKNODE, this, true);
-     
-              Set<String> liveNodesSet = new HashSet<String>();
-              liveNodesSet.addAll(liveNodes);
-              Set<String> ln = ZkStateReader.this.clusterState.getLiveNodes();
-              ClusterState clusterState = ClusterState.load(stat.getVersion(), data, ln);
-              // update volatile
-              ZkStateReader.this.clusterState = clusterState;
-            }
-          } catch (KeeperException e) {
-            if (e.code() == KeeperException.Code.SESSIONEXPIRED
-                || e.code() == KeeperException.Code.CONNECTIONLOSS) {
-              log.warn("ZooKeeper watch triggered, but Solr cannot talk to ZK");
-              return;
-            }
-            log.error("", e);
-            throw new ZooKeeperException(SolrException.ErrorCode.SERVER_ERROR,
-                "", e);
-          } catch (InterruptedException e) {
-            // Restore the interrupted status
-            Thread.currentThread().interrupt();
-            log.warn("", e);
-            return;
-          }
-        }
-        
-      }, true);
-    }
-   
-    
-    synchronized (ZkStateReader.this.getUpdateLock()) {
-      List<String> liveNodes = zkClient.getChildren(LIVE_NODES_ZKNODE,
-          new Watcher() {
-            
-            @Override
-            public void process(WatchedEvent event) {
-              // session events are not change events,
-              // and do not remove the watcher
-              if (EventType.None.equals(event.getType())) {
-                return;
-              }
-              try {
-                // delayed approach
-                // ZkStateReader.this.updateClusterState(false, true);
-                synchronized (ZkStateReader.this.getUpdateLock()) {
-                  List<String> liveNodes = zkClient.getChildren(
-                      LIVE_NODES_ZKNODE, this, true);
-                  log.info("Updating live nodes... ({})", liveNodes.size());
-                  Set<String> liveNodesSet = new HashSet<String>();
-                  liveNodesSet.addAll(liveNodes);
-                  ClusterState clusterState = new ClusterState(
-                      ZkStateReader.this.clusterState.getZkClusterStateVersion(),
-                      liveNodesSet, ZkStateReader.this.clusterState
-                          .getCollectionStates());
-                  ZkStateReader.this.clusterState = clusterState;
-                }
-              } catch (KeeperException e) {
-                if (e.code() == KeeperException.Code.SESSIONEXPIRED
-                    || e.code() == KeeperException.Code.CONNECTIONLOSS) {
-                  log.warn("ZooKeeper watch triggered, but Solr cannot talk to ZK");
-                  return;
-                }
-                log.error("", e);
-                throw new ZooKeeperException(
-                    SolrException.ErrorCode.SERVER_ERROR, "", e);
-              } catch (InterruptedException e) {
-                // Restore the interrupted status
-                Thread.currentThread().interrupt();
-                log.warn("", e);
-                return;
-              }
-            }
-            
-          }, true);
-    
-      Set<String> liveNodeSet = new HashSet<String>();
-      liveNodeSet.addAll(liveNodes);
-      ClusterState clusterState = ClusterState.load(zkClient, liveNodeSet);
-      this.clusterState = clusterState;
-      
-      zkClient.exists(ALIASES,
-          new Watcher() {
-            
-            @Override
-            public void process(WatchedEvent event) {
-              // session events are not change events,
-              // and do not remove the watcher
-              if (EventType.None.equals(event.getType())) {
-                return;
-              }
-              try {
-                synchronized (ZkStateReader.this.getUpdateLock()) {
-                  log.info("Updating aliases... ");
-
-                  // remake watch
-                  final Watcher thisWatch = this;
-                  Stat stat = new Stat();
-                  byte[] data = zkClient.getData(ALIASES, thisWatch, stat ,
-                      true);
-
-                  Aliases aliases = ClusterState.load(data);
-
-                  ZkStateReader.this.aliases = aliases;
-                }
-              } catch (KeeperException e) {
-                if (e.code() == KeeperException.Code.SESSIONEXPIRED
-                    || e.code() == KeeperException.Code.CONNECTIONLOSS) {
-                  log.warn("ZooKeeper watch triggered, but Solr cannot talk to ZK");
-                  return;
-                }
-                log.error("", e);
-                throw new ZooKeeperException(
-                    SolrException.ErrorCode.SERVER_ERROR, "", e);
-              } catch (InterruptedException e) {
-                // Restore the interrupted status
-                Thread.currentThread().interrupt();
-                log.warn("", e);
-                return;
-              }
-            }
-            
-          }, true);
+    tf = get(args, "tokenizerFactory");
+    if (!args.isEmpty()) {
+      throw new IllegalArgumentException("Unknown parameters: " + args);
     }
   }
   
-  
-  // load and publish a new CollectionInfo
-  private synchronized void updateClusterState(boolean immediate,
-      final boolean onlyLiveNodes) throws KeeperException,
-      InterruptedException {
-    // build immutable CloudInfo
+  public void inform(ResourceLoader loader) throws IOException {
+    TokenizerFactory tokFactory = null;
+    if( tf != null ){
+      tokFactory = loadTokenizerFactory(loader, tf);
+    }
+
+    Iterable<String> wlist=loadRules( synonyms, loader );
     
-    if (immediate) {
-      ClusterState clusterState;
-      synchronized (getUpdateLock()) {
-        List<String> liveNodes = zkClient.getChildren(LIVE_NODES_ZKNODE, null,
-            true);
-        Set<String> liveNodesSet = new HashSet<String>();
-        liveNodesSet.addAll(liveNodes);
-        
-        if (!onlyLiveNodes) {
-          log.info("Updating cloud state from ZooKeeper... ");
-          
-          clusterState = ClusterState.load(zkClient, liveNodesSet);
+    synMap = new SlowSynonymMap(ignoreCase);
+    parseRules(wlist, synMap, "=>", ",", expand,tokFactory);
+  }
+  
+  /**
+   * @return a list of all rules
+   */
+  protected Iterable<String> loadRules( String synonyms, ResourceLoader loader ) throws IOException {
+    List<String> wlist=null;
+    File synonymFile = new File(synonyms);
+    if (synonymFile.exists()) {
+      wlist = getLines(loader, synonyms);
+    } else  {
+      List<String> files = splitFileNames(synonyms);
+      wlist = new ArrayList<String>();
+      for (String file : files) {
+        List<String> lines = getLines(loader, file.trim());
+        wlist.addAll(lines);
+      }
+    }
+    return wlist;
+  }
+
+  private SlowSynonymMap synMap;
+
+  static void parseRules(Iterable<String> rules, SlowSynonymMap map, String mappingSep,
+    String synSep, boolean expansion, TokenizerFactory tokFactory) throws IOException {
+    int count=0;
+    for (String rule : rules) {
+      // To use regexes, we need an expression that specifies an odd number of chars.
+      // This can't really be done with string.split(), and since we need to
+      // do unescaping at some point anyway, we wouldn't be saving any effort
+      // by using regexes.
+
+      List<String> mapping = splitSmart(rule, mappingSep, false);
+
+      List<List<String>> source;
+      List<List<String>> target;
+
+      if (mapping.size() > 2) {
+        throw new IllegalArgumentException("Invalid Synonym Rule:" + rule);
+      } else if (mapping.size()==2) {
+        source = getSynList(mapping.get(0), synSep, tokFactory);
+        target = getSynList(mapping.get(1), synSep, tokFactory);
+      } else {
+        source = getSynList(mapping.get(0), synSep, tokFactory);
+        if (expansion) {
+          // expand to all arguments
+          target = source;
         } else {
-          log.info("Updating live nodes from ZooKeeper... ({})", liveNodesSet.size());
-          clusterState = new ClusterState(
-              ZkStateReader.this.clusterState.getZkClusterStateVersion(), liveNodesSet,
-              ZkStateReader.this.clusterState.getCollectionStates());
-        }
-        this.clusterState = clusterState;
-      }
-
-    } else {
-      if (clusterStateUpdateScheduled) {
-        log.info("Cloud state update for ZooKeeper already scheduled");
-        return;
-      }
-      log.info("Scheduling cloud state update from ZooKeeper...");
-      clusterStateUpdateScheduled = true;
-      updateCloudExecutor.schedule(new Runnable() {
-        
-        @Override
-        public void run() {
-          log.info("Updating cluster state from ZooKeeper...");
-          synchronized (getUpdateLock()) {
-            clusterStateUpdateScheduled = false;
-            ClusterState clusterState;
-            try {
-              List<String> liveNodes = zkClient.getChildren(LIVE_NODES_ZKNODE,
-                  null, true);
-              Set<String> liveNodesSet = new HashSet<String>();
-              liveNodesSet.addAll(liveNodes);
-              
-              if (!onlyLiveNodes) {
-                log.info("Updating cloud state from ZooKeeper... ");
-                
-                clusterState = ClusterState.load(zkClient, liveNodesSet);
-              } else {
-                log.info("Updating live nodes from ZooKeeper... ");
-                clusterState = new ClusterState(ZkStateReader.this.clusterState.getZkClusterStateVersion(), liveNodesSet, ZkStateReader.this.clusterState.getCollectionStates());
-              }
-              
-              ZkStateReader.this.clusterState = clusterState;
-              
-            } catch (KeeperException e) {
-              if (e.code() == KeeperException.Code.SESSIONEXPIRED
-                  || e.code() == KeeperException.Code.CONNECTIONLOSS) {
-                log.warn("ZooKeeper watch triggered, but Solr cannot talk to ZK");
-                return;
-              }
-              log.error("", e);
-              throw new ZooKeeperException(
-                  SolrException.ErrorCode.SERVER_ERROR, "", e);
-            } catch (InterruptedException e) {
-              // Restore the interrupted status
-              Thread.currentThread().interrupt();
-              log.error("", e);
-              throw new ZooKeeperException(
-                  SolrException.ErrorCode.SERVER_ERROR, "", e);
-            } 
-            // update volatile
-            ZkStateReader.this.clusterState = clusterState;
-          }
-        }
-      }, SOLRCLOUD_UPDATE_DELAY, TimeUnit.MILLISECONDS);
-    }
-    
-  }
-   
-  /**
-   * @return information about the cluster from ZooKeeper
-   */
-  public ClusterState getClusterState() {
-    return clusterState;
-  }
-  
-  public Object getUpdateLock() {
-    return this;
-  }
-
-  public void close() {
-    this.closed  = true;
-    if (closeClient) {
-      zkClient.close();
-    }
-  }
-  
-  abstract class RunnableWatcher implements Runnable {
-    Watcher watcher;
-    public RunnableWatcher(Watcher watcher){
-      this.watcher = watcher;
-    }
-
-  }
-  
-  public String getLeaderUrl(String collection, String shard, int timeout)
-      throws InterruptedException, KeeperException {
-    ZkCoreNodeProps props = new ZkCoreNodeProps(getLeaderRetry(collection,
-        shard, timeout));
-    return props.getCoreUrl();
-  }
-  
-  /**
-   * Get shard leader properties, with retry if none exist.
-   */
-  public Replica getLeaderRetry(String collection, String shard) throws InterruptedException {
-    return getLeaderRetry(collection, shard, 1000);
-  }
-
-  /**
-   * Get shard leader properties, with retry if none exist.
-   */
-  public Replica getLeaderRetry(String collection, String shard, int timeout) throws InterruptedException {
-    long timeoutAt = System.currentTimeMillis() + timeout;
-    while (System.currentTimeMillis() < timeoutAt && !closed) {
-      if (clusterState != null) {    
-        Replica replica = clusterState.getLeader(collection, shard);
-        if (replica != null && getClusterState().liveNodesContain(replica.getNodeName())) {
-          return replica;
+          // reduce to first argument
+          target = new ArrayList<List<String>>(1);
+          target.add(source.get(0));
         }
       }
-      Thread.sleep(50);
+
+      boolean includeOrig=false;
+      for (List<String> fromToks : source) {
+        count++;
+        for (List<String> toToks : target) {
+          map.add(fromToks,
+                  SlowSynonymMap.makeTokens(toToks),
+                  includeOrig,
+                  true
+          );
+        }
+      }
     }
-    throw new SolrException(ErrorCode.SERVICE_UNAVAILABLE, "No registered leader was found, collection:" + collection + " slice:" + shard);
   }
 
-  /**
-   * Get path where shard leader properties live in zookeeper.
-   */
-  public static String getShardLeadersPath(String collection, String shardId) {
-    return COLLECTIONS_ZKNODE + "/" + collection + "/"
-        + SHARD_LEADERS_ZKNODE + (shardId != null ? ("/" + shardId)
-        : "");
+  // a , b c , d e f => [[a],[b,c],[d,e,f]]
+  private static List<List<String>> getSynList(String str, String separator, TokenizerFactory tokFactory) throws IOException {
+    List<String> strList = splitSmart(str, separator, false);
+    // now split on whitespace to get a list of token strings
+    List<List<String>> synList = new ArrayList<List<String>>();
+    for (String toks : strList) {
+      List<String> tokList = tokFactory == null ?
+        splitWS(toks, true) : splitByTokenizer(toks, tokFactory);
+      synList.add(tokList);
+    }
+    return synList;
   }
 
-  public List<ZkCoreNodeProps> getReplicaProps(String collection,
-      String shardId, String thisCoreNodeName, String coreName) {
-    return getReplicaProps(collection, shardId, thisCoreNodeName, coreName, null);
+  private static List<String> splitByTokenizer(String source, TokenizerFactory tokFactory) throws IOException{
+    StringReader reader = new StringReader( source );
+    TokenStream ts = loadTokenizer(tokFactory, reader);
+    List<String> tokList = new ArrayList<String>();
+    try {
+      CharTermAttribute termAtt = ts.addAttribute(CharTermAttribute.class);
+      while (ts.incrementToken()){
+        if( termAtt.length() > 0 )
+          tokList.add( termAtt.toString() );
+      }
+    } finally{
+      reader.close();
+    }
+    return tokList;
+  }
+
+  private TokenizerFactory loadTokenizerFactory(ResourceLoader loader, String cname) throws IOException {
+    Map<String,String> args = new HashMap<String,String>();
+    args.put("luceneMatchVersion", getLuceneMatchVersion().toString());
+    Class<? extends TokenizerFactory> clazz = loader.findClass(cname, TokenizerFactory.class);
+    try {
+      TokenizerFactory tokFactory = clazz.getConstructor(Map.class).newInstance(args);
+      if (tokFactory instanceof ResourceLoaderAware) {
+        ((ResourceLoaderAware) tokFactory).inform(loader);
+      }
+      return tokFactory;
+    } catch (Exception e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  private static TokenStream loadTokenizer(TokenizerFactory tokFactory, Reader reader){
+    return tokFactory.create( reader );
+  }
+
+  public SlowSynonymMap getSynonymMap() {
+    return synMap;
+  }
+
+  public SlowSynonymFilter create(TokenStream input) {
+    return new SlowSynonymFilter(input,synMap);
   }
   
-  public List<ZkCoreNodeProps> getReplicaProps(String collection,
-      String shardId, String thisCoreNodeName, String coreName, String mustMatchStateFilter) {
-    return getReplicaProps(collection, shardId, thisCoreNodeName, coreName, mustMatchStateFilter, null);
-  }
-  
-  public List<ZkCoreNodeProps> getReplicaProps(String collection,
-      String shardId, String thisCoreNodeName, String coreName, String mustMatchStateFilter, String mustNotMatchStateFilter) {
-    ClusterState clusterState = this.clusterState;
-    if (clusterState == null) {
-      return null;
-    }
-    Map<String,Slice> slices = clusterState.getSlicesMap(collection);
-    if (slices == null) {
-      throw new ZooKeeperException(ErrorCode.BAD_REQUEST,
-          "Could not find collection in zk: " + collection + " "
-              + clusterState.getCollections());
-    }
-    
-    Slice replicas = slices.get(shardId);
-    if (replicas == null) {
-      throw new ZooKeeperException(ErrorCode.BAD_REQUEST, "Could not find shardId in zk: " + shardId);
-    }
-    
-    Map<String,Replica> shardMap = replicas.getReplicasMap();
-    List<ZkCoreNodeProps> nodes = new ArrayList<ZkCoreNodeProps>(shardMap.size());
-    for (Entry<String,Replica> entry : shardMap.entrySet()) {
-      ZkCoreNodeProps nodeProps = new ZkCoreNodeProps(entry.getValue());
-      
-      String coreNodeName = entry.getValue().getName();
-      
-      if (clusterState.liveNodesContain(nodeProps.getNodeName()) && !coreNodeName.equals(thisCoreNodeName)) {
-        if (mustMatchStateFilter == null || mustMatchStateFilter.equals(nodeProps.getState())) {
-          if (mustNotMatchStateFilter == null || !mustNotMatchStateFilter.equals(nodeProps.getState())) {
-            nodes.add(nodeProps);
+  public static List<String> splitWS(String s, boolean decode) {
+    ArrayList<String> lst = new ArrayList<String>(2);
+    StringBuilder sb = new StringBuilder();
+    int pos=0, end=s.length();
+    while (pos < end) {
+      char ch = s.charAt(pos++);
+      if (Character.isWhitespace(ch)) {
+        if (sb.length() > 0) {
+          lst.add(sb.toString());
+          sb=new StringBuilder();
+        }
+        continue;
+      }
+
+      if (ch=='\\') {
+        if (!decode) sb.append(ch);
+        if (pos>=end) break;  // ERROR, or let it go?
+        ch = s.charAt(pos++);
+        if (decode) {
+          switch(ch) {
+            case 'n' : ch='\n'; break;
+            case 't' : ch='\t'; break;
+            case 'r' : ch='\r'; break;
+            case 'b' : ch='\b'; break;
+            case 'f' : ch='\f'; break;
           }
         }
       }
-    }
-    if (nodes.size() == 0) {
-      // no replicas - go local
-      return null;
+
+      sb.append(ch);
     }
 
-    return nodes;
-  }
+    if (sb.length() > 0) {
+      lst.add(sb.toString());
+    }
 
-  public SolrZkClient getZkClient() {
-    return zkClient;
-  }
-
-  public void updateAliases() throws KeeperException, InterruptedException {
-    byte[] data = zkClient.getData(ALIASES, null, null, true);
-
-    Aliases aliases = ClusterState.load(data);
-
-    ZkStateReader.this.aliases = aliases;
+    return lst;
   }
   
+  /** Splits a backslash escaped string on the separator.
+   * <p>
+   * Current backslash escaping supported:
+   * <br> \n \t \r \b \f are escaped the same as a Java String
+   * <br> Other characters following a backslash are produced verbatim (\c => c)
+   *
+   * @param s  the string to split
+   * @param separator the separator to split on
+   * @param decode decode backslash escaping
+   */
+  public static List<String> splitSmart(String s, String separator, boolean decode) {
+    ArrayList<String> lst = new ArrayList<String>(2);
+    StringBuilder sb = new StringBuilder();
+    int pos=0, end=s.length();
+    while (pos < end) {
+      if (s.startsWith(separator,pos)) {
+        if (sb.length() > 0) {
+          lst.add(sb.toString());
+          sb=new StringBuilder();
+        }
+        pos+=separator.length();
+        continue;
+      }
+
+      char ch = s.charAt(pos++);
+      if (ch=='\\') {
+        if (!decode) sb.append(ch);
+        if (pos>=end) break;  // ERROR, or let it go?
+        ch = s.charAt(pos++);
+        if (decode) {
+          switch(ch) {
+            case 'n' : ch='\n'; break;
+            case 't' : ch='\t'; break;
+            case 'r' : ch='\r'; break;
+            case 'b' : ch='\b'; break;
+            case 'f' : ch='\f'; break;
+          }
+        }
+      }
+
+      sb.append(ch);
+    }
+
+    if (sb.length() > 0) {
+      lst.add(sb.toString());
+    }
+
+    return lst;
+  }
 }

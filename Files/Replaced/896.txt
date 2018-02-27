@@ -1,4 +1,4 @@
-List<InetAddress> endpoints = StorageService.instance.getLiveNaturalEndpoints(command.table, command.key);
+if (cf == null || cf.getColumnNames().size() == 0)
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one
@@ -8,9 +8,9 @@ List<InetAddress> endpoints = StorageService.instance.getLiveNaturalEndpoints(co
  * to you under the Apache License, Version 2.0 (the
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
+ * <p/>
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * <p/>
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -18,106 +18,221 @@ List<InetAddress> endpoints = StorageService.instance.getLiveNaturalEndpoints(co
  * limitations under the License.
  */
 
-package org.apache.cassandra.db;
-
-import java.io.ByteArrayInputStream;
-import java.io.DataInputStream;
-import java.io.IOException;
-import java.util.List;
+package org.apache.cassandra.db.migration;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.io.util.DataOutputBuffer;
-import java.net.InetAddress;
-import org.apache.cassandra.net.IVerbHandler;
-import org.apache.cassandra.net.Message;
-import org.apache.cassandra.net.MessagingService;
-import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.config.KSMetaData;
+import org.apache.cassandra.db.ColumnFamily;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.CompactionManager;
+import org.apache.cassandra.db.IColumn;
+import org.apache.cassandra.db.RowMutation;
+import org.apache.cassandra.db.Table;
+import org.apache.cassandra.db.filter.NamesQueryFilter;
+import org.apache.cassandra.db.filter.QueryFilter;
+import org.apache.cassandra.db.filter.QueryPath;
+import org.apache.cassandra.db.filter.SliceQueryFilter;
+import org.apache.cassandra.gms.ApplicationState;
+import org.apache.cassandra.gms.Gossiper;
+import org.apache.cassandra.io.ICompactSerializer;
+import org.apache.cassandra.service.MigrationManager;
+import org.apache.cassandra.utils.UUIDGen;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import org.apache.log4j.Logger;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.util.Collection;
+import java.util.UUID;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
 
-public class ReadVerbHandler implements IVerbHandler
+/**
+ * A migration represents a single metadata mutation (cf dropped, added, etc.).  Migrations can be applied locally, or
+ * serialized and sent to another machine where it can be applied there. Each migration has a version represented by
+ * a TimeUUID that can be used to look up both the Migration itself (see getLocalMigrations) as well as a serialization
+ * of the Keyspace definition that was modified.
+ * 
+ * There are three parts to a migration (think of it as a schema update):
+ * 1. data is written to the schema cf.
+ * 2. the migration is serialized to the migrations cf.
+ * 3. updated models are applied to the cassandra instance.
+ * 
+ * Since steps 1, 2 and 3 are not committed atomically, care should be taken to ensure that a node/cluster is reasonably
+ * quiescent with regard to the keyspace or columnfamily whose schema is being modified.
+ * 
+ * Each class that extends Migration is required to implement a constructor that takes a DataInputStream as its only
+ * argument.  Also, each implementation must take care to ensure that its serialization can be deserialized.  For 
+ * example, it is required that the class name be serialized first always.
+ */
+public abstract class Migration
 {
-    protected static class ReadContext
-    {
-        protected ByteArrayInputStream bufIn_;
-        protected DataOutputBuffer bufOut_ = new DataOutputBuffer();
-    }
-
-    private static Logger logger_ = Logger.getLogger( ReadVerbHandler.class );
-    /* We use this so that we can reuse the same row mutation context for the mutation. */
-    private static ThreadLocal<ReadVerbHandler.ReadContext> tls_ = new InheritableThreadLocal<ReadVerbHandler.ReadContext>();
+    private static final Logger logger = LoggerFactory.getLogger(Migration.class);
     
-    protected static ReadVerbHandler.ReadContext getCurrentReadContext()
+    public static final String MIGRATIONS_CF = "Migrations";
+    public static final String SCHEMA_CF = "Schema";
+    public static final String MIGRATIONS_KEY = "Migrations Key";
+    public static final String LAST_MIGRATION_KEY = "Last Migration";
+    
+    protected RowMutation rm;
+    protected final UUID newVersion;
+    protected UUID lastVersion;
+    
+    Migration(UUID newVersion, UUID lastVersion)
     {
-        return tls_.get();
+        this.newVersion = newVersion;
+        this.lastVersion = lastVersion;
     }
     
-    protected static void setCurrentReadContext(ReadVerbHandler.ReadContext readContext)
+    /** apply changes */
+    public final void apply() throws IOException
     {
-        tls_.set(readContext);
-    }
-
-    public void doVerb(Message message)
-    {
-        byte[] body = message.getMessageBody();
-        /* Obtain a Read Context from TLS */
-        ReadContext readCtx = tls_.get();
-        if ( readCtx == null )
+        // ensure migration is serial. don't apply unless the previous version matches.
+        if (!DatabaseDescriptor.getDefsVersion().equals(lastVersion))
+            throw new IOException("Previous version mismatch. cannot apply.");
+        // write to schema
+        assert rm != null;
+        rm.apply();
+        
+        // write migration.
+        long now = System.currentTimeMillis();
+        byte[] buf = getBytes();
+        RowMutation migration = new RowMutation(Table.DEFINITIONS, MIGRATIONS_KEY);
+        migration.add(new QueryPath(MIGRATIONS_CF, null, UUIDGen.decompose(newVersion)), buf, now);
+        migration.apply();
+        
+        // note that we storing this in the system table, which is not replicated, instead of the definitions table, which is.
+        logger.debug("Applying migration " + newVersion.toString());
+        migration = new RowMutation(Table.DEFINITIONS, LAST_MIGRATION_KEY);
+        migration.add(new QueryPath(SCHEMA_CF, null, LAST_MIGRATION_KEY.getBytes()), UUIDGen.decompose(newVersion), now);
+        migration.apply();
+        
+        // flush changes out of memtables so we don't need to rely on the commit log.
+        for (Future f : Table.open(Table.DEFINITIONS).flush())
         {
-            readCtx = new ReadContext();
-            tls_.set(readCtx);
+            try
+            {
+                f.get();
+            }
+            catch (InterruptedException e)
+            {
+                throw new IOException(e);
+            }
+            catch (ExecutionException e)
+            {
+                throw new IOException(e);
+            }
         }
-        readCtx.bufIn_ = new ByteArrayInputStream(body);
-
+        
+        applyModels(); 
+    }
+    
+    public final void announce()
+    {
+        // immediate notification for esiting nodes.
+        MigrationManager.announce(newVersion, Gossiper.instance.getLiveMembers());
+        // this is for notifying nodes as they arrive in the cluster.
+        Gossiper.instance.addLocalApplicationState(MigrationManager.MIGRATION_STATE, new ApplicationState(newVersion.toString()));
+    }
+    
+    public static UUID getLastMigrationId()
+    {
+        Table defs = Table.open(Table.DEFINITIONS);
+        ColumnFamilyStore cfStore = defs.getColumnFamilyStore(SCHEMA_CF);
+        QueryFilter filter = QueryFilter.getNamesFilter(LAST_MIGRATION_KEY, new QueryPath(SCHEMA_CF), LAST_MIGRATION_KEY.getBytes());
+        ColumnFamily cf = cfStore.getColumnFamily(filter);
+        if (cf.getColumnNames().size() == 0)
+            return null;
+        else
+            return UUIDGen.makeType1UUID(cf.getColumn(LAST_MIGRATION_KEY.getBytes()).value());
+    }
+    
+    /** keep in mind that applyLive might happen on another machine */
+    abstract void applyModels() throws IOException;
+    
+    /** serialize migration */
+    public abstract ICompactSerializer getSerializer();
+    
+    private byte[] getBytes() throws IOException
+    {
+        ByteArrayOutputStream bout = new ByteArrayOutputStream();
+        DataOutputStream dout = new DataOutputStream(bout);
+        dout.writeUTF(getClass().getName());
+        getSerializer().serialize(this, dout);
+        dout.close();
+        return bout.toByteArray();
+    }
+    
+    public UUID getVersion()
+    {
+        return newVersion;
+    }
+    
+    static RowMutation makeDefinitionMutation(KSMetaData add, KSMetaData remove, UUID versionId) throws IOException
+    {
+        final long now = System.currentTimeMillis();
+        RowMutation rm = new RowMutation(Table.DEFINITIONS, versionId.toString());
+        if (remove != null)
+            rm.delete(new QueryPath(SCHEMA_CF, null, remove.name.getBytes()), System.currentTimeMillis());
+        if (add != null)
+            rm.add(new QueryPath(SCHEMA_CF, null, add.name.getBytes()), KSMetaData.serialize(add), now);
+        return rm;
+    }
+    
+    static void cleanupDeadFiles(boolean wait)
+    {
+        Future cleanup = CompactionManager.instance.submitGraveyardCleanup();
+        if (wait)
+        {
+            // notify the compaction manager that it needs to clean up the dropped cf files.
+            try
+            {
+                cleanup.get();
+            }
+            catch (InterruptedException e)
+            {
+                throw new RuntimeException(e);
+            }
+            catch (ExecutionException e)
+            {
+                throw new RuntimeException(e);
+            }
+        } 
+    }
+    
+    /** deserialize any Migration. */
+    public static Migration deserialize(InputStream in) throws IOException
+    {
+        DataInputStream din = new DataInputStream(in);
+        String className = din.readUTF();
         try
         {
-            if (StorageService.instance.isBootstrapMode())
-            {
-                /* Don't service reads! */
-                throw new RuntimeException("Cannot service reads while bootstrapping!");
-            }
-            ReadCommand command = ReadCommand.serializer().deserialize(new DataInputStream(readCtx.bufIn_));
-            Table table = Table.open(command.table);
-            Row row = command.getRow(table);
-            ReadResponse readResponse;
-            if (command.isDigestQuery())
-            {
-                if (logger_.isDebugEnabled())
-                    logger_.debug("digest is " + FBUtilities.bytesToHex(ColumnFamily.digest(row.cf)));
-                readResponse = new ReadResponse(ColumnFamily.digest(row.cf));
-            }
-            else
-            {
-                readResponse = new ReadResponse(row);
-            }
-            readResponse.setIsDigestQuery(command.isDigestQuery());
-            /* serialize the ReadResponseMessage. */
-            readCtx.bufOut_.reset();
-
-            ReadResponse.serializer().serialize(readResponse, readCtx.bufOut_);
-
-            byte[] bytes = new byte[readCtx.bufOut_.getLength()];
-            System.arraycopy(readCtx.bufOut_.getData(), 0, bytes, 0, bytes.length);
-
-            Message response = message.getReply(FBUtilities.getLocalAddress(), bytes);
-            if (logger_.isDebugEnabled())
-              logger_.debug("Read key " + command.key + "; sending response to " + message.getMessageId() + "@" + message.getFrom());
-            MessagingService.instance.sendOneWay(response, message.getFrom());
-
-            /* Do read repair if header of the message says so */
-            if (message.getHeader(ReadCommand.DO_REPAIR) != null)
-            {
-                List<InetAddress> endpoints = StorageService.instance.getLiveNaturalEndpoints(command.key);
-                /* Remove the local storage endpoint from the list. */
-                endpoints.remove(FBUtilities.getLocalAddress());
-                if (endpoints.size() > 0 && DatabaseDescriptor.getConsistencyCheck())
-                    StorageService.instance.doConsistencyCheck(row, endpoints, command);
-            }
+            Class migrationClass = Class.forName(className);
+            Field serializerField = migrationClass.getDeclaredField("serializer");
+            serializerField.setAccessible(true);
+            ICompactSerializer serializer = (ICompactSerializer)serializerField.get(migrationClass);
+            return (Migration)serializer.deserialize(din);
         }
-        catch (IOException ex)
+        catch (Exception e)
         {
-            throw new RuntimeException(ex);
+            throw new IOException(e);
         }
     }
+    
+    /** load serialized migrations. */
+    public static Collection<IColumn> getLocalMigrations(UUID start, UUID end)
+    {
+        Table defs = Table.open(Table.DEFINITIONS);
+        ColumnFamilyStore cfStore = defs.getColumnFamilyStore(Migration.MIGRATIONS_CF);
+        QueryFilter filter = QueryFilter.getSliceFilter(Migration.MIGRATIONS_KEY, new QueryPath(MIGRATIONS_CF), UUIDGen.decompose(start), UUIDGen.decompose(end), null, false, 1000);
+        ColumnFamily cf = cfStore.getColumnFamily(filter);
+        return cf.getSortedColumns();
+    }
+    
 }

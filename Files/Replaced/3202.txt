@@ -1,6 +1,6 @@
-public boolean incrementToken() {
+private int parseIntAt(BytesRef bytes, int offset, CharsRef scratch) {
 
-package org.apache.lucene.analysis;
+package org.apache.lucene.codecs.simpletext;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,106 +19,169 @@ package org.apache.lucene.analysis;
  * limitations under the License.
  */
 
-
 import java.io.IOException;
+import java.util.BitSet;
+import java.util.Collection;
 
-import org.apache.lucene.analysis.tokenattributes.OffsetAttribute;
-import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.TextField;
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.MultiFields;
-import org.apache.lucene.index.DocsAndPositionsEnum;
-import org.apache.lucene.index.RandomIndexWriter;
-import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.codecs.LiveDocsFormat;
+import org.apache.lucene.index.IndexFileNames;
+import org.apache.lucene.index.SegmentInfoPerCommit;
 import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.IOContext;
+import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.util.ArrayUtil;
+import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.CharsRef;
+import org.apache.lucene.util.IOUtils;
+import org.apache.lucene.util.MutableBits;
+import org.apache.lucene.util.StringHelper;
+import org.apache.lucene.util.UnicodeUtil;
 
-public class TestCachingTokenFilter extends BaseTokenStreamTestCase {
-  private String[] tokens = new String[] {"term1", "term2", "term3", "term2"};
+/**
+ * reads/writes plaintext live docs
+ * <p>
+ * <b><font color="red">FOR RECREATIONAL USE ONLY</font></B>
+ * @lucene.experimental
+ */
+public class SimpleTextLiveDocsFormat extends LiveDocsFormat {
+
+  static final String LIVEDOCS_EXTENSION = "liv";
   
-  public void testCaching() throws IOException {
-    Directory dir = newDirectory();
-    RandomIndexWriter writer = new RandomIndexWriter(random(), dir);
-    Document doc = new Document();
-    TokenStream stream = new TokenStream() {
-      private int index = 0;
-      private CharTermAttribute termAtt = addAttribute(CharTermAttribute.class);
-      private OffsetAttribute offsetAtt = addAttribute(OffsetAttribute.class);
+  final static BytesRef SIZE             = new BytesRef("size ");
+  final static BytesRef DOC              = new BytesRef("  doc ");
+  final static BytesRef END              = new BytesRef("END");
+  
+  @Override
+  public MutableBits newLiveDocs(int size) throws IOException {
+    return new SimpleTextMutableBits(size);
+  }
+
+  @Override
+  public MutableBits newLiveDocs(Bits existing) throws IOException {
+    final SimpleTextBits bits = (SimpleTextBits) existing;
+    return new SimpleTextMutableBits((BitSet)bits.bits.clone(), bits.size);
+  }
+
+  @Override
+  public Bits readLiveDocs(Directory dir, SegmentInfoPerCommit info, IOContext context) throws IOException {
+    assert info.hasDeletions();
+    BytesRef scratch = new BytesRef();
+    CharsRef scratchUTF16 = new CharsRef();
+    
+    String fileName = IndexFileNames.fileNameFromGeneration(info.info.name, LIVEDOCS_EXTENSION, info.getDelGen());
+    IndexInput in = null;
+    boolean success = false;
+    try {
+      in = dir.openInput(fileName, context);
       
-      @Override
-      public boolean incrementToken() throws IOException {
-        if (index == tokens.length) {
-          return false;
-        } else {
-          clearAttributes();
-          termAtt.append(tokens[index++]);
-          offsetAtt.setOffset(0,0);
-          return true;
-        }        
+      SimpleTextUtil.readLine(in, scratch);
+      assert StringHelper.startsWith(scratch, SIZE);
+      int size = parseIntAt(scratch, SIZE.length, scratchUTF16);
+      
+      BitSet bits = new BitSet(size);
+      
+      SimpleTextUtil.readLine(in, scratch);
+      while (!scratch.equals(END)) {
+        assert StringHelper.startsWith(scratch, DOC);
+        int docid = parseIntAt(scratch, DOC.length, scratchUTF16);
+        bits.set(docid);
+        SimpleTextUtil.readLine(in, scratch);
       }
       
-    };
-    
-    stream = new CachingTokenFilter(stream);
-    
-    doc.add(new TextField("preanalyzed", stream));
-    
-    // 1) we consume all tokens twice before we add the doc to the index
-    checkTokens(stream);
-    stream.reset();  
-    checkTokens(stream);
-    
-    // 2) now add the document to the index and verify if all tokens are indexed
-    //    don't reset the stream here, the DocumentWriter should do that implicitly
-    writer.addDocument(doc);
-    
-    IndexReader reader = writer.getReader();
-    DocsAndPositionsEnum termPositions = MultiFields.getTermPositionsEnum(reader,
-                                                                          MultiFields.getLiveDocs(reader),
-                                                                          "preanalyzed",
-                                                                          new BytesRef("term1"),
-                                                                          false);
-    assertTrue(termPositions.nextDoc() != DocIdSetIterator.NO_MORE_DOCS);
-    assertEquals(1, termPositions.freq());
-    assertEquals(0, termPositions.nextPosition());
-
-    termPositions = MultiFields.getTermPositionsEnum(reader,
-                                                     MultiFields.getLiveDocs(reader),
-                                                     "preanalyzed",
-                                                     new BytesRef("term2"),
-                                                     false);
-    assertTrue(termPositions.nextDoc() != DocIdSetIterator.NO_MORE_DOCS);
-    assertEquals(2, termPositions.freq());
-    assertEquals(1, termPositions.nextPosition());
-    assertEquals(3, termPositions.nextPosition());
-    
-    termPositions = MultiFields.getTermPositionsEnum(reader,
-                                                     MultiFields.getLiveDocs(reader),
-                                                     "preanalyzed",
-                                                     new BytesRef("term3"),
-                                                     false);
-    assertTrue(termPositions.nextDoc() != DocIdSetIterator.NO_MORE_DOCS);
-    assertEquals(1, termPositions.freq());
-    assertEquals(2, termPositions.nextPosition());
-    reader.close();
-    writer.close();
-    // 3) reset stream and consume tokens again
-    stream.reset();
-    checkTokens(stream);
-    dir.close();
+      success = true;
+      return new SimpleTextBits(bits, size);
+    } finally {
+      if (success) {
+        IOUtils.close(in);
+      } else {
+        IOUtils.closeWhileHandlingException(in);
+      }
+    }
   }
   
-  private void checkTokens(TokenStream stream) throws IOException {
-    int count = 0;
+  private int parseIntAt(BytesRef bytes, int offset, CharsRef scratch) throws IOException {
+    UnicodeUtil.UTF8toUTF16(bytes.bytes, bytes.offset+offset, bytes.length-offset, scratch);
+    return ArrayUtil.parseInt(scratch.chars, 0, scratch.length);
+  }
+
+  @Override
+  public void writeLiveDocs(MutableBits bits, Directory dir, SegmentInfoPerCommit info, int newDelCount, IOContext context) throws IOException {
+    BitSet set = ((SimpleTextBits) bits).bits;
+    int size = bits.length();
+    BytesRef scratch = new BytesRef();
     
-    CharTermAttribute termAtt = stream.getAttribute(CharTermAttribute.class);
-    while (stream.incrementToken()) {
-      assertTrue(count < tokens.length);
-      assertEquals(tokens[count], termAtt.toString());
-      count++;
+    String fileName = IndexFileNames.fileNameFromGeneration(info.info.name, LIVEDOCS_EXTENSION, info.getNextDelGen());
+    IndexOutput out = null;
+    boolean success = false;
+    try {
+      out = dir.createOutput(fileName, context);
+      SimpleTextUtil.write(out, SIZE);
+      SimpleTextUtil.write(out, Integer.toString(size), scratch);
+      SimpleTextUtil.writeNewline(out);
+      
+      for (int i = set.nextSetBit(0); i >= 0; i=set.nextSetBit(i + 1)) { 
+        SimpleTextUtil.write(out, DOC);
+        SimpleTextUtil.write(out, Integer.toString(i), scratch);
+        SimpleTextUtil.writeNewline(out);
+      }
+      
+      SimpleTextUtil.write(out, END);
+      SimpleTextUtil.writeNewline(out);
+      success = true;
+    } finally {
+      if (success) {
+        IOUtils.close(out);
+      } else {
+        IOUtils.closeWhileHandlingException(out);
+      }
+    }
+  }
+
+  @Override
+  public void files(SegmentInfoPerCommit info, Collection<String> files) throws IOException {
+    if (info.hasDeletions()) {
+      files.add(IndexFileNames.fileNameFromGeneration(info.info.name, LIVEDOCS_EXTENSION, info.getDelGen()));
+    }
+  }
+  
+  // read-only
+  static class SimpleTextBits implements Bits {
+    final BitSet bits;
+    final int size;
+    
+    SimpleTextBits(BitSet bits, int size) {
+      this.bits = bits;
+      this.size = size;
     }
     
-    assertEquals(tokens.length, count);
+    @Override
+    public boolean get(int index) {
+      return bits.get(index);
+    }
+
+    @Override
+    public int length() {
+      return size;
+    }
+  }
+  
+  // read-write
+  static class SimpleTextMutableBits extends SimpleTextBits implements MutableBits {
+
+    SimpleTextMutableBits(int size) {
+      this(new BitSet(size), size);
+      bits.set(0, size);
+    }
+    
+    SimpleTextMutableBits(BitSet bits, int size) {
+      super(bits, size);
+    }
+    
+    @Override
+    public void clear(int bit) {
+      bits.clear(bit);
+    }
   }
 }

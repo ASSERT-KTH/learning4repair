@@ -1,6 +1,4 @@
-if (field == null || !field.equals(f)) {
-
-package org.apache.lucene.search;
+result.add(rs.getLong(2));
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,574 +17,710 @@ package org.apache.lucene.search;
  * limitations under the License.
  */
 
-import java.io.IOException;
-import java.util.*;
+package org.apache.mahout.cf.taste.impl.model.jdbc;
 
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.Term;
-import org.apache.lucene.index.DocsEnum;
-import org.apache.lucene.index.MultiFields;
-import org.apache.lucene.index.DocsAndPositionsEnum;
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.ToStringUtils;
-import org.apache.lucene.util.PriorityQueue;
-import org.apache.lucene.util.Bits;
+import org.apache.mahout.cf.taste.common.NoSuchUserException;
+import org.apache.mahout.cf.taste.common.Refreshable;
+import org.apache.mahout.cf.taste.common.TasteException;
+import org.apache.mahout.cf.taste.impl.common.Cache;
+import org.apache.mahout.cf.taste.impl.common.FastByIDMap;
+import org.apache.mahout.cf.taste.impl.common.FastIDSet;
+import org.apache.mahout.cf.taste.impl.common.IOUtils;
+import org.apache.mahout.cf.taste.impl.common.LongPrimitiveIterator;
+import org.apache.mahout.cf.taste.impl.common.Retriever;
+import org.apache.mahout.cf.taste.impl.common.SkippingIterator;
+import org.apache.mahout.cf.taste.impl.common.jdbc.AbstractJDBCComponent;
+import org.apache.mahout.cf.taste.impl.model.GenericItemPreferenceArray;
+import org.apache.mahout.cf.taste.impl.model.GenericPreference;
+import org.apache.mahout.cf.taste.impl.model.GenericUserPreferenceArray;
+import org.apache.mahout.cf.taste.model.DataModel;
+import org.apache.mahout.cf.taste.model.JDBCDataModel;
+import org.apache.mahout.cf.taste.model.Preference;
+import org.apache.mahout.cf.taste.model.PreferenceArray;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.sql.DataSource;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+import java.util.NoSuchElementException;
 
 /**
- * MultiPhraseQuery is a generalized version of PhraseQuery, with an added
- * method {@link #add(Term[])}.
- * To use this class, to search for the phrase "Microsoft app*" first use
- * add(Term) on the term "Microsoft", then find all terms that have "app" as
- * prefix using IndexReader.terms(Term), and use MultiPhraseQuery.add(Term[]
- * terms) to add them to the query.
+ * <p>An abstract superclass for JDBC-related {@link DataModel} implementations, providing most of the common
+ * functionality that any such implementation would need.</p>
  *
- * @version 1.0
+ * <p>Performance will be a concern with any JDBC-based {@link DataModel}. There are going to be lots of simultaneous
+ * reads and some writes to one table. Make sure the table is set up optimally -- for example, you'll want to establish
+ * indexes.</p>
+ *
+ * <p>You'll also want to use connection pooling of some kind. Most J2EE containers like Tomcat provide connection
+ * pooling, so make sure the {@link DataSource} it exposes is using pooling. Outside a J2EE container, you can use
+ * packages like Jakarta's <a href="http://jakarta.apache.org/commons/dbcp/">DBCP</a> to create a {@link DataSource} on
+ * top of your database whose {@link Connection}s are pooled.</p>
  */
-public class MultiPhraseQuery extends Query {
-  private String field;
-  private ArrayList<Term[]> termArrays = new ArrayList<Term[]>();
-  private ArrayList<Integer> positions = new ArrayList<Integer>();
+public abstract class AbstractJDBCDataModel extends AbstractJDBCComponent implements JDBCDataModel {
 
-  private int slop = 0;
+  private static final Logger log = LoggerFactory.getLogger(AbstractJDBCDataModel.class);
 
-  /** Sets the phrase slop for this query.
-   * @see PhraseQuery#setSlop(int)
-   */
-  public void setSlop(int s) { slop = s; }
+  public static final String DEFAULT_PREFERENCE_TABLE = "taste_preferences";
+  public static final String DEFAULT_USER_ID_COLUMN = "user_id";
+  public static final String DEFAULT_ITEM_ID_COLUMN = "item_id";
+  public static final String DEFAULT_PREFERENCE_COLUMN = "preference";
 
-  /** Sets the phrase slop for this query.
-   * @see PhraseQuery#getSlop()
-   */
-  public int getSlop() { return slop; }
+  private final DataSource dataSource;
+  private final String preferenceTable;
+  private final String userIDColumn;
+  private final String itemIDColumn;
+  private final String preferenceColumn;
+  private final String getPreferenceSQL;
+  private final String getUserSQL;
+  private final String getAllUsersSQL;
+  private final String getNumItemsSQL;
+  private final String getNumUsersSQL;
+  private final String setPreferenceSQL;
+  private final String removePreferenceSQL;
+  private final String getUsersSQL;
+  private final String getItemsSQL;
+  private final String getPrefsForItemSQL;
+  private final String getNumPreferenceForItemSQL;
+  private final String getNumPreferenceForItemsSQL;
+  private int cachedNumUsers;
+  private int cachedNumItems;
+  private final Cache<Long, Integer> itemPrefCounts;
 
-  /** Add a single term at the next position in the phrase.
-   * @see PhraseQuery#add(Term)
-   */
-  public void add(Term term) { add(new Term[]{term}); }
-
-  /** Add multiple terms at the next position in the phrase.  Any of the terms
-   * may match.
-   *
-   * @see PhraseQuery#add(Term)
-   */
-  public void add(Term[] terms) {
-    int position = 0;
-    if (positions.size() > 0)
-      position = positions.get(positions.size()-1).intValue() + 1;
-
-    add(terms, position);
+  protected AbstractJDBCDataModel(DataSource dataSource,
+                                  String getPreferenceSQL,
+                                  String getUserSQL,
+                                  String getAllUsersSQL,
+                                  String getNumItemsSQL,
+                                  String getNumUsersSQL,
+                                  String setPreferenceSQL,
+                                  String removePreferenceSQL,
+                                  String getUsersSQL,
+                                  String getItemsSQL,
+                                  String getPrefsForItemSQL,
+                                  String getNumPreferenceForItemSQL,
+                                  String getNumPreferenceForItemsSQL) {
+    this(dataSource,
+        DEFAULT_PREFERENCE_TABLE,
+        DEFAULT_USER_ID_COLUMN,
+        DEFAULT_ITEM_ID_COLUMN,
+        DEFAULT_PREFERENCE_COLUMN,
+        getPreferenceSQL,
+        getUserSQL,
+        getAllUsersSQL,
+        getNumItemsSQL,
+        getNumUsersSQL,
+        setPreferenceSQL,
+        removePreferenceSQL,
+        getUsersSQL,
+        getItemsSQL,
+        getPrefsForItemSQL,
+        getNumPreferenceForItemSQL,
+        getNumPreferenceForItemsSQL);
   }
 
-  /**
-   * Allows to specify the relative position of terms within the phrase.
-   * 
-   * @see PhraseQuery#add(Term, int)
-   * @param terms
-   * @param position
-   */
-  public void add(Term[] terms, int position) {
-    if (termArrays.size() == 0)
-      field = terms[0].field();
+  protected AbstractJDBCDataModel(DataSource dataSource,
+                                  String preferenceTable,
+                                  String userIDColumn,
+                                  String itemIDColumn,
+                                  String preferenceColumn,
+                                  String getPreferenceSQL,
+                                  String getUserSQL,
+                                  String getAllUsersSQL,
+                                  String getNumItemsSQL,
+                                  String getNumUsersSQL,
+                                  String setPreferenceSQL,
+                                  String removePreferenceSQL,
+                                  String getUsersSQL,
+                                  String getItemsSQL,
+                                  String getPrefsForItemSQL,
+                                  String getNumPreferenceForItemSQL,
+                                  String getNumPreferenceForItemsSQL) {
 
-    for (int i = 0; i < terms.length; i++) {
-      if (terms[i].field() != field) {
-        throw new IllegalArgumentException(
-            "All phrase terms must be in the same field (" + field + "): "
-                + terms[i]);
-      }
+    log.debug("Creating AbstractJDBCModel...");
+
+    checkNotNullAndLog("preferenceTable", preferenceTable);
+    checkNotNullAndLog("userIDColumn", userIDColumn);
+    checkNotNullAndLog("itemIDColumn", itemIDColumn);
+    checkNotNullAndLog("preferenceColumn", preferenceColumn);
+
+    checkNotNullAndLog("dataSource", dataSource);
+    checkNotNullAndLog("getUserSQL", getUserSQL);
+    checkNotNullAndLog("getAllUsersSQL", getAllUsersSQL);
+    checkNotNullAndLog("getPreferenceSQL", getPreferenceSQL);
+    checkNotNullAndLog("getNumItemsSQL", getNumItemsSQL);
+    checkNotNullAndLog("getNumUsersSQL", getNumUsersSQL);
+    checkNotNullAndLog("setPreferenceSQL", setPreferenceSQL);
+    checkNotNullAndLog("removePreferenceSQL", removePreferenceSQL);
+    checkNotNullAndLog("getUsersSQL", getUsersSQL);
+    checkNotNullAndLog("getItemsSQL", getItemsSQL);
+    checkNotNullAndLog("getPrefsForItemSQL", getPrefsForItemSQL);
+    checkNotNullAndLog("getNumPreferenceForItemSQL", getNumPreferenceForItemSQL);
+    checkNotNullAndLog("getNumPreferenceForItemsSQL", getNumPreferenceForItemsSQL);
+
+    if (!(dataSource instanceof ConnectionPoolDataSource)) {
+      log.warn("You are not using ConnectionPoolDataSource. Make sure your DataSource pools connections " +
+          "to the database itself, or database performance will be severely reduced.");
     }
 
-    termArrays.add(terms);
-    positions.add(Integer.valueOf(position));
+    this.preferenceTable = preferenceTable;
+    this.userIDColumn = userIDColumn;
+    this.itemIDColumn = itemIDColumn;
+    this.preferenceColumn = preferenceColumn;
+
+    this.dataSource = dataSource;
+    this.getPreferenceSQL = getPreferenceSQL;
+    this.getUserSQL = getUserSQL;
+    this.getAllUsersSQL = getAllUsersSQL;
+    this.getNumItemsSQL = getNumItemsSQL;
+    this.getNumUsersSQL = getNumUsersSQL;
+    this.setPreferenceSQL = setPreferenceSQL;
+    this.removePreferenceSQL = removePreferenceSQL;
+    this.getUsersSQL = getUsersSQL;
+    this.getItemsSQL = getItemsSQL;
+    this.getPrefsForItemSQL = getPrefsForItemSQL;
+    this.getNumPreferenceForItemSQL = getNumPreferenceForItemSQL;
+    this.getNumPreferenceForItemsSQL = getNumPreferenceForItemsSQL;
+
+    this.cachedNumUsers = -1;
+    this.cachedNumItems = -1;
+    this.itemPrefCounts = new Cache<Long, Integer>(new ItemPrefCountRetriever(getNumPreferenceForItemSQL));
+
   }
 
-  /**
-   * Returns a List of the terms in the multiphrase.
-   * Do not modify the List or its contents.
-   */
-  public List<Term[]> getTermArrays() {
-	  return Collections.unmodifiableList(termArrays);
-  }
-
-  /**
-   * Returns the relative positions of terms in this phrase.
-   */
-  public int[] getPositions() {
-    int[] result = new int[positions.size()];
-    for (int i = 0; i < positions.size(); i++)
-      result[i] = positions.get(i).intValue();
-    return result;
-  }
-
-  // inherit javadoc
+  /** @return the {@link DataSource} that this instance is using */
   @Override
-  public void extractTerms(Set<Term> terms) {
-    for (final Term[] arr : termArrays) {
-      for (final Term term: arr) {
-        terms.add(term);
-      }
-    }
+  public DataSource getDataSource() {
+    return dataSource;
   }
 
+  public String getPreferenceTable() {
+    return preferenceTable;
+  }
 
-  private class MultiPhraseWeight extends Weight {
-    private Similarity similarity;
-    private float value;
-    private float idf;
-    private float queryNorm;
-    private float queryWeight;
+  public String getUserIDColumn() {
+    return userIDColumn;
+  }
 
-    public MultiPhraseWeight(Searcher searcher)
-      throws IOException {
-      this.similarity = getSimilarity(searcher);
+  public String getItemIDColumn() {
+    return itemIDColumn;
+  }
 
-      // compute idf
-      final int maxDoc = searcher.maxDoc();
-      for(final Term[] terms: termArrays) {
-        for (Term term: terms) {
-          idf += this.similarity.idf(searcher.docFreq(term), maxDoc);
-        }
+  public String getPreferenceColumn() {
+    return preferenceColumn;
+  }
+
+  @Override
+  public LongPrimitiveIterator getUserIDs() throws TasteException {
+    log.debug("Retrieving all users...");
+    return new ResultSetIDIterator(getUsersSQL);
+  }
+
+  /** @throws NoSuchUserException if there is no such user */
+  @Override
+  public PreferenceArray getPreferencesFromUser(long id) throws TasteException {
+
+    log.debug("Retrieving user ID '{}'", id);
+
+    Connection conn = null;
+    PreparedStatement stmt = null;
+    ResultSet rs = null;
+
+    try {
+      conn = dataSource.getConnection();
+      stmt = conn.prepareStatement(getUserSQL, ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY);
+      stmt.setFetchDirection(ResultSet.FETCH_FORWARD);
+      stmt.setFetchSize(getFetchSize());
+      stmt.setLong(1, id);
+
+      log.debug("Executing SQL query: {}", getUserSQL);
+      rs = stmt.executeQuery();
+
+      List<Preference> prefs = new ArrayList<Preference>();
+      while (rs.next()) {
+        prefs.add(buildPreference(rs));
       }
+
+      if (prefs.isEmpty()) {
+        throw new NoSuchUserException();
+      }
+
+      return new GenericUserPreferenceArray(prefs);
+
+    } catch (SQLException sqle) {
+      log.warn("Exception while retrieving user", sqle);
+      throw new TasteException(sqle);
+    } finally {
+      IOUtils.quietClose(rs, stmt, conn);
     }
 
-    @Override
-    public Query getQuery() { return MultiPhraseQuery.this; }
+  }
 
-    @Override
-    public float getValue() { return value; }
+  @Override
+  public FastByIDMap<PreferenceArray> exportWithPrefs() throws TasteException {
+    log.debug("Exporting all data");
 
-    @Override
-    public float sumOfSquaredWeights() {
-      queryWeight = idf * getBoost();             // compute query weight
-      return queryWeight * queryWeight;           // square it
-    }
+    Connection conn = null;
+    Statement stmt = null;
+    ResultSet rs = null;
 
-    @Override
-    public void normalize(float queryNorm) {
-      this.queryNorm = queryNorm;
-      queryWeight *= queryNorm;                   // normalize query weight
-      value = queryWeight * idf;                  // idf for document 
-    }
+    FastByIDMap<PreferenceArray> result = new FastByIDMap<PreferenceArray>();
 
-    @Override
-    public Scorer scorer(IndexReader reader, boolean scoreDocsInOrder, boolean topScorer) throws IOException {
-      if (termArrays.size() == 0)                  // optimize zero-term case
-        return null;
+    try {
+      conn = dataSource.getConnection();
+      stmt = conn.createStatement(ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY);
+      stmt.setFetchDirection(ResultSet.FETCH_FORWARD);
+      stmt.setFetchSize(getFetchSize());
 
-      final Bits delDocs = MultiFields.getDeletedDocs(reader);
-      
-      PhraseQuery.PostingsAndFreq[] postingsFreqs = new PhraseQuery.PostingsAndFreq[termArrays.size()];
+      log.debug("Executing SQL query: {}", getAllUsersSQL);
+      rs = stmt.executeQuery(getAllUsersSQL);
 
-      for (int i=0; i<postingsFreqs.length; i++) {
-        Term[] terms = termArrays.get(i);
-
-        final DocsAndPositionsEnum postingsEnum;
-        int docFreq;
-
-        if (terms.length > 1) {
-          postingsEnum = new UnionDocsAndPositionsEnum(reader, terms);
-
-          // coarse -- this overcounts since a given doc can
-          // have more than one terms:
-          docFreq = 0;
-          for(int j=0;j<terms.length;j++) {
-            docFreq += reader.docFreq(terms[i]);
+      Long currentUserID = null;
+      List<Preference> currentPrefs = new ArrayList<Preference>();
+      while (rs.next()) {
+        long nextUserID = rs.getLong(1);
+        if (currentUserID != null && !currentUserID.equals(nextUserID)) {
+          if (!currentPrefs.isEmpty()) {
+            result.put(currentUserID, new GenericUserPreferenceArray(currentPrefs));
+            currentPrefs.clear();
           }
         } else {
-          final BytesRef text = new BytesRef(terms[0].text());
-          postingsEnum = reader.termPositionsEnum(delDocs,
-                                                  terms[0].field(),
-                                                  text);
-
-          if (postingsEnum == null) {
-            if (MultiFields.getTermDocsEnum(reader, delDocs, terms[0].field(), text) != null) {
-              // term does exist, but has no positions
-              throw new IllegalStateException("field \"" + terms[0].field() + "\" was indexed with Field.omitTermFreqAndPositions=true; cannot run PhraseQuery (term=" + terms[0].text() + ")");
-            } else {
-              // term does not exist
-              return null;
-            }
-          }
-
-          docFreq = reader.docFreq(terms[0].field(), text);
+          currentPrefs.add(buildPreference(rs));
         }
-
-        postingsFreqs[i] = new PhraseQuery.PostingsAndFreq(postingsEnum, docFreq, positions.get(i).intValue());
+        currentUserID = nextUserID;
       }
-
-      // sort by increasing docFreq order
-      if (slop == 0) {
-        Arrays.sort(postingsFreqs);
+      if (!currentPrefs.isEmpty()) {
+        result.put(currentUserID, new GenericUserPreferenceArray(currentPrefs));
       }
-
-      if (slop == 0) {
-        ExactPhraseScorer s = new ExactPhraseScorer(this, postingsFreqs, similarity,
-                                                    reader.norms(field));
-        if (s.noDocs) {
-          return null;
-        } else {
-          return s;
-        }
-      } else {
-        return new SloppyPhraseScorer(this, postingsFreqs, similarity,
-                                      slop, reader.norms(field));
-      }
-    }
-
-    @Override
-    public Explanation explain(IndexReader reader, int doc)
-      throws IOException {
-      ComplexExplanation result = new ComplexExplanation();
-      result.setDescription("weight("+getQuery()+" in "+doc+"), product of:");
-
-      Explanation idfExpl = new Explanation(idf, "idf("+getQuery()+")");
-
-      // explain query weight
-      Explanation queryExpl = new Explanation();
-      queryExpl.setDescription("queryWeight(" + getQuery() + "), product of:");
-
-      Explanation boostExpl = new Explanation(getBoost(), "boost");
-      if (getBoost() != 1.0f)
-        queryExpl.addDetail(boostExpl);
-
-      queryExpl.addDetail(idfExpl);
-
-      Explanation queryNormExpl = new Explanation(queryNorm,"queryNorm");
-      queryExpl.addDetail(queryNormExpl);
-
-      queryExpl.setValue(boostExpl.getValue() *
-                         idfExpl.getValue() *
-                         queryNormExpl.getValue());
-
-      result.addDetail(queryExpl);
-
-      // explain field weight
-      ComplexExplanation fieldExpl = new ComplexExplanation();
-      fieldExpl.setDescription("fieldWeight("+getQuery()+" in "+doc+
-                               "), product of:");
-
-      Scorer scorer = (Scorer) scorer(reader, true, false);
-      if (scorer == null) {
-        return new Explanation(0.0f, "no matching docs");
-      }
-
-      Explanation tfExplanation = new Explanation();
-      int d = scorer.advance(doc);
-      float phraseFreq;
-      if (d == doc) {
-        if (slop == 0) {
-          phraseFreq = ((ExactPhraseScorer) scorer).currentFreq();
-        } else {
-          phraseFreq = ((SloppyPhraseScorer) scorer).currentFreq();
-        }
-      } else {
-        phraseFreq = 0.0f;
-      }
-
-      tfExplanation.setValue(similarity.tf(phraseFreq));
-      tfExplanation.setDescription("tf(phraseFreq=" + phraseFreq + ")");
-      fieldExpl.addDetail(tfExplanation);
-      fieldExpl.addDetail(idfExpl);
-
-      Explanation fieldNormExpl = new Explanation();
-      byte[] fieldNorms = reader.norms(field);
-      float fieldNorm =
-        fieldNorms!=null ? similarity.decodeNormValue(fieldNorms[doc]) : 1.0f;
-      fieldNormExpl.setValue(fieldNorm);
-      fieldNormExpl.setDescription("fieldNorm(field="+field+", doc="+doc+")");
-      fieldExpl.addDetail(fieldNormExpl);
-
-      fieldExpl.setMatch(Boolean.valueOf(tfExplanation.isMatch()));
-      fieldExpl.setValue(tfExplanation.getValue() *
-                         idfExpl.getValue() *
-                         fieldNormExpl.getValue());
-
-      result.addDetail(fieldExpl);
-      result.setMatch(fieldExpl.getMatch());
-
-      // combine them
-      result.setValue(queryExpl.getValue() * fieldExpl.getValue());
-
-      if (queryExpl.getValue() == 1.0f)
-        return fieldExpl;
 
       return result;
+
+    } catch (SQLException sqle) {
+      log.warn("Exception while exporting all data", sqle);
+      throw new TasteException(sqle);
+    } finally {
+      IOUtils.quietClose(rs, stmt, conn);
+
     }
   }
 
   @Override
-  public Query rewrite(IndexReader reader) {
-    if (termArrays.size() == 1) {                 // optimize one-term case
-      Term[] terms = termArrays.get(0);
-      BooleanQuery boq = new BooleanQuery(true);
-      for (int i=0; i<terms.length; i++) {
-        boq.add(new TermQuery(terms[i]), BooleanClause.Occur.SHOULD);
-      }
-      boq.setBoost(getBoost());
-      return boq;
-    } else {
-      return this;
-    }
-  }
+  public FastByIDMap<FastIDSet> exportWithIDsOnly() throws TasteException {
+    log.debug("Exporting all data");
 
-  @Override
-  public Weight createWeight(Searcher searcher) throws IOException {
-    return new MultiPhraseWeight(searcher);
-  }
+    Connection conn = null;
+    Statement stmt = null;
+    ResultSet rs = null;
 
-  /** Prints a user-readable version of this query. */
-  @Override
-  public final String toString(String f) {
-    StringBuilder buffer = new StringBuilder();
-    if (!field.equals(f)) {
-      buffer.append(field);
-      buffer.append(":");
-    }
+    FastByIDMap<FastIDSet> result = new FastByIDMap<FastIDSet>();
 
-    buffer.append("\"");
-    Iterator<Term[]> i = termArrays.iterator();
-    while (i.hasNext()) {
-      Term[] terms = i.next();
-      if (terms.length > 1) {
-        buffer.append("(");
-        for (int j = 0; j < terms.length; j++) {
-          buffer.append(terms[j].text());
-          if (j < terms.length-1)
-            buffer.append(" ");
+    try {
+      conn = dataSource.getConnection();
+      stmt = conn.createStatement(ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY);
+      stmt.setFetchDirection(ResultSet.FETCH_FORWARD);
+      stmt.setFetchSize(getFetchSize());
+
+      log.debug("Executing SQL query: {}", getAllUsersSQL);
+      rs = stmt.executeQuery(getAllUsersSQL);
+
+      boolean currentUserIDSet = false;
+      long currentUserID = 0L; // value isn't used
+      FastIDSet currentItemIDs = new FastIDSet(2);
+      while (rs.next()) {
+        long nextUserID = rs.getLong(1);
+        if (currentUserIDSet && currentUserID != nextUserID) {
+          if (!currentItemIDs.isEmpty()) {
+            result.put(currentUserID, currentItemIDs);
+            currentItemIDs = new FastIDSet(2);
+          }
+        } else {
+          currentItemIDs.add(rs.getLong(2));
         }
-        buffer.append(")");
+        currentUserID = nextUserID;
+        currentUserIDSet = true;
+      }
+      if (!currentItemIDs.isEmpty()) {
+        result.put(currentUserID, currentItemIDs);
+      }
+
+      return result;
+
+    } catch (SQLException sqle) {
+      log.warn("Exception while exporting all data", sqle);
+      throw new TasteException(sqle);
+    } finally {
+      IOUtils.quietClose(rs, stmt, conn);
+
+    }
+  }
+
+  /** @throws NoSuchUserException if there is no such user */
+  @Override
+  public FastIDSet getItemIDsFromUser(long id) throws TasteException {
+
+    log.debug("Retrieving items for user ID '{}'", id);
+
+    Connection conn = null;
+    PreparedStatement stmt = null;
+    ResultSet rs = null;
+
+    try {
+      conn = dataSource.getConnection();
+      stmt = conn.prepareStatement(getUserSQL, ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY);
+      stmt.setFetchDirection(ResultSet.FETCH_FORWARD);
+      stmt.setFetchSize(getFetchSize());
+      stmt.setLong(1, id);
+
+      log.debug("Executing SQL query: {}", getUserSQL);
+      rs = stmt.executeQuery();
+
+      FastIDSet result = new FastIDSet();
+      while (rs.next()) {
+        result.add(rs.getLong(1));
+      }
+
+      if (result.isEmpty()) {
+        throw new NoSuchUserException();
+      }
+
+      return result;
+
+    } catch (SQLException sqle) {
+      log.warn("Exception while retrieving item s", sqle);
+      throw new TasteException(sqle);
+    } finally {
+      IOUtils.quietClose(rs, stmt, conn);
+    }
+
+  }
+
+  @Override
+  public Float getPreferenceValue(long userID, long itemID) throws TasteException {
+    log.debug("Retrieving preferences for item ID '{}'", itemID);
+    Connection conn = null;
+    PreparedStatement stmt = null;
+    ResultSet rs = null;
+    try {
+      conn = dataSource.getConnection();
+      stmt = conn.prepareStatement(getPreferenceSQL, ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY);
+      stmt.setFetchDirection(ResultSet.FETCH_FORWARD);
+      stmt.setFetchSize(1);
+      stmt.setLong(1, userID);
+      stmt.setLong(2, itemID);
+
+      log.debug("Executing SQL query: {}", getPreferenceSQL);
+      rs = stmt.executeQuery();
+      if (rs.next()) {
+        return rs.getFloat(1);
       } else {
-        buffer.append(terms[0].text());
+        return null;
       }
-      if (i.hasNext())
-        buffer.append(" ");
+    } catch (SQLException sqle) {
+      log.warn("Exception while retrieving prefs for item", sqle);
+      throw new TasteException(sqle);
+    } finally {
+      IOUtils.quietClose(rs, stmt, conn);
     }
-    buffer.append("\"");
-
-    if (slop != 0) {
-      buffer.append("~");
-      buffer.append(slop);
-    }
-
-    buffer.append(ToStringUtils.boost(getBoost()));
-
-    return buffer.toString();
   }
 
-
-  /** Returns true if <code>o</code> is equal to this. */
   @Override
-  public boolean equals(Object o) {
-    if (!(o instanceof MultiPhraseQuery)) return false;
-    MultiPhraseQuery other = (MultiPhraseQuery)o;
-    return this.getBoost() == other.getBoost()
-      && this.slop == other.slop
-      && termArraysEquals(this.termArrays, other.termArrays)
-      && this.positions.equals(other.positions);
+  public LongPrimitiveIterator getItemIDs() throws TasteException {
+    log.debug("Retrieving all items...");
+    return new ResultSetIDIterator(getItemsSQL);
   }
 
-  /** Returns a hash code value for this object.*/
   @Override
-  public int hashCode() {
-    return Float.floatToIntBits(getBoost())
-      ^ slop
-      ^ termArraysHashCode()
-      ^ positions.hashCode()
-      ^ 0x4AC65113;
-  }
-  
-  // Breakout calculation of the termArrays hashcode
-  private int termArraysHashCode() {
-    int hashCode = 1;
-    for (final Term[] termArray: termArrays) {
-      hashCode = 31 * hashCode
-          + (termArray == null ? 0 : Arrays.hashCode(termArray));
-    }
-    return hashCode;
+  public PreferenceArray getPreferencesForItem(long itemID) throws TasteException {
+    List<Preference> list = doGetPreferencesForItem(itemID);
+    return new GenericItemPreferenceArray(list);
   }
 
-  // Breakout calculation of the termArrays equals
-  private boolean termArraysEquals(List<Term[]> termArrays1, List<Term[]> termArrays2) {
-    if (termArrays1.size() != termArrays2.size()) {
-      return false;
-    }
-    ListIterator<Term[]> iterator1 = termArrays1.listIterator();
-    ListIterator<Term[]> iterator2 = termArrays2.listIterator();
-    while (iterator1.hasNext()) {
-      Term[] termArray1 = iterator1.next();
-      Term[] termArray2 = iterator2.next();
-      if (!(termArray1 == null ? termArray2 == null : Arrays.equals(termArray1,
-          termArray2))) {
-        return false;
+  protected List<Preference> doGetPreferencesForItem(long itemID) throws TasteException {
+    log.debug("Retrieving preferences for item ID '{}'", itemID);
+    Connection conn = null;
+    PreparedStatement stmt = null;
+    ResultSet rs = null;
+    try {
+      conn = dataSource.getConnection();
+      stmt = conn.prepareStatement(getPrefsForItemSQL, ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY);
+      stmt.setFetchDirection(ResultSet.FETCH_FORWARD);
+      stmt.setFetchSize(getFetchSize());
+      stmt.setLong(1, itemID);
+
+      log.debug("Executing SQL query: {}", getPrefsForItemSQL);
+      rs = stmt.executeQuery();
+      List<Preference> prefs = new ArrayList<Preference>();
+      while (rs.next()) {
+        prefs.add(buildPreference(rs));
       }
+      return prefs;
+    } catch (SQLException sqle) {
+      log.warn("Exception while retrieving prefs for item", sqle);
+      throw new TasteException(sqle);
+    } finally {
+      IOUtils.quietClose(rs, stmt, conn);
     }
-    return true;
   }
-}
 
-/**
- * Takes the logical union of multiple DocsEnum iterators.
- */
+  @Override
+  public int getNumItems() throws TasteException {
+    if (cachedNumItems < 0) {
+      cachedNumItems = getNumThings("items", getNumItemsSQL);
+    }
+    return cachedNumItems;
+  }
 
-// TODO: if ever we allow subclassing of the *PhraseScorer
-class UnionDocsAndPositionsEnum extends DocsAndPositionsEnum {
+  @Override
+  public int getNumUsers() throws TasteException {
+    if (cachedNumUsers < 0) {
+      cachedNumUsers = getNumThings("users", getNumUsersSQL);
+    }
+    return cachedNumUsers;
+  }
 
-  private static final class DocsQueue extends PriorityQueue<DocsAndPositionsEnum> {
-    DocsQueue(List<DocsAndPositionsEnum> docsEnums) throws IOException {
-      initialize(docsEnums.size());
+  @Override
+  public int getNumUsersWithPreferenceFor(long... itemIDs) throws TasteException {
+    if (itemIDs == null) {
+      throw new IllegalArgumentException("itemIDs is null");
+    }
+    int length = itemIDs.length;
+    if (length == 0 || length > 2) {
+      throw new IllegalArgumentException("Illegal number of item IDs: " + length);
+    }
+    return length == 1 ?
+        itemPrefCounts.get(itemIDs[0]) :
+        getNumThings("user preferring items", getNumPreferenceForItemsSQL, itemIDs);
+  }
 
-      Iterator<DocsAndPositionsEnum> i = docsEnums.iterator();
-      while (i.hasNext()) {
-        DocsAndPositionsEnum postings = (DocsAndPositionsEnum) i.next();
-        if (postings.nextDoc() != DocsAndPositionsEnum.NO_MORE_DOCS) {
-          add(postings);
+
+  private int getNumThings(String name, String sql, long... args) throws TasteException {
+    log.debug("Retrieving number of {} in model", name);
+    Connection conn = null;
+    PreparedStatement stmt = null;
+    ResultSet rs = null;
+    try {
+      conn = dataSource.getConnection();
+      stmt = conn.prepareStatement(sql, ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY);
+      stmt.setFetchDirection(ResultSet.FETCH_FORWARD);
+      stmt.setFetchSize(getFetchSize());
+      if (args != null) {
+        for (int i = 1; i <= args.length; i++) {
+          stmt.setLong(i, args[i - 1]);
         }
       }
+      log.debug("Executing SQL query: {}", sql);
+      rs = stmt.executeQuery();
+      rs.next();
+      return rs.getInt(1);
+    } catch (SQLException sqle) {
+      log.warn("Exception while retrieving number of " + name, sqle);
+      throw new TasteException(sqle);
+    } finally {
+      IOUtils.quietClose(rs, stmt, conn);
+    }
+  }
+
+  @Override
+  public void setPreference(long userID, long itemID, float value) throws TasteException {
+    if (Float.isNaN(value)) {
+      throw new IllegalArgumentException("Invalid value: " + value);
     }
 
-    final public DocsEnum peek() {
-      return top();
+    log.debug("Setting preference for user {}, item {}", userID, itemID);    
+
+    Connection conn = null;
+    PreparedStatement stmt = null;
+
+    try {
+      conn = dataSource.getConnection();
+      stmt = conn.prepareStatement(setPreferenceSQL);
+      stmt.setLong(1, userID);
+      stmt.setLong(2, itemID);
+      stmt.setDouble(3, value);
+      stmt.setDouble(4, value);
+
+      log.debug("Executing SQL update: {}", setPreferenceSQL);
+      stmt.executeUpdate();
+
+    } catch (SQLException sqle) {
+      log.warn("Exception while setting preference", sqle);
+      throw new TasteException(sqle);
+    } finally {
+      IOUtils.quietClose(null, stmt, conn);
+    }
+  }
+
+  @Override
+  public void removePreference(long userID, long itemID) throws TasteException {
+
+    log.debug("Removing preference for user '{}', item '{}'", userID, itemID);
+
+    Connection conn = null;
+    PreparedStatement stmt = null;
+
+    try {
+      conn = dataSource.getConnection();
+      stmt = conn.prepareStatement(removePreferenceSQL);
+      stmt.setLong(1, userID);
+      stmt.setLong(2, itemID);
+
+      log.debug("Executing SQL update: {}", removePreferenceSQL);
+      stmt.executeUpdate();
+
+    } catch (SQLException sqle) {
+      log.warn("Exception while removing preference", sqle);
+      throw new TasteException(sqle);
+    } finally {
+      IOUtils.quietClose(null, stmt, conn);
+    }
+  }
+
+  @Override
+  public void refresh(Collection<Refreshable> alreadyRefreshed) {
+    cachedNumUsers = -1;
+    cachedNumItems = -1;
+    itemPrefCounts.clear();
+  }
+
+  protected Preference buildPreference(ResultSet rs) throws SQLException {
+    return new GenericPreference(rs.getLong(1), rs.getLong(2), rs.getFloat(3));
+  }
+
+  /**
+   * <p>An {@link java.util.Iterator} which returns items from a {@link ResultSet}.
+   * This is a useful way to iterate over all user data since it does not require all data to be
+   * read into memory at once. It does however require that the DB connection be held open. Note that this class will
+   * only release database resources after {@link #hasNext()} has been called and has returned <code>false</code>;
+   * callers should make sure to "drain" the entire set of data to avoid tying up database resources.</p>
+   */
+  private final class ResultSetIDIterator implements LongPrimitiveIterator, SkippingIterator<Long> {
+
+    private final Connection connection;
+    private final Statement statement;
+    private final ResultSet resultSet;
+    private boolean closed;
+
+    private ResultSetIDIterator(String sql) throws TasteException {
+      try {
+        connection = dataSource.getConnection();
+        statement = connection.createStatement(ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY);
+        statement.setFetchDirection(ResultSet.FETCH_FORWARD);
+        statement.setFetchSize(getFetchSize());
+        log.debug("Executing SQL query: {}", sql);
+        resultSet = statement.executeQuery(sql);
+        boolean anyResults = resultSet.next();
+        if (!anyResults) {
+          close();
+        }
+      } catch (SQLException sqle) {
+        close();
+        throw new TasteException(sqle);
+      }
     }
 
     @Override
-    public final boolean lessThan(DocsAndPositionsEnum a, DocsAndPositionsEnum b) {
-      return a.docID() < b.docID();
-    }
-  }
-
-  private static final class IntQueue {
-    private int _arraySize = 16;
-    private int _index = 0;
-    private int _lastIndex = 0;
-    private int[] _array = new int[_arraySize];
-    
-    final void add(int i) {
-      if (_lastIndex == _arraySize)
-        growArray();
-
-      _array[_lastIndex++] = i;
-    }
-
-    final int next() {
-      return _array[_index++];
+    public boolean hasNext() {
+      boolean nextExists = false;
+      if (!closed) {
+        try {
+          if (resultSet.isAfterLast()) {
+            close();
+          } else {
+            nextExists = true;
+          }
+        } catch (SQLException sqle) {
+          log.warn("Unexpected exception while accessing ResultSet; continuing...", sqle);
+          close();
+        }
+      }
+      return nextExists;
     }
 
-    final void sort() {
-      Arrays.sort(_array, _index, _lastIndex);
+    @Override
+    public Long next() {
+      return nextLong();
     }
 
-    final void clear() {
-      _index = 0;
-      _lastIndex = 0;
+    @Override
+    public long nextLong() {
+
+      if (!hasNext()) {
+        throw new NoSuchElementException();
+      }
+
+      try {
+        long ID = resultSet.getLong(1);
+        resultSet.next();
+        return ID;
+      } catch (SQLException sqle) {
+        // No good way to handle this since we can't throw an exception
+        log.warn("Exception while iterating", sqle);
+        close();
+        throw new NoSuchElementException("Can't retrieve more due to exception: " + sqle);
+      }
+
     }
 
-    final int size() {
-      return (_lastIndex - _index);
+    @Override
+    public long peek() {
+      if (!hasNext()) {
+        throw new NoSuchElementException();
+      }
+      try {
+        return resultSet.getLong(1);
+      } catch (SQLException sqle) {
+        // No good way to handle this since we can't throw an exception
+        log.warn("Exception while iterating", sqle);
+        close();
+        throw new NoSuchElementException("Can't retrieve more due to exception: " + sqle);
+      }
+
     }
 
-    private void growArray() {
-      int[] newArray = new int[_arraySize * 2];
-      System.arraycopy(_array, 0, newArray, 0, _arraySize);
-      _array = newArray;
-      _arraySize *= 2;
+    /**
+     * @throws UnsupportedOperationException
+     */
+    @Override
+    public void remove() {
+      throw new UnsupportedOperationException();
     }
-  }
 
-  private int _doc;
-  private int _freq;
-  private DocsQueue _queue;
-  private IntQueue _posList;
+    private void close() {
+      closed = true;
+      IOUtils.quietClose(resultSet, statement, connection);
+    }
 
-  public UnionDocsAndPositionsEnum(IndexReader indexReader, Term[] terms) throws IOException {
-    List<DocsAndPositionsEnum> docsEnums = new LinkedList<DocsAndPositionsEnum>();
-    final Bits delDocs = MultiFields.getDeletedDocs(indexReader);
-    for (int i = 0; i < terms.length; i++) {
-      final BytesRef text = new BytesRef(terms[i].text());
-      DocsAndPositionsEnum postings = indexReader.termPositionsEnum(delDocs,
-                                                                    terms[i].field(),
-                                                                    text);
-      if (postings != null) {
-        docsEnums.add(postings);
-      } else {
-        if (MultiFields.getTermDocsEnum(indexReader, delDocs, terms[i].field(), text) != null) {
-          // term does exist, but has no positions
-          throw new IllegalStateException("field \"" + terms[i].field() + "\" was indexed with Field.omitTermFreqAndPositions=true; cannot run PhraseQuery (term=" + terms[i].text() + ")");
+    @Override
+    public void skip(int n) {
+      if (n >= 1) {
+        try {
+          advanceResultSet(resultSet, n);
+        } catch (SQLException sqle) {
+          log.warn("Exception while iterating over items", sqle);
+          close();
         }
       }
     }
 
-    _queue = new DocsQueue(docsEnums);
-    _posList = new IntQueue();
   }
 
-  @Override
-  public final int nextDoc() throws IOException {
-    if (_queue.size() == 0) {
-      return NO_MORE_DOCS;
+  private class ItemPrefCountRetriever implements Retriever<Long, Integer> {
+    private final String getNumPreferenceForItemSQL;
+
+    private ItemPrefCountRetriever(String getNumPreferenceForItemSQL) {
+      this.getNumPreferenceForItemSQL = getNumPreferenceForItemSQL;
     }
 
-    // TODO: move this init into positions(): if the search
-    // doesn't need the positions for this doc then don't
-    // waste CPU merging them:
-    _posList.clear();
-    _doc = _queue.top().docID();
-
-    // merge sort all positions together
-    DocsAndPositionsEnum postings;
-    do {
-      postings = _queue.top();
-
-      final int freq = postings.freq();
-      for (int i = 0; i < freq; i++) {
-        _posList.add(postings.nextPosition());
-      }
-
-      if (postings.nextDoc() != NO_MORE_DOCS) {
-        _queue.updateTop();
-      } else {
-        _queue.pop();
-      }
-    } while (_queue.size() > 0 && _queue.top().docID() == _doc);
-
-    _posList.sort();
-    _freq = _posList.size();
-
-    return _doc;
-  }
-
-  @Override
-  public int nextPosition() {
-    return _posList.next();
-  }
-
-  @Override
-  public BytesRef getPayload() {
-    throw new UnsupportedOperationException();
-  }
-
-  @Override
-  public boolean hasPayload() {
-    throw new UnsupportedOperationException();
-  }
-
-  @Override
-  public final int advance(int target) throws IOException {
-    while (_queue.top() != null && target > _queue.top().docID()) {
-      DocsAndPositionsEnum postings = _queue.pop();
-      if (postings.advance(target) != NO_MORE_DOCS) {
-        _queue.add(postings);
-      }
+    @Override
+    public Integer get(Long key) throws TasteException {
+      return getNumThings("user preferring item", getNumPreferenceForItemSQL, key);
     }
-    return nextDoc();
-  }
-
-  @Override
-  public final int freq() {
-    return _freq;
-  }
-
-  @Override
-  public final int docID() {
-    return _doc;
   }
 }

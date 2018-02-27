@@ -1,7 +1,5 @@
 @Override
 
-package org.apache.lucene.util;
-
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
@@ -19,110 +17,415 @@ package org.apache.lucene.util;
  * limitations under the License.
  */
 
-import java.util.Collections;
-import java.util.Iterator;
-import java.util.Map;
-import java.util.LinkedHashMap;
-import java.util.Set;
-import java.util.ServiceConfigurationError;
+package org.apache.lucene.util;
 
-/**
- * Helper class for loading named SPIs from classpath (e.g. Codec, PostingsFormat).
+import java.io.IOException;
+import java.util.Arrays;
+
+import org.apache.lucene.search.DocIdSet;
+import org.apache.lucene.search.DocIdSetIterator;
+
+// TODO: maybe merge with BitVector?  Problem is BitVector
+// caches its cardinality...
+
+/** BitSet of fixed length (numBits), backed by accessible
+ *  ({@link #getBits}) long[], accessed with an int index,
+ *  implementing Bits and DocIdSet.  Unlike {@link
+ *  OpenBitSet} this bit set does not auto-expand, cannot
+ *  handle long index, and does not have fastXX/XX variants
+ *  (just X).
+ *
  * @lucene.internal
- */
-public final class NamedSPILoader<S extends NamedSPILoader.NamedSPI> implements Iterable<S> {
+ **/
 
-  private volatile Map<String,S> services = Collections.emptyMap();
-  private final Class<S> clazz;
+public final class FixedBitSet extends DocIdSet implements Bits {
+  private final long[] bits;
+  private int numBits;
 
-  public NamedSPILoader(Class<S> clazz) {
-    this(clazz, Thread.currentThread().getContextClassLoader());
+  /** returns the number of 64 bit words it would take to hold numBits */
+  public static int bits2words(int numBits) {
+    int numLong = numBits >>> 6;
+    if ((numBits & 63) != 0) {
+      numLong++;
+    }
+    return numLong;
   }
-  
-  public NamedSPILoader(Class<S> clazz, ClassLoader classloader) {
-    this.clazz = clazz;
-    reload(classloader);
+
+  public FixedBitSet(int numBits) {
+    this.numBits = numBits;
+    bits = new long[bits2words(numBits)];
   }
+
+  public FixedBitSet(long[]storedBits,int numBits) {
+    this.numBits = numBits;
+    this.bits = storedBits;
+  }  
   
-  /** 
-   * Reloads the internal SPI list from the given {@link ClassLoader}.
-   * Changes to the service list are visible after the method ends, all
-   * iterators ({@link #iterator()},...) stay consistent. 
-   * 
-   * <p><b>NOTE:</b> Only new service providers are added, existing ones are
-   * never removed or replaced.
-   * 
-   * <p><em>This method is expensive and should only be called for discovery
-   * of new service providers on the given classpath/classloader!</em>
+  
+  /** Makes full copy. */
+  public FixedBitSet(FixedBitSet other) {
+    bits = new long[other.bits.length];
+    System.arraycopy(other.bits, 0, bits, 0, bits.length);
+    numBits = other.numBits;
+  }
+
+  @Override
+  public DocIdSetIterator iterator() {
+    return new OpenBitSetIterator(bits, bits.length);
+  }
+
+  @Override
+  public Bits bits() {
+    return this;
+  }
+
+  @Override
+  public int length() {
+    return numBits;
+  }
+
+  /** This DocIdSet implementation is cacheable. */
+  @Override
+  public boolean isCacheable() {
+    return true;
+  }
+
+  /** Expert. */
+  public long[] getBits() {
+    return bits;
+  }
+
+  /** Returns number of set bits.  NOTE: this visits every
+   *  long in the backing bits array, and the result is not
+   *  internally cached! */
+  public int cardinality() {
+    return (int) BitUtil.pop_array(bits, 0, bits.length);
+  }
+
+  public boolean get(int index) {
+    assert index >= 0 && index < numBits: "index=" + index;
+    int i = index >> 6;               // div 64
+    // signed shift will keep a negative index and force an
+    // array-index-out-of-bounds-exception, removing the need for an explicit check.
+    int bit = index & 0x3f;           // mod 64
+    long bitmask = 1L << bit;
+    return (bits[i] & bitmask) != 0;
+  }
+
+  public void set(int index) {
+    assert index >= 0 && index < numBits;
+    int wordNum = index >> 6;      // div 64
+    int bit = index & 0x3f;     // mod 64
+    long bitmask = 1L << bit;
+    bits[wordNum] |= bitmask;
+  }
+
+  public boolean getAndSet(int index) {
+    assert index >= 0 && index < numBits;
+    int wordNum = index >> 6;      // div 64
+    int bit = index & 0x3f;     // mod 64
+    long bitmask = 1L << bit;
+    boolean val = (bits[wordNum] & bitmask) != 0;
+    bits[wordNum] |= bitmask;
+    return val;
+  }
+
+  public void clear(int index) {
+    assert index >= 0 && index < numBits;
+    int wordNum = index >> 6;
+    int bit = index & 0x03f;
+    long bitmask = 1L << bit;
+    bits[wordNum] &= ~bitmask;
+  }
+
+  public boolean getAndClear(int index) {
+    assert index >= 0 && index < numBits;
+    int wordNum = index >> 6;      // div 64
+    int bit = index & 0x3f;     // mod 64
+    long bitmask = 1L << bit;
+    boolean val = (bits[wordNum] & bitmask) != 0;
+    bits[wordNum] &= ~bitmask;
+    return val;
+  }
+
+  /** Returns the index of the first set bit starting at the index specified.
+   *  -1 is returned if there are no more set bits.
    */
-  public void reload(ClassLoader classloader) {
-    final LinkedHashMap<String,S> services = new LinkedHashMap<String,S>(this.services);
-    final SPIClassIterator<S> loader = SPIClassIterator.get(clazz, classloader);
-    while (loader.hasNext()) {
-      final Class<? extends S> c = loader.next();
-      try {
-        final S service = c.newInstance();
-        final String name = service.getName();
-        // only add the first one for each name, later services will be ignored
-        // this allows to place services before others in classpath to make 
-        // them used instead of others
-        if (!services.containsKey(name)) {
-          checkServiceName(name);
-          services.put(name, service);
-        }
-      } catch (Exception e) {
-        throw new ServiceConfigurationError("Cannot instantiate SPI class: " + c.getName(), e);
+  public int nextSetBit(int index) {
+    assert index >= 0 && index < numBits;
+    int i = index >> 6;
+    final int subIndex = index & 0x3f;      // index within the word
+    long word = bits[i] >> subIndex;  // skip all the bits to the right of index
+
+    if (word!=0) {
+      return (i<<6) + subIndex + Long.numberOfTrailingZeros(word);
+    }
+
+    while(++i < bits.length) {
+      word = bits[i];
+      if (word != 0) {
+        return (i<<6) + Long.numberOfTrailingZeros(word);
       }
     }
-    this.services = Collections.unmodifiableMap(services);
+
+    return -1;
   }
-  
-  /**
-   * Validates that a service name meets the requirements of {@link NamedSPI}
+
+  /** Returns the index of the last set bit before or on the index specified.
+   *  -1 is returned if there are no more set bits.
    */
-  public static void checkServiceName(String name) {
-    // based on harmony charset.java
-    if (name.length() >= 128) {
-      throw new IllegalArgumentException("Illegal service name: '" + name + "' is too long (must be < 128 chars).");
+  public int prevSetBit(int index) {
+    assert index >= 0 && index < numBits: "index=" + index + " numBits=" + numBits;
+    int i = index >> 6;
+    final int subIndex = index & 0x3f;  // index within the word
+    long word = (bits[i] << (63-subIndex));  // skip all the bits to the left of index
+
+    if (word != 0) {
+      return (i << 6) + subIndex - Long.numberOfLeadingZeros(word); // See LUCENE-3197
     }
-    for (int i = 0, len = name.length(); i < len; i++) {
-      char c = name.charAt(i);
-      if (!isLetterOrDigit(c)) {
-        throw new IllegalArgumentException("Illegal service name: '" + name + "' must be simple ascii alphanumeric.");
+
+    while (--i >= 0) {
+      word = bits[i];
+      if (word !=0 ) {
+        return (i << 6) + 63 - Long.numberOfLeadingZeros(word);
+      }
+    }
+
+    return -1;
+  }
+
+  /** Does in-place OR of the bits provided by the
+   *  iterator. */
+  public void or(DocIdSetIterator iter) throws IOException {
+    if (iter instanceof OpenBitSetIterator && iter.docID() == -1) {
+      final OpenBitSetIterator obs = (OpenBitSetIterator) iter;
+      or(obs.arr, obs.words);
+      // advance after last doc that would be accepted if standard
+      // iteration is used (to exhaust it):
+      obs.advance(numBits);
+    } else {
+      int doc;
+      while ((doc = iter.nextDoc()) < numBits) {
+        set(doc);
       }
     }
   }
-  
-  /**
-   * Checks whether a character is a letter or digit (ascii) which are defined in the spec.
-   */
-  private static boolean isLetterOrDigit(char c) {
-    return ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') || ('0' <= c && c <= '9');
+
+  /** this = this OR other */
+  public void or(FixedBitSet other) {
+    or(other.bits, other.bits.length);
   }
   
-  public S lookup(String name) {
-    final S service = services.get(name);
-    if (service != null) return service;
-    throw new IllegalArgumentException("A SPI class of type "+clazz.getName()+" with name '"+name+"' does not exist. "+
-     "You need to add the corresponding JAR file supporting this SPI to your classpath."+
-     "The current classpath supports the following names: "+availableServices());
+  private void or(final long[] otherArr, final int otherLen) {
+    final long[] thisArr = this.bits;
+    int pos = Math.min(thisArr.length, otherLen);
+    while (--pos >= 0) {
+      thisArr[pos] |= otherArr[pos];
+    }
   }
 
-  public Set<String> availableServices() {
-    return services.keySet();
+  /** Does in-place AND of the bits provided by the
+   *  iterator. */
+  public void and(DocIdSetIterator iter) throws IOException {
+    if (iter instanceof OpenBitSetIterator && iter.docID() == -1) {
+      final OpenBitSetIterator obs = (OpenBitSetIterator) iter;
+      and(obs.arr, obs.words);
+      // advance after last doc that would be accepted if standard
+      // iteration is used (to exhaust it):
+      obs.advance(numBits);
+    } else {
+      if (numBits == 0) return;
+      int disiDoc, bitSetDoc = nextSetBit(0);
+      while (bitSetDoc != -1 && (disiDoc = iter.advance(bitSetDoc)) < numBits) {
+        clear(bitSetDoc, disiDoc);
+        disiDoc++;
+        bitSetDoc = (disiDoc < numBits) ? nextSetBit(disiDoc) : -1;
+      }
+      if (bitSetDoc != -1) {
+        clear(bitSetDoc, numBits);
+      }
+    }
+  }
+
+  /** this = this AND other */
+  public void and(FixedBitSet other) {
+    and(other.bits, other.bits.length);
   }
   
-  public Iterator<S> iterator() {
-    return services.values().iterator();
+  private void and(final long[] otherArr, final int otherLen) {
+    final long[] thisArr = this.bits;
+    int pos = Math.min(thisArr.length, otherLen);
+    while(--pos >= 0) {
+      thisArr[pos] &= otherArr[pos];
+    }
+    if (thisArr.length > otherLen) {
+      Arrays.fill(thisArr, otherLen, thisArr.length, 0L);
+    }
+  }
+
+  /** Does in-place AND NOT of the bits provided by the
+   *  iterator. */
+  public void andNot(DocIdSetIterator iter) throws IOException {
+    if (iter instanceof OpenBitSetIterator && iter.docID() == -1) {
+      final OpenBitSetIterator obs = (OpenBitSetIterator) iter;
+      andNot(obs.arr, obs.words);
+      // advance after last doc that would be accepted if standard
+      // iteration is used (to exhaust it):
+      obs.advance(numBits);
+    } else {
+      int doc;
+      while ((doc = iter.nextDoc()) < numBits) {
+        clear(doc);
+      }
+    }
+  }
+
+  /** this = this AND NOT other */
+  public void andNot(FixedBitSet other) {
+    andNot(other.bits, other.bits.length);
   }
   
-  /**
-   * Interface to support {@link NamedSPILoader#lookup(String)} by name.
-   * <p>
-   * Names must be all ascii alphanumeric, and less than 128 characters in length.
+  private void andNot(final long[] otherArr, final int otherLen) {
+    final long[] thisArr = this.bits;
+    int pos = Math.min(thisArr.length, otherLen);
+    while(--pos >= 0) {
+      thisArr[pos] &= ~otherArr[pos];
+    }
+  }
+
+  // NOTE: no .isEmpty() here because that's trappy (ie,
+  // typically isEmpty is low cost, but this one wouldn't
+  // be)
+
+  /** Flips a range of bits
+   *
+   * @param startIndex lower index
+   * @param endIndex one-past the last bit to flip
    */
-  public static interface NamedSPI {
-    String getName();
+  public void flip(int startIndex, int endIndex) {
+    assert startIndex >= 0 && startIndex < numBits;
+    assert endIndex >= 0 && endIndex <= numBits;
+    if (endIndex <= startIndex) {
+      return;
+    }
+
+    int startWord = startIndex >> 6;
+    int endWord = (endIndex-1) >> 6;
+
+    /*** Grrr, java shifting wraps around so -1L>>>64 == -1
+     * for that reason, make sure not to use endmask if the bits to flip will
+     * be zero in the last word (redefine endWord to be the last changed...)
+    long startmask = -1L << (startIndex & 0x3f);     // example: 11111...111000
+    long endmask = -1L >>> (64-(endIndex & 0x3f));   // example: 00111...111111
+    ***/
+
+    long startmask = -1L << startIndex;
+    long endmask = -1L >>> -endIndex;  // 64-(endIndex&0x3f) is the same as -endIndex due to wrap
+
+    if (startWord == endWord) {
+      bits[startWord] ^= (startmask & endmask);
+      return;
+    }
+
+    bits[startWord] ^= startmask;
+
+    for (int i=startWord+1; i<endWord; i++) {
+      bits[i] = ~bits[i];
+    }
+
+    bits[endWord] ^= endmask;
   }
-  
+
+  /** Sets a range of bits
+   *
+   * @param startIndex lower index
+   * @param endIndex one-past the last bit to set
+   */
+  public void set(int startIndex, int endIndex) {
+    assert startIndex >= 0 && startIndex < numBits;
+    assert endIndex >= 0 && endIndex <= numBits;
+    if (endIndex <= startIndex) {
+      return;
+    }
+
+    int startWord = startIndex >> 6;
+    int endWord = (endIndex-1) >> 6;
+
+    long startmask = -1L << startIndex;
+    long endmask = -1L >>> -endIndex;  // 64-(endIndex&0x3f) is the same as -endIndex due to wrap
+
+    if (startWord == endWord) {
+      bits[startWord] |= (startmask & endmask);
+      return;
+    }
+
+    bits[startWord] |= startmask;
+    Arrays.fill(bits, startWord+1, endWord, -1L);
+    bits[endWord] |= endmask;
+  }
+
+  /** Clears a range of bits.
+   *
+   * @param startIndex lower index
+   * @param endIndex one-past the last bit to clear
+   */
+  public void clear(int startIndex, int endIndex) {
+    assert startIndex >= 0 && startIndex < numBits;
+    assert endIndex >= 0 && endIndex <= numBits;
+    if (endIndex <= startIndex) {
+      return;
+    }
+
+    int startWord = startIndex >> 6;
+    int endWord = (endIndex-1) >> 6;
+
+    long startmask = -1L << startIndex;
+    long endmask = -1L >>> -endIndex;  // 64-(endIndex&0x3f) is the same as -endIndex due to wrap
+
+    // invert masks since we are clearing
+    startmask = ~startmask;
+    endmask = ~endmask;
+
+    if (startWord == endWord) {
+      bits[startWord] &= (startmask | endmask);
+      return;
+    }
+
+    bits[startWord] &= startmask;
+    Arrays.fill(bits, startWord+1, endWord, 0L);
+    bits[endWord] &= endmask;
+  }
+
+  @Override
+  public FixedBitSet clone() {
+    return new FixedBitSet(this);
+  }
+
+  /** returns true if both sets have the same bits set */
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) {
+      return true;
+    }
+    if (!(o instanceof FixedBitSet)) {
+      return false;
+    }
+    FixedBitSet other = (FixedBitSet) o;
+    if (numBits != other.length()) {
+      return false;
+    }
+    return Arrays.equals(bits, other.bits);
+  }
+
+  @Override
+  public int hashCode() {
+    long h = 0;
+    for (int i = bits.length; --i>=0;) {
+      h ^= bits[i];
+      h = (h << 1) | (h >>> 63); // rotate left
+    }
+    // fold leftmost bits into right and add a constant to prevent
+    // empty sets from returning 0, which is too common.
+    return (int) ((h>>32) ^ h) + 0x98761234;
+  }
 }

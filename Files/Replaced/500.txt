@@ -1,11 +1,6 @@
-public boolean incrementToken() {
+LanczosState state = new LanczosState(L, overshoot, DistributedLanczosSolver.getInitialVector(L));
 
-/*
- * Created on 28-Oct-2004
- */
-package org.apache.lucene.search.highlight;
-
-/*
+/**
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -22,306 +17,178 @@ package org.apache.lucene.search.highlight;
  * limitations under the License.
  */
 
-import java.io.IOException;
-import java.io.StringReader;
-import java.util.ArrayList;
-import java.util.Comparator;
+package org.apache.mahout.clustering.spectral.kmeans;
 
-import org.apache.lucene.analysis.Analyzer;
-import org.apache.lucene.analysis.Token;
-import org.apache.lucene.analysis.TokenStream;
-import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
-import org.apache.lucene.analysis.tokenattributes.OffsetAttribute;
-import org.apache.lucene.analysis.tokenattributes.PositionIncrementAttribute;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.index.DocsAndPositionsEnum;
-import org.apache.lucene.index.Fields;
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.Terms;
-import org.apache.lucene.index.TermsEnum;
-import org.apache.lucene.util.ArrayUtil;
-import org.apache.lucene.util.BytesRef;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.util.ToolRunner;
+import org.apache.mahout.clustering.Cluster;
+import org.apache.mahout.clustering.kmeans.KMeansDriver;
+import org.apache.mahout.clustering.kmeans.RandomSeedGenerator;
+import org.apache.mahout.clustering.spectral.common.AffinityMatrixInputJob;
+import org.apache.mahout.clustering.spectral.common.MatrixDiagonalizeJob;
+import org.apache.mahout.clustering.spectral.common.UnitVectorizerJob;
+import org.apache.mahout.clustering.spectral.common.VectorMatrixMultiplicationJob;
+import org.apache.mahout.common.AbstractJob;
+import org.apache.mahout.common.ClassUtils;
+import org.apache.mahout.common.HadoopUtil;
+import org.apache.mahout.common.commandline.DefaultOptionCreator;
+import org.apache.mahout.common.distance.DistanceMeasure;
+import org.apache.mahout.math.Vector;
+import org.apache.mahout.math.decomposer.lanczos.LanczosState;
+import org.apache.mahout.math.hadoop.DistributedRowMatrix;
+import org.apache.mahout.math.hadoop.decomposer.DistributedLanczosSolver;
+import org.apache.mahout.math.hadoop.decomposer.EigenVerificationJob;
+
+import java.io.IOException;
+import java.util.List;
+import java.util.Map;
 
 /**
- * Hides implementation issues associated with obtaining a TokenStream for use
- * with the higlighter - can obtain from TermFreqVectors with offsets and
- * (optionally) positions or from Analyzer class reparsing the stored content.
+ * Implementation of the EigenCuts spectral clustering algorithm.
  */
-public class TokenSources {
-  /**
-   * A convenience method that tries to first get a TermPositionVector for the
-   * specified docId, then, falls back to using the passed in
-   * {@link org.apache.lucene.document.Document} to retrieve the TokenStream.
-   * This is useful when you already have the document, but would prefer to use
-   * the vector first.
-   * 
-   * @param reader The {@link org.apache.lucene.index.IndexReader} to use to try
-   *        and get the vector from
-   * @param docId The docId to retrieve.
-   * @param field The field to retrieve on the document
-   * @param doc The document to fall back on
-   * @param analyzer The analyzer to use for creating the TokenStream if the
-   *        vector doesn't exist
-   * @return The {@link org.apache.lucene.analysis.TokenStream} for the
-   *         {@link org.apache.lucene.index.IndexableField} on the
-   *         {@link org.apache.lucene.document.Document}
-   * @throws IOException if there was an error loading
-   */
+public class SpectralKMeansDriver extends AbstractJob {
 
-  public static TokenStream getAnyTokenStream(IndexReader reader, int docId,
-      String field, Document doc, Analyzer analyzer) throws IOException {
-    TokenStream ts = null;
+  public static final double OVERSHOOT_MULTIPLIER = 2.0;
 
-    Fields vectors = reader.getTermVectors(docId);
-    if (vectors != null) {
-      Terms vector = vectors.terms(field);
-      if (vector != null) {
-        ts = getTokenStream(vector);
-      }
+  public static void main(String[] args) throws Exception {
+    ToolRunner.run(new SpectralKMeansDriver(), args);
+  }
+
+  @Override
+  public int run(String[] arg0) throws IOException, ClassNotFoundException, InterruptedException {
+    // set up command line options
+    Configuration conf = getConf();
+    addInputOption();
+    addOutputOption();
+    addOption("dimensions", "d", "Square dimensions of affinity matrix", true);
+    addOption("clusters", "k", "Number of clusters and top eigenvectors", true);
+    addOption(DefaultOptionCreator.distanceMeasureOption().create());
+    addOption(DefaultOptionCreator.convergenceOption().create());
+    addOption(DefaultOptionCreator.maxIterationsOption().create());
+    addOption(DefaultOptionCreator.overwriteOption().create());
+    Map<String, List<String>> parsedArgs = parseArguments(arg0);
+    if (parsedArgs == null) {
+      return 0;
     }
 
-    // No token info stored so fall back to analyzing raw content
-    if (ts == null) {
-      ts = getTokenStream(doc, field, analyzer);
+    Path input = getInputPath();
+    Path output = getOutputPath();
+    if (hasOption(DefaultOptionCreator.OVERWRITE_OPTION)) {
+      HadoopUtil.delete(conf, output);
     }
-    return ts;
+    int numDims = Integer.parseInt(getOption("dimensions"));
+    int clusters = Integer.parseInt(getOption("clusters"));
+    String measureClass = getOption(DefaultOptionCreator.DISTANCE_MEASURE_OPTION);
+    DistanceMeasure measure = ClassUtils.instantiateAs(measureClass, DistanceMeasure.class);
+    double convergenceDelta = Double.parseDouble(getOption(DefaultOptionCreator.CONVERGENCE_DELTA_OPTION));
+    int maxIterations = Integer.parseInt(getOption(DefaultOptionCreator.MAX_ITERATIONS_OPTION));
+
+    run(conf, input, output, numDims, clusters, measure, convergenceDelta, maxIterations);
+
+    return 0;
   }
 
   /**
-   * A convenience method that tries a number of approaches to getting a token
-   * stream. The cost of finding there are no termVectors in the index is
-   * minimal (1000 invocations still registers 0 ms). So this "lazy" (flexible?)
-   * approach to coding is probably acceptable
+   * Run the Spectral KMeans clustering on the supplied arguments
    * 
-   * @param reader
-   * @param docId
-   * @param field
-   * @param analyzer
-   * @return null if field not stored correctly
-   * @throws IOException
+   * @param conf the Configuration to be used
+   * @param input the Path to the input tuples directory
+   * @param output the Path to the output directory
+   * @param numDims the int number of dimensions of the affinity matrix
+   * @param clusters the int number of eigenvectors and thus clusters to produce
+   * @param measure the DistanceMeasure for the k-Means calculations
+   * @param convergenceDelta the double convergence delta for the k-Means calculations
+   * @param maxIterations the int maximum number of iterations for the k-Means calculations
    */
-  public static TokenStream getAnyTokenStream(IndexReader reader, int docId,
-      String field, Analyzer analyzer) throws IOException {
-    TokenStream ts = null;
+  public static void run(Configuration conf,
+                         Path input,
+                         Path output,
+                         int numDims,
+                         int clusters,
+                         DistanceMeasure measure,
+                         double convergenceDelta,
+                         int maxIterations)
+    throws IOException, InterruptedException, ClassNotFoundException {
+    // create a few new Paths for temp files and transformations
+    Path outputCalc = new Path(output, "calculations");
+    Path outputTmp = new Path(output, "temporary");
 
-    Fields vectors = reader.getTermVectors(docId);
-    if (vectors != null) {
-      Terms vector = vectors.terms(field);
-      if (vector != null) {
-        ts = getTokenStream(vector);
-      }
-    }
+    // Take in the raw CSV text file and split it ourselves,
+    // creating our own SequenceFiles for the matrices to read later 
+    // (similar to the style of syntheticcontrol.canopy.InputMapper)
+    Path affSeqFiles = new Path(outputCalc, "seqfile-" + (System.nanoTime() & 0xFF));
+    AffinityMatrixInputJob.runJob(input, affSeqFiles, numDims, numDims);
 
-    // No token info stored so fall back to analyzing raw content
-    if (ts == null) {
-      ts = getTokenStream(reader, docId, field, analyzer);
-    }
-    return ts;
-  }
+    // Next step: construct the affinity matrix using the newly-created
+    // sequence files
+    DistributedRowMatrix A = new DistributedRowMatrix(affSeqFiles,
+                                                      new Path(outputTmp, "afftmp-" + (System.nanoTime() & 0xFF)),
+                                                      numDims,
+                                                      numDims);
+    Configuration depConf = new Configuration(conf);
+    A.setConf(depConf);
 
-  public static TokenStream getTokenStream(Terms vector) throws IOException {
-    // assumes the worst and makes no assumptions about token position
-    // sequences.
-    return getTokenStream(vector, false);
-  }
+    // Next step: construct the diagonal matrix D (represented as a vector)
+    // and calculate the normalized Laplacian of the form:
+    // L = D^(-0.5)AD^(-0.5)
+    Vector D = MatrixDiagonalizeJob.runJob(affSeqFiles, numDims);
+    DistributedRowMatrix L =
+        VectorMatrixMultiplicationJob.runJob(affSeqFiles, D,
+            new Path(outputCalc, "laplacian-" + (System.nanoTime() & 0xFF)), new Path(outputCalc, "laplacian-tmp-" + (System.nanoTime() & 0xFF)));
+    L.setConf(depConf);
 
-  private static boolean hasPositions(Terms vector) throws IOException {
-    final TermsEnum termsEnum = vector.iterator(null);
-    if (termsEnum.next() != null) {
-      DocsAndPositionsEnum dpEnum = termsEnum.docsAndPositions(null, null, false);
-      if (dpEnum != null) {
-        int pos = dpEnum.nextPosition();
-        if (pos >= 0) {
-          return true;
-        }
-      }
-    }
+    // Next step: perform eigen-decomposition using LanczosSolver
+    // since some of the eigen-output is spurious and will be eliminated
+    // upon verification, we have to aim to overshoot and then discard
+    // unnecessary vectors later
+    int overshoot = (int) ((double) clusters * OVERSHOOT_MULTIPLIER);
+    DistributedLanczosSolver solver = new DistributedLanczosSolver();
+    LanczosState state = new LanczosState(L, clusters, DistributedLanczosSolver.getInitialVector(L));
+    Path lanczosSeqFiles = new Path(outputCalc, "eigenvectors-" + (System.nanoTime() & 0xFF));
+    solver.runJob(conf,
+                  state,
+                  overshoot,
+                  true,
+                  lanczosSeqFiles.toString());
 
-    return false;
-  }
+    // perform a verification
+    EigenVerificationJob verifier = new EigenVerificationJob();
+    Path verifiedEigensPath = new Path(outputCalc, "eigenverifier");
+    verifier.runJob(conf, lanczosSeqFiles, L.getRowPath(), verifiedEigensPath, true, 1.0, clusters);
+    Path cleanedEigens = verifier.getCleanedEigensPath();
+    DistributedRowMatrix W = new DistributedRowMatrix(cleanedEigens, new Path(cleanedEigens, "tmp"), clusters, numDims);
+    W.setConf(depConf);
+    DistributedRowMatrix Wtrans = W.transpose();
+    //    DistributedRowMatrix Wt = W.transpose();
 
-  /**
-   * Low level api. Returns a token stream or null if no offset info available
-   * in index. This can be used to feed the highlighter with a pre-parsed token
-   * stream
-   * 
-   * In my tests the speeds to recreate 1000 token streams using this method
-   * are: - with TermVector offset only data stored - 420 milliseconds - with
-   * TermVector offset AND position data stored - 271 milliseconds (nb timings
-   * for TermVector with position data are based on a tokenizer with contiguous
-   * positions - no overlaps or gaps) The cost of not using TermPositionVector
-   * to store pre-parsed content and using an analyzer to re-parse the original
-   * content: - reanalyzing the original content - 980 milliseconds
-   * 
-   * The re-analyze timings will typically vary depending on - 1) The complexity
-   * of the analyzer code (timings above were using a
-   * stemmer/lowercaser/stopword combo) 2) The number of other fields (Lucene
-   * reads ALL fields off the disk when accessing just one document field - can
-   * cost dear!) 3) Use of compression on field storage - could be faster due to
-   * compression (less disk IO) or slower (more CPU burn) depending on the
-   * content.
-   * 
-   * @param tpv
-   * @param tokenPositionsGuaranteedContiguous true if the token position
-   *        numbers have no overlaps or gaps. If looking to eek out the last
-   *        drops of performance, set to true. If in doubt, set to false.
-   */
-  public static TokenStream getTokenStream(Terms tpv,
-      boolean tokenPositionsGuaranteedContiguous) 
-  throws IOException {
-    if (!tokenPositionsGuaranteedContiguous && hasPositions(tpv)) {
-      return new TokenStreamFromTermPositionVector(tpv);
-    }
+    // next step: normalize the rows of Wt to unit length
+    Path unitVectors = new Path(outputCalc, "unitvectors-" + (System.nanoTime() & 0xFF));
+    UnitVectorizerJob.runJob(Wtrans.getRowPath(), unitVectors);
+    DistributedRowMatrix Wt = new DistributedRowMatrix(unitVectors, new Path(unitVectors, "tmp"), clusters, numDims);
+    Wt.setConf(depConf);
 
-    // an object used to iterate across an array of tokens
-    final class StoredTokenStream extends TokenStream {
-      Token tokens[];
-
-      int currentToken = 0;
-
-      CharTermAttribute termAtt;
-
-      OffsetAttribute offsetAtt;
-
-      PositionIncrementAttribute posincAtt;
-
-      StoredTokenStream(Token tokens[]) {
-        this.tokens = tokens;
-        termAtt = addAttribute(CharTermAttribute.class);
-        offsetAtt = addAttribute(OffsetAttribute.class);
-        posincAtt = addAttribute(PositionIncrementAttribute.class);
-      }
-
-      @Override
-      public boolean incrementToken() throws IOException {
-        if (currentToken >= tokens.length) {
-          return false;
-        }
-        Token token = tokens[currentToken++];
-        clearAttributes();
-        termAtt.setEmpty().append(token);
-        offsetAtt.setOffset(token.startOffset(), token.endOffset());
-        posincAtt
-            .setPositionIncrement(currentToken <= 1
-                || tokens[currentToken - 1].startOffset() > tokens[currentToken - 2]
-                    .startOffset() ? 1 : 0);
-        return true;
-      }
-    }
-    // code to reconstruct the original sequence of Tokens
-    TermsEnum termsEnum = tpv.iterator(null);
-    int totalTokens = 0;
-    while(termsEnum.next() != null) {
-      totalTokens += (int) termsEnum.totalTermFreq();
-    }
-    Token tokensInOriginalOrder[] = new Token[totalTokens];
-    ArrayList<Token> unsortedTokens = null;
-    termsEnum = tpv.iterator(null);
-    BytesRef text;
-    DocsAndPositionsEnum dpEnum = null;
-    while ((text = termsEnum.next()) != null) {
-
-      dpEnum = termsEnum.docsAndPositions(null, dpEnum, true);
-      if (dpEnum == null) {
-        throw new IllegalArgumentException(
-            "Required TermVector Offset information was not found");
-      }
-
-      final String term = text.utf8ToString();
-
-      dpEnum.nextDoc();
-      final int freq = dpEnum.freq();
-      for(int posUpto=0;posUpto<freq;posUpto++) {
-        final int pos = dpEnum.nextPosition();
-        final Token token = new Token(term,
-                                      dpEnum.startOffset(),
-                                      dpEnum.endOffset());
-        if (tokenPositionsGuaranteedContiguous && pos != -1) {
-          // We have positions stored and a guarantee that the token position
-          // information is contiguous
-
-          // This may be fast BUT wont work if Tokenizers used which create >1
-          // token in same position or
-          // creates jumps in position numbers - this code would fail under those
-          // circumstances
-
-          // tokens stored with positions - can use this to index straight into
-          // sorted array
-          tokensInOriginalOrder[pos] = token;
-        } else {
-          // tokens NOT stored with positions or not guaranteed contiguous - must
-          // add to list and sort later
-          if (unsortedTokens == null) {
-            unsortedTokens = new ArrayList<Token>();
-          }
-          unsortedTokens.add(token);
-        }
-      }
-    }
-
-    // If the field has been stored without position data we must perform a sort
-    if (unsortedTokens != null) {
-      tokensInOriginalOrder = unsortedTokens.toArray(new Token[unsortedTokens
-          .size()]);
-      ArrayUtil.mergeSort(tokensInOriginalOrder, new Comparator<Token>() {
-        public int compare(Token t1, Token t2) {
-          if (t1.startOffset() == t2.startOffset()) return t1.endOffset()
-              - t2.endOffset();
-          else return t1.startOffset() - t2.startOffset();
-        }
-      });
-    }
-    return new StoredTokenStream(tokensInOriginalOrder);
-  }
-
-  public static TokenStream getTokenStream(IndexReader reader, int docId,
-      String field) throws IOException {
-
-    Fields vectors = reader.getTermVectors(docId);
-    if (vectors == null) {
-      throw new IllegalArgumentException(field + " in doc #" + docId
-          + "does not have any term position data stored");
-    }
-
-    Terms vector = vectors.terms(field);
-    if (vector == null) {
-      throw new IllegalArgumentException(field + " in doc #" + docId
-          + "does not have any term position data stored");
-    }
-
-    if (!hasPositions(vector)) {
-      throw new IllegalArgumentException(field + " in doc #" + docId
-          + "does not have any term position data stored");
-    }
+    // Finally, perform k-means clustering on the rows of L (or W)
+    // generate random initial clusters
+    Path initialclusters = RandomSeedGenerator.buildRandom(conf,
+                                                           Wt.getRowPath(),
+                                                           new Path(output, Cluster.INITIAL_CLUSTERS_DIR),
+                                                           clusters,
+                                                           measure);
     
-    return getTokenStream(vector);
+    // The output format is the same as the K-means output format.
+    // TODO: Perhaps a conversion of the output format from points and clusters
+    // in eigenspace to the original dataset. Currently, the user has to perform
+    // the association step after this job finishes on their own.
+    KMeansDriver.run(conf,
+                     Wt.getRowPath(),
+                     initialclusters,
+                     output,
+                     measure,
+                     convergenceDelta,
+                     maxIterations,
+                     true,
+                     0.0, 
+                     false);
   }
-
-  // convenience method
-  public static TokenStream getTokenStream(IndexReader reader, int docId,
-      String field, Analyzer analyzer) throws IOException {
-    Document doc = reader.document(docId);
-    return getTokenStream(doc, field, analyzer);
-  }
-
-  public static TokenStream getTokenStream(Document doc, String field,
-      Analyzer analyzer) {
-    String contents = doc.get(field);
-    if (contents == null) {
-      throw new IllegalArgumentException("Field " + field
-          + " in document is not stored and cannot be analyzed");
-    }
-    return getTokenStream(field, contents, analyzer);
-  }
-
-  // convenience method
-  public static TokenStream getTokenStream(String field, String contents,
-      Analyzer analyzer) {
-    try {
-      return analyzer.tokenStream(field, new StringReader(contents));
-    } catch (IOException ex) {
-      throw new RuntimeException(ex);
-    }
-  }
-
 }

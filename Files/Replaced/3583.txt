@@ -1,4 +1,6 @@
-writer.shutdown();
+w.shutdown();
+
+package org.apache.lucene.index;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -16,85 +18,66 @@ writer.shutdown();
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.lucene.search;
 
-
-import java.io.IOException;
-
-import org.apache.lucene.analysis.Analyzer;
-import org.apache.lucene.analysis.MockTokenizer;
-import org.apache.lucene.analysis.Tokenizer;
+import org.apache.lucene.analysis.MockAnalyzer;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
-import org.apache.lucene.index.DirectoryReader;
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.RandomIndexWriter;
-import org.apache.lucene.index.Term;
-import org.apache.lucene.store.Directory;
+import org.apache.lucene.document.TextField;
+import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.TermRangeQuery;
+import org.apache.lucene.search.TopDocs;
+import org.apache.lucene.store.MockDirectoryWrapper;
+import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.LuceneTestCase;
 import org.apache.lucene.util.TestUtil;
-import org.junit.Test;
+import org.apache.lucene.util.TestUtil;
 
+public class TestForTooMuchCloning extends LuceneTestCase {
 
-public class FuzzyTermOnShortTermsTest extends LuceneTestCase {
-   private final static String FIELD = "field";
-   
-   @Test
-   public void test() throws Exception {
-      // proves rule that edit distance between the two terms
-      // must be > smaller term for there to be a match
-      Analyzer a = getAnalyzer();
-      //these work
-      countHits(a, new String[]{"abc"}, new FuzzyQuery(new Term(FIELD, "ab"), 1), 1);
-      countHits(a, new String[]{"ab"}, new FuzzyQuery(new Term(FIELD, "abc"), 1), 1);
-
-      countHits(a, new String[]{"abcde"}, new FuzzyQuery(new Term(FIELD, "abc"), 2), 1);
-      countHits(a, new String[]{"abc"}, new FuzzyQuery(new Term(FIELD, "abcde"), 2), 1);
-      
-      //these don't      
-      countHits(a, new String[]{"ab"}, new FuzzyQuery(new Term(FIELD, "a"), 1), 0);
-      countHits(a, new String[]{"a"}, new FuzzyQuery(new Term(FIELD, "ab"), 1), 0);
-      
-      countHits(a, new String[]{"abc"}, new FuzzyQuery(new Term(FIELD, "a"), 2), 0);
-      countHits(a, new String[]{"a"}, new FuzzyQuery(new Term(FIELD, "abc"), 2), 0);
-
-      countHits(a, new String[]{"abcd"}, new FuzzyQuery(new Term(FIELD, "ab"), 2), 0);
-      countHits(a, new String[]{"ab"}, new FuzzyQuery(new Term(FIELD, "abcd"), 2), 0);
-   }
-   
-   private void countHits(Analyzer analyzer, String[] docs, Query q, int expected) throws Exception {
-      Directory d = getDirectory(analyzer, docs);
-      IndexReader r = DirectoryReader.open(d);
-      IndexSearcher s = new IndexSearcher(r);
-      TotalHitCountCollector c = new TotalHitCountCollector();
-      s.search(q,  c);
-      assertEquals(q.toString(), expected, c.getTotalHits());
-      r.close();
-      d.close();
-   }
-   
-   public static Analyzer getAnalyzer(){
-      return new Analyzer() {
-         @Override
-         public TokenStreamComponents createComponents(String fieldName) {
-            Tokenizer tokenizer = new MockTokenizer(MockTokenizer.SIMPLE, true);
-            return new TokenStreamComponents(tokenizer, tokenizer);
-         }
-      };
-   }
-   public static Directory getDirectory(Analyzer analyzer, String[] vals) throws IOException{
-      Directory directory = newDirectory();
-      RandomIndexWriter writer = new RandomIndexWriter(random(), directory,
-          newIndexWriterConfig(TEST_VERSION_CURRENT, analyzer)
-          .setMaxBufferedDocs(TestUtil.nextInt(random(), 100, 1000)).setMergePolicy(newLogMergePolicy()));
-
-      for (String s : vals){
-         Document d = new Document();
-         d.add(newTextField(FIELD, s, Field.Store.YES));
-         writer.addDocument(d);
-            
+  // Make sure we don't clone IndexInputs too frequently
+  // during merging:
+  public void test() throws Exception {
+    // NOTE: if we see a fail on this test with "NestedPulsing" its because its 
+    // reuse isnt perfect (but reasonable). see TestPulsingReuse.testNestedPulsing 
+    // for more details
+    final MockDirectoryWrapper dir = newMockDirectory();
+    final TieredMergePolicy tmp = new TieredMergePolicy();
+    tmp.setMaxMergeAtOnce(2);
+    final RandomIndexWriter w = new RandomIndexWriter(random(), dir,
+                                                      newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())).setMaxBufferedDocs(2).setMergePolicy(tmp));
+    final int numDocs = 20;
+    for(int docs=0;docs<numDocs;docs++) {
+      StringBuilder sb = new StringBuilder();
+      for(int terms=0;terms<100;terms++) {
+        sb.append(TestUtil.randomRealisticUnicodeString(random()));
+        sb.append(' ');
       }
-      writer.close();
-      return directory;
-   }
+      final Document doc = new Document();
+      doc.add(new TextField("field", sb.toString(), Field.Store.NO));
+      w.addDocument(doc);
+    }
+    final IndexReader r = w.getReader();
+    w.close();
+
+    final int cloneCount = dir.getInputCloneCount();
+    //System.out.println("merge clone count=" + cloneCount);
+    assertTrue("too many calls to IndexInput.clone during merging: " + dir.getInputCloneCount(), cloneCount < 500);
+
+    final IndexSearcher s = newSearcher(r);
+
+    // MTQ that matches all terms so the AUTO_REWRITE should
+    // cutover to filter rewrite and reuse a single DocsEnum
+    // across all terms;
+    final TopDocs hits = s.search(new TermRangeQuery("field",
+                                                     new BytesRef(),
+                                                     new BytesRef("\uFFFF"),
+                                                     true,
+                                                     true), 10);
+    assertTrue(hits.totalHits > 0);
+    final int queryCloneCount = dir.getInputCloneCount() - cloneCount;
+    //System.out.println("query clone count=" + queryCloneCount);
+    assertTrue("too many calls to IndexInput.clone during TermRangeQuery: " + queryCloneCount, queryCloneCount < 50);
+    r.close();
+    dir.close();
+  }
 }

@@ -1,6 +1,6 @@
-public void setNextEnum(TermsEnum termsEnum) {
+SeekingTermSetTermsEnum(TermsEnum tenum, BytesRefHash terms) {
 
-package org.apache.lucene.search;
+package org.apache.lucene.search.join;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,204 +19,119 @@ package org.apache.lucene.search;
  * limitations under the License.
  */
 
-import java.io.IOException;
-
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.Term;
-import org.apache.lucene.index.TermContext;
-import org.apache.lucene.index.TermState;
+import org.apache.lucene.index.FilteredTermsEnum;
+import org.apache.lucene.index.Terms;
 import org.apache.lucene.index.TermsEnum;
-import org.apache.lucene.util.ArrayUtil;
-import org.apache.lucene.util.ByteBlockPool;
+import org.apache.lucene.search.MultiTermQuery;
+import org.apache.lucene.util.AttributeSource;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.BytesRefHash;
-import org.apache.lucene.util.RamUsageEstimator;
-import org.apache.lucene.util.BytesRefHash.DirectBytesStartArray;
 
-class ConstantScoreAutoRewrite extends TermCollectingRewrite<BooleanQuery> {
+import java.io.IOException;
+import java.util.Comparator;
 
-  // Defaults derived from rough tests with a 20.0 million
-  // doc Wikipedia index.  With more than 350 terms in the
-  // query, the filter method is fastest:
-  public static int DEFAULT_TERM_COUNT_CUTOFF = 350;
+/**
+ * A query that has an array of terms from a specific field. This query will match documents have one or more terms in
+ * the specified field that match with the terms specified in the array.
+ *
+ * @lucene.experimental
+ */
+class TermsQuery extends MultiTermQuery {
 
-  // If the query will hit more than 1 in 1000 of the docs
-  // in the index (0.1%), the filter method is fastest:
-  public static double DEFAULT_DOC_COUNT_PERCENT = 0.1;
+  private final BytesRefHash terms;
 
-  private int termCountCutoff = DEFAULT_TERM_COUNT_CUTOFF;
-  private double docCountPercent = DEFAULT_DOC_COUNT_PERCENT;
-
-  /** If the number of terms in this query is equal to or
-   *  larger than this setting then {@link
-   *  MultiTermQuery#CONSTANT_SCORE_FILTER_REWRITE} is used. */
-  public void setTermCountCutoff(int count) {
-    termCountCutoff = count;
+  /**
+   * @param field The field that should contain terms that are specified in the previous parameter
+   * @param terms The terms that matching documents should have. The terms must be sorted by natural order.
+   */
+  TermsQuery(String field, BytesRefHash terms) {
+    super(field);
+    this.terms = terms;
   }
 
-  /** @see #setTermCountCutoff */
-  public int getTermCountCutoff() {
-    return termCountCutoff;
-  }
-
-  /** If the number of documents to be visited in the
-   *  postings exceeds this specified percentage of the
-   *  maxDoc() for the index, then {@link
-   *  MultiTermQuery#CONSTANT_SCORE_FILTER_REWRITE} is used.
-   *  @param percent 0.0 to 100.0 */
-  public void setDocCountPercent(double percent) {
-    docCountPercent = percent;
-  }
-
-  /** @see #setDocCountPercent */
-  public double getDocCountPercent() {
-    return docCountPercent;
-  }
-
-  @Override
-  protected BooleanQuery getTopLevelQuery() {
-    return new BooleanQuery(true);
-  }
-  
-  @Override
-  protected void addClause(BooleanQuery topLevel, Term term, int docFreq, float boost /*ignored*/, TermContext states) {
-    topLevel.add(new TermQuery(term, states), BooleanClause.Occur.SHOULD);
-  }
-
-  @Override
-  public Query rewrite(final IndexReader reader, final MultiTermQuery query) throws IOException {
-
-    // Get the enum and start visiting terms.  If we
-    // exhaust the enum before hitting either of the
-    // cutoffs, we use ConstantBooleanQueryRewrite; else,
-    // ConstantFilterRewrite:
-    final int docCountCutoff = (int) ((docCountPercent / 100.) * reader.maxDoc());
-    final int termCountLimit = Math.min(BooleanQuery.getMaxClauseCount(), termCountCutoff);
-
-    final CutOffTermCollector col = new CutOffTermCollector(docCountCutoff, termCountLimit);
-    collectTerms(reader, query, col);
-    final int size = col.pendingTerms.size();
-    if (col.hasCutOff) {
-      return MultiTermQuery.CONSTANT_SCORE_FILTER_REWRITE.rewrite(reader, query);
-    } else if (size == 0) {
-      return getTopLevelQuery();
-    } else {
-      final BooleanQuery bq = getTopLevelQuery();
-      final BytesRefHash pendingTerms = col.pendingTerms;
-      final int sort[] = pendingTerms.sort(col.termsEnum.getComparator());
-      for(int i = 0; i < size; i++) {
-        final int pos = sort[i];
-        // docFreq is not used for constant score here, we pass 1
-        // to explicitely set a fake value, so it's not calculated
-        addClause(bq, new Term(query.field, pendingTerms.get(pos, new BytesRef())), 1, 1.0f, col.array.termState[pos]);
-      }
-      // Strip scores
-      final Query result = new ConstantScoreQuery(bq);
-      result.setBoost(query.getBoost());
-      return result;
+  protected TermsEnum getTermsEnum(Terms terms, AttributeSource atts) throws IOException {
+    if (this.terms.size() == 0) {
+      return TermsEnum.EMPTY;
     }
+
+    return new SeekingTermSetTermsEnum(terms.iterator(null), this.terms);
   }
-  
-  static final class CutOffTermCollector extends TermCollector {
-    CutOffTermCollector(int docCountCutoff, int termCountLimit) {
-      this.docCountCutoff = docCountCutoff;
-      this.termCountLimit = termCountLimit;
+
+  public String toString(String string) {
+    return "TermsQuery{" +
+        "field=" + field +
+        '}';
+  }
+
+  static class SeekingTermSetTermsEnum extends FilteredTermsEnum {
+
+    private final BytesRefHash terms;
+    private final int[] ords;
+    private final int lastElement;
+
+    private final BytesRef lastTerm;
+    private final BytesRef spare = new BytesRef();
+    private final Comparator<BytesRef> comparator;
+
+    private BytesRef seekTerm;
+    private int upto = 0;
+
+    SeekingTermSetTermsEnum(TermsEnum tenum, BytesRefHash terms) throws IOException {
+      super(tenum);
+      this.terms = terms;
+
+      lastElement = terms.size() - 1;
+      ords = terms.sort(comparator = tenum.getComparator());
+      lastTerm = terms.get(ords[lastElement], new BytesRef());
+      seekTerm = terms.get(ords[upto], spare);
     }
-  
+
     @Override
-    public void setNextEnum(TermsEnum termsEnum) throws IOException {
-      this.termsEnum = termsEnum;
+    protected BytesRef nextSeekTerm(BytesRef currentTerm) throws IOException {
+      BytesRef temp = seekTerm;
+      seekTerm = null;
+      return temp;
     }
-      
-    @Override
-    public boolean collect(BytesRef bytes) throws IOException {
-      int pos = pendingTerms.add(bytes);
-      docVisitCount += termsEnum.docFreq();
-      if (pendingTerms.size() >= termCountLimit || docVisitCount >= docCountCutoff) {
-        hasCutOff = true;
-        return false;
+
+    protected AcceptStatus accept(BytesRef term) throws IOException {
+      if (comparator.compare(term, lastTerm) > 0) {
+        return AcceptStatus.END;
       }
-      
-      final TermState termState = termsEnum.termState();
-      assert termState != null;
-      if (pos < 0) {
-        pos = (-pos)-1;
-        array.termState[pos].register(termState, readerContext.ord, termsEnum.docFreq(), termsEnum.totalTermFreq());
+
+      BytesRef currentTerm = terms.get(ords[upto], spare);
+      if (comparator.compare(term, currentTerm) == 0) {
+        if (upto == lastElement) {
+          return AcceptStatus.YES;
+        } else {
+          seekTerm = terms.get(ords[++upto], spare);
+          return AcceptStatus.YES_AND_SEEK;
+        }
       } else {
-        array.termState[pos] = new TermContext(topReaderContext, termState, readerContext.ord, termsEnum.docFreq(), termsEnum.totalTermFreq());
+        if (upto == lastElement) {
+          return AcceptStatus.NO;
+        } else { // Our current term doesn't match the the given term.
+          int cmp;
+          do { // We maybe are behind the given term by more than one step. Keep incrementing till we're the same or higher.
+            if (upto == lastElement) {
+              return AcceptStatus.NO;
+            }
+            // typically the terms dict is a superset of query's terms so it's unusual that we have to skip many of
+            // our terms so we don't do a binary search here
+            seekTerm = terms.get(ords[++upto], spare);
+          } while ((cmp = comparator.compare(seekTerm, term)) < 0);
+          if (cmp == 0) {
+            if (upto == lastElement) {
+              return AcceptStatus.YES;
+            }
+            seekTerm = terms.get(ords[++upto], spare);
+            return AcceptStatus.YES_AND_SEEK;
+          } else {
+            return AcceptStatus.NO_AND_SEEK;
+          }
+        }
       }
-      return true;
     }
-    
-    int docVisitCount = 0;
-    boolean hasCutOff = false;
-    TermsEnum termsEnum;
 
-    final int docCountCutoff, termCountLimit;
-    final TermStateByteStart array = new TermStateByteStart(16);
-    final BytesRefHash pendingTerms = new BytesRefHash(new ByteBlockPool(new ByteBlockPool.DirectAllocator()), 16, array);
   }
 
-  @Override
-  public int hashCode() {
-    final int prime = 1279;
-    return (int) (prime * termCountCutoff + Double.doubleToLongBits(docCountPercent));
-  }
-
-  @Override
-  public boolean equals(Object obj) {
-    if (this == obj)
-      return true;
-    if (obj == null)
-      return false;
-    if (getClass() != obj.getClass())
-      return false;
-
-    ConstantScoreAutoRewrite other = (ConstantScoreAutoRewrite) obj;
-    if (other.termCountCutoff != termCountCutoff) {
-      return false;
-    }
-
-    if (Double.doubleToLongBits(other.docCountPercent) != Double.doubleToLongBits(docCountPercent)) {
-      return false;
-    }
-    
-    return true;
-  }
-  
-  /** Special implementation of BytesStartArray that keeps parallel arrays for {@link TermContext} */
-  static final class TermStateByteStart extends DirectBytesStartArray  {
-    TermContext[] termState;
-    
-    public TermStateByteStart(int initSize) {
-      super(initSize);
-    }
-
-    @Override
-    public int[] init() {
-      final int[] ord = super.init();
-      termState = new TermContext[ArrayUtil.oversize(ord.length, RamUsageEstimator.NUM_BYTES_OBJECT_REF)];
-      assert termState.length >= ord.length;
-      return ord;
-    }
-
-    @Override
-    public int[] grow() {
-      final int[] ord = super.grow();
-      if (termState.length < ord.length) {
-        TermContext[] tmpTermState = new TermContext[ArrayUtil.oversize(ord.length, RamUsageEstimator.NUM_BYTES_OBJECT_REF)];
-        System.arraycopy(termState, 0, tmpTermState, 0, termState.length);
-        termState = tmpTermState;
-      }      
-      assert termState.length >= ord.length;
-      return ord;
-    }
-
-    @Override
-    public int[] clear() {
-     termState = null;
-     return super.clear();
-    }
-    
-  }
 }

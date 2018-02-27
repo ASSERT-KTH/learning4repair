@@ -16,127 +16,111 @@
  * limitations under the License.
  */
 
-package org.apache.cassandra.loader;
+package org.apache.cassandra.service;
 
-import java.io.BufferedReader;
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.InputStreamReader;
-import java.util.List;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.util.concurrent.locks.*;
 
-import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.Column;
+import org.apache.cassandra.db.ColumnFamily;
 import org.apache.cassandra.db.RowMutation;
-import org.apache.cassandra.db.Table;
-import org.apache.cassandra.io.SSTable;
-import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.db.RowMutationMessage;
+import org.apache.cassandra.db.SuperColumn;
+import org.apache.cassandra.net.EndPoint;
+import org.apache.cassandra.net.Header;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.utils.Cachetable;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.ICacheExpungeHook;
+import org.apache.cassandra.utils.ICachetable;
 import org.apache.cassandra.utils.LogUtil;
 import org.apache.log4j.Logger;
 
-/**
+
+
+/*
+ * This class manages the read repairs . This is a singleton class
+ * it basically uses the cache table construct to schedule writes that have to be 
+ * made for read repairs. 
+ * A cachetable is created which wakes up every n  milliseconds specified by 
+ * expirationTimeInMillis and calls a global hook fn on pending entries 
+ * This fn basically sends the message to the appropriate servers to update them
+ * with the latest changes.
  * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
  */
-
-public class PreLoad
+class ReadRepairManager
 {
-	
-	private static long siesta_ = 2*60*1000;
-	private static Logger logger_ = Logger.getLogger( Loader.class );
-    private StorageService storageService_;
-	
-	public PreLoad(StorageService storageService)
-    {
-        storageService_ = storageService;
-    }
-    /*
-     * This method loads all the keys into a special column family 
-     * called "RecycleBin". This column family is used for temporary
-     * processing of data and then can be recycled. The idea is that 
-     * after the load is complete we have all the keys in the system.
-     * Now we force a compaction and examine the single Index file 
-     * that is generated to determine how the nodes need to relocate
-     * to be perfectly load balanced.
-     * 
-     *  param @ rootDirectory - rootDirectory at which the parsing begins.
-     *  param @ table - table that will be populated.
-     *  param @ cfName - name of the column that will be populated. This is 
-     *  passed in so that we do not unncessary allocate temporary String objects.
-    */
-    private void preParse(String rootDirectory, String table, String cfName) throws Throwable
-    {        
-        BufferedReader bufReader = new BufferedReader(new InputStreamReader(
-                new FileInputStream(rootDirectory)), 16 * 1024 * 1024);
-        String line = null;
-        while ((line = bufReader.readLine()) != null)
-        {
-                String userId = line;
-                RowMutation rm = new RowMutation(table, userId);
-                rm.add(cfName, userId.getBytes(), 0);
-                rm.apply();
-        }
-    }
-    
-    void run(String userFile) throws Throwable
-    {
-        String table = DatabaseDescriptor.getTables().get(0);
-        String cfName = Table.recycleBin_ + ":" + "Keys";
-        /* populate just the keys. */
-        preParse(userFile, table, cfName);
-        /* dump the memtables */
-        Table.open(table).flush(false);
-        /* force a compaction of the files. */
-        Table.open(table).forceCompaction(null, null,null);
-        
-        /*
-         * This is a hack to let everyone finish. Just sleep for
-         * a couple of minutes. 
-        */
-        logger_.info("Taking a nap after forcing a compaction ...");
-        Thread.sleep(PreLoad.siesta_);
-        
-        /* Figure out the keys in the index file to relocate the node */
-        List<String> ssTables = Table.open(table).getAllSSTablesOnDisk();
-        /* Load the indexes into memory */
-        for ( String df : ssTables )
-        {
-        	SSTable ssTable = new SSTable(df, StorageService.getPartitioner());
-        	ssTable.close();
-        }
-        /* We should have only one file since we just compacted. */        
-        List<String> indexedKeys = SSTable.getIndexedKeys();        
-        storageService_.relocate(indexedKeys.toArray( new String[0]) );
-        
-        /*
-         * This is a hack to let everyone relocate and learn about
-         * each other. Just sleep for a couple of minutes. 
-        */
-        logger_.info("Taking a nap after relocating ...");
-        Thread.sleep(PreLoad.siesta_);  
-        
-        /* 
-         * Do the cleanup necessary. Delete all commit logs and
-         * the SSTables and reset the load state in the StorageService. 
-        */
-        SSTable.delete(ssTables.get(0));
-        storageService_.resetLoadState();
-        logger_.info("Finished all the requisite clean up ...");
-    }
+    private static Logger logger_ = Logger.getLogger(ReadRepairManager.class);
+	private static final long expirationTimeInMillis = 2000;
+	private static Lock lock_ = new ReentrantLock();
+	private static ReadRepairManager self_ = null;
 
-    
-	/**
-	 * @param args
+	/*
+	 * This is the internal class which actually
+	 * implements the global hook fn called by the readrepair manager
 	 */
-	public static void main(String[] args) throws Throwable
+	static class ReadRepairPerformer implements
+			ICacheExpungeHook<String, Message>
 	{
-		if(args.length != 1)
+		private static Logger logger_ = Logger.getLogger(ReadRepairPerformer.class);
+		/*
+		 * The hook fn which takes the end point and the row mutation that 
+		 * needs to be sent to the end point in order 
+		 * to perform read repair.
+		 */
+		public void callMe(String target,
+				Message message)
 		{
-			System.out.println("Usage: PreLoad <Fully qualified path of the file containing user names>");
+			String[] pieces = FBUtilities.strip(target, ":");
+			EndPoint to = new EndPoint(pieces[0], Integer.parseInt(pieces[1]));
+			MessagingService.getMessagingInstance().sendOneWay(message, to);			
 		}
-		// TODO Auto-generated method stub
-		LogUtil.init();
-        StorageService s = StorageService.instance();
-        s.start();
-        PreLoad preLoad = new PreLoad(s);
-        preLoad.run(args[0]);
+
 	}
 
+	private ICachetable<String, Message> readRepairTable_ = new Cachetable<String, Message>(expirationTimeInMillis, new ReadRepairManager.ReadRepairPerformer());
+
+	protected ReadRepairManager()
+	{
+
+	}
+
+	public  static ReadRepairManager instance()
+	{
+		if (self_ == null)
+		{
+            lock_.lock();
+            try
+            {
+                if ( self_ == null )
+                    self_ = new ReadRepairManager();
+            }
+            finally
+            {
+                lock_.unlock();
+            }
+		}
+		return self_;
+	}
+
+	/*
+	 * Schedules a read repair.
+	 * @param target endpoint on whcih the read repair should happen
+	 * @param rowMutationMessage the row mutation message that has the repaired row.
+	 */
+	public void schedule(EndPoint target, RowMutationMessage rowMutationMessage)
+	{
+        try
+        {
+            Message message = RowMutationMessage.makeRowMutationMessage(rowMutationMessage, StorageService.readRepairVerbHandler_);
+    		String key = target + ":" + message.getMessageId();
+    		readRepairTable_.put(key, message);
+        }
+        catch ( IOException ex )
+        {
+            logger_.error(LogUtil.throwableToString(ex));
+        }
+	}
 }

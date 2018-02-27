@@ -1,6 +1,6 @@
-public PulsingPostingsReader(PostingsReaderBase wrappedPostingsReader) {
+private void pushTop() {
 
-package org.apache.lucene.codecs.pulsing;
+package org.apache.lucene.index;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -18,620 +18,348 @@ package org.apache.lucene.codecs.pulsing;
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 import java.io.IOException;
-import java.util.IdentityHashMap;
-import java.util.Map;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
 
-import org.apache.lucene.codecs.BlockTermState;
-import org.apache.lucene.codecs.CodecUtil;
-import org.apache.lucene.codecs.PostingsReaderBase;
-import org.apache.lucene.index.DocsAndPositionsEnum;
-import org.apache.lucene.index.DocsEnum;
-import org.apache.lucene.index.FieldInfo;
-import org.apache.lucene.index.FieldInfo.IndexOptions;
-import org.apache.lucene.index.TermState;
-import org.apache.lucene.store.ByteArrayDataInput;
-import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.index.DocValues.SortedSource;
+import org.apache.lucene.index.DocValues.Source;
+import org.apache.lucene.index.DocValues.Type;
+import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.util.ArrayUtil;
-import org.apache.lucene.util.Attribute;
-import org.apache.lucene.util.AttributeImpl;
-import org.apache.lucene.util.AttributeSource;
-import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.PriorityQueue;
+import org.apache.lucene.util.packed.PackedInts;
 
-/** Concrete class that reads the current doc/freq/skip
- *  postings format 
- *  @lucene.experimental */
+/**
+ * @lucene.internal
+ */
+public final class SortedBytesMergeUtils {
 
-// TODO: -- should we switch "hasProx" higher up?  and
-// create two separate docs readers, one that also reads
-// prox and one that doesn't?
-
-public class PulsingPostingsReader extends PostingsReaderBase {
-
-  // Fallback reader for non-pulsed terms:
-  final PostingsReaderBase wrappedPostingsReader;
-  int maxPositions;
-
-  public PulsingPostingsReader(PostingsReaderBase wrappedPostingsReader) throws IOException {
-    this.wrappedPostingsReader = wrappedPostingsReader;
+  private SortedBytesMergeUtils() {
+    // no instance
   }
 
-  @Override
-  public void init(IndexInput termsIn) throws IOException {
-    CodecUtil.checkHeader(termsIn, PulsingPostingsWriter.CODEC,
-      PulsingPostingsWriter.VERSION_START, PulsingPostingsWriter.VERSION_START);
-    maxPositions = termsIn.readVInt();
-    wrappedPostingsReader.init(termsIn);
+  public static MergeContext init(Type type, DocValues[] docValues,
+      Comparator<BytesRef> comp, int mergeDocCount) {
+    int size = -1;
+    if (type == Type.BYTES_FIXED_SORTED) {
+      for (DocValues indexDocValues : docValues) {
+        if (indexDocValues != null) {
+          size = indexDocValues.getValueSize();
+          break;
+        }
+      }
+      assert size >= 0;
+    }
+    return new MergeContext(comp, mergeDocCount, size, type);
   }
 
-  private static class PulsingTermState extends BlockTermState {
-    private byte[] postings;
-    private int postingsSize;                     // -1 if this term was not inlined
-    private BlockTermState wrappedTermState;
+  public static final class MergeContext {
+    private final Comparator<BytesRef> comp;
+    private final BytesRef missingValue = new BytesRef();
+    public final int sizePerValues; // -1 if var length
+    final Type type;
+    public final int[] docToEntry;
+    public long[] offsets; // if non-null #mergeRecords collects byte offsets here
 
-    ByteArrayDataInput inlinedBytesReader;
-    private byte[] inlinedBytes;
-
-    @Override
-    public PulsingTermState clone() {
-      PulsingTermState clone;
-      clone = (PulsingTermState) super.clone();
-      if (postingsSize != -1) {
-        clone.postings = new byte[postingsSize];
-        System.arraycopy(postings, 0, clone.postings, 0, postingsSize);
-      } else {
-        assert wrappedTermState != null;
-        clone.wrappedTermState = (BlockTermState) wrappedTermState.clone();
+    public MergeContext(Comparator<BytesRef> comp, int mergeDocCount,
+        int size, Type type) {
+      assert type == Type.BYTES_FIXED_SORTED || type == Type.BYTES_VAR_SORTED;
+      this.comp = comp;
+      this.sizePerValues = size;
+      this.type = type;
+      if (size > 0) {
+        missingValue.grow(size);
+        missingValue.length = size;
       }
-      return clone;
+      docToEntry = new int[mergeDocCount];
     }
-
-    @Override
-    public void copyFrom(TermState _other) {
-      super.copyFrom(_other);
-      PulsingTermState other = (PulsingTermState) _other;
-      postingsSize = other.postingsSize;
-      if (other.postingsSize != -1) {
-        if (postings == null || postings.length < other.postingsSize) {
-          postings = new byte[ArrayUtil.oversize(other.postingsSize, 1)];
-        }
-        System.arraycopy(other.postings, 0, postings, 0, other.postingsSize);
-      } else {
-        wrappedTermState.copyFrom(other.wrappedTermState);
-      }
-
-      // NOTE: we do not copy the
-      // inlinedBytes/inlinedBytesReader; these are only
-      // stored on the "primary" TermState.  They are
-      // "transient" to cloned term states.
-    }
-
-    @Override
-    public String toString() {
-      if (postingsSize == -1) {
-        return "PulsingTermState: not inlined: wrapped=" + wrappedTermState;
-      } else {
-        return "PulsingTermState: inlined size=" + postingsSize + " " + super.toString();
-      }
-    }
-  }
-
-  @Override
-  public void readTermsBlock(IndexInput termsIn, FieldInfo fieldInfo, BlockTermState _termState) throws IOException {
-    //System.out.println("PR.readTermsBlock state=" + _termState);
-    final PulsingTermState termState = (PulsingTermState) _termState;
-    if (termState.inlinedBytes == null) {
-      termState.inlinedBytes = new byte[128];
-      termState.inlinedBytesReader = new ByteArrayDataInput();
-    }
-    int len = termsIn.readVInt();
-    //System.out.println("  len=" + len + " fp=" + termsIn.getFilePointer());
-    if (termState.inlinedBytes.length < len) {
-      termState.inlinedBytes = new byte[ArrayUtil.oversize(len, 1)];
-    }
-    termsIn.readBytes(termState.inlinedBytes, 0, len);
-    termState.inlinedBytesReader.reset(termState.inlinedBytes);
-    termState.wrappedTermState.termBlockOrd = 0;
-    wrappedPostingsReader.readTermsBlock(termsIn, fieldInfo, termState.wrappedTermState);
-  }
-
-  @Override
-  public BlockTermState newTermState() throws IOException {
-    PulsingTermState state = new PulsingTermState();
-    state.wrappedTermState = wrappedPostingsReader.newTermState();
-    return state;
-  }
-
-  @Override
-  public void nextTerm(FieldInfo fieldInfo, BlockTermState _termState) throws IOException {
-    //System.out.println("PR nextTerm");
-    PulsingTermState termState = (PulsingTermState) _termState;
-
-    // if we have positions, its total TF, otherwise its computed based on docFreq.
-    long count = fieldInfo.getIndexOptions().compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) >= 0 ? termState.totalTermFreq : termState.docFreq;
-    //System.out.println("  count=" + count + " threshold=" + maxPositions);
-
-    if (count <= maxPositions) {
-
-      // Inlined into terms dict -- just read the byte[] blob in,
-      // but don't decode it now (we only decode when a DocsEnum
-      // or D&PEnum is pulled):
-      termState.postingsSize = termState.inlinedBytesReader.readVInt();
-      if (termState.postings == null || termState.postings.length < termState.postingsSize) {
-        termState.postings = new byte[ArrayUtil.oversize(termState.postingsSize, 1)];
-      }
-      // TODO: sort of silly to copy from one big byte[]
-      // (the blob holding all inlined terms' blobs for
-      // current term block) into another byte[] (just the
-      // blob for this term)...
-      termState.inlinedBytesReader.readBytes(termState.postings, 0, termState.postingsSize);
-      //System.out.println("  inlined bytes=" + termState.postingsSize);
-    } else {
-      //System.out.println("  not inlined");
-      termState.postingsSize = -1;
-      // TODO: should we do full copyFrom?  much heavier...?
-      termState.wrappedTermState.docFreq = termState.docFreq;
-      termState.wrappedTermState.totalTermFreq = termState.totalTermFreq;
-      wrappedPostingsReader.nextTerm(fieldInfo, termState.wrappedTermState);
-      termState.wrappedTermState.termBlockOrd++;
-    }
-  }
-
-  @Override
-  public DocsEnum docs(FieldInfo field, BlockTermState _termState, Bits liveDocs, DocsEnum reuse, boolean needsFreqs) throws IOException {
-    PulsingTermState termState = (PulsingTermState) _termState;
-    if (termState.postingsSize != -1) {
-      PulsingDocsEnum postings;
-      if (reuse instanceof PulsingDocsEnum) {
-        postings = (PulsingDocsEnum) reuse;
-        if (!postings.canReuse(field)) {
-          postings = new PulsingDocsEnum(field);
-        }
-      } else {
-        // the 'reuse' is actually the wrapped enum
-        PulsingDocsEnum previous = (PulsingDocsEnum) getOther(reuse);
-        if (previous != null && previous.canReuse(field)) {
-          postings = previous;
-        } else {
-          postings = new PulsingDocsEnum(field);
-        }
-      }
-      if (reuse != postings) {
-        setOther(postings, reuse); // postings.other = reuse
-      }
-      return postings.reset(liveDocs, termState);
-    } else {
-      if (reuse instanceof PulsingDocsEnum) {
-        DocsEnum wrapped = wrappedPostingsReader.docs(field, termState.wrappedTermState, liveDocs, getOther(reuse), needsFreqs);
-        setOther(wrapped, reuse); // wrapped.other = reuse
-        return wrapped;
-      } else {
-        return wrappedPostingsReader.docs(field, termState.wrappedTermState, liveDocs, reuse, needsFreqs);
-      }
-    }
-  }
-
-  @Override
-  public DocsAndPositionsEnum docsAndPositions(FieldInfo field, BlockTermState _termState, Bits liveDocs, DocsAndPositionsEnum reuse,
-                                               boolean needsOffsets) throws IOException {
-
-    final PulsingTermState termState = (PulsingTermState) _termState;
-
-    if (termState.postingsSize != -1) {
-      PulsingDocsAndPositionsEnum postings;
-      if (reuse instanceof PulsingDocsAndPositionsEnum) {
-        postings = (PulsingDocsAndPositionsEnum) reuse;
-        if (!postings.canReuse(field)) {
-          postings = new PulsingDocsAndPositionsEnum(field);
-        }
-      } else {
-        // the 'reuse' is actually the wrapped enum
-        PulsingDocsAndPositionsEnum previous = (PulsingDocsAndPositionsEnum) getOther(reuse);
-        if (previous != null && previous.canReuse(field)) {
-          postings = previous;
-        } else {
-          postings = new PulsingDocsAndPositionsEnum(field);
-        }
-      }
-      if (reuse != postings) {
-        setOther(postings, reuse); // postings.other = reuse 
-      }
-      return postings.reset(liveDocs, termState);
-    } else {
-      if (reuse instanceof PulsingDocsAndPositionsEnum) {
-        DocsAndPositionsEnum wrapped = wrappedPostingsReader.docsAndPositions(field, termState.wrappedTermState, liveDocs, (DocsAndPositionsEnum) getOther(reuse),
-                                                                              needsOffsets);
-        setOther(wrapped, reuse); // wrapped.other = reuse
-        return wrapped;
-      } else {
-        return wrappedPostingsReader.docsAndPositions(field, termState.wrappedTermState, liveDocs, reuse, needsOffsets);
-      }
-    }
-  }
-
-  private static class PulsingDocsEnum extends DocsEnum {
-    private byte[] postingsBytes;
-    private final ByteArrayDataInput postings = new ByteArrayDataInput();
-    private final IndexOptions indexOptions;
-    private final boolean storePayloads;
-    private final boolean storeOffsets;
-    private Bits liveDocs;
-    private int docID = -1;
-    private int accum;
-    private int freq;
-    private int payloadLength;
-
-    public PulsingDocsEnum(FieldInfo fieldInfo) {
-      indexOptions = fieldInfo.getIndexOptions();
-      storePayloads = fieldInfo.hasPayloads();
-      storeOffsets = indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) >= 0;
-    }
-
-    public PulsingDocsEnum reset(Bits liveDocs, PulsingTermState termState) {
-      //System.out.println("PR docsEnum termState=" + termState + " docFreq=" + termState.docFreq);
-      assert termState.postingsSize != -1;
-
-      // Must make a copy of termState's byte[] so that if
-      // app does TermsEnum.next(), this DocsEnum is not affected
-      if (postingsBytes == null) {
-        postingsBytes = new byte[termState.postingsSize];
-      } else if (postingsBytes.length < termState.postingsSize) {
-        postingsBytes = ArrayUtil.grow(postingsBytes, termState.postingsSize);
-      }
-      System.arraycopy(termState.postings, 0, postingsBytes, 0, termState.postingsSize);
-      postings.reset(postingsBytes, 0, termState.postingsSize);
-      docID = -1;
-      accum = 0;
-      payloadLength = 0;
-      this.liveDocs = liveDocs;
-      return this;
-    }
-
-    boolean canReuse(FieldInfo fieldInfo) {
-      return indexOptions == fieldInfo.getIndexOptions() && storePayloads == fieldInfo.hasPayloads();
-    }
-
-    @Override
-    public int nextDoc() throws IOException {
-      //System.out.println("PR nextDoc this= "+ this);
-      while(true) {
-        if (postings.eof()) {
-          //System.out.println("PR   END");
-          return docID = NO_MORE_DOCS;
-        }
-
-        final int code = postings.readVInt();
-        //System.out.println("  read code=" + code);
-        if (indexOptions == IndexOptions.DOCS_ONLY) {
-          accum += code;
-        } else {
-          accum += code >>> 1;              // shift off low bit
-          if ((code & 1) != 0) {          // if low bit is set
-            freq = 1;                     // freq is one
-          } else {
-            freq = postings.readVInt();     // else read freq
-          }
-
-          if (indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) >= 0) {
-            // Skip positions
-            if (storePayloads) {
-              for(int pos=0;pos<freq;pos++) {
-                final int posCode = postings.readVInt();
-                if ((posCode & 1) != 0) {
-                  payloadLength = postings.readVInt();
-                }
-                if (storeOffsets && (postings.readVInt() & 1) != 0) {
-                  // new offset length
-                  postings.readVInt();
-                }
-                if (payloadLength != 0) {
-                  postings.skipBytes(payloadLength);
-                }
-              }
-            } else {
-              for(int pos=0;pos<freq;pos++) {
-                // TODO: skipVInt
-                postings.readVInt();
-                if (storeOffsets && (postings.readVInt() & 1) != 0) {
-                  // new offset length
-                  postings.readVInt();
-                }
-              }
-            }
-          }
-        }
-
-        if (liveDocs == null || liveDocs.get(accum)) {
-          return (docID = accum);
-        }
-      }
-    }
-
-    @Override
-    public int freq() throws IOException {
-      assert indexOptions != IndexOptions.DOCS_ONLY;
-      return freq;
-    }
-
-    @Override
-    public int docID() {
-      return docID;
-    }
-
-    @Override
-    public int advance(int target) throws IOException {
-      int doc;
-      while((doc=nextDoc()) != NO_MORE_DOCS) {
-        if (doc >= target)
-          return doc;
-      }
-      return docID = NO_MORE_DOCS;
-    }
-  }
-
-  private static class PulsingDocsAndPositionsEnum extends DocsAndPositionsEnum {
-    private byte[] postingsBytes;
-    private final ByteArrayDataInput postings = new ByteArrayDataInput();
-    private final boolean storePayloads;
-    private final boolean storeOffsets;
-    // note: we could actually reuse across different options, if we passed this to reset()
-    // and re-init'ed storeOffsets accordingly (made it non-final)
-    private final IndexOptions indexOptions;
-
-    private Bits liveDocs;
-    private int docID = -1;
-    private int accum;
-    private int freq;
-    private int posPending;
-    private int position;
-    private int payloadLength;
-    private BytesRef payload;
-    private int startOffset;
-    private int offsetLength;
-
-    private boolean payloadRetrieved;
-
-    public PulsingDocsAndPositionsEnum(FieldInfo fieldInfo) {
-      indexOptions = fieldInfo.getIndexOptions();
-      storePayloads = fieldInfo.hasPayloads();
-      storeOffsets = indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) >= 0;
-    }
-
-    boolean canReuse(FieldInfo fieldInfo) {
-      return indexOptions == fieldInfo.getIndexOptions() && storePayloads == fieldInfo.hasPayloads();
-    }
-
-    public PulsingDocsAndPositionsEnum reset(Bits liveDocs, PulsingTermState termState) {
-      assert termState.postingsSize != -1;
-      if (postingsBytes == null) {
-        postingsBytes = new byte[termState.postingsSize];
-      } else if (postingsBytes.length < termState.postingsSize) {
-        postingsBytes = ArrayUtil.grow(postingsBytes, termState.postingsSize);
-      }
-      System.arraycopy(termState.postings, 0, postingsBytes, 0, termState.postingsSize);
-      postings.reset(postingsBytes, 0, termState.postingsSize);
-      this.liveDocs = liveDocs;
-      payloadLength = 0;
-      posPending = 0;
-      docID = -1;
-      accum = 0;
-      startOffset = storeOffsets ? 0 : -1; // always return -1 if no offsets are stored
-      offsetLength = 0;
-      //System.out.println("PR d&p reset storesPayloads=" + storePayloads + " bytes=" + bytes.length + " this=" + this);
-      return this;
-    }
-
-    @Override
-    public int nextDoc() throws IOException {
-      //System.out.println("PR d&p nextDoc this=" + this);
-
-      while(true) {
-        //System.out.println("  cycle skip posPending=" + posPending);
-
-        skipPositions();
-
-        if (postings.eof()) {
-          //System.out.println("PR   END");
-          return docID = NO_MORE_DOCS;
-        }
-
-        final int code = postings.readVInt();
-        accum += code >>> 1;            // shift off low bit
-        if ((code & 1) != 0) {          // if low bit is set
-          freq = 1;                     // freq is one
-        } else {
-          freq = postings.readVInt();     // else read freq
-        }
-        posPending = freq;
-        startOffset = storeOffsets ? 0 : -1; // always return -1 if no offsets are stored
-
-        if (liveDocs == null || liveDocs.get(accum)) {
-          //System.out.println("  return docID=" + docID + " freq=" + freq);
-          position = 0;
-          return (docID = accum);
-        }
-      }
-    }
-
-    @Override
-    public int freq() throws IOException {
-      return freq;
-    }
-
-    @Override
-    public int docID() {
-      return docID;
-    }
-
-    @Override
-    public int advance(int target) throws IOException {
-      int doc;
-      while((doc=nextDoc()) != NO_MORE_DOCS) {
-        if (doc >= target) {
-          return docID = doc;
-        }
-      }
-      return docID = NO_MORE_DOCS;
-    }
-
-    @Override
-    public int nextPosition() throws IOException {
-      //System.out.println("PR d&p nextPosition posPending=" + posPending + " vs freq=" + freq);
-      
-      assert posPending > 0;
-      posPending--;
-
-      if (storePayloads) {
-        if (!payloadRetrieved) {
-          //System.out.println("PR     skip payload=" + payloadLength);
-          postings.skipBytes(payloadLength);
-        }
-        final int code = postings.readVInt();
-        //System.out.println("PR     code=" + code);
-        if ((code & 1) != 0) {
-          payloadLength = postings.readVInt();
-          //System.out.println("PR     new payload len=" + payloadLength);
-        }
-        position += code >>> 1;
-        payloadRetrieved = false;
-      } else {
-        position += postings.readVInt();
-      }
-      
-      if (storeOffsets) {
-        int offsetCode = postings.readVInt();
-        if ((offsetCode & 1) != 0) {
-          // new offset length
-          offsetLength = postings.readVInt();
-        }
-        startOffset += offsetCode >>> 1;
-      }
-
-      //System.out.println("PR d&p nextPos return pos=" + position + " this=" + this);
-      return position;
-    }
-
-    @Override
-    public int startOffset() {
-      return startOffset;
-    }
-
-    @Override
-    public int endOffset() {
-      return startOffset + offsetLength;
-    }
-
-    private void skipPositions() throws IOException {
-      while(posPending != 0) {
-        nextPosition();
-      }
-      if (storePayloads && !payloadRetrieved) {
-        //System.out.println("  skip payload len=" + payloadLength);
-        postings.skipBytes(payloadLength);
-        payloadRetrieved = true;
-      }
-    }
-
-    @Override
-    public boolean hasPayload() {
-      return storePayloads && !payloadRetrieved && payloadLength > 0;
-    }
-
-    @Override
-    public BytesRef getPayload() throws IOException {
-      //System.out.println("PR  getPayload payloadLength=" + payloadLength + " this=" + this);
-      if (payloadRetrieved) {
-        throw new IOException("Either no payload exists at this term position or an attempt was made to load it more than once.");
-      }
-      payloadRetrieved = true;
-      if (payloadLength > 0) {
-        if (payload == null) {
-          payload = new BytesRef(payloadLength);
-        } else {
-          payload.grow(payloadLength);
-        }
-        postings.readBytes(payload.bytes, 0, payloadLength);
-        payload.length = payloadLength;
-        return payload;
-      } else {
-        return null;
-      }
-    }
-  }
-
-  @Override
-  public void close() throws IOException {
-    wrappedPostingsReader.close();
-  }
-  
-  /** for a docsenum, gets the 'other' reused enum.
-   * Example: Pulsing(Standard).
-   * when doing a term range query you are switching back and forth
-   * between Pulsing and Standard
-   * 
-   * The way the reuse works is that Pulsing.other = Standard and
-   * Standard.other = Pulsing.
-   */
-  private DocsEnum getOther(DocsEnum de) {
-    if (de == null) {
-      return null;
-    } else {
-      final AttributeSource atts = de.attributes();
-      return atts.addAttribute(PulsingEnumAttribute.class).enums().get(this);
-    }
-  }
-  
-  /** 
-   * for a docsenum, sets the 'other' reused enum.
-   * see getOther for an example.
-   */
-  private DocsEnum setOther(DocsEnum de, DocsEnum other) {
-    final AttributeSource atts = de.attributes();
-    return atts.addAttribute(PulsingEnumAttribute.class).enums().put(this, other);
-  }
-
-  /** 
-   * A per-docsenum attribute that stores additional reuse information
-   * so that pulsing enums can keep a reference to their wrapped enums,
-   * and vice versa. this way we can always reuse.
-   * 
-   * @lucene.internal */
-  public static interface PulsingEnumAttribute extends Attribute {
-    public Map<PulsingPostingsReader,DocsEnum> enums();
-  }
     
-  /** 
-   * Implementation of {@link PulsingEnumAttribute} for reuse of
-   * wrapped postings readers underneath pulsing.
-   * 
-   * @lucene.internal */
-  public static final class PulsingEnumAttributeImpl extends AttributeImpl implements PulsingEnumAttribute {
-    // we could store 'other', but what if someone 'chained' multiple postings readers,
-    // this could cause problems?
-    // TODO: we should consider nuking this map and just making it so if you do this,
-    // you don't reuse? and maybe pulsingPostingsReader should throw an exc if it wraps
-    // another pulsing, because this is just stupid and wasteful. 
-    // we still have to be careful in case someone does Pulsing(Stomping(Pulsing(...
-    private final Map<PulsingPostingsReader,DocsEnum> enums = 
-      new IdentityHashMap<PulsingPostingsReader,DocsEnum>();
-      
-    public Map<PulsingPostingsReader,DocsEnum> enums() {
-      return enums;
+    public int getMergeDocCount() {
+      return docToEntry.length;
+    }
+  }
+
+  public static List<SortedSourceSlice> buildSlices(
+      int[] docBases, MergeState.DocMap[] docMaps,
+      DocValues[] docValues, MergeContext ctx) throws IOException {
+    final List<SortedSourceSlice> slices = new ArrayList<SortedSourceSlice>();
+    for (int i = 0; i < docValues.length; i++) {
+      final SortedSourceSlice nextSlice;
+      final Source directSource;
+      if (docValues[i] != null
+          && (directSource = docValues[i].getDirectSource()) != null) {
+        final SortedSourceSlice slice = new SortedSourceSlice(i, directSource
+            .asSortedSource(), docBases, ctx.getMergeDocCount(), ctx.docToEntry);
+        nextSlice = slice;
+      } else {
+        nextSlice = new SortedSourceSlice(i, new MissingValueSource(ctx),
+            docBases, ctx.getMergeDocCount(), ctx.docToEntry);
+      }
+      createOrdMapping(docBases, docMaps, nextSlice);
+      slices.add(nextSlice);
+    }
+    return Collections.unmodifiableList(slices);
+  }
+
+  /*
+   * In order to merge we need to map the ords used in each segment to the new
+   * global ords in the new segment. Additionally we need to drop values that
+   * are not referenced anymore due to deleted documents. This method walks all
+   * live documents and fetches their current ordinal. We store this ordinal per
+   * slice and (SortedSourceSlice#ordMapping) and remember the doc to ord
+   * mapping in docIDToRelativeOrd. After the merge SortedSourceSlice#ordMapping
+   * contains the new global ordinals for the relative index.
+   */
+  private static void createOrdMapping(int[] docBases, MergeState.DocMap[] docMaps,
+      SortedSourceSlice currentSlice) {
+    final int readerIdx = currentSlice.readerIdx;
+    final MergeState.DocMap currentDocMap = docMaps[readerIdx];
+    final int docBase = currentSlice.docToOrdStart;
+    assert docBase == docBases[readerIdx];
+    if (currentDocMap != null && currentDocMap.hasDeletions()) { // we have deletes
+      for (int i = 0; i < currentDocMap.maxDoc(); i++) {
+        final int doc = currentDocMap.get(i);
+        if (doc != -1) { // not deleted
+          final int ord = currentSlice.source.ord(i); // collect ords strictly
+                                                      // increasing
+          currentSlice.docIDToRelativeOrd[docBase + doc] = ord;
+          // use ord + 1 to identify unreferenced values (ie. == 0)
+          currentSlice.ordMapping[ord] = ord + 1;
+        }
+      }
+    } else { // no deletes
+      final int numDocs = currentSlice.docToOrdEnd - currentSlice.docToOrdStart;
+      for (int doc = 0; doc < numDocs; doc++) {
+        final int ord = currentSlice.source.ord(doc);
+        currentSlice.docIDToRelativeOrd[docBase + doc] = ord;
+        // use ord + 1 to identify unreferenced values (ie. == 0)
+        currentSlice.ordMapping[ord] = ord + 1;
+      }
+    }
+  }
+
+  public static int mergeRecords(MergeContext ctx, BytesRefConsumer consumer,
+      List<SortedSourceSlice> slices) throws IOException {
+    final RecordMerger merger = new RecordMerger(new MergeQueue(slices.size(),
+        ctx.comp), slices.toArray(new SortedSourceSlice[0]));
+    long[] offsets = ctx.offsets;
+    final boolean recordOffsets = offsets != null;
+    long offset = 0;
+    BytesRef currentMergedBytes;
+    merger.pushTop();
+    while (merger.queue.size() > 0) {
+      merger.pullTop();
+      currentMergedBytes = merger.current;
+      assert ctx.sizePerValues == -1 || ctx.sizePerValues == currentMergedBytes.length : "size: "
+          + ctx.sizePerValues + " spare: " + currentMergedBytes.length;
+      offset += currentMergedBytes.length;
+      if (recordOffsets) {
+        if (merger.currentOrd >= offsets.length) {
+          offsets = ArrayUtil.grow(offsets, merger.currentOrd + 1);
+        }
+        offsets[merger.currentOrd] = offset;
+      }
+      consumer.consume(currentMergedBytes, merger.currentOrd, offset);
+      merger.pushTop();
+    }
+    ctx.offsets = offsets;
+    assert offsets == null || offsets[merger.currentOrd - 1] == offset;
+    return merger.currentOrd;
+  }
+  
+  public static interface BytesRefConsumer {
+    public void consume(BytesRef ref, int ord, long offset) throws IOException;
+  }
+  
+  public static final class IndexOutputBytesRefConsumer implements BytesRefConsumer {
+    private final IndexOutput datOut;
+    
+    public IndexOutputBytesRefConsumer(IndexOutput datOut) {
+      this.datOut = datOut;
     }
 
     @Override
-    public void clear() {
-      // our state is per-docsenum, so this makes no sense.
-      // its best not to clear, in case a wrapped enum has a per-doc attribute or something
-      // and is calling clearAttributes(), so they don't nuke the reuse information!
+    public void consume(BytesRef currentMergedBytes, int ord, long offset) throws IOException {
+      datOut.writeBytes(currentMergedBytes.bytes, currentMergedBytes.offset,
+          currentMergedBytes.length);      
+    }
+  }
+
+  private static final class RecordMerger {
+    private final MergeQueue queue;
+    private final SortedSourceSlice[] top;
+    private int numTop;
+    BytesRef current;
+    int currentOrd = -1;
+
+    RecordMerger(MergeQueue queue, SortedSourceSlice[] top) {
+      super();
+      this.queue = queue;
+      this.top = top;
+      this.numTop = top.length;
+    }
+
+    private void pullTop() {
+      // extract all subs from the queue that have the same
+      // top record
+      assert numTop == 0;
+      assert currentOrd >= 0;
+      while (true) {
+        final SortedSourceSlice popped = top[numTop++] = queue.pop();
+        // use ord + 1 to identify unreferenced values (ie. == 0)
+        popped.ordMapping[popped.relativeOrd] = currentOrd + 1;
+        if (queue.size() == 0
+            || !(queue.top()).current.bytesEquals(top[0].current)) {
+          break;
+        }
+      }
+      current = top[0].current;
+    }
+
+    private void pushTop() throws IOException {
+      // call next() on each top, and put back into queue
+      for (int i = 0; i < numTop; i++) {
+        top[i].current = top[i].next();
+        if (top[i].current != null) {
+          queue.add(top[i]);
+        }
+      }
+      currentOrd++;
+      numTop = 0;
+    }
+  }
+
+  public static class SortedSourceSlice {
+    final SortedSource source;
+    final int readerIdx;
+    /* global array indexed by docID containg the relative ord for the doc */
+    final int[] docIDToRelativeOrd;
+    /*
+     * maps relative ords to merged global ords - index is relative ord value
+     * new global ord this map gets updates as we merge ords. later we use the
+     * docIDtoRelativeOrd to get the previous relative ord to get the new ord
+     * from the relative ord map.
+     */
+    final int[] ordMapping;
+
+    /* start index into docIDToRelativeOrd */
+    final int docToOrdStart;
+    /* end index into docIDToRelativeOrd */
+    final int docToOrdEnd;
+    BytesRef current = new BytesRef();
+    /* the currently merged relative ordinal */
+    int relativeOrd = -1;
+
+    SortedSourceSlice(int readerIdx, SortedSource source, int[] docBase, int mergeDocCount,
+        int[] docToOrd) {
+      super();
+      this.readerIdx = readerIdx;
+      this.source = source;
+      this.docIDToRelativeOrd = docToOrd;
+      this.ordMapping = new int[source.getValueCount()];
+      this.docToOrdStart = docBase[readerIdx];
+      this.docToOrdEnd = this.docToOrdStart + numDocs(docBase, mergeDocCount, readerIdx);
+    }
+
+    private static int numDocs(int[] docBase, int mergedDocCount, int readerIndex) {
+      if (readerIndex == docBase.length - 1) {
+        return mergedDocCount - docBase[readerIndex];
+      }
+      return docBase[readerIndex + 1] - docBase[readerIndex];
+    }
+
+    BytesRef next() {
+      for (int i = relativeOrd + 1; i < ordMapping.length; i++) {
+        if (ordMapping[i] != 0) { // skip ords that are not referenced anymore
+          source.getByOrd(i, current);
+          relativeOrd = i;
+          return current;
+        }
+      }
+      return null;
+    }
+    
+    public int[] toAbsolutOrds(int[] docToOrd) {
+      for (int i = docToOrdStart; i < docToOrdEnd; i++) {
+        final int mappedOrd = docIDToRelativeOrd[i];
+        assert mappedOrd < ordMapping.length;
+        assert ordMapping[mappedOrd] > 0 : "illegal mapping ord maps to an unreferenced value";
+        docToOrd[i] = ordMapping[mappedOrd] -1;
+      }
+      return docToOrd;
+    }
+
+    public void writeOrds(PackedInts.Writer writer) throws IOException {
+      for (int i = docToOrdStart; i < docToOrdEnd; i++) {
+        final int mappedOrd = docIDToRelativeOrd[i];
+        assert mappedOrd < ordMapping.length;
+        assert ordMapping[mappedOrd] > 0 : "illegal mapping ord maps to an unreferenced value";
+        writer.add(ordMapping[mappedOrd] - 1);
+      }
+    }
+  }
+
+  /*
+   * if a segment has no values at all we use this source to fill in the missing
+   * value in the right place (depending on the comparator used)
+   */
+  private static final class MissingValueSource extends SortedSource {
+
+    private BytesRef missingValue;
+
+    public MissingValueSource(MergeContext ctx) {
+      super(ctx.type, ctx.comp);
+      this.missingValue = ctx.missingValue;
     }
 
     @Override
-    public void copyTo(AttributeImpl target) {
-      // this makes no sense for us, because our state is per-docsenum.
-      // we don't want to copy any stuff over to another docsenum ever!
+    public int ord(int docID) {
+      return 0;
     }
+
+    @Override
+    public BytesRef getByOrd(int ord, BytesRef bytesRef) {
+      bytesRef.copyBytes(missingValue);
+      return bytesRef;
+    }
+
+    @Override
+    public PackedInts.Reader getDocToOrd() {
+      return null;
+    }
+
+    @Override
+    public int getValueCount() {
+      return 1;
+    }
+
+  }
+
+  /*
+   * merge queue
+   */
+  private static final class MergeQueue extends
+      PriorityQueue<SortedSourceSlice> {
+    final Comparator<BytesRef> comp;
+
+    public MergeQueue(int maxSize, Comparator<BytesRef> comp) {
+      super(maxSize);
+      this.comp = comp;
+    }
+
+    @Override
+    protected boolean lessThan(SortedSourceSlice a, SortedSourceSlice b) {
+      int cmp = comp.compare(a.current, b.current);
+      if (cmp != 0) {
+        return cmp < 0;
+      } else { // just a tie-breaker
+        return a.docToOrdStart < b.docToOrdStart;
+      }
+    }
+
   }
 }

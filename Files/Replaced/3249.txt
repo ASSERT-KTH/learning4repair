@@ -1,6 +1,4 @@
-public void document(int docID, StoredFieldVisitor visitor) throws IOException {
-
-package org.apache.lucene.index;
+public HttpRequestContentStream( HttpServletRequest req ) {
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,394 +17,398 @@ package org.apache.lucene.index;
  * limitations under the License.
  */
 
-import org.apache.lucene.util.AttributeSource;
-import org.apache.lucene.util.Bits;
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.automaton.CompiledAutomaton;
+package org.apache.solr.servlet;
 
+import java.io.File;
 import java.io.IOException;
-import java.util.Comparator;
+import java.io.InputStream;
+import java.io.UnsupportedEncodingException;
+import java.net.URL;
+import java.net.URLDecoder;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-/**  A <code>FilterAtomicReader</code> contains another AtomicReader, which it
- * uses as its basic source of data, possibly transforming the data along the
- * way or providing additional functionality. The class
- * <code>FilterAtomicReader</code> itself simply implements all abstract methods
- * of <code>IndexReader</code> with versions that pass all requests to the
- * contained index reader. Subclasses of <code>FilterAtomicReader</code> may
- * further override some of these methods and may also provide additional
- * methods and fields.
- */
-public class FilterAtomicReader extends AtomicReader {
+import javax.servlet.http.HttpServletRequest;
 
-  /** Base class for filtering {@link Fields}
-   *  implementations. */
-  public static class FilterFields extends Fields {
-    protected final Fields in;
+import org.apache.commons.fileupload.FileItem;
+import org.apache.commons.fileupload.disk.DiskFileItemFactory;
+import org.apache.commons.fileupload.servlet.ServletFileUpload;
+import org.apache.solr.common.SolrException;
+import org.apache.solr.common.params.CommonParams;
+import org.apache.solr.common.params.MultiMapSolrParams;
+import org.apache.solr.common.params.SolrParams;
+import org.apache.solr.common.util.ContentStream;
+import org.apache.solr.common.util.ContentStreamBase;
+import org.apache.solr.core.Config;
+import org.apache.solr.core.SolrCore;
+import org.apache.solr.request.ServletSolrParams;
+import org.apache.solr.request.SolrQueryRequest;
+import org.apache.solr.request.SolrQueryRequestBase;
 
-    public FilterFields(Fields in) {
-      this.in = in;
+
+public class SolrRequestParsers 
+{
+  final Logger log = LoggerFactory.getLogger(SolrRequestParsers.class);
+  
+  // Should these constants be in a more public place?
+  public static final String MULTIPART = "multipart";
+  public static final String RAW = "raw";
+  public static final String SIMPLE = "simple";
+  public static final String STANDARD = "standard";
+  
+  private HashMap<String, SolrRequestParser> parsers;
+  private boolean enableRemoteStreams = false;
+  private boolean handleSelect = true;
+  private StandardRequestParser standard;
+  
+  /**
+   * Pass in an xml configuration.  A null configuration will enable
+   * everythign with maximum values.
+   */
+  public SolrRequestParsers( Config globalConfig )
+  {
+    long uploadLimitKB = 1048;  // 2MB default
+    if( globalConfig == null ) {
+      uploadLimitKB = Long.MAX_VALUE; 
+      enableRemoteStreams = true;
+      handleSelect = true;
     }
-
-    @Override
-    public FieldsEnum iterator() throws IOException {
-      return in.iterator();
+    else {
+      uploadLimitKB = globalConfig.getInt( 
+          "requestDispatcher/requestParsers/@multipartUploadLimitInKB", (int)uploadLimitKB );
+      
+      enableRemoteStreams = globalConfig.getBool( 
+          "requestDispatcher/requestParsers/@enableRemoteStreaming", false ); 
+  
+      // Let this filter take care of /select?xxx format
+      handleSelect = globalConfig.getBool( 
+          "requestDispatcher/@handleSelect", handleSelect ); 
     }
-
-    @Override
-    public Terms terms(String field) throws IOException {
-      return in.terms(field);
-    }
-
-    @Override
-    public int size() throws IOException {
-      return in.size();
-    }
-
-    @Override
-    public long getUniqueTermCount() throws IOException {
-      return in.getUniqueTermCount();
-    }
+       
+    MultipartRequestParser multi = new MultipartRequestParser( uploadLimitKB );
+    RawRequestParser raw = new RawRequestParser();
+    standard = new StandardRequestParser( multi, raw );
+    
+    // I don't see a need to have this publicly configured just yet
+    // adding it is trivial
+    parsers = new HashMap<String, SolrRequestParser>();
+    parsers.put( MULTIPART, multi );
+    parsers.put( RAW, raw );
+    parsers.put( SIMPLE, new SimpleRequestParser() );
+    parsers.put( STANDARD, standard );
+    parsers.put( "", standard );
   }
+  
+  public SolrQueryRequest parse( SolrCore core, String path, HttpServletRequest req ) throws Exception
+  {
+    SolrRequestParser parser = standard;
+    
+    // TODO -- in the future, we could pick a different parser based on the request
+    
+    // Pick the parser from the request...
+    ArrayList<ContentStream> streams = new ArrayList<ContentStream>(1);
+    SolrParams params = parser.parseParamsAndFillStreams( req, streams );
+    SolrQueryRequest sreq = buildRequestFrom( core, params, streams );
 
-  /** Base class for filtering {@link Terms}
-   *  implementations. */
-  public static class FilterTerms extends Terms {
-    protected final Terms in;
-
-    public FilterTerms(Terms in) {
-      this.in = in;
-    }
-
-    @Override
-    public TermsEnum iterator(TermsEnum reuse) throws IOException {
-      return in.iterator(reuse);
-    }
-
-    @Override
-    public Comparator<BytesRef> getComparator() throws IOException {
-      return in.getComparator();
-    }
-
-    @Override
-    public long size() throws IOException {
-      return in.size();
-    }
-
-    @Override
-    public long getSumTotalTermFreq() throws IOException {
-      return in.getSumTotalTermFreq();
-    }
-
-    @Override
-    public long getSumDocFreq() throws IOException {
-      return in.getSumDocFreq();
-    }
-
-    @Override
-    public int getDocCount() throws IOException {
-      return in.getDocCount();
+    // Handlers and login will want to know the path. If it contains a ':'
+    // the handler could use it for RESTful URLs
+    sreq.getContext().put( "path", path );
+    return sreq;
+  }
+  
+  public SolrQueryRequest buildRequestFrom( SolrCore core, SolrParams params, Collection<ContentStream> streams ) throws Exception
+  {
+    // The content type will be applied to all streaming content
+    String contentType = params.get( CommonParams.STREAM_CONTENTTYPE );
+      
+    // Handle anything with a remoteURL
+    String[] strs = params.getParams( CommonParams.STREAM_URL );
+    if( strs != null ) {
+      if( !enableRemoteStreams ) {
+        throw new SolrException( SolrException.ErrorCode.BAD_REQUEST, "Remote Streaming is disabled." );
+      }
+      for( final String url : strs ) {
+        ContentStreamBase stream = new ContentStreamBase.URLStream( new URL(url) );
+        if( contentType != null ) {
+          stream.setContentType( contentType );
+        }
+        streams.add( stream );
+      }
     }
     
-    @Override
-    public TermsEnum intersect(CompiledAutomaton automaton, BytesRef bytes) throws java.io.IOException {
-      return in.intersect(automaton, bytes);
-    }
-  }
-
-  /** Base class for filtering {@link TermsEnum} implementations. */
-  public static class FilterFieldsEnum extends FieldsEnum {
-    protected final FieldsEnum in;
-    public FilterFieldsEnum(FieldsEnum in) {
-      this.in = in;
-    }
-
-    @Override
-    public String next() throws IOException {
-      return in.next();
-    }
-
-    @Override
-    public Terms terms() throws IOException {
-      return in.terms();
+    // Handle streaming files
+    strs = params.getParams( CommonParams.STREAM_FILE );
+    if( strs != null ) {
+      if( !enableRemoteStreams ) {
+        throw new SolrException( SolrException.ErrorCode.BAD_REQUEST, "Remote Streaming is disabled." );
+      }
+      for( final String file : strs ) {
+        ContentStreamBase stream = new ContentStreamBase.FileStream( new File(file) );
+        if( contentType != null ) {
+          stream.setContentType( contentType );
+        }
+        streams.add( stream );
+      }
     }
     
-    @Override
-    public AttributeSource attributes() {
-      return in.attributes();
-    }
-  }
-
-  /** Base class for filtering {@link TermsEnum} implementations. */
-  public static class FilterTermsEnum extends TermsEnum {
-    protected final TermsEnum in;
-
-    public FilterTermsEnum(TermsEnum in) { this.in = in; }
-
-    @Override
-    public boolean seekExact(BytesRef text, boolean useCache) throws IOException {
-      return in.seekExact(text, useCache);
-    }
-
-    @Override
-    public SeekStatus seekCeil(BytesRef text, boolean useCache) throws IOException {
-      return in.seekCeil(text, useCache);
-    }
-
-    @Override
-    public void seekExact(long ord) throws IOException {
-      in.seekExact(ord);
-    }
-
-    @Override
-    public BytesRef next() throws IOException {
-      return in.next();
-    }
-
-    @Override
-    public BytesRef term() throws IOException {
-      return in.term();
-    }
-
-    @Override
-    public long ord() throws IOException {
-      return in.ord();
-    }
-
-    @Override
-    public int docFreq() throws IOException {
-      return in.docFreq();
-    }
-
-    @Override
-    public long totalTermFreq() throws IOException {
-      return in.totalTermFreq();
-    }
-
-    @Override
-    public DocsEnum docs(Bits liveDocs, DocsEnum reuse, boolean needsFreqs) throws IOException {
-      return in.docs(liveDocs, reuse, needsFreqs);
-    }
-
-    @Override
-    public DocsAndPositionsEnum docsAndPositions(Bits liveDocs, DocsAndPositionsEnum reuse, boolean needsOffsets) throws IOException {
-      return in.docsAndPositions(liveDocs, reuse, needsOffsets);
-    }
-
-    @Override
-    public Comparator<BytesRef> getComparator() {
-      return in.getComparator();
-    }
-
-    @Override
-    public void seekExact(BytesRef term, TermState state) throws IOException {
-      in.seekExact(term, state);
-    }
-
-    @Override
-    public TermState termState() throws IOException {
-      return in.termState();
+    // Check for streams in the request parameters
+    strs = params.getParams( CommonParams.STREAM_BODY );
+    if( strs != null ) {
+      for( final String body : strs ) {
+        ContentStreamBase stream = new ContentStreamBase.StringStream( body );
+        if( contentType != null ) {
+          stream.setContentType( contentType );
+        }
+        streams.add( stream );
+      }
     }
     
-    @Override
-    public AttributeSource attributes() {
-      return in.attributes();
+    SolrQueryRequestBase q = new SolrQueryRequestBase( core, params ) { };
+    if( streams != null && streams.size() > 0 ) {
+      q.setContentStreams( streams );
     }
+    return q;
   }
-
-  /** Base class for filtering {@link DocsEnum} implementations. */
-  public static class FilterDocsEnum extends DocsEnum {
-    protected final DocsEnum in;
-
-    public FilterDocsEnum(DocsEnum in) {
-      this.in = in;
-    }
-
-    @Override
-    public int docID() {
-      return in.docID();
-    }
-
-    @Override
-    public int freq() throws IOException {
-      return in.freq();
-    }
-
-    @Override
-    public int nextDoc() throws IOException {
-      return in.nextDoc();
-    }
-
-    @Override
-    public int advance(int target) throws IOException {
-      return in.advance(target);
-    }
-    
-    @Override
-    public AttributeSource attributes() {
-      return in.attributes();
-    }
-  }
-
-  /** Base class for filtering {@link DocsAndPositionsEnum} implementations. */
-  public static class FilterDocsAndPositionsEnum extends DocsAndPositionsEnum {
-    protected final DocsAndPositionsEnum in;
-
-    public FilterDocsAndPositionsEnum(DocsAndPositionsEnum in) {
-      this.in = in;
-    }
-
-    @Override
-    public int docID() {
-      return in.docID();
-    }
-
-    @Override
-    public int freq() throws IOException {
-      return in.freq();
-    }
-
-    @Override
-    public int nextDoc() throws IOException {
-      return in.nextDoc();
-    }
-
-    @Override
-    public int advance(int target) throws IOException {
-      return in.advance(target);
-    }
-
-    @Override
-    public int nextPosition() throws IOException {
-      return in.nextPosition();
-    }
-
-    @Override
-    public int startOffset() throws IOException {
-      return in.startOffset();
-    }
-
-    @Override
-    public int endOffset() throws IOException {
-      return in.endOffset();
-    }
-
-    @Override
-    public BytesRef getPayload() throws IOException {
-      return in.getPayload();
-    }
-
-    @Override
-    public boolean hasPayload() {
-      return in.hasPayload();
-    }
-    
-    @Override
-    public AttributeSource attributes() {
-      return in.attributes();
-    }
-  }
-
-  protected final AtomicReader in;
+  
 
   /**
-   * <p>Construct a FilterAtomicReader based on the specified base reader.
-   * <p>Note that base reader is closed if this FilterAtomicReader is closed.</p>
-   * @param in specified base reader.
+   * Given a standard query string map it into solr params
    */
-  public FilterAtomicReader(AtomicReader in) {
-    super();
-    this.in = in;
-    in.registerParentReader(this);
+  public static MultiMapSolrParams parseQueryString(String queryString) 
+  {
+    Map<String,String[]> map = new HashMap<String, String[]>();
+    if( queryString != null && queryString.length() > 0 ) {
+      try {
+        for( String kv : queryString.split( "&" ) ) {
+          int idx = kv.indexOf( '=' );
+          if( idx > 0 ) {
+            String name = URLDecoder.decode( kv.substring( 0, idx ), "UTF-8");
+            String value = URLDecoder.decode( kv.substring( idx+1 ), "UTF-8");
+            MultiMapSolrParams.addParam( name, value, map );
+          }
+          else {
+            String name = URLDecoder.decode( kv, "UTF-8" );
+            MultiMapSolrParams.addParam( name, "", map );
+          }
+        }
+      }
+      catch( UnsupportedEncodingException uex ) {
+        throw new SolrException( SolrException.ErrorCode.SERVER_ERROR, uex );
+      }
+    }
+    return new MultiMapSolrParams( map );
   }
 
-  @Override
-  public Bits getLiveDocs() {
-    ensureOpen();
-    return in.getLiveDocs();
-  }
-  
-  @Override
-  public FieldInfos getFieldInfos() {
-    return in.getFieldInfos();
+  public boolean isHandleSelect() {
+    return handleSelect;
   }
 
-  @Override
-  public Fields getTermVectors(int docID)
-          throws IOException {
-    ensureOpen();
-    return in.getTermVectors(docID);
-  }
-
-  @Override
-  public int numDocs() {
-    // Don't call ensureOpen() here (it could affect performance)
-    return in.numDocs();
-  }
-
-  @Override
-  public int maxDoc() {
-    // Don't call ensureOpen() here (it could affect performance)
-    return in.maxDoc();
-  }
-
-  @Override
-  public void document(int docID, StoredFieldVisitor visitor) throws CorruptIndexException, IOException {
-    ensureOpen();
-    in.document(docID, visitor);
-  }
-
-  @Override
-  public boolean hasDeletions() {
-    ensureOpen();
-    return in.hasDeletions();
-  }
-
-  @Override
-  protected void doClose() throws IOException {
-    in.close();
-  }
-  
-  @Override
-  public Fields fields() throws IOException {
-    ensureOpen();
-    return in.fields();
-  }
-
-  /** {@inheritDoc}
-   * <p>If the subclass of FilteredIndexReader modifies the
-   *  contents (but not liveDocs) of the index, you must override this
-   *  method to provide a different key. */
-  @Override
-  public Object getCoreCacheKey() {
-    return in.getCoreCacheKey();
-  }
-
-  /** {@inheritDoc}
-   * <p>If the subclass of FilteredIndexReader modifies the
-   *  liveDocs, you must override this
-   *  method to provide a different key. */
-  @Override
-  public Object getCombinedCoreAndDeletesKey() {
-    return in.getCombinedCoreAndDeletesKey();
-  }
-
-  @Override
-  public String toString() {
-    final StringBuilder buffer = new StringBuilder("FilterAtomicReader(");
-    buffer.append(in);
-    buffer.append(')');
-    return buffer.toString();
-  }
-
-  @Override
-  public DocValues docValues(String field) throws IOException {
-    ensureOpen();
-    return in.docValues(field);
-  }
-  
-  @Override
-  public DocValues normValues(String field) throws IOException {
-    ensureOpen();
-    return in.normValues(field);
+  public void setHandleSelect(boolean handleSelect) {
+    this.handleSelect = handleSelect;
   }
 }
+
+//-----------------------------------------------------------------
+//-----------------------------------------------------------------
+
+// I guess we don't really even need the interface, but i'll keep it here just for kicks
+interface SolrRequestParser 
+{
+  public SolrParams parseParamsAndFillStreams(
+    final HttpServletRequest req, ArrayList<ContentStream> streams ) throws Exception;
+}
+
+
+//-----------------------------------------------------------------
+//-----------------------------------------------------------------
+
+/**
+ * The simple parser just uses the params directly
+ */
+class SimpleRequestParser implements SolrRequestParser
+{
+  public SolrParams parseParamsAndFillStreams( 
+      final HttpServletRequest req, ArrayList<ContentStream> streams ) throws Exception
+  {
+    return new ServletSolrParams(req);
+  }
+}
+
+/**
+ * Wrap an HttpServletRequest as a ContentStream
+ */
+class HttpRequestContentStream extends ContentStreamBase
+{
+  private final HttpServletRequest req;
+  
+  public HttpRequestContentStream( HttpServletRequest req ) throws IOException {
+    this.req = req;
+    
+    contentType = req.getContentType();
+    // name = ???
+    // sourceInfo = ???
+    
+    String v = req.getHeader( "Content-Length" );
+    if( v != null ) {
+      size = Long.valueOf( v );
+    }
+  }
+
+  public InputStream getStream() throws IOException {
+    return req.getInputStream();
+  }
+}
+
+
+/**
+ * Wrap a FileItem as a ContentStream
+ */
+class FileItemContentStream extends ContentStreamBase
+{
+  private final FileItem item;
+  
+  public FileItemContentStream( FileItem f )
+  {
+    item = f;
+    contentType = item.getContentType();
+    name = item.getName();
+    sourceInfo = item.getFieldName();
+    size = item.getSize();
+  }
+    
+  public InputStream getStream() throws IOException {
+    return item.getInputStream();
+  }
+}
+
+/**
+ * The raw parser just uses the params directly
+ */
+class RawRequestParser implements SolrRequestParser
+{
+  public SolrParams parseParamsAndFillStreams( 
+      final HttpServletRequest req, ArrayList<ContentStream> streams ) throws Exception
+  {
+    // The javadocs for HttpServletRequest are clear that req.getReader() should take
+    // care of any character encoding issues.  BUT, there are problems while running on
+    // some servlet containers: including Tomcat 5 and resin.
+    //
+    // Rather than return req.getReader(), this uses the default ContentStreamBase method
+    // that checks for charset definitions in the ContentType.
+    
+    streams.add( new HttpRequestContentStream( req ) );
+    return SolrRequestParsers.parseQueryString( req.getQueryString() );
+  }
+}
+
+
+
+/**
+ * Extract Multipart streams
+ */
+class MultipartRequestParser implements SolrRequestParser
+{
+  private long uploadLimitKB;
+  
+  public MultipartRequestParser( long limit )
+  {
+    uploadLimitKB = limit;
+  }
+  
+  public SolrParams parseParamsAndFillStreams( 
+      final HttpServletRequest req, ArrayList<ContentStream> streams ) throws Exception
+  {
+    if( !ServletFileUpload.isMultipartContent(req) ) {
+      throw new SolrException( SolrException.ErrorCode.BAD_REQUEST, "Not multipart content! "+req.getContentType() );
+    }
+    
+    MultiMapSolrParams params = SolrRequestParsers.parseQueryString( req.getQueryString() );
+    
+    // Create a factory for disk-based file items
+    DiskFileItemFactory factory = new DiskFileItemFactory();
+
+    // Set factory constraints
+    // TODO - configure factory.setSizeThreshold(yourMaxMemorySize);
+    // TODO - configure factory.setRepository(yourTempDirectory);
+
+    // Create a new file upload handler
+    ServletFileUpload upload = new ServletFileUpload(factory);
+    upload.setSizeMax( uploadLimitKB*1024 );
+
+    // Parse the request
+    List items = upload.parseRequest(req);
+    Iterator iter = items.iterator();
+    while (iter.hasNext()) {
+        FileItem item = (FileItem) iter.next();
+
+        // If its a form field, put it in our parameter map
+        if (item.isFormField()) {
+          MultiMapSolrParams.addParam( 
+            item.getFieldName(), 
+            item.getString(), params.getMap() );
+        }
+        // Add the stream
+        else { 
+          streams.add( new FileItemContentStream( item ) );
+        }
+    }
+    return params;
+  }
+}
+
+
+/**
+ * The default Logic
+ */
+class StandardRequestParser implements SolrRequestParser
+{
+  MultipartRequestParser multipart;
+  RawRequestParser raw;
+  
+  StandardRequestParser( MultipartRequestParser multi, RawRequestParser raw ) 
+  {
+    this.multipart = multi;
+    this.raw = raw;
+  }
+  
+  public SolrParams parseParamsAndFillStreams( 
+      final HttpServletRequest req, ArrayList<ContentStream> streams ) throws Exception
+  {
+    String method = req.getMethod().toUpperCase(Locale.ENGLISH);
+    if( "GET".equals( method ) || "HEAD".equals( method )) {
+      return new ServletSolrParams(req);
+    }
+    if( "POST".equals( method ) ) {
+      String contentType = req.getContentType();
+      if( contentType != null ) {
+        int idx = contentType.indexOf( ';' );
+        if( idx > 0 ) { // remove the charset definition "; charset=utf-8"
+          contentType = contentType.substring( 0, idx );
+        }
+        if( "application/x-www-form-urlencoded".equals( contentType.toLowerCase(Locale.ENGLISH) ) ) {
+          return new ServletSolrParams(req); // just get the params from parameterMap
+        }
+        if( ServletFileUpload.isMultipartContent(req) ) {
+          return multipart.parseParamsAndFillStreams(req, streams);
+        }
+      }
+      return raw.parseParamsAndFillStreams(req, streams);
+    }
+    throw new SolrException( SolrException.ErrorCode.BAD_REQUEST, "Unsupported method: "+method );
+  }
+}
+
+
+
+
+
+
+
+

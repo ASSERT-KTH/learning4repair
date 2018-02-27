@@ -1,354 +1,295 @@
-new ApplicationRepository(app),
+newIndexWriter(core, true, false);
+
+package org.apache.solr.update;
 
 /*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
- *   http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIESOR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
-package org.apache.aries.application.management.impl;
-
-import java.io.File;
-import java.io.FileOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.net.URL;
-import java.util.Collections;
-import java.util.Dictionary;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Hashtable;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.jar.Manifest;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
-import org.apache.aries.application.ApplicationMetadata;
-import org.apache.aries.application.ApplicationMetadataFactory;
-import org.apache.aries.application.DeploymentMetadata;
-import org.apache.aries.application.DeploymentMetadataFactory;
-import org.apache.aries.application.filesystem.IDirectory;
-import org.apache.aries.application.filesystem.IFile;
-import org.apache.aries.application.management.AriesApplication;
-import org.apache.aries.application.management.AriesApplicationContext;
-import org.apache.aries.application.management.AriesApplicationContextManager;
-import org.apache.aries.application.management.AriesApplicationListener;
-import org.apache.aries.application.management.AriesApplicationManager;
-import org.apache.aries.application.management.AriesApplicationResolver;
-import org.apache.aries.application.management.BundleConversion;
-import org.apache.aries.application.management.BundleConverter;
-import org.apache.aries.application.management.BundleInfo;
-import org.apache.aries.application.management.BundleRepository;
-import org.apache.aries.application.management.ConversionException;
-import org.apache.aries.application.management.LocalPlatform;
-import org.apache.aries.application.management.ManagementException;
-import org.apache.aries.application.management.ResolveConstraint;
-import org.apache.aries.application.management.ResolverException;
-import org.apache.aries.application.management.internal.MessageUtil;
-import org.apache.aries.application.management.repository.ApplicationRepository;
-import org.apache.aries.application.utils.AppConstants;
-import org.apache.aries.application.utils.filesystem.FileSystem;
-import org.apache.aries.application.utils.filesystem.IOUtils;
-import org.apache.aries.application.utils.management.SimpleBundleInfo;
-import org.apache.aries.application.utils.manifest.BundleManifest;
-import org.apache.aries.application.utils.manifest.ManifestDefaultsInjector;
-import org.apache.aries.application.utils.manifest.ManifestProcessor;
-import org.osgi.framework.BundleContext;
-import org.osgi.framework.BundleException;
-import org.osgi.framework.Constants;
-import org.osgi.framework.ServiceException;
+import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.store.AlreadyClosedException;
+import org.apache.solr.cloud.RecoveryStrategy;
+import org.apache.solr.common.SolrException;
+import org.apache.solr.common.SolrException.ErrorCode;
+import org.apache.solr.core.CoreContainer;
+import org.apache.solr.core.CoreDescriptor;
+import org.apache.solr.core.DirectoryFactory;
+import org.apache.solr.core.SolrCore;
+import org.apache.solr.util.RefCounted;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public class AriesApplicationManagerImpl implements AriesApplicationManager {
+public final class DefaultSolrCoreState extends SolrCoreState implements RecoveryStrategy.RecoveryListener {
+  public static Logger log = LoggerFactory.getLogger(DefaultSolrCoreState.class);
+  
+  private final boolean SKIP_AUTO_RECOVERY = Boolean.getBoolean("solrcloud.skip.autorecovery");
+  
+  private final Object recoveryLock = new Object();
+  
+  // protects pauseWriter and writerFree
+  private final Object writerPauseLock = new Object();
+  
+  private SolrIndexWriter indexWriter = null;
+  private DirectoryFactory directoryFactory;
 
-  private ApplicationMetadataFactory _applicationMetadataFactory;
-  private DeploymentMetadataFactory _deploymentMetadataFactory;
-  private List<BundleConverter> _bundleConverters;
-  private AriesApplicationResolver _resolver;
-  private LocalPlatform _localPlatform;
-  private AriesApplicationContextManager _applicationContextManager;
-  private BundleContext _bundleContext;
+  private volatile boolean recoveryRunning;
+  private RecoveryStrategy recoveryStrat;
+  private volatile boolean closed = false;
 
-  private static final Logger _logger = LoggerFactory.getLogger("org.apache.aries.application.management.impl");
+  private RefCounted<IndexWriter> refCntWriter;
 
-  public void setApplicationMetadataFactory (ApplicationMetadataFactory amf) { 
-    _applicationMetadataFactory = amf;
-  }
+  private boolean pauseWriter;
+  private boolean writerFree = true;
   
-  public void setDeploymentMetadataFactory (DeploymentMetadataFactory dmf) { 
-    _deploymentMetadataFactory = dmf;
-  }
-  
-  public void setBundleConverters (List<BundleConverter> bcs) { 
-    _bundleConverters = bcs;
-  }
-  
-  public void setResolver (AriesApplicationResolver resolver) { 
-    _resolver = resolver;
-  }
+  protected final ReentrantLock commitLock = new ReentrantLock();
 
-  public void setLocalPlatform (LocalPlatform lp) { 
-    _localPlatform = lp;
+  public DefaultSolrCoreState(DirectoryFactory directoryFactory) {
+    this.directoryFactory = directoryFactory;
   }
   
-  public void setApplicationContextManager (AriesApplicationContextManager acm) { 
-    _applicationContextManager = acm;
-  }
-  
-  public void setBundleContext(BundleContext b)
-  {
-    _bundleContext = b;
-  }
-  
-  
-  /**
-   * Create an AriesApplication from a .eba file: a zip file with a '.eba' extension
-   * as per http://incubator.apache.org/aries/applications.html 
-   */
-  public AriesApplication createApplication(IDirectory ebaFile) throws ManagementException {
-    ApplicationMetadata applicationMetadata = null;
-    DeploymentMetadata deploymentMetadata = null;
-    Map<String, BundleConversion> modifiedBundles = new HashMap<String, BundleConversion>();
-    AriesApplicationImpl application = null;
-    String appPath = ebaFile.toString();
-    try {   
-      // try to read the app name out of the application.mf
-      Manifest applicationManifest = parseApplicationManifest (ebaFile);
-      String appName = applicationManifest.getMainAttributes().getValue(AppConstants.APPLICATION_NAME);
-
-      //If the application name is null, we will try to get the file name.
-      if (appName == null || appName.isEmpty()) {
-          String fullPath = appPath;
-          if (fullPath.endsWith("/")) {
-            fullPath = fullPath.substring(0, fullPath.length() -1);  
-          }
-              
-          int last_slash = fullPath.lastIndexOf("/");
-          appName = fullPath.substring(last_slash + 1, fullPath.length()); 
+  private void closeIndexWriter(IndexWriterCloser closer) {
+    try {
+      log.info("SolrCoreState ref count has reached 0 - closing IndexWriter");
+      if (closer != null) {
+        log.info("closing IndexWriter with IndexWriterCloser");
+        closer.closeWriter(indexWriter);
+      } else if (indexWriter != null) {
+        log.info("closing IndexWriter...");
+        indexWriter.close();
       }
-                  
-      IFile deploymentManifest = ebaFile.getFile(AppConstants.DEPLOYMENT_MF);
-      /* We require that all other .jar and .war files included by-value be valid bundles
-       * because a DEPLOYMENT.MF has been provided. If no DEPLOYMENT.MF, migrate 
-       * wars to wabs, plain jars to bundles
-       */
-      Set<BundleInfo> extraBundlesInfo = new HashSet<BundleInfo>();
-      for (IFile f : ebaFile) { 
-        if (f.isDirectory()) { 
-          continue;
-        }
-        BundleManifest bm = getBundleManifest (f);
-        if (bm != null) {
-          if (bm.isValid()) {
-            extraBundlesInfo.add(new SimpleBundleInfo(bm, f.toURL().toExternalForm()));
-          } else if (deploymentManifest == null) { 
-            // We have a jar that needs converting to a bundle, or a war to migrate to a WAB 
-            // We only do this if a DEPLOYMENT.MF does not exist.
-            BundleConversion convertedBinary = null;
-            Iterator<BundleConverter> converters = _bundleConverters.iterator();
-            List<ConversionException> conversionExceptions = Collections.emptyList();
-            while (converters.hasNext() && convertedBinary == null) { 
-              try {
-                convertedBinary = converters.next().convert(ebaFile, f);
-              } catch (ServiceException sx) {
-                // We'll get this if our optional BundleConverter has not been injected. 
-              } catch (ConversionException cx) { 
-                conversionExceptions.add(cx);
-              }
-            }
-            if (conversionExceptions.size() > 0) {
-              for (ConversionException cx : conversionExceptions) { 
-                _logger.error("APPMANAGEMENT0004E", new Object[]{f.getName(), appName, cx});
-              }
-              throw new ManagementException (MessageUtil.getMessage("APPMANAGEMENT0005E", appName));
-            }
-            if (convertedBinary != null) { 
-              modifiedBundles.put (f.getName(), convertedBinary);             
-              extraBundlesInfo.add(convertedBinary.getBundleInfo());
-            } 
-          }
-        } 
-      }
- 
-      // if Application-Content header was not specified build it based on the bundles included by value
-      if (applicationManifest.getMainAttributes().getValue(AppConstants.APPLICATION_CONTENT) == null) {
-          String appContent = buildAppContent(extraBundlesInfo);
-          applicationManifest.getMainAttributes().putValue(AppConstants.APPLICATION_CONTENT, appContent);
+    } catch (Throwable t) {
+      log.error("Error during shutdown of writer.", t);
+    } 
+  }
+  
+  @Override
+  public RefCounted<IndexWriter> getIndexWriter(SolrCore core)
+      throws IOException {
+    
+    if (closed) {
+      throw new SolrException(ErrorCode.SERVICE_UNAVAILABLE, "SolrCoreState already closed");
+    }
+    
+    synchronized (writerPauseLock) {
+      if (core == null) {
+        // core == null is a signal to just return the current writer, or null
+        // if none.
+        if (refCntWriter != null) refCntWriter.incref();
+        return refCntWriter;
       }
       
-      ManifestDefaultsInjector.updateManifest(applicationManifest, appName, ebaFile); 
-      applicationMetadata = _applicationMetadataFactory.createApplicationMetadata(applicationManifest);
-      
-      if (deploymentManifest != null) { 
-        deploymentMetadata = _deploymentMetadataFactory.parseDeploymentMetadata(deploymentManifest);
+      while (pauseWriter) {
+        try {
+          writerPauseLock.wait(100);
+        } catch (InterruptedException e) {}
         
-        // Validate: symbolic names must match
-        String appSymbolicName = applicationMetadata.getApplicationSymbolicName();
-        String depSymbolicName = deploymentMetadata.getApplicationSymbolicName();
-        if (!appSymbolicName.equals(depSymbolicName)) {
-          throw new ManagementException (MessageUtil.getMessage("APPMANAGEMENT0002E", appName, appSymbolicName, depSymbolicName));
+        if (closed) {
+          throw new SolrException(ErrorCode.SERVICE_UNAVAILABLE, "Already closed");
+        }
+      }
+      
+      if (indexWriter == null) {
+        indexWriter = createMainIndexWriter(core, "DirectUpdateHandler2", false);
+      }
+      initRefCntWriter();
+      writerFree = false;
+      writerPauseLock.notifyAll();
+      refCntWriter.incref();
+      return refCntWriter;
+    }
+  }
+
+  private void initRefCntWriter() {
+    if (refCntWriter == null) {
+      refCntWriter = new RefCounted<IndexWriter>(indexWriter) {
+        @Override
+        public void close() {
+          synchronized (writerPauseLock) {
+            writerFree = true;
+            writerPauseLock.notifyAll();
+          }
+        }
+      };
+    }
+  }
+
+  @Override
+  public synchronized void newIndexWriter(SolrCore core, boolean rollback, boolean forceNewDir) throws IOException {
+    if (closed) {
+      throw new AlreadyClosedException("SolrCoreState already closed");
+    }
+    log.info("Creating new IndexWriter...");
+    String coreName = core.getName();
+    synchronized (writerPauseLock) {
+      // we need to wait for the Writer to fall out of use
+      // first lets stop it from being lent out
+      pauseWriter = true;
+      // then lets wait until its out of use
+      log.info("Waiting until IndexWriter is unused... core=" + coreName);
+      
+      while (!writerFree) {
+        try {
+          writerPauseLock.wait(100);
+        } catch (InterruptedException e) {}
+        
+        if (closed) {
+          throw new SolrException(ErrorCode.SERVICE_UNAVAILABLE, "SolrCoreState already closed");
         }
       }
 
-      application = new AriesApplicationImpl (applicationMetadata, extraBundlesInfo, _localPlatform);
-      application.setDeploymentMetadata(deploymentMetadata);
-      // Store a reference to any modified bundles
-      application.setModifiedBundles (modifiedBundles);
-    } catch (IOException iox) {
-      _logger.error ("APPMANAGEMENT0006E", new Object []{appPath, iox});
-      throw new ManagementException(iox);
-    }
-    return application;
-  }
-
-  private String buildAppContent(Set<BundleInfo> bundleInfos) {
-      StringBuilder builder = new StringBuilder();
-      Iterator<BundleInfo> iterator = bundleInfos.iterator();
-      while (iterator.hasNext()) {
-          BundleInfo info = iterator.next();
-          builder.append(info.getSymbolicName());
-
-          // bundle version is not a required manifest header
-          if (info.getVersion() != null) {
-              String version = info.getVersion().toString();
-              builder.append(";version=\"[");
-              builder.append(version);
-              builder.append(',');
-              builder.append(version);
-              builder.append("]\"");
+      try {
+        if (indexWriter != null) {
+          if (!rollback) {
+            try {
+              log.info("Closing old IndexWriter... core=" + coreName);
+              indexWriter.close();
+            } catch (Throwable t) {
+              SolrException.log(log, "Error closing old IndexWriter. core="
+                  + coreName, t);
+            }
+          } else {
+            try {
+              log.info("Rollback old IndexWriter... core=" + coreName);
+              indexWriter.rollback();
+            } catch (Throwable t) {
+              SolrException.log(log, "Error rolling back old IndexWriter. core="
+                  + coreName, t);
+            }
           }
-
-          if (iterator.hasNext()) {
-              builder.append(",");
-          }
-      }
-      return builder.toString();
-  }
-  
-  /**
-   * Create an application from a URL. 
-   * The first version of this method isn't smart enough to check whether
-   * the input URL is file://
-   */
-  public AriesApplication createApplication(URL url) throws ManagementException {
-    OutputStream os = null;
-    AriesApplication app = null;
-    try { 
-      File tempFile = _localPlatform.getTemporaryFile();
-      InputStream is = url.openStream();
-      os = new FileOutputStream (tempFile);
-      IOUtils.copy(is, os);
-      IDirectory downloadedSource = FileSystem.getFSRoot(tempFile);
-      app = createApplication (downloadedSource);
-    } catch (IOException iox) {
-      throw new ManagementException (iox);
-    }
-      finally { 
-      IOUtils.close(os);
-    }
-    return app;
-  }
-
-  public AriesApplication resolve(AriesApplication originalApp, ResolveConstraint... constraints) throws ResolverException {
-    AriesApplicationImpl application = new AriesApplicationImpl(originalApp.getApplicationMetadata(), originalApp.getBundleInfo(), _localPlatform);
-    Set<BundleInfo> additionalBundlesRequired = _resolver.resolve(application, constraints);
-    DeploymentMetadata deploymentMetadata = _deploymentMetadataFactory.createDeploymentMetadata(application, additionalBundlesRequired);
-    application.setDeploymentMetadata(deploymentMetadata);
-    // Store a reference to any modified bundles
-    if (originalApp instanceof AriesApplicationImpl) {
-        // TODO: are we really passing streams around ?
-        application.setModifiedBundles(((AriesApplicationImpl) originalApp).getModifiedBundles());
-    }
-    return application;
-  } 
-
-  public AriesApplicationContext install(AriesApplication app) throws BundleException, ManagementException, ResolverException {
-    if (!app.isResolved()) {
-        app = resolve(app);
-    }
-    
-    // Register an Application Repository for this application
-    Dictionary dict = new Hashtable();
-    dict.put(ApplicationRepository.REPOSITORY_SCOPE, app.getApplicationMetadata().getApplicationScope());
-    _bundleContext.registerService(BundleRepository.class.getName(), 
-        new ApplicationRepository(_resolver), 
-        dict);
-    
-    AriesApplicationContext result = _applicationContextManager.getApplicationContext(app);
-    return result;
-  }
-  
-  public void uninstall(AriesApplicationContext app) throws BundleException 
-  {
-    _applicationContextManager.remove(app);
-  }
-
-  public void addApplicationListener(AriesApplicationListener l) {
-    // Need application listener lifecycle support
-  }
-
-  public void removeApplicationListener(AriesApplicationListener l) {
-    // TODO Auto-generated method stub
-
-  }
-
-
-
-  /**
-   * Locate and parse an application.mf in an eba
-   * @param source An aries application file
-   * @return parsed manifest, or an empty Manifest
-   * @throws IOException
-   */
-  private Manifest parseApplicationManifest (IDirectory source) throws IOException {
-    Manifest result = new Manifest();
-    IFile f = source.getFile(AppConstants.APPLICATION_MF);
-    if (f != null) { 
-      InputStream is = null;
-      try { 
-        is = f.open();
-        result = ManifestProcessor.parseManifest(is);
-      } catch (IOException iox) { 
-        _logger.error ("APPMANAGEMENT0007E", new Object[]{source.getName(), iox});
-        throw iox;
-      } finally { 
-        IOUtils.close(is);
+        }
+        indexWriter = createMainIndexWriter(core, "DirectUpdateHandler2", forceNewDir);
+        log.info("New IndexWriter is ready to be used.");
+        // we need to null this so it picks up the new writer next get call
+        refCntWriter = null;
+      } finally {
+        
+        pauseWriter = false;
+        writerPauseLock.notifyAll();
       }
     }
-    return result;
-  }
-  
-  /**
-   * Extract a bundle manifest from an IFile representing a bundle
-   * @param file The bundle to extract the manifest from
-   * @return bundle manifest
-   */
-  private BundleManifest getBundleManifest(IFile file) throws IOException {
-    BundleManifest mf = null;
-    InputStream in = null;
-    try { 
-      in = file.open();
-      mf = BundleManifest.fromBundle(in);
-    } finally { 
-      IOUtils.close(in);
-    }    
-    return mf;
   }
 
+  @Override
+  public synchronized void rollbackIndexWriter(SolrCore core) throws IOException {
+    newIndexWriter(core, true, true);
+  }
+  
+  protected SolrIndexWriter createMainIndexWriter(SolrCore core, String name, boolean forceNewDirectory) throws IOException {
+    return SolrIndexWriter.create(name, core.getNewIndexDir(),
+        core.getDirectoryFactory(), false, core.getSchema(),
+        core.getSolrConfig().indexConfig, core.getDeletionPolicy(), core.getCodec(), forceNewDirectory);
+  }
+
+  @Override
+  public DirectoryFactory getDirectoryFactory() {
+    return directoryFactory;
+  }
+
+  @Override
+  public void doRecovery(CoreContainer cc, CoreDescriptor cd) {
+    if (SKIP_AUTO_RECOVERY) {
+      log.warn("Skipping recovery according to sys prop solrcloud.skip.autorecovery");
+      return;
+    }
+    
+    // check before we grab the lock
+    if (cc.isShutDown()) {
+      log.warn("Skipping recovery because Solr is shutdown");
+      return;
+    }
+    
+    synchronized (recoveryLock) {
+      // to be air tight we must also check after lock
+      if (cc.isShutDown()) {
+        log.warn("Skipping recovery because Solr is shutdown");
+        return;
+      }
+      log.info("Running recovery - first canceling any ongoing recovery");
+      cancelRecovery();
+      
+      while (recoveryRunning) {
+        try {
+          recoveryLock.wait(1000);
+        } catch (InterruptedException e) {
+
+        }
+        // check again for those that were waiting
+        if (cc.isShutDown()) {
+          log.warn("Skipping recovery because Solr is shutdown");
+          return;
+        }
+        if (closed) return;
+      }
+
+      // if true, we are recovering after startup and shouldn't have (or be receiving) additional updates (except for local tlog recovery)
+      boolean recoveringAfterStartup = recoveryStrat == null;
+
+      recoveryStrat = new RecoveryStrategy(cc, cd, this);
+      recoveryStrat.setRecoveringAfterStartup(recoveringAfterStartup);
+      recoveryStrat.start();
+      recoveryRunning = true;
+    }
+    
+  }
+  
+  @Override
+  public void cancelRecovery() {
+    synchronized (recoveryLock) {
+      if (recoveryStrat != null && recoveryRunning) {
+        recoveryStrat.close();
+        while (true) {
+          try {
+            recoveryStrat.join();
+          } catch (InterruptedException e) {
+            // not interruptible - keep waiting
+            continue;
+          }
+          break;
+        }
+        
+        recoveryRunning = false;
+        recoveryLock.notifyAll();
+      }
+    }
+  }
+
+  @Override
+  public void recovered() {
+    recoveryRunning = false;
+  }
+
+  @Override
+  public void failed() {
+    recoveryRunning = false;
+  }
+
+  @Override
+  public synchronized void close(IndexWriterCloser closer) {
+    closed = true;
+    cancelRecovery();
+    closeIndexWriter(closer);
+  }
+  
+  @Override
+  public Lock getCommitLock() {
+    return commitLock;
+  }
+  
 }

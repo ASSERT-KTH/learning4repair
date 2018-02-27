@@ -1,6 +1,8 @@
-String s = getStringFromContext("fetchMailsSince", null);
+infoStream.message("IFD", "now checkpoint \"" + writer.segString(writer.toLiveInfos(segmentInfos)) + "\" [" + segmentInfos.size() + " segments " + "; isCommit = " + isCommit + "]");
 
-/*
+package org.apache.lucene.index;
+
+/**
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -16,600 +18,709 @@ String s = getStringFromContext("fetchMailsSince", null);
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.solr.handler.dataimport;
 
-import com.sun.mail.imap.IMAPMessage;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
-import org.apache.tika.Tika;
-import org.apache.tika.metadata.HttpHeaders;
-import org.apache.tika.metadata.Metadata;
-import org.apache.tika.metadata.TikaMetadataKeys;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.NoSuchDirectoryException;
+import org.apache.lucene.util.CollectionUtil;
+import org.apache.lucene.util.InfoStream;
 
-import javax.mail.*;
-import javax.mail.internet.AddressException;
-import javax.mail.internet.ContentType;
-import javax.mail.internet.InternetAddress;
-import javax.mail.internet.MimeMessage;
-import javax.mail.search.AndTerm;
-import javax.mail.search.ComparisonTerm;
-import javax.mail.search.ReceivedDateTerm;
-import javax.mail.search.SearchTerm;
-import java.io.InputStream;
-import java.text.ParseException;
-import java.text.SimpleDateFormat;
-import java.util.*;
-
-/**
- * An {@link EntityProcessor} instance which can index emails along with their attachments from POP3 or IMAP sources. Refer to
- * <a href="http://wiki.apache.org/solr/DataImportHandler">http://wiki.apache.org/solr/DataImportHandler</a> for more
- * details. <b>This API is experimental and subject to change</b>
+/*
+ * This class keeps track of each SegmentInfos instance that
+ * is still "live", either because it corresponds to a
+ * segments_N file in the Directory (a "commit", i.e. a
+ * committed SegmentInfos) or because it's an in-memory
+ * SegmentInfos that a writer is actively updating but has
+ * not yet committed.  This class uses simple reference
+ * counting to map the live SegmentInfos instances to
+ * individual files in the Directory.
  *
+ * The same directory file may be referenced by more than
+ * one IndexCommit, i.e. more than one SegmentInfos.
+ * Therefore we count how many commits reference each file.
+ * When all the commits referencing a certain file have been
+ * deleted, the refcount for that file becomes zero, and the
+ * file is deleted.
  *
- * @since solr 1.4
+ * A separate deletion policy interface
+ * (IndexDeletionPolicy) is consulted on creation (onInit)
+ * and once per commit (onCommit), to decide when a commit
+ * should be removed.
+ *
+ * It is the business of the IndexDeletionPolicy to choose
+ * when to delete commit points.  The actual mechanics of
+ * file deletion, retrying, etc, derived from the deletion
+ * of commit points is the business of the IndexFileDeleter.
+ *
+ * The current default deletion policy is {@link
+ * KeepOnlyLastCommitDeletionPolicy}, which removes all
+ * prior commits when a new commit has completed.  This
+ * matches the behavior before 2.2.
+ *
+ * Note that you must hold the write.lock before
+ * instantiating this class.  It opens segments_N file(s)
+ * directly with no retry logic.
  */
-public class MailEntityProcessor extends EntityProcessorBase {
 
-  public static interface CustomFilter {
-    public SearchTerm getCustomSearch(Folder folder);
+final class IndexFileDeleter {
+
+  /* Files that we tried to delete but failed (likely
+   * because they are open and we are running on Windows),
+   * so we will retry them again later: */
+  private List<String> deletable;
+
+  /* Reference count for all files in the index.
+   * Counts how many existing commits reference a file.
+   **/
+  private Map<String, RefCount> refCounts = new HashMap<String, RefCount>();
+
+  /* Holds all commits (segments_N) currently in the index.
+   * This will have just 1 commit if you are using the
+   * default delete policy (KeepOnlyLastCommitDeletionPolicy).
+   * Other policies may leave commit points live for longer
+   * in which case this list would be longer than 1: */
+  private List<CommitPoint> commits = new ArrayList<CommitPoint>();
+
+  /* Holds files we had incref'd from the previous
+   * non-commit checkpoint: */
+  private List<Collection<String>> lastFiles = new ArrayList<Collection<String>>();
+
+  /* Commits that the IndexDeletionPolicy have decided to delete: */
+  private List<CommitPoint> commitsToDelete = new ArrayList<CommitPoint>();
+
+  private final InfoStream infoStream;
+  private Directory directory;
+  private IndexDeletionPolicy policy;
+
+  final boolean startingCommitDeleted;
+  private SegmentInfos lastSegmentInfos;
+
+  /** Change to true to see details of reference counts when
+   *  infoStream is enabled */
+  public static boolean VERBOSE_REF_COUNTS = false;
+
+  // Used only for assert
+  private final IndexWriter writer;
+
+  // called only from assert
+  private boolean locked() {
+    return writer == null || Thread.holdsLock(writer);
   }
 
-  @Override
-  public void init(Context context) {
-    super.init(context);
-    // set attributes using  XXX getXXXFromContext(attribute, defualtValue);
-    // applies variable resolver and return default if value is not found or null
-    // REQUIRED : connection and folder info
-    user = getStringFromContext("user", null);
-    password = getStringFromContext("password", null);
-    host = getStringFromContext("host", null);
-    protocol = getStringFromContext("protocol", null);
-    folderNames = getStringFromContext("folders", null);
-    // validate
-    if (host == null || protocol == null || user == null || password == null
-            || folderNames == null)
-      throw new DataImportHandlerException(DataImportHandlerException.SEVERE,
-              "'user|password|protocol|host|folders' are required attributes");
+  /**
+   * Initialize the deleter: find all previous commits in
+   * the Directory, incref the files they reference, call
+   * the policy to let it delete commits.  This will remove
+   * any files not referenced by any of the commits.
+   * @throws CorruptIndexException if the index is corrupt
+   * @throws IOException if there is a low-level IO error
+   */
+  public IndexFileDeleter(Directory directory, IndexDeletionPolicy policy, SegmentInfos segmentInfos,
+                          InfoStream infoStream, IndexWriter writer) throws CorruptIndexException, IOException {
+    this.infoStream = infoStream;
+    this.writer = writer;
 
-    //OPTIONAL : have defaults and are optional
-    recurse = getBoolFromContext("recurse", true);
-    String excludes = getStringFromContext("exclude", "");
-    if (excludes != null && !excludes.trim().equals("")) {
-      exclude = Arrays.asList(excludes.split(","));
+    final String currentSegmentsFile = segmentInfos.getSegmentsFileName();
+
+    if (infoStream.isEnabled("IFD")) {
+      infoStream.message("IFD", "init: current segments file is \"" + currentSegmentsFile + "\"; deletionPolicy=" + policy);
     }
-    String includes = getStringFromContext("include", "");
-    if (includes != null && !includes.trim().equals("")) {
-      include = Arrays.asList(includes.split(","));
-    }
-    batchSize = getIntFromContext("batchSize", 20);
-    customFilter = getStringFromContext("customFilter", "");
-    String s = getStringFromContext("fetchMailsSince", "");
-    if (s != null)
-      try {
-        fetchMailsSince = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").parse(s);
-      } catch (ParseException e) {
-        throw new DataImportHandlerException(DataImportHandlerException.SEVERE, "Invalid value for fetchMailSince: " + s, e);
-      }
 
-    fetchSize = getIntFromContext("fetchSize", 32 * 1024);
-    cTimeout = getIntFromContext("connectTimeout", 30 * 1000);
-    rTimeout = getIntFromContext("readTimeout", 60 * 1000);
-    processAttachment = getBoolFromContext(
-              getStringFromContext("processAttachment",null) == null ? "processAttachement":"processAttachment"
-            , true);
+    this.policy = policy;
+    this.directory = directory;
 
-    tika = new Tika();
-    
-    logConfig();
-  }
+    // First pass: walk the files and initialize our ref
+    // counts:
+    long currentGen = segmentInfos.getGeneration();
 
-  @Override
-  public Map<String, Object> nextRow() {
-    Message mail;
-    Map<String, Object> row = null;
-    do {
-      // try till there is a valid document or folders get exhausted.
-      // when mail == NULL, it means end of processing
-      mail = getNextMail();
-      if (mail != null)
-        row = getDocumentFromMail(mail);
-    } while (row == null && mail != null);    
-    return row;
-  }
-
-  private Message getNextMail() {
-    if (!connected) {
-      if (!connectToMailBox())
-        return null;
-      connected = true;
-    }
-    if (folderIter == null) {
-      createFilters();
-      folderIter = new FolderIterator(mailbox);
-    }
-    // get next message from the folder
-    // if folder is exhausted get next folder
-    // loop till a valid mail or all folders exhausted.
-    while (msgIter == null || !msgIter.hasNext()) {
-      Folder next = folderIter.hasNext() ? folderIter.next() : null;
-      if (next == null) {
-        return null;
-      }
-      msgIter = new MessageIterator(next, batchSize);
-    }
-    return msgIter.next();
-  }
-
-  private Map<String, Object> getDocumentFromMail(Message mail) {
-    Map<String, Object> row = new HashMap<String, Object>();
+    CommitPoint currentCommitPoint = null;
+    String[] files = null;
     try {
-      addPartToDocument(mail, row, true);
-      return row;
-    } catch (Exception e) {
-      return null;
-    }
-  }
-
-  public void addPartToDocument(Part part, Map<String, Object> row, boolean outerMost) throws Exception {
-    if (part instanceof Message) {
-      addEnvelopToDocument(part, row);
+      files = directory.listAll();
+    } catch (NoSuchDirectoryException e) {
+      // it means the directory is empty, so ignore it.
+      files = new String[0];
     }
 
-    String ct = part.getContentType();
-    ContentType ctype = new ContentType(ct);
-    if (part.isMimeType("multipart/*")) {
-      Multipart mp = (Multipart) part.getContent();
-      int count = mp.getCount();
-      if (part.isMimeType("multipart/alternative"))
-        count = 1;
-      for (int i = 0; i < count; i++)
-        addPartToDocument(mp.getBodyPart(i), row, false);
-    } else if (part.isMimeType("message/rfc822")) {
-      addPartToDocument((Part) part.getContent(), row, false);
-    } else {
-      String disp = part.getDisposition();
-      if (!processAttachment || (disp != null && disp.equalsIgnoreCase(Part.ATTACHMENT)))        return;
-      InputStream is = part.getInputStream();
-      String fileName = part.getFileName();
-      Metadata md = new Metadata();
-      md.set(HttpHeaders.CONTENT_TYPE, ctype.getBaseType().toLowerCase(Locale.ENGLISH));
-      md.set(TikaMetadataKeys.RESOURCE_NAME_KEY, fileName);
-      String content = tika.parseToString(is, md);
-      if (disp != null && disp.equalsIgnoreCase(Part.ATTACHMENT)) {
-        if (row.get(ATTACHMENT) == null)
-          row.put(ATTACHMENT, new ArrayList<String>());
-        List<String> contents = (List<String>) row.get(ATTACHMENT);
-        contents.add(content);
-        row.put(ATTACHMENT, contents);
-        if (row.get(ATTACHMENT_NAMES) == null)
-          row.put(ATTACHMENT_NAMES, new ArrayList<String>());
-        List<String> names = (List<String>) row.get(ATTACHMENT_NAMES);
-        names.add(fileName);
-        row.put(ATTACHMENT_NAMES, names);
-      } else {
-        if (row.get(CONTENT) == null)
-          row.put(CONTENT, new ArrayList<String>());
-        List<String> contents = (List<String>) row.get(CONTENT);
-        contents.add(content);
-        row.put(CONTENT, contents);
-      }
-    }
-  }
+    for (String fileName : files) {
 
-  private void addEnvelopToDocument(Part part, Map<String, Object> row) throws MessagingException {
-    MimeMessage mail = (MimeMessage) part;
-    Address[] adresses;
-    if ((adresses = mail.getFrom()) != null && adresses.length > 0)
-      row.put(FROM, adresses[0].toString());
+      if ((IndexFileNameFilter.INSTANCE.accept(null, fileName)) && !fileName.endsWith("write.lock") && !fileName.equals(IndexFileNames.SEGMENTS_GEN)) {
 
-    List<String> to = new ArrayList<String>();
-    if ((adresses = mail.getRecipients(Message.RecipientType.TO)) != null)
-      addAddressToList(adresses, to);
-    if ((adresses = mail.getRecipients(Message.RecipientType.CC)) != null)
-      addAddressToList(adresses, to);
-    if ((adresses = mail.getRecipients(Message.RecipientType.BCC)) != null)
-      addAddressToList(adresses, to);
-    if (to.size() > 0)
-      row.put(TO_CC_BCC, to);
+        // Add this file to refCounts with initial count 0:
+        getRefCount(fileName);
 
-    row.put(MESSAGE_ID, mail.getMessageID());
-    row.put(SUBJECT, mail.getSubject());
+        if (fileName.startsWith(IndexFileNames.SEGMENTS)) {
 
-    Date d = mail.getSentDate();
-    if (d != null) {
-      row.put(SENT_DATE, d);
-    }
-
-    List<String> flags = new ArrayList<String>();
-    for (Flags.Flag flag : mail.getFlags().getSystemFlags()) {
-      if (flag == Flags.Flag.ANSWERED)
-        flags.add(FLAG_ANSWERED);
-      else if (flag == Flags.Flag.DELETED)
-        flags.add(FLAG_DELETED);
-      else if (flag == Flags.Flag.DRAFT)
-        flags.add(FLAG_DRAFT);
-      else if (flag == Flags.Flag.FLAGGED)
-        flags.add(FLAG_FLAGGED);
-      else if (flag == Flags.Flag.RECENT)
-        flags.add(FLAG_RECENT);
-      else if (flag == Flags.Flag.SEEN)
-        flags.add(FLAG_SEEN);
-    }
-    flags.addAll(Arrays.asList(mail.getFlags().getUserFlags()));
-    row.put(FLAGS, flags);
-
-    String[] hdrs = mail.getHeader("X-Mailer");
-    if (hdrs != null)
-      row.put(XMAILER, hdrs[0]);
-  }
-
-
-  private void addAddressToList(Address[] adresses, List<String> to) throws AddressException {
-    for (Address address : adresses) {
-      to.add(address.toString());
-      InternetAddress ia = (InternetAddress) address;
-      if (ia.isGroup()) {
-        InternetAddress[] group = ia.getGroup(false);
-        for (InternetAddress member : group)
-          to.add(member.toString());
-      }
-    }
-  }
-
-  private boolean connectToMailBox() {
-    try {
-      Properties props = new Properties();
-      props.setProperty("mail.store.protocol", protocol);
-      props.setProperty("mail.imap.fetchsize", "" + fetchSize);
-      props.setProperty("mail.imap.timeout", "" + rTimeout);
-      props.setProperty("mail.imap.connectiontimeout", "" + cTimeout);
-      Session session = Session.getDefaultInstance(props, null);
-      mailbox = session.getStore(protocol);
-      mailbox.connect(host, user, password);
-      LOG.info("Connected to mailbox");
-      return true;
-    } catch (MessagingException e) {
-      throw new DataImportHandlerException(DataImportHandlerException.SEVERE,
-              "Connection failed", e);
-    }
-  }
-
-  private void createFilters() {
-    if (fetchMailsSince != null) {
-      filters.add(new MailsSinceLastCheckFilter(fetchMailsSince));
-    }
-    if (customFilter != null && !customFilter.equals("")) {
-      try {
-        Class cf = Class.forName(customFilter);
-        Object obj = cf.newInstance();
-        if (obj instanceof CustomFilter) {
-          filters.add((CustomFilter) obj);
-        }
-      } catch (Exception e) {
-        throw new DataImportHandlerException(DataImportHandlerException.SEVERE,
-                "Custom filter could not be created", e);
-      }
-    }
-  }
-
-  private void logConfig() {
-    if (!LOG.isInfoEnabled()) return;
-    StringBuffer config = new StringBuffer();
-    config.append("user : ").append(user).append(System.getProperty("line.separator"));
-    config.append("pwd : ").append(password).append(System.getProperty("line.separator"));
-    config.append("protocol : ").append(protocol).append(System.getProperty("line.separator"));
-    config.append("host : ").append(host).append(System.getProperty("line.separator"));
-    config.append("folders : ").append(folderNames).append(System.getProperty("line.separator"));
-    config.append("recurse : ").append(recurse).append(System.getProperty("line.separator"));
-    config.append("exclude : ").append(exclude.toString()).append(System.getProperty("line.separator"));
-    config.append("include : ").append(include.toString()).append(System.getProperty("line.separator"));
-    config.append("batchSize : ").append(batchSize).append(System.getProperty("line.separator"));
-    config.append("fetchSize : ").append(fetchSize).append(System.getProperty("line.separator"));
-    config.append("read timeout : ").append(rTimeout).append(System.getProperty("line.separator"));
-    config.append("conection timeout : ").append(cTimeout).append(System.getProperty("line.separator"));
-    config.append("custom filter : ").append(customFilter).append(System.getProperty("line.separator"));
-    config.append("fetch mail since : ").append(fetchMailsSince).append(System.getProperty("line.separator"));
-    LOG.info(config.toString());
-  }
-
-  class FolderIterator implements Iterator<Folder> {
-    private Store mailbox;
-    private List<String> topLevelFolders;
-    private List<Folder> folders = null;
-    private Folder lastFolder = null;
-
-    public FolderIterator(Store mailBox) {
-      this.mailbox = mailBox;
-      folders = new ArrayList<Folder>();
-      getTopLevelFolders(mailBox);
-    }
-
-    public boolean hasNext() {
-      return !folders.isEmpty();
-    }
-
-    public Folder next() {
-      try {
-        boolean hasMessages = false;
-        Folder next;
-        do {
-          if (lastFolder != null) {
-            lastFolder.close(false);
-            lastFolder = null;
+          // This is a commit (segments or segments_N), and
+          // it's valid (<= the max gen).  Load it, then
+          // incref all files it refers to:
+          if (infoStream.isEnabled("IFD")) {
+            infoStream.message("IFD", "init: load commit \"" + fileName + "\"");
           }
-          if (folders.isEmpty()) {
-            mailbox.close();
-            return null;
-          }
-          next = folders.remove(0);
-          if (next != null) {
-            String fullName = next.getFullName();
-            if (!excludeFolder(fullName)) {
-              hasMessages = (next.getType() & Folder.HOLDS_MESSAGES) != 0;
-              next.open(Folder.READ_ONLY);
-              lastFolder = next;
-              LOG.info("Opened folder : " + fullName);
+          SegmentInfos sis = new SegmentInfos();
+          try {
+            sis.read(directory, fileName);
+          } catch (FileNotFoundException e) {
+            // LUCENE-948: on NFS (and maybe others), if
+            // you have writers switching back and forth
+            // between machines, it's very likely that the
+            // dir listing will be stale and will claim a
+            // file segments_X exists when in fact it
+            // doesn't.  So, we catch this and handle it
+            // as if the file does not exist
+            if (infoStream.isEnabled("IFD")) {
+              infoStream.message("IFD", "init: hit FileNotFoundException when loading commit \"" + fileName + "\"; skipping this commit point");
             }
-            if (recurse && ((next.getType() & Folder.HOLDS_FOLDERS) != 0)) {
-              Folder[] children = next.list();
-              LOG.info("Added its children to list  : ");
-              for (int i = children.length - 1; i >= 0; i--) {
-                folders.add(0, children[i]);
-                LOG.info("child name : " + children[i].getFullName());
+            sis = null;
+          } catch (IOException e) {
+            if (SegmentInfos.generationFromSegmentsFileName(fileName) <= currentGen && directory.fileLength(fileName) > 0) {
+              throw e;
+            } else {
+              // Most likely we are opening an index that
+              // has an aborted "future" commit, so suppress
+              // exc in this case
+              sis = null;
+            }
+          }
+          if (sis != null) {
+            final SegmentInfos infos = sis;
+            for (SegmentInfo segmentInfo : infos) {
+              try {
+                /*
+                 * Force FI to load for each segment since we could see a
+                 * segments file and load successfully above if the files are
+                 * still referenced when they are deleted and the os doesn't let
+                 * you delete them. Yet its likely that fnm files are removed
+                 * while seg file is still around Since LUCENE-2984 we need FI
+                 * to find out if a seg has vectors and prox so we need those
+                 * files to be opened for a commit point.
+                 */
+                segmentInfo.getFieldInfos();
+              } catch (FileNotFoundException e) {
+                refresh(segmentInfo.name);
+                sis = null;
+                if (infoStream.isEnabled("IFD")) {
+                  infoStream.message("IFD", "init: hit FileNotFoundException when loading commit \"" + fileName + "\"; skipping this commit point");
+                }
               }
-              if (children.length == 0)
-                LOG.info("NO children : ");
+            }
+           
+          }
+          if (sis != null) {
+            final CommitPoint commitPoint = new CommitPoint(commitsToDelete, directory, sis);
+            if (sis.getGeneration() == segmentInfos.getGeneration()) {
+              currentCommitPoint = commitPoint;
+            }
+            commits.add(commitPoint);
+            incRef(sis, true);
+
+            if (lastSegmentInfos == null || sis.getGeneration() > lastSegmentInfos.getGeneration()) {
+              lastSegmentInfos = sis;
             }
           }
         }
-        while (!hasMessages);
-        return next;
-      } catch (MessagingException e) {
-        //throw new DataImportHandlerException(DataImportHandlerException.SEVERE,
-        //        "Folder open failed", e);
-      }
-      return null;
-    }
-
-    public void remove() {
-      throw new UnsupportedOperationException("Its read only mode...");
-    }
-
-    private void getTopLevelFolders(Store mailBox) {
-      if (folderNames != null)
-        topLevelFolders = Arrays.asList(folderNames.split(","));
-      for (int i = 0; topLevelFolders != null && i < topLevelFolders.size(); i++) {
-        try {
-          folders.add(mailbox.getFolder(topLevelFolders.get(i)));
-        } catch (MessagingException e) {
-          // skip bad ones unless its the last one and still no good folder
-          if (folders.size() == 0 && i == topLevelFolders.size() - 1)
-            throw new DataImportHandlerException(DataImportHandlerException.SEVERE,
-                    "Folder retreival failed");
-        }
-      }
-      if (topLevelFolders == null || topLevelFolders.size() == 0) {
-        try {
-          folders.add(mailBox.getDefaultFolder());
-        } catch (MessagingException e) {
-          throw new DataImportHandlerException(DataImportHandlerException.SEVERE,
-                  "Folder retreival failed");
-        }
       }
     }
 
-    private boolean excludeFolder(String name) {
-      for (String s : exclude) {
-        if (name.matches(s))
-          return true;
-      }
-      for (String s : include) {
-        if (name.matches(s))
-          return false;
-      }
-      return include.size() > 0;
-    }
-  }
-
-  class MessageIterator implements Iterator<Message> {
-    private Folder folder;
-    private Message[] messagesInCurBatch;
-    private int current = 0;
-    private int currentBatch = 0;
-    private int batchSize = 0;
-    private int totalInFolder = 0;
-    private boolean doBatching = true;
-
-    public MessageIterator(Folder folder, int batchSize) {
+    if (currentCommitPoint == null && currentSegmentsFile != null) {
+      // We did not in fact see the segments_N file
+      // corresponding to the segmentInfos that was passed
+      // in.  Yet, it must exist, because our caller holds
+      // the write lock.  This can happen when the directory
+      // listing was stale (eg when index accessed via NFS
+      // client with stale directory listing cache).  So we
+      // try now to explicitly open this commit point:
+      SegmentInfos sis = new SegmentInfos();
       try {
-        this.folder = folder;
-        this.batchSize = batchSize;
-        SearchTerm st = getSearchTerm();
-        if (st != null) {
-          doBatching = false;
-          messagesInCurBatch = folder.search(st);
-          totalInFolder = messagesInCurBatch.length;
-          folder.fetch(messagesInCurBatch, fp);
-          current = 0;
-          LOG.info("Total messages : " + totalInFolder);
-          LOG.info("Search criteria applied. Batching disabled");
-        } else {
-          totalInFolder = folder.getMessageCount();
-          LOG.info("Total messages : " + totalInFolder);
-          getNextBatch(batchSize, folder);
+        sis.read(directory, currentSegmentsFile);
+      } catch (IOException e) {
+        throw new CorruptIndexException("failed to locate current segments_N file");
+      }
+      if (infoStream.isEnabled("IFD")) {
+        infoStream.message("IFD", "forced open of current segments file " + segmentInfos.getSegmentsFileName());
+      }
+      currentCommitPoint = new CommitPoint(commitsToDelete, directory, sis);
+      commits.add(currentCommitPoint);
+      incRef(sis, true);
+    }
+
+    // We keep commits list in sorted order (oldest to newest):
+    CollectionUtil.mergeSort(commits);
+
+    // Now delete anything with ref count at 0.  These are
+    // presumably abandoned files eg due to crash of
+    // IndexWriter.
+    for(Map.Entry<String, RefCount> entry : refCounts.entrySet() ) {
+      RefCount rc = entry.getValue();
+      final String fileName = entry.getKey();
+      if (0 == rc.count) {
+        if (infoStream.isEnabled("IFD")) {
+          infoStream.message("IFD", "init: removing unreferenced file \"" + fileName + "\"");
         }
-      } catch (MessagingException e) {
-        throw new DataImportHandlerException(DataImportHandlerException.SEVERE,
-                "Message retreival failed", e);
+        deleteFile(fileName);
       }
     }
 
-    private void getNextBatch(int batchSize, Folder folder) throws MessagingException {
-      // after each batch invalidate cache
-      if (messagesInCurBatch != null) {
-        for (Message m : messagesInCurBatch) {
-          if (m instanceof IMAPMessage)
-            ((IMAPMessage) m).invalidateHeaders();
+    // Finally, give policy a chance to remove things on
+    // startup:
+    if (currentSegmentsFile != null) {
+      policy.onInit(commits);
+    }
+
+    // Always protect the incoming segmentInfos since
+    // sometime it may not be the most recent commit
+    checkpoint(segmentInfos, false);
+
+    startingCommitDeleted = currentCommitPoint == null ? false : currentCommitPoint.isDeleted();
+
+    deleteCommits();
+  }
+
+  public SegmentInfos getLastSegmentInfos() {
+    return lastSegmentInfos;
+  }
+
+  /**
+   * Remove the CommitPoints in the commitsToDelete List by
+   * DecRef'ing all files from each SegmentInfos.
+   */
+  private void deleteCommits() throws IOException {
+
+    int size = commitsToDelete.size();
+
+    if (size > 0) {
+
+      // First decref all files that had been referred to by
+      // the now-deleted commits:
+      for(int i=0;i<size;i++) {
+        CommitPoint commit = commitsToDelete.get(i);
+        if (infoStream.isEnabled("IFD")) {
+          infoStream.message("IFD", "deleteCommits: now decRef commit \"" + commit.getSegmentsFileName() + "\"");
+        }
+        for (final String file : commit.files) {
+          decRef(file);
         }
       }
-      int lastMsg = (currentBatch + 1) * batchSize;
-      lastMsg = lastMsg > totalInFolder ? totalInFolder : lastMsg;
-      messagesInCurBatch = folder.getMessages(currentBatch * batchSize + 1, lastMsg);
-      folder.fetch(messagesInCurBatch, fp);
-      current = 0;
-      currentBatch++;
-      LOG.info("Current Batch  : " + currentBatch);
-      LOG.info("Messages in this batch  : " + messagesInCurBatch.length);
-    }
+      commitsToDelete.clear();
 
-    public boolean hasNext() {
-      boolean hasMore = current < messagesInCurBatch.length;
-      if (!hasMore && doBatching
-              && currentBatch * batchSize < totalInFolder) {
-        // try next batch
-        try {
-          getNextBatch(batchSize, folder);
-          hasMore = current < messagesInCurBatch.length;
-        } catch (MessagingException e) {
-          throw new DataImportHandlerException(DataImportHandlerException.SEVERE,
-                  "Message retreival failed", e);
+      // Now compact commits to remove deleted ones (preserving the sort):
+      size = commits.size();
+      int readFrom = 0;
+      int writeTo = 0;
+      while(readFrom < size) {
+        CommitPoint commit = commits.get(readFrom);
+        if (!commit.deleted) {
+          if (writeTo != readFrom) {
+            commits.set(writeTo, commits.get(readFrom));
+          }
+          writeTo++;
         }
+        readFrom++;
       }
-      return hasMore;
-    }
 
-    public Message next() {
-      return hasNext() ? messagesInCurBatch[current++] : null;
-    }
-
-    public void remove() {
-      throw new UnsupportedOperationException("Its read only mode...");
-    }
-
-    private SearchTerm getSearchTerm() {
-      if (filters.size() == 0)
-        return null;
-      if (filters.size() == 1)
-        return filters.get(0).getCustomSearch(folder);
-      SearchTerm last = filters.get(0).getCustomSearch(folder);
-      for (int i = 1; i < filters.size(); i++) {
-        CustomFilter filter = filters.get(i);
-        SearchTerm st = filter.getCustomSearch(folder);
-        if (st != null) {
-          last = new AndTerm(last, st);
-        }
+      while(size > writeTo) {
+        commits.remove(size-1);
+        size--;
       }
-      return last;
     }
   }
 
-  class MailsSinceLastCheckFilter implements CustomFilter {
+  /**
+   * Writer calls this when it has hit an error and had to
+   * roll back, to tell us that there may now be
+   * unreferenced files in the filesystem.  So we re-list
+   * the filesystem and delete such files.  If segmentName
+   * is non-null, we will only delete files corresponding to
+   * that segment.
+   */
+  public void refresh(String segmentName) throws IOException {
+    assert locked();
 
-    private Date since;
-
-    public MailsSinceLastCheckFilter(Date date) {
-      since = date;
+    String[] files = directory.listAll();
+    String segmentPrefix1;
+    String segmentPrefix2;
+    if (segmentName != null) {
+      segmentPrefix1 = segmentName + ".";
+      segmentPrefix2 = segmentName + "_";
+    } else {
+      segmentPrefix1 = null;
+      segmentPrefix2 = null;
     }
 
-    public SearchTerm getCustomSearch(Folder folder) {
-      return new ReceivedDateTerm(ComparisonTerm.GE, since);
+    for(int i=0;i<files.length;i++) {
+      String fileName = files[i];
+      if ((segmentName == null || fileName.startsWith(segmentPrefix1) || fileName.startsWith(segmentPrefix2)) &&
+          IndexFileNameFilter.INSTANCE.accept(null, fileName) &&
+          !refCounts.containsKey(fileName) &&
+          !fileName.equals(IndexFileNames.SEGMENTS_GEN)) {
+        // Unreferenced file, so remove it
+        if (infoStream.isEnabled("IFD")) {
+          infoStream.message("IFD", "refresh [prefix=" + segmentName + "]: removing newly created unreferenced file \"" + fileName + "\"");
+        }
+        deleteFile(fileName);
+      }
     }
   }
 
-  // user settings stored in member variables
-  private String user;
-  private String password;
-  private String host;
-  private String protocol;
-
-  private String folderNames;
-  private List<String> exclude = new ArrayList<String>();
-  private List<String> include = new ArrayList<String>();
-  private boolean recurse;
-
-  private int batchSize;
-  private int fetchSize;
-  private int cTimeout;
-  private int rTimeout;
-
-  private Date fetchMailsSince;
-  private String customFilter;
-
-  private boolean processAttachment = true;
-
-  private Tika tika;
-  
-  // holds the current state
-  private Store mailbox;
-  private boolean connected = false;
-  private FolderIterator folderIter;
-  private MessageIterator msgIter;
-  private List<CustomFilter> filters = new ArrayList<CustomFilter>();
-  private static FetchProfile fp = new FetchProfile();
-  private static final Logger LOG = LoggerFactory.getLogger(DataImporter.class);
-
-  // diagnostics
-  private int rowCount = 0;
-
-  static {
-    fp.add(FetchProfile.Item.ENVELOPE);
-    fp.add(FetchProfile.Item.FLAGS);
-    fp.add("X-Mailer");
+  public void refresh() throws IOException {
+    // Set to null so that we regenerate the list of pending
+    // files; else we can accumulate same file more than
+    // once
+    assert locked();
+    deletable = null;
+    refresh(null);
   }
 
-  // Fields To Index
-  // single valued
-  private static final String MESSAGE_ID = "messageId";
-  private static final String SUBJECT = "subject";
-  private static final String FROM = "from";
-  private static final String SENT_DATE = "sentDate";
-  private static final String XMAILER = "xMailer";
-  // multi valued
-  private static final String TO_CC_BCC = "allTo";
-  private static final String FLAGS = "flags";
-  private static final String CONTENT = "content";
-  private static final String ATTACHMENT = "attachment";
-  private static final String ATTACHMENT_NAMES = "attachmentNames";
-  // flag values
-  private static final String FLAG_ANSWERED = "answered";
-  private static final String FLAG_DELETED = "deleted";
-  private static final String FLAG_DRAFT = "draft";
-  private static final String FLAG_FLAGGED = "flagged";
-  private static final String FLAG_RECENT = "recent";
-  private static final String FLAG_SEEN = "seen";
+  public void close() throws IOException {
+    // DecRef old files from the last checkpoint, if any:
+    assert locked();
+    int size = lastFiles.size();
+    if (size > 0) {
+      for(int i=0;i<size;i++) {
+        decRef(lastFiles.get(i));
+      }
+      lastFiles.clear();
+    }
 
-  private int getIntFromContext(String prop, int ifNull) {
-    int v = ifNull;
+    deletePendingFiles();
+  }
+
+  /**
+   * Revisits the {@link IndexDeletionPolicy} by calling its
+   * {@link IndexDeletionPolicy#onCommit(List)} again with the known commits.
+   * This is useful in cases where a deletion policy which holds onto index
+   * commits is used. The application may know that some commits are not held by
+   * the deletion policy anymore and call
+   * {@link IndexWriter#deleteUnusedFiles()}, which will attempt to delete the
+   * unused commits again.
+   */
+  void revisitPolicy() throws IOException {
+    assert locked();
+    if (infoStream.isEnabled("IFD")) {
+      infoStream.message("IFD", "now revisitPolicy");
+    }
+
+    if (commits.size() > 0) {
+      policy.onCommit(commits);
+      deleteCommits();
+    }
+  }
+
+  public void deletePendingFiles() throws IOException {
+    assert locked();
+    if (deletable != null) {
+      List<String> oldDeletable = deletable;
+      deletable = null;
+      int size = oldDeletable.size();
+      for(int i=0;i<size;i++) {
+        if (infoStream.isEnabled("IFD")) {
+          infoStream.message("IFD", "delete pending file " + oldDeletable.get(i));
+        }
+        deleteFile(oldDeletable.get(i));
+      }
+    }
+  }
+
+  /**
+   * For definition of "check point" see IndexWriter comments:
+   * "Clarification: Check Points (and commits)".
+   *
+   * Writer calls this when it has made a "consistent
+   * change" to the index, meaning new files are written to
+   * the index and the in-memory SegmentInfos have been
+   * modified to point to those files.
+   *
+   * This may or may not be a commit (segments_N may or may
+   * not have been written).
+   *
+   * We simply incref the files referenced by the new
+   * SegmentInfos and decref the files we had previously
+   * seen (if any).
+   *
+   * If this is a commit, we also call the policy to give it
+   * a chance to remove other commits.  If any commits are
+   * removed, we decref their files as well.
+   */
+  public void checkpoint(SegmentInfos segmentInfos, boolean isCommit) throws IOException {
+    assert locked();
+
+    assert Thread.holdsLock(writer);
+
+    if (infoStream.isEnabled("IFD")) {
+      infoStream.message("IFD", "now checkpoint \"" + writer.segString(segmentInfos) + "\" [" + segmentInfos.size() + " segments " + "; isCommit = " + isCommit + "]");
+    }
+
+    // Try again now to delete any previously un-deletable
+    // files (because they were in use, on Windows):
+    deletePendingFiles();
+
+    // Incref the files:
+    incRef(segmentInfos, isCommit);
+
+    if (isCommit) {
+      // Append to our commits list:
+      commits.add(new CommitPoint(commitsToDelete, directory, segmentInfos));
+
+      // Tell policy so it can remove commits:
+      policy.onCommit(commits);
+
+      // Decref files for commits that were deleted by the policy:
+      deleteCommits();
+    } else {
+      // DecRef old files from the last checkpoint, if any:
+      for (Collection<String> lastFile : lastFiles) {
+        decRef(lastFile);
+      }
+      lastFiles.clear();
+
+      // Save files so we can decr on next checkpoint/commit:
+      lastFiles.add(segmentInfos.files(directory, false));
+    }
+  }
+
+  void incRef(SegmentInfos segmentInfos, boolean isCommit) throws IOException {
+    assert locked();
+    // If this is a commit point, also incRef the
+    // segments_N file:
+    for( final String fileName: segmentInfos.files(directory, isCommit) ) {
+      incRef(fileName);
+    }
+  }
+
+  void incRef(Collection<String> files) throws IOException {
+    assert locked();
+    for(final String file : files) {
+      incRef(file);
+    }
+  }
+
+  void incRef(String fileName) throws IOException {
+    assert locked();
+    RefCount rc = getRefCount(fileName);
+    if (infoStream.isEnabled("IFD")) {
+      if (VERBOSE_REF_COUNTS) {
+        infoStream.message("IFD", "  IncRef \"" + fileName + "\": pre-incr count is " + rc.count);
+      }
+    }
+    rc.IncRef();
+  }
+
+  void decRef(Collection<String> files) throws IOException {
+    assert locked();
+    for(final String file : files) {
+      decRef(file);
+    }
+  }
+
+  void decRef(String fileName) throws IOException {
+    assert locked();
+    RefCount rc = getRefCount(fileName);
+    if (infoStream.isEnabled("IFD")) {
+      if (VERBOSE_REF_COUNTS) {
+        infoStream.message("IFD", "  DecRef \"" + fileName + "\": pre-decr count is " + rc.count);
+      }
+    }
+    if (0 == rc.DecRef()) {
+      // This file is no longer referenced by any past
+      // commit points nor by the in-memory SegmentInfos:
+      deleteFile(fileName);
+      refCounts.remove(fileName);
+    }
+  }
+
+  void decRef(SegmentInfos segmentInfos) throws IOException {
+    assert locked();
+    for (final String file : segmentInfos.files(directory, false)) {
+      decRef(file);
+    }
+  }
+
+  public boolean exists(String fileName) {
+    assert locked();
+    if (!refCounts.containsKey(fileName)) {
+      return false;
+    } else {
+      return getRefCount(fileName).count > 0;
+    }
+  }
+
+  private RefCount getRefCount(String fileName) {
+    assert locked();
+    RefCount rc;
+    if (!refCounts.containsKey(fileName)) {
+      rc = new RefCount(fileName);
+      refCounts.put(fileName, rc);
+    } else {
+      rc = refCounts.get(fileName);
+    }
+    return rc;
+  }
+
+  void deleteFiles(List<String> files) throws IOException {
+    assert locked();
+    for(final String file: files) {
+      deleteFile(file);
+    }
+  }
+
+  /** Deletes the specified files, but only if they are new
+   *  (have not yet been incref'd). */
+  void deleteNewFiles(Collection<String> files) throws IOException {
+    assert locked();
+    for (final String fileName: files) {
+      if (!refCounts.containsKey(fileName)) {
+        if (infoStream.isEnabled("IFD")) {
+          infoStream.message("IFD", "delete new file \"" + fileName + "\"");
+        }
+        deleteFile(fileName);
+      }
+    }
+  }
+
+  void deleteFile(String fileName)
+       throws IOException {
+    assert locked();
     try {
-      String val = context.getEntityAttribute(prop);
-      if (val != null) {
-        val = context.replaceTokens(val);
-        v = Integer.valueOf(val);
+      if (infoStream.isEnabled("IFD")) {
+        infoStream.message("IFD", "delete \"" + fileName + "\"");
       }
-    } catch (NumberFormatException e) {
-      //do nothing
+      directory.deleteFile(fileName);
+    } catch (IOException e) {			  // if delete fails
+      if (directory.fileExists(fileName)) {
+
+        // Some operating systems (e.g. Windows) don't
+        // permit a file to be deleted while it is opened
+        // for read (e.g. by another process or thread). So
+        // we assume that when a delete fails it is because
+        // the file is open in another process, and queue
+        // the file for subsequent deletion.
+
+        if (infoStream.isEnabled("IFD")) {
+          infoStream.message("IFD", "unable to remove file \"" + fileName + "\": " + e.toString() + "; Will re-try later.");
+        }
+        if (deletable == null) {
+          deletable = new ArrayList<String>();
+        }
+        deletable.add(fileName);                  // add to deletable
+      }
     }
-    return v;
   }
 
-  private boolean getBoolFromContext(String prop, boolean ifNull) {
-    boolean v = ifNull;
-    String val = context.getEntityAttribute(prop);
-    if (val != null) {
-      val = context.replaceTokens(val);
-      v = Boolean.valueOf(val);
+  /**
+   * Tracks the reference count for a single index file:
+   */
+  final private static class RefCount {
+
+    // fileName used only for better assert error messages
+    final String fileName;
+    boolean initDone;
+    RefCount(String fileName) {
+      this.fileName = fileName;
     }
-    return v;
+
+    int count;
+
+    public int IncRef() {
+      if (!initDone) {
+        initDone = true;
+      } else {
+        assert count > 0: Thread.currentThread().getName() + ": RefCount is 0 pre-increment for file \"" + fileName + "\"";
+      }
+      return ++count;
+    }
+
+    public int DecRef() {
+      assert count > 0: Thread.currentThread().getName() + ": RefCount is 0 pre-decrement for file \"" + fileName + "\"";
+      return --count;
+    }
   }
 
-  private String getStringFromContext(String prop, String ifNull) {
-    String v = ifNull;
-    String val = context.getEntityAttribute(prop);
-    if (val != null) {
-      val = context.replaceTokens(val);
-      v = val;
+  /**
+   * Holds details for each commit point.  This class is
+   * also passed to the deletion policy.  Note: this class
+   * has a natural ordering that is inconsistent with
+   * equals.
+   */
+
+  final private static class CommitPoint extends IndexCommit {
+
+    Collection<String> files;
+    String segmentsFileName;
+    boolean deleted;
+    Directory directory;
+    Collection<CommitPoint> commitsToDelete;
+    long generation;
+    final Map<String,String> userData;
+    private final int segmentCount;
+
+    public CommitPoint(Collection<CommitPoint> commitsToDelete, Directory directory, SegmentInfos segmentInfos) throws IOException {
+      this.directory = directory;
+      this.commitsToDelete = commitsToDelete;
+      userData = segmentInfos.getUserData();
+      segmentsFileName = segmentInfos.getSegmentsFileName();
+      generation = segmentInfos.getGeneration();
+      files = Collections.unmodifiableCollection(segmentInfos.files(directory, true));
+      segmentCount = segmentInfos.size();
     }
-    return v;
+
+    @Override
+    public String toString() {
+      return "IndexFileDeleter.CommitPoint(" + segmentsFileName + ")";
+    }
+
+    @Override
+    public int getSegmentCount() {
+      return segmentCount;
+    }
+
+    @Override
+    public String getSegmentsFileName() {
+      return segmentsFileName;
+    }
+
+    @Override
+    public Collection<String> getFileNames() throws IOException {
+      return files;
+    }
+
+    @Override
+    public Directory getDirectory() {
+      return directory;
+    }
+
+    @Override
+    public long getGeneration() {
+      return generation;
+    }
+
+    @Override
+    public Map<String,String> getUserData() {
+      return userData;
+    }
+
+    /**
+     * Called only be the deletion policy, to remove this
+     * commit point from the index.
+     */
+    @Override
+    public void delete() {
+      if (!deleted) {
+        deleted = true;
+        commitsToDelete.add(this);
+      }
+    }
+
+    @Override
+    public boolean isDeleted() {
+      return deleted;
+    }
   }
 }

@@ -1,6 +1,6 @@
-assert nextPos - pos <= count: "nextPos=" + nextPos + " pos=" + pos + " count=" + count;
+import org.apache.lucene.index.codecs.docvalues.DocValuesConsumer;
 
-package org.apache.lucene.util;
+package org.apache.lucene.index.codecs.preflexrw;
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,132 +19,204 @@ package org.apache.lucene.util;
  * limitations under the License.
  */
 
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.index.codecs.FieldsConsumer;
+import org.apache.lucene.index.codecs.TermsConsumer;
+import org.apache.lucene.index.codecs.PostingsConsumer;
+import org.apache.lucene.index.codecs.standard.DefaultSkipListWriter;
+import org.apache.lucene.index.codecs.preflex.PreFlexCodec;
+import org.apache.lucene.index.CorruptIndexException;
+import org.apache.lucene.index.IndexFileNames;
+import org.apache.lucene.index.SegmentWriteState;
+import org.apache.lucene.index.FieldInfo;
+import org.apache.lucene.index.codecs.preflex.TermInfo;
+import org.apache.lucene.index.values.codec.DocValuesConsumer;
+import org.apache.lucene.store.IndexOutput;
+
 import java.io.IOException;
-import java.io.Reader;
+import java.util.Comparator;
 
-/** Acts like a forever growing char[] as you read
- *  characters into it from the provided reader, but
- *  internally it uses a circular buffer to only hold the
- *  characters that haven't been freed yet.  This is like a
- *  PushbackReader, except you don't have to specify
- *  up-front the max size of the buffer, but you do have to
- *  periodically call {@link #freeBefore}. */
+class PreFlexFieldsWriter extends FieldsConsumer {
 
-public final class RollingCharBuffer {
+  private final TermInfosWriter termsOut;
+  private final IndexOutput freqOut;
+  private final IndexOutput proxOut;
+  private final DefaultSkipListWriter skipListWriter;
+  private final int totalNumDocs;
 
-  private Reader reader;
+  public PreFlexFieldsWriter(SegmentWriteState state) throws IOException {
+    termsOut = new TermInfosWriter(state.directory,
+                                   state.segmentName,
+                                   state.fieldInfos,
+                                   state.termIndexInterval);
+    state.flushedFiles.add(IndexFileNames.segmentFileName(state.segmentName, "", PreFlexCodec.TERMS_EXTENSION));
+    state.flushedFiles.add(IndexFileNames.segmentFileName(state.segmentName, "", PreFlexCodec.TERMS_INDEX_EXTENSION));
 
-  private char[] buffer = new char[32];
+    final String freqFile = IndexFileNames.segmentFileName(state.segmentName, "", PreFlexCodec.FREQ_EXTENSION);
+    freqOut = state.directory.createOutput(freqFile);
+    state.flushedFiles.add(freqFile);
+    totalNumDocs = state.numDocs;
 
-  // Next array index to write to in buffer:
-  private int nextWrite;
+    if (state.fieldInfos.hasProx()) {
+      final String proxFile = IndexFileNames.segmentFileName(state.segmentName, "", PreFlexCodec.PROX_EXTENSION);
+      proxOut = state.directory.createOutput(proxFile);
+      state.flushedFiles.add(proxFile);
+    } else {
+      proxOut = null;
+    }
 
-  // Next absolute position to read from reader:
-  private int nextPos;
+    skipListWriter = new DefaultSkipListWriter(termsOut.skipInterval,
+                                               termsOut.maxSkipLevels,
+                                               totalNumDocs,
+                                               freqOut,
+                                               proxOut);
+    //System.out.println("\nw start seg=" + segment);
+  }
 
-  // How many valid chars (wrapped) are in the buffer:
-  private int count;
+  @Override
+  public TermsConsumer addField(FieldInfo field) throws IOException {
+    assert field.number != -1;
+    //System.out.println("w field=" + field.name + " storePayload=" + field.storePayloads + " number=" + field.number);
+    return new PreFlexTermsWriter(field);
+  }
 
-  // True if we hit EOF
-  private boolean end;
+  @Override
+  public void close() throws IOException {
+    termsOut.close();
+    freqOut.close();
+    if (proxOut != null) {
+      proxOut.close();
+    }
+  }
+
+  private class PreFlexTermsWriter extends TermsConsumer {
+    private final FieldInfo fieldInfo;
+    private final boolean omitTF;
+    private final boolean storePayloads;
     
-  /** Clear array and switch to new reader. */
-  public void reset(Reader reader) {
-    this.reader = reader;
-    nextPos = 0;
-    nextWrite = 0;
-    count = 0;
-    end = false;
-  }
+    private final TermInfo termInfo = new TermInfo();
+    private final PostingsWriter postingsWriter = new PostingsWriter();
 
-  /* Absolute position read.  NOTE: pos must not jump
-   * ahead by more than 1!  Ie, it's OK to read arbitarily
-   * far back (just not prior to the last {@link
-   * #freeBefore}), but NOT ok to read arbitrarily far
-   * ahead.  Returns -1 if you hit EOF. */
-  public int get(int pos) throws IOException {
-    //System.out.println("    get pos=" + pos + " nextPos=" + nextPos + " count=" + count);
-    if (pos == nextPos) {
-      if (end) {
-        return -1;
-      }
-      final int ch = reader.read();
-      if (ch == -1) {
-        end = true;
-        return -1;
-      }
-      if (count == buffer.length) {
-        // Grow
-        final char[] newBuffer = new char[ArrayUtil.oversize(1+count, RamUsageEstimator.NUM_BYTES_CHAR)];
-        //System.out.println(Thread.currentThread().getName() + ": cb grow " + newBuffer.length);
-        System.arraycopy(buffer, nextWrite, newBuffer, 0, buffer.length - nextWrite);
-        System.arraycopy(buffer, 0, newBuffer, buffer.length - nextWrite, nextWrite);
-        nextWrite = buffer.length;
-        buffer = newBuffer;
-      }
-      if (nextWrite == buffer.length) {
-        nextWrite = 0;
-      }
-      buffer[nextWrite++] = (char) ch;
-      count++;
-      nextPos++;
-      return ch;
-    } else {
-      // Cannot read from future (except by 1):
-      assert pos < nextPos;
+    public PreFlexTermsWriter(FieldInfo fieldInfo) {
+      this.fieldInfo = fieldInfo;
+      omitTF = fieldInfo.omitTermFreqAndPositions;
+      storePayloads = fieldInfo.storePayloads;
+    }
 
-      // Cannot read from already freed past:
-      assert nextPos - pos <= count;
+    private class PostingsWriter extends PostingsConsumer {
+      private int lastDocID;
+      private int lastPayloadLength = -1;
+      private int lastPosition;
+      private int df;
 
-      final int index = getIndex(pos);
-      return buffer[index];
+      public PostingsWriter reset() {
+        df = 0;
+        lastDocID = 0;
+        lastPayloadLength = -1;
+        return this;
+      }
+
+      @Override
+      public void startDoc(int docID, int termDocFreq) throws IOException {
+        //System.out.println("    w doc=" + docID);
+
+        final int delta = docID - lastDocID;
+        if (docID < 0 || (df > 0 && delta <= 0)) {
+          throw new CorruptIndexException("docs out of order (" + docID + " <= " + lastDocID + " )");
+        }
+
+        if ((++df % termsOut.skipInterval) == 0) {
+          skipListWriter.setSkipData(lastDocID, storePayloads, lastPayloadLength);
+          skipListWriter.bufferSkip(df);
+        }
+
+        lastDocID = docID;
+
+        assert docID < totalNumDocs: "docID=" + docID + " totalNumDocs=" + totalNumDocs;
+
+        if (omitTF) {
+          freqOut.writeVInt(delta);
+        } else {
+          final int code = delta << 1;
+          if (termDocFreq == 1) {
+            freqOut.writeVInt(code|1);
+          } else {
+            freqOut.writeVInt(code);
+            freqOut.writeVInt(termDocFreq);
+          }
+        }
+        lastPosition = 0;
+      }
+
+      @Override
+      public void addPosition(int position, BytesRef payload) throws IOException {
+        assert proxOut != null;
+
+        //System.out.println("      w pos=" + position + " payl=" + payload);
+        final int delta = position - lastPosition;
+        lastPosition = position;
+
+        if (storePayloads) {
+          final int payloadLength = payload == null ? 0 : payload.length;
+          if (payloadLength != lastPayloadLength) {
+            //System.out.println("        write payload len=" + payloadLength);
+            lastPayloadLength = payloadLength;
+            proxOut.writeVInt((delta<<1)|1);
+            proxOut.writeVInt(payloadLength);
+          } else {
+            proxOut.writeVInt(delta << 1);
+          }
+          if (payloadLength > 0) {
+            proxOut.writeBytes(payload.bytes, payload.offset, payload.length);
+          }
+        } else {
+          proxOut.writeVInt(delta);
+        }
+      }
+
+      @Override
+      public void finishDoc() throws IOException {
+      }
+    }
+
+    @Override
+    public PostingsConsumer startTerm(BytesRef text) throws IOException {
+      //System.out.println("  w term=" + text.utf8ToString());
+      skipListWriter.resetSkip();
+      termInfo.freqPointer = freqOut.getFilePointer();
+      if (proxOut != null) {
+        termInfo.proxPointer = proxOut.getFilePointer();
+      }
+      return postingsWriter.reset();
+    }
+
+    @Override
+    public void finishTerm(BytesRef text, int numDocs) throws IOException {
+      if (numDocs > 0) {
+        long skipPointer = skipListWriter.writeSkip(freqOut);
+        termInfo.docFreq = numDocs;
+        termInfo.skipOffset = (int) (skipPointer - termInfo.freqPointer);
+        //System.out.println("  w finish term=" + text.utf8ToString() + " fnum=" + fieldInfo.number);
+        termsOut.add(fieldInfo.number,
+                     text,
+                     termInfo);
+      }
+    }
+
+    @Override
+    public void finish() throws IOException {
+    }
+
+    @Override
+    public Comparator<BytesRef> getComparator() throws IOException {
+      return BytesRef.getUTF8SortedAsUTF16Comparator();
     }
   }
 
-  // For assert:
-  private boolean inBounds(int pos) {
-    return pos >= 0 && pos < nextPos && pos >= nextPos - count;
-  }
-
-  private int getIndex(int pos) {
-    int index = nextWrite - (nextPos - pos);
-    if (index < 0) {
-      // Wrap:
-      index += buffer.length;
-      assert index >= 0;
-    }
-    return index;
-  }
-
-  public char[] get(int posStart, int length) {
-    assert length > 0;
-    assert inBounds(posStart): "posStart=" + posStart + " length=" + length;
-    //System.out.println("    buffer.get posStart=" + posStart + " len=" + length);
-      
-    final int startIndex = getIndex(posStart);
-    final int endIndex = getIndex(posStart + length);
-    //System.out.println("      startIndex=" + startIndex + " endIndex=" + endIndex);
-
-    final char[] result = new char[length];
-    if (endIndex >= startIndex && length < buffer.length) {
-      System.arraycopy(buffer, startIndex, result, 0, endIndex-startIndex);
-    } else {
-      // Wrapped:
-      final int part1 = buffer.length-startIndex;
-      System.arraycopy(buffer, startIndex, result, 0, part1);
-      System.arraycopy(buffer, 0, result, buffer.length-startIndex, length-part1);
-    }
-    return result;
-  }
-
-  /** Call this to notify us that no chars before this
-   *  absolute position are needed anymore. */
-  public void freeBefore(int pos) {
-    assert pos >= 0;
-    assert pos <= nextPos;
-    final int newCount = nextPos - pos;
-    assert newCount <= count: "newCount=" + newCount + " count=" + count;
-    assert newCount <= buffer.length: "newCount=" + newCount + " buf.length=" + buffer.length;
-    count = newCount;
+  @Override
+  public DocValuesConsumer addValuesField(FieldInfo field) throws IOException {
+    //TODO(simonw): can we fix this easily?
+    throw new UnsupportedOperationException("no implemented");
   }
 }
+ No newline at end of file

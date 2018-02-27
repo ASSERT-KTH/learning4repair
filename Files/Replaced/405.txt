@@ -1,6 +1,6 @@
-ModifiableSolrParams params) {
+public InputStream open() {
 
-package org.apache.solr.update;
+package org.apache.solr.handler.clustering.carrot2;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,489 +19,600 @@ package org.apache.solr.update;
  * limitations under the License.
  */
 
-import java.io.IOException;
+import java.io.*;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
 import java.util.Set;
-import java.util.concurrent.Callable;
-import java.util.concurrent.CompletionService;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorCompletionService;
-import java.util.concurrent.Future;
-import java.util.concurrent.SynchronousQueue;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
 
-import org.apache.http.client.HttpClient;
-import org.apache.solr.client.solrj.SolrServerException;
-import org.apache.solr.client.solrj.impl.HttpClientUtil;
-import org.apache.solr.client.solrj.impl.HttpSolrServer;
-import org.apache.solr.client.solrj.request.AbstractUpdateRequest;
-import org.apache.solr.client.solrj.request.UpdateRequestExt;
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang.ObjectUtils;
+import org.apache.commons.lang.StringUtils;
+import org.apache.lucene.search.Query;
+import org.apache.solr.common.SolrDocument;
+import org.apache.solr.common.SolrDocumentList;
 import org.apache.solr.common.SolrException;
-import org.apache.solr.common.cloud.ZkCoreNodeProps;
-import org.apache.solr.common.params.ModifiableSolrParams;
+import org.apache.solr.common.SolrException.ErrorCode;
+import org.apache.solr.common.params.HighlightParams;
+import org.apache.solr.common.params.SolrParams;
 import org.apache.solr.common.util.NamedList;
+import org.apache.solr.common.util.SimpleOrderedMap;
 import org.apache.solr.core.SolrCore;
-import org.apache.solr.util.DefaultSolrThreadFactory;
+import org.apache.solr.core.SolrResourceLoader;
+import org.apache.solr.handler.clustering.SearchClusteringEngine;
+import org.apache.solr.handler.component.HighlightComponent;
+import org.apache.solr.highlight.SolrHighlighter;
+import org.apache.solr.request.LocalSolrQueryRequest;
+import org.apache.solr.request.SolrQueryRequest;
+import org.apache.solr.schema.SchemaField;
+import org.apache.solr.search.DocList;
+import org.apache.solr.search.DocSlice;
+import org.apache.solr.search.SolrIndexSearcher;
+import org.apache.solr.util.SolrPluginUtils;
+import org.carrot2.core.Cluster;
+import org.carrot2.core.Controller;
+import org.carrot2.core.ControllerFactory;
+import org.carrot2.core.Document;
+import org.carrot2.core.IClusteringAlgorithm;
+import org.carrot2.core.LanguageCode;
+import org.carrot2.core.attribute.AttributeNames;
+import org.carrot2.text.linguistic.DefaultLexicalDataFactoryDescriptor;
+import org.carrot2.text.preprocessing.pipeline.BasicPreprocessingPipelineDescriptor;
+import org.carrot2.text.preprocessing.pipeline.BasicPreprocessingPipelineDescriptor.AttributeBuilder;
+import org.carrot2.util.resource.ClassLoaderLocator;
+import org.carrot2.util.resource.IResource;
+import org.carrot2.util.resource.IResourceLocator;
+import org.carrot2.util.resource.ResourceLookup;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
+import com.google.common.collect.Sets;
+import com.google.common.io.Closeables;
 
+/**
+ * Search results clustering engine based on Carrot2 clustering algorithms.
+ * <p/>
+ * Output from this class is subject to change.
+ *
+ * @see "http://project.carrot2.org"
+ */
+public class CarrotClusteringEngine extends SearchClusteringEngine {
+  private transient static Logger log = LoggerFactory
+          .getLogger(CarrotClusteringEngine.class);
 
+  /**
+   * The subdirectory in Solr config dir to read customized Carrot2 resources from.
+   */
+  private static final String CARROT_RESOURCES_PREFIX = "clustering/carrot2";
 
-public class SolrCmdDistributor {
-  private static final int MAX_RETRIES_ON_FORWARD = 6;
-  public static Logger log = LoggerFactory.getLogger(SolrCmdDistributor.class);
-  
-  // TODO: shut this thing down
-  // TODO: this cannot be per instance...
-  static ThreadPoolExecutor commExecutor = new ThreadPoolExecutor(0,
-      Integer.MAX_VALUE, 5, TimeUnit.SECONDS, new SynchronousQueue<Runnable>(),
-      new DefaultSolrThreadFactory("cmdDistribExecutor"));
+  /**
+   * Name of Carrot2 document's field containing Solr document's identifier.
+   */
+  private static final String SOLR_DOCUMENT_ID = "solrId";
 
-  static final HttpClient client;
-  
-  static {
-    ModifiableSolrParams params = new ModifiableSolrParams();
-    params.set(HttpClientUtil.PROP_MAX_CONNECTIONS, 200);
-    params.set(HttpClientUtil.PROP_MAX_CONNECTIONS_PER_HOST, 8);
-    client = HttpClientUtil.createClient(params);
-  }
-  
-  CompletionService<Request> completionService;
-  Set<Future<Request>> pending;
-  
-  int maxBufferedAddsPerServer = 10;
-  int maxBufferedDeletesPerServer = 10;
+  /**
+   * Name of Solr document's field containing the document's identifier. To avoid
+   * repeating the content of documents in clusters on output, each cluster contains
+   * identifiers of documents it contains.
+   */
+  private String idFieldName;
 
-  private Response response = new Response();
-  
-  private final Map<Node,List<AddRequest>> adds = new HashMap<Node,List<AddRequest>>();
-  private final Map<Node,List<DeleteRequest>> deletes = new HashMap<Node,List<DeleteRequest>>();
-  
-  class AddRequest {
-    AddUpdateCommand cmd;
-    ModifiableSolrParams params;
-  }
-  
-  class DeleteRequest {
-    DeleteUpdateCommand cmd;
-    ModifiableSolrParams params;
-  }
-  
-  public SolrCmdDistributor() {
-   
-  }
-  
-  public void finish() {
+  /**
+   * Carrot2 controller that manages instances of clustering algorithms
+   */
+  private Controller controller = ControllerFactory.createPooling();
+  private Class<? extends IClusteringAlgorithm> clusteringAlgorithmClass;
 
-    // piggyback on any outstanding adds or deletes if possible.
-    flushAdds(1);
-    flushDeletes(1);
+  /** Solr core we're bound to. */
+  private SolrCore core;
 
-    checkResponses(true);
-  }
-  
-  public void distribDelete(DeleteUpdateCommand cmd, List<Node> urls, ModifiableSolrParams params) throws IOException {
-    checkResponses(false);
-    
-    if (cmd.isDeleteById()) {
-      doDelete(cmd, urls, params);
-    } else {
-      doDelete(cmd, urls, params);
+  private static class SolrResourceLocator implements IResourceLocator {
+    private final SolrResourceLoader resourceLoader;
+    private final String carrot2ResourcesDir;
+
+    public SolrResourceLocator(SolrCore core, SolrParams initParams) {
+      resourceLoader = core.getResourceLoader();
+      carrot2ResourcesDir = initParams.get(
+          CarrotParams.LEXICAL_RESOURCES_DIR, CARROT_RESOURCES_PREFIX);
     }
-  }
-  
-  public void distribAdd(AddUpdateCommand cmd, List<Node> nodes, ModifiableSolrParams params) throws IOException {
-    checkResponses(false);
-    
-    // make sure any pending deletes are flushed
-    flushDeletes(1);
-    
-    // TODO: this is brittle
-    // need to make a clone since these commands may be reused
-    AddUpdateCommand clone = new AddUpdateCommand(null);
-    
-    clone.solrDoc = cmd.solrDoc;
-    clone.commitWithin = cmd.commitWithin;
-    clone.overwrite = cmd.overwrite;
-    clone.setVersion(cmd.getVersion());
-    AddRequest addRequest = new AddRequest();
-    addRequest.cmd = clone;
-    addRequest.params = params;
 
-    for (Node node : nodes) {
-      List<AddRequest> alist = adds.get(node);
-      if (alist == null) {
-        alist = new ArrayList<AddRequest>(2);
-        adds.put(node, alist);
-      }
-      alist.add(addRequest);
-    }
-    
-    flushAdds(maxBufferedAddsPerServer);
-  }
-  
-  public void distribCommit(CommitUpdateCommand cmd, List<Node> nodes,
-      ModifiableSolrParams params) throws IOException {
-    // Wait for all outstanding responses to make sure that a commit
-    // can't sneak in ahead of adds or deletes we already sent.
-    // We could do this on a per-server basis, but it's more complex
-    // and this solution will lead to commits happening closer together.
-    checkResponses(true);
-    
-    // currently, we dont try to piggy back on outstanding adds or deletes
-    
-    UpdateRequestExt ureq = new UpdateRequestExt();
-    ureq.setParams(params);
-    
-    addCommit(ureq, cmd);
-    
-    for (Node node : nodes) {
-      submit(ureq, node);
-    }
-    
-    // if the command wanted to block until everything was committed,
-    // then do that here.
-    
-    if (cmd.waitSearcher) {
-      checkResponses(true);
-    }
-  }
-  
-  private void doDelete(DeleteUpdateCommand cmd, List<Node> nodes,
-      ModifiableSolrParams params) throws IOException {
-    
-    flushAdds(1);
-    
-    DeleteUpdateCommand clonedCmd = clone(cmd);
-    DeleteRequest deleteRequest = new DeleteRequest();
-    deleteRequest.cmd = clonedCmd;
-    deleteRequest.params = params;
-    for (Node node : nodes) {
-      List<DeleteRequest> dlist = deletes.get(node);
-      
-      if (dlist == null) {
-        dlist = new ArrayList<DeleteRequest>(2);
-        deletes.put(node, dlist);
-      }
-      dlist.add(deleteRequest);
-    }
-    
-    flushDeletes(maxBufferedDeletesPerServer);
-  }
-  
-  void addCommit(UpdateRequestExt ureq, CommitUpdateCommand cmd) {
-    if (cmd == null) return;
-    ureq.setAction(cmd.optimize ? AbstractUpdateRequest.ACTION.OPTIMIZE
-        : AbstractUpdateRequest.ACTION.COMMIT, false, cmd.waitSearcher);
-  }
-  
-  boolean flushAdds(int limit) {
-    // check for pending deletes
-  
-    Set<Node> removeNodes = new HashSet<Node>();
-    Set<Node> nodes = adds.keySet();
- 
-    for (Node node : nodes) {
-      List<AddRequest> alist = adds.get(node);
-      if (alist == null || alist.size() < limit) return false;
-  
-      UpdateRequestExt ureq = new UpdateRequestExt();
-      
-      ModifiableSolrParams combinedParams = new ModifiableSolrParams();
-      
-      for (AddRequest aReq : alist) {
-        AddUpdateCommand cmd = aReq.cmd;
-        combinedParams.add(aReq.params);
-       
-        ureq.add(cmd.solrDoc, cmd.commitWithin, cmd.overwrite);
-      }
-      
-      if (ureq.getParams() == null) ureq.setParams(new ModifiableSolrParams());
-      ureq.getParams().add(combinedParams);
+    @Override
+    public IResource[] getAll(final String resource) {
+      final String resourceName = carrot2ResourcesDir + "/" + resource;
+      log.debug("Looking for Solr resource: " + resourceName);
 
-      removeNodes.add(node);
-      
-      submit(ureq, node);
-    }
-    
-    for (Node node : removeNodes) {
-      adds.remove(node);
-    }
-    
-    return true;
-  }
-  
-  boolean flushDeletes(int limit) {
-    // check for pending deletes
- 
-    Set<Node> removeNodes = new HashSet<Node>();
-    Set<Node> nodes = deletes.keySet();
-    for (Node node : nodes) {
-      List<DeleteRequest> dlist = deletes.get(node);
-      if (dlist == null || dlist.size() < limit) return false;
-      UpdateRequestExt ureq = new UpdateRequestExt();
-      
-      ModifiableSolrParams combinedParams = new ModifiableSolrParams();
-      
-      for (DeleteRequest dReq : dlist) {
-        DeleteUpdateCommand cmd = dReq.cmd;
-        combinedParams.add(dReq.params);
-        if (cmd.isDeleteById()) {
-          ureq.deleteById(cmd.getId(), cmd.getVersion());
-        } else {
-          ureq.deleteByQuery(cmd.query);
-        }
-        
-        if (ureq.getParams() == null) ureq
-            .setParams(new ModifiableSolrParams());
-        ureq.getParams().add(combinedParams);
-      }
-      
-      removeNodes.add(node);
-      submit(ureq, node);
-    }
-    
-    for (Node node : removeNodes) {
-      deletes.remove(node);
-    }
-    
-    return true;
-  }
-  
-  private DeleteUpdateCommand clone(DeleteUpdateCommand cmd) {
-    DeleteUpdateCommand c = (DeleteUpdateCommand)cmd.clone();
-    // TODO: shouldnt the clone do this?
-    c.setFlags(cmd.getFlags());
-    c.setVersion(cmd.getVersion());
-    return c;
-  }
-  
-  public static class Request {
-    public Node node;
-    UpdateRequestExt ureq;
-    NamedList<Object> ursp;
-    int rspCode;
-    public Exception exception;
-    int retries;
-  }
-  
-  void submit(UpdateRequestExt ureq, Node node) {
-    Request sreq = new Request();
-    sreq.node = node;
-    sreq.ureq = ureq;
-    submit(sreq);
-  }
-  
-  public void submit(final Request sreq) {
-    if (completionService == null) {
-      completionService = new ExecutorCompletionService<Request>(commExecutor);
-      pending = new HashSet<Future<Request>>();
-    }
-    final String url = sreq.node.getUrl();
-
-    Callable<Request> task = new Callable<Request>() {
-      @Override
-      public Request call() throws Exception {
-        Request clonedRequest = new Request();
-        clonedRequest.node = sreq.node;
-        clonedRequest.ureq = sreq.ureq;
-        clonedRequest.retries = sreq.retries;
-        
-        try {
-          String fullUrl;
-          if (!url.startsWith("http://") && !url.startsWith("https://")) {
-            fullUrl = "http://" + url;
-          } else {
-            fullUrl = url;
-          }
-  
-          HttpSolrServer server = new HttpSolrServer(fullUrl,
-              client);
-          
-          clonedRequest.ursp = server.request(clonedRequest.ureq);
-          
-          // currently no way to get the request body.
-        } catch (Exception e) {
-          clonedRequest.exception = e;
-          if (e instanceof SolrException) {
-            clonedRequest.rspCode = ((SolrException) e).code();
-          } else {
-            clonedRequest.rspCode = -1;
-          }
-        }
-        return clonedRequest;
-      }
-    };
-    
-    pending.add(completionService.submit(task));
-    
-  }
-
-  void checkResponses(boolean block) {
-
-    while (pending != null && pending.size() > 0) {
+      InputStream resourceStream = null;
+      final byte [] asBytes;
       try {
-        Future<Request> future = block ? completionService.take()
-            : completionService.poll();
-        if (future == null) return;
-        pending.remove(future);
-        
-        try {
-          Request sreq = future.get();
-          if (sreq.rspCode != 0) {
-            // error during request
-            
-            // if there is a retry url, we want to retry...
-            boolean isRetry = sreq.node.checkRetry();
-            boolean doRetry = false;
-            int rspCode = sreq.rspCode;
-            
-            // this can happen in certain situations such as shutdown
-            if (isRetry) {
-              if (rspCode == 404 || rspCode == 403 || rspCode == 503
-                  || rspCode == 500) {
-                doRetry = true;
-              }
-              
-              // if its an ioexception, lets try again
-              if (sreq.exception instanceof IOException) {
-                doRetry = true;
-              } else if (sreq.exception instanceof SolrServerException) {
-                if (((SolrServerException) sreq.exception).getRootCause() instanceof IOException) {
-                  doRetry = true;
-                }
-              }
-            }
-            
-            if (isRetry && sreq.retries < MAX_RETRIES_ON_FORWARD && doRetry) {
-              sreq.retries++;
-              sreq.rspCode = 0;
-              sreq.exception = null;
-              SolrException.log(SolrCmdDistributor.log, "forwarding update to " + sreq.node.getUrl() + " failed - retrying ... ");
-              Thread.sleep(500);
-              submit(sreq);
-              checkResponses(block);
-            } else {
-              Exception e = sreq.exception;
-              Error error = new Error();
-              error.e = e;
-              error.node = sreq.node;
-              response.errors.add(error);
-              response.sreq = sreq;
-              SolrException.log(SolrCmdDistributor.log, "shard update error "
-                  + sreq.node, sreq.exception);
-            }
-          }
-          
-        } catch (ExecutionException e) {
-          // shouldn't happen since we catch exceptions ourselves
-          SolrException.log(SolrCore.log,
-              "error sending update request to shard", e);
+        resourceStream = resourceLoader.openResource(resourceName);
+        asBytes = IOUtils.toByteArray(resourceStream);
+      } catch (RuntimeException e) {
+        log.debug("Resource not found in Solr's config: " + resourceName
+            + ". Using the default " + resource + " from Carrot JAR.");          
+        return new IResource[] {};
+      } catch (IOException e) {
+        log.warn("Could not read Solr resource " + resourceName);
+        return new IResource[] {};
+      } finally {
+        if (resourceStream != null) Closeables.closeQuietly(resourceStream);
+      }
+
+      log.info("Loaded Solr resource: " + resourceName);
+
+      final IResource foundResource = new IResource() {
+        @Override
+        public InputStream open() throws IOException {
+          return new ByteArrayInputStream(asBytes);
+        }
+
+        @Override
+        public int hashCode() {
+          // In case multiple resources are found they will be deduped, but we don't use it in Solr,
+          // so simply rely on instance equivalence.
+          return super.hashCode();
         }
         
-      } catch (InterruptedException e) {
-        throw new SolrException(SolrException.ErrorCode.SERVICE_UNAVAILABLE,
-            "interrupted waiting for shard update response", e);
-      }
-    }
-  }
-  
-  public static class Response {
-    public Request sreq;
-    public List<Error> errors = new ArrayList<Error>();
-  }
-  
-  public static class Error {
-    public Node node;
-    public Exception e;
-  }
+        @Override
+        public boolean equals(Object obj) {
+          // In case multiple resources are found they will be deduped, but we don't use it in Solr,
+          // so simply rely on instance equivalence.
+          return super.equals(obj);
+        }
 
-  public Response getResponse() {
-    return response;
-  }
-  
-  public static abstract class Node {
-    public abstract String getUrl();
-    public abstract boolean checkRetry();
-    public abstract String getCoreName();
-    public abstract String getBaseUrl();
-    public abstract ZkCoreNodeProps getNodeProps();
-  }
+        @Override
+        public String toString() {
+          return "Solr config resource: " + resourceName;
+        }
+      };
 
-  public static class StdNode extends Node {
-    protected String url;
-    protected String baseUrl;
-    protected String coreName;
-    private ZkCoreNodeProps nodeProps;
-
-    public StdNode(ZkCoreNodeProps nodeProps) {
-      this.url = nodeProps.getCoreUrl();
-      this.baseUrl = nodeProps.getBaseUrl();
-      this.coreName = nodeProps.getCoreName();
-      this.nodeProps = nodeProps;
-    }
-    
-    @Override
-    public String getUrl() {
-      return url;
-    }
-    
-    @Override
-    public String toString() {
-      return this.getClass().getSimpleName() + ": " + url;
-    }
-
-    @Override
-    public boolean checkRetry() {
-      return false;
-    }
-
-    @Override
-    public String getBaseUrl() {
-      return baseUrl;
-    }
-
-    @Override
-    public String getCoreName() {
-      return coreName;
+      return new IResource[] { foundResource };
     }
 
     @Override
     public int hashCode() {
-      final int prime = 31;
-      int result = 1;
-      result = prime * result + ((baseUrl == null) ? 0 : baseUrl.hashCode());
-      result = prime * result + ((coreName == null) ? 0 : coreName.hashCode());
-      result = prime * result + ((url == null) ? 0 : url.hashCode());
-      return result;
+      // In case multiple locations are used locators will be deduped, but we don't use it in Solr,
+      // so simply rely on instance equivalence.
+      return super.hashCode();
     }
 
     @Override
     public boolean equals(Object obj) {
-      if (this == obj) return true;
-      if (obj == null) return false;
-      if (getClass() != obj.getClass()) return false;
-      StdNode other = (StdNode) obj;
-      if (baseUrl == null) {
-        if (other.baseUrl != null) return false;
-      } else if (!baseUrl.equals(other.baseUrl)) return false;
-      if (coreName == null) {
-        if (other.coreName != null) return false;
-      } else if (!coreName.equals(other.coreName)) return false;
-      if (url == null) {
-        if (other.url != null) return false;
-      } else if (!url.equals(other.url)) return false;
-      return true;
+      // In case multiple locations are used locators will be deduped, but we don't use it in Solr,
+      // so simply rely on instance equivalence.
+      return super.equals(obj);
     }
 
-    public ZkCoreNodeProps getNodeProps() {
-      return nodeProps;
+    @Override
+    public String toString() {
+      String configDir = "";
+      try {
+        configDir = "configDir=" + new File(resourceLoader.getConfigDir()).getAbsolutePath() + ", ";
+      } catch (Exception ignored) {
+        // If we get the exception, the resource loader implementation 
+        // probably does not support getConfigDir(). Not a big problem.
+      }
+      
+      return "SolrResourceLocator, " + configDir
+          + "Carrot2 relative lexicalResourcesDir=" + carrot2ResourcesDir;
+    }
+  }
+
+  @Override
+  @Deprecated
+  public Object cluster(Query query, DocList docList, SolrQueryRequest sreq) {
+    SolrIndexSearcher searcher = sreq.getSearcher();
+    SolrDocumentList solrDocList;
+    try {
+      Map<SolrDocument,Integer> docIds = new HashMap<SolrDocument, Integer>(docList.size());
+      solrDocList = SolrPluginUtils.docListToSolrDocumentList( docList, searcher, getFieldsToLoad(sreq), docIds );
+      return cluster(query, solrDocList, docIds, sreq);
+    } catch (IOException e) {
+      throw new SolrException(ErrorCode.SERVER_ERROR, e);
+    }
+  }
+
+  @Override
+  public Object cluster(Query query, SolrDocumentList solrDocList,
+      Map<SolrDocument, Integer> docIds, SolrQueryRequest sreq) {
+    try {
+      // Prepare attributes for Carrot2 clustering call
+      Map<String, Object> attributes = new HashMap<String, Object>();
+      List<Document> documents = getDocuments(solrDocList, docIds, query, sreq);
+      attributes.put(AttributeNames.DOCUMENTS, documents);
+      attributes.put(AttributeNames.QUERY, query.toString());
+
+      // Pass the fields on which clustering runs to the
+      // SolrStopwordsCarrot2LexicalDataFactory
+      attributes.put("solrFieldNames", getFieldsForClustering(sreq));
+
+      // Pass extra overriding attributes from the request, if any
+      extractCarrotAttributes(sreq.getParams(), attributes);
+
+      // Perform clustering and convert to named list
+      // Carrot2 uses current thread's context class loader to get
+      // certain classes (e.g. custom tokenizer/stemmer) at runtime.
+      // To make sure classes from contrib JARs are available,
+      // we swap the context class loader for the time of clustering.
+      Thread ct = Thread.currentThread();
+      ClassLoader prev = ct.getContextClassLoader();
+      try {
+        ct.setContextClassLoader(core.getResourceLoader().getClassLoader());
+        return clustersToNamedList(controller.process(attributes,
+                clusteringAlgorithmClass).getClusters(), sreq.getParams());
+      } finally {
+        ct.setContextClassLoader(prev);
+      }
+    } catch (Exception e) {
+      log.error("Carrot2 clustering failed", e);
+      throw new SolrException(ErrorCode.SERVER_ERROR, "Carrot2 clustering failed", e);
+    }
+  }
+
+  @Override
+  @SuppressWarnings({ "unchecked", "rawtypes" })
+  public String init(NamedList config, final SolrCore core) {
+    this.core = core;
+
+    String result = super.init(config, core);
+    final SolrParams initParams = SolrParams.toSolrParams(config);
+
+    // Initialize Carrot2 controller. Pass initialization attributes, if any.
+    HashMap<String, Object> initAttributes = new HashMap<String, Object>();
+    extractCarrotAttributes(initParams, initAttributes);
+
+    // Customize the stemmer and tokenizer factories. The implementations we provide here
+    // are included in the code base of Solr, so that it's possible to refactor
+    // the Lucene APIs the factories rely on if needed.
+    // Additionally, we set a custom lexical resource factory for Carrot2 that
+    // will use both Carrot2 default stop words as well as stop words from
+    // the StopFilter defined on the field.
+    final AttributeBuilder attributeBuilder = BasicPreprocessingPipelineDescriptor.attributeBuilder(initAttributes);
+    attributeBuilder.lexicalDataFactory(SolrStopwordsCarrot2LexicalDataFactory.class);
+    if (!initAttributes.containsKey(BasicPreprocessingPipelineDescriptor.Keys.TOKENIZER_FACTORY)) {
+      attributeBuilder.tokenizerFactory(LuceneCarrot2TokenizerFactory.class);
+    }
+    if (!initAttributes.containsKey(BasicPreprocessingPipelineDescriptor.Keys.STEMMER_FACTORY)) {
+      attributeBuilder.stemmerFactory(LuceneCarrot2StemmerFactory.class);
+    }
+
+    // Pass the schema to SolrStopwordsCarrot2LexicalDataFactory.
+    initAttributes.put("solrIndexSchema", core.getSchema());
+
+    // Customize Carrot2's resource lookup to first look for resources
+    // using Solr's resource loader. If that fails, try loading from the classpath.
+    DefaultLexicalDataFactoryDescriptor.attributeBuilder(initAttributes).resourceLookup(
+      new ResourceLookup(
+        // Solr-specific resource loading.
+        new SolrResourceLocator(core, initParams),
+        // Using the class loader directly because this time we want to omit the prefix
+        new ClassLoaderLocator(core.getResourceLoader().getClassLoader())));
+
+    // Carrot2 uses current thread's context class loader to get
+    // certain classes (e.g. custom tokenizer/stemmer) at initialization time.
+    // To make sure classes from contrib JARs are available,
+    // we swap the context class loader for the time of clustering.
+    Thread ct = Thread.currentThread();
+    ClassLoader prev = ct.getContextClassLoader();
+    try {
+      ct.setContextClassLoader(core.getResourceLoader().getClassLoader());
+      this.controller.init(initAttributes);
+    } finally {
+      ct.setContextClassLoader(prev);
+    }
+
+    SchemaField uniqueField = core.getSchema().getUniqueKeyField();
+    if (uniqueField == null) {
+      throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, 
+          CarrotClusteringEngine.class.getSimpleName() + " requires the schema to have a uniqueKeyField");
+    }
+    this.idFieldName = uniqueField.getName();
+
+    // Make sure the requested Carrot2 clustering algorithm class is available
+    String carrotAlgorithmClassName = initParams.get(CarrotParams.ALGORITHM);
+    this.clusteringAlgorithmClass = core.getResourceLoader().findClass(carrotAlgorithmClassName, IClusteringAlgorithm.class);
+    return result;
+  }
+
+  @Override
+  protected Set<String> getFieldsToLoad(SolrQueryRequest sreq){
+    SolrParams solrParams = sreq.getParams();
+
+    HashSet<String> fields = Sets.newHashSet(getFieldsForClustering(sreq));
+    fields.add(idFieldName);
+    fields.add(solrParams.get(CarrotParams.URL_FIELD_NAME, "url"));
+    fields.addAll(getCustomFieldsMap(solrParams).keySet());
+
+    String languageField = solrParams.get(CarrotParams.LANGUAGE_FIELD_NAME);
+    if (StringUtils.isNotBlank(languageField)) { 
+      fields.add(languageField);
+    }
+    return fields;
+  }
+
+  /**
+   * Returns the names of fields that will be delivering the actual
+   * content for clustering. Currently, there are two such fields: document
+   * title and document content.
+   */
+  private Set<String> getFieldsForClustering(SolrQueryRequest sreq) {
+    SolrParams solrParams = sreq.getParams();
+
+    String titleFieldSpec = solrParams.get(CarrotParams.TITLE_FIELD_NAME, "title");
+    String snippetFieldSpec = solrParams.get(CarrotParams.SNIPPET_FIELD_NAME, titleFieldSpec);
+    if (StringUtils.isBlank(snippetFieldSpec)) {
+      throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, CarrotParams.SNIPPET_FIELD_NAME
+              + " must not be blank.");
+    }
+    
+    final Set<String> fields = Sets.newHashSet();
+    fields.addAll(Arrays.asList(titleFieldSpec.split("[, ]")));
+    fields.addAll(Arrays.asList(snippetFieldSpec.split("[, ]")));
+    return fields;
+  }
+
+  /**
+   * Prepares Carrot2 documents for clustering.
+   */
+  private List<Document> getDocuments(SolrDocumentList solrDocList, Map<SolrDocument, Integer> docIds,
+                                      Query query, final SolrQueryRequest sreq) throws IOException {
+    SolrHighlighter highlighter = null;
+    SolrParams solrParams = sreq.getParams();
+    SolrCore core = sreq.getCore();
+
+    String urlField = solrParams.get(CarrotParams.URL_FIELD_NAME, "url");
+    String titleFieldSpec = solrParams.get(CarrotParams.TITLE_FIELD_NAME, "title");
+    String snippetFieldSpec = solrParams.get(CarrotParams.SNIPPET_FIELD_NAME, titleFieldSpec);
+    String languageField = solrParams.get(CarrotParams.LANGUAGE_FIELD_NAME, null);
+    
+    // Maps Solr field names to Carrot2 custom field names
+    Map<String, String> customFields = getCustomFieldsMap(solrParams);
+
+    // Parse language code map string into a map
+    Map<String, String> languageCodeMap = Maps.newHashMap();
+    if (StringUtils.isNotBlank(languageField)) {
+      for (String pair : solrParams.get(CarrotParams.LANGUAGE_CODE_MAP, "")
+          .split("[, ]")) {
+        final String[] split = pair.split(":");
+        if (split.length == 2 && StringUtils.isNotBlank(split[0]) && StringUtils.isNotBlank(split[1])) {
+          languageCodeMap.put(split[0], split[1]);
+        } else {
+          log.warn("Unsupported format for " + CarrotParams.LANGUAGE_CODE_MAP
+              + ": '" + pair + "'. Skipping this mapping.");
+        }
+      }
+    }
+    
+    // Get the documents
+    boolean produceSummary = solrParams.getBool(CarrotParams.PRODUCE_SUMMARY, false);
+
+    SolrQueryRequest req = null;
+    String[] snippetFieldAry = null;
+    if (produceSummary) {
+      highlighter = HighlightComponent.getHighlighter(core);
+      if (highlighter != null){
+        Map<String, Object> args = Maps.newHashMap();
+        snippetFieldAry = snippetFieldSpec.split("[, ]");
+        args.put(HighlightParams.FIELDS, snippetFieldAry);
+        args.put(HighlightParams.HIGHLIGHT, "true");
+        args.put(HighlightParams.SIMPLE_PRE, ""); //we don't care about actually highlighting the area
+        args.put(HighlightParams.SIMPLE_POST, "");
+        args.put(HighlightParams.FRAGSIZE, solrParams.getInt(CarrotParams.SUMMARY_FRAGSIZE, solrParams.getInt(HighlightParams.FRAGSIZE, 100)));
+        args.put(HighlightParams.SNIPPETS, solrParams.getInt(CarrotParams.SUMMARY_SNIPPETS, solrParams.getInt(HighlightParams.SNIPPETS, 1)));
+        req = new LocalSolrQueryRequest(core, query.toString(), "", 0, 1, args) {
+          @Override
+          public SolrIndexSearcher getSearcher() {
+            return sreq.getSearcher();
+          }
+        };
+      } else {
+        log.warn("No highlighter configured, cannot produce summary");
+        produceSummary = false;
+      }
+    }
+
+    Iterator<SolrDocument> docsIter = solrDocList.iterator();
+    List<Document> result = new ArrayList<Document>(solrDocList.size());
+
+    float[] scores = {1.0f};
+    int[] docsHolder = new int[1];
+    Query theQuery = query;
+
+    while (docsIter.hasNext()) {
+      SolrDocument sdoc = docsIter.next();
+      String snippet = null;
+      
+      // TODO: docIds will be null when running distributed search.
+      // See comment in ClusteringComponent#finishStage().
+      if (produceSummary && docIds != null) {
+        docsHolder[0] = docIds.get(sdoc).intValue();
+        DocList docAsList = new DocSlice(0, 1, docsHolder, scores, 1, 1.0f);
+        NamedList<Object> highlights = highlighter.doHighlighting(docAsList, theQuery, req, snippetFieldAry);
+        if (highlights != null && highlights.size() == 1) {//should only be one value given our setup
+          //should only be one document
+          @SuppressWarnings("unchecked")
+          NamedList<String []> tmp = (NamedList<String[]>) highlights.getVal(0);
+          
+          final StringBuilder sb = new StringBuilder();
+          for (int j = 0; j < snippetFieldAry.length; j++) {
+            // Join fragments with a period, so that Carrot2 does not create
+            // cross-fragment phrases, such phrases rarely make sense.
+            String [] highlt = tmp.get(snippetFieldAry[j]);
+            if (highlt != null && highlt.length > 0) {
+              for (int i = 0; i < highlt.length; i++) {
+                sb.append(highlt[i]);
+                sb.append(" . ");
+              }
+            }
+          }
+          snippet = sb.toString();
+        }
+      }
+      
+      // If summaries not enabled or summary generation failed, use full content.
+      if (snippet == null) {
+        snippet = getConcatenated(sdoc, snippetFieldSpec);
+      }
+      
+      // Create a Carrot2 document
+      Document carrotDocument = new Document(getConcatenated(sdoc, titleFieldSpec),
+              snippet, ObjectUtils.toString(sdoc.getFieldValue(urlField), ""));
+      
+      // Store Solr id of the document, we need it to map document instances 
+      // found in clusters back to identifiers.
+      carrotDocument.setField(SOLR_DOCUMENT_ID, sdoc.getFieldValue(idFieldName));
+      
+      // Set language
+      if (StringUtils.isNotBlank(languageField)) {
+        Collection<Object> languages = sdoc.getFieldValues(languageField);
+        if (languages != null) {
+          
+          // Use the first Carrot2-supported language
+          for (Object l : languages) {
+            String lang = ObjectUtils.toString(l, "");
+            
+            if (languageCodeMap.containsKey(lang)) {
+              lang = languageCodeMap.get(lang);
+            }
+            
+            // Language detection Library for Java uses dashes to separate
+            // language variants, such as 'zh-cn', but Carrot2 uses underscores.
+            if (lang.indexOf('-') > 0) {
+              lang = lang.replace('-', '_');
+            }
+            
+            // If the language is supported by Carrot2, we'll get a non-null value
+            final LanguageCode carrot2Language = LanguageCode.forISOCode(lang);
+            if (carrot2Language != null) {
+              carrotDocument.setLanguage(carrot2Language);
+              break;
+            }
+          }
+        }
+      }
+      
+      // Add custom fields
+      if (customFields != null) {
+        for (Entry<String, String> entry : customFields.entrySet()) {
+          carrotDocument.setField(entry.getValue(), sdoc.getFieldValue(entry.getKey()));
+        }
+      }
+      
+      result.add(carrotDocument);
+    }
+
+    return result;
+  }
+
+  /**
+   * Prepares a map of Solr field names (keys) to the corresponding Carrot2
+   * custom field names.
+   */
+  private Map<String, String> getCustomFieldsMap(SolrParams solrParams) {
+    Map<String, String> customFields = Maps.newHashMap();
+    String [] customFieldsSpec = solrParams.getParams(CarrotParams.CUSTOM_FIELD_NAME);
+    if (customFieldsSpec != null) {
+      customFields = Maps.newHashMap();
+      for (String customFieldSpec : customFieldsSpec) {
+        String [] split = customFieldSpec.split(":"); 
+        if (split.length == 2 && StringUtils.isNotBlank(split[0]) && StringUtils.isNotBlank(split[1])) {
+          customFields.put(split[0], split[1]);
+        } else {
+          log.warn("Unsupported format for " + CarrotParams.CUSTOM_FIELD_NAME
+              + ": '" + customFieldSpec + "'. Skipping this field definition.");
+        }
+      }
+    }
+    return customFields;
+  }
+
+  private String getConcatenated(SolrDocument sdoc, String fieldsSpec) {
+    StringBuilder result = new StringBuilder();
+    for (String field : fieldsSpec.split("[, ]")) {
+      Collection<Object> vals = sdoc.getFieldValues(field);
+      if (vals == null) continue;
+      Iterator<Object> ite = vals.iterator();
+      while(ite.hasNext()){
+        // Join multiple values with a period so that Carrot2 does not pick up
+        // phrases that cross field value boundaries (in most cases it would
+        // create useless phrases).
+        result.append(ObjectUtils.toString(ite.next())).append(" . ");
+      }
+    }
+    return result.toString().trim();
+  }
+
+  private List<NamedList<Object>> clustersToNamedList(List<Cluster> carrotClusters,
+                                   SolrParams solrParams) {
+    List<NamedList<Object>> result = Lists.newArrayList();
+    clustersToNamedList(carrotClusters, result, solrParams.getBool(
+            CarrotParams.OUTPUT_SUB_CLUSTERS, true), solrParams.getInt(
+            CarrotParams.NUM_DESCRIPTIONS, Integer.MAX_VALUE));
+    return result;
+  }
+
+  private void clustersToNamedList(List<Cluster> outputClusters,
+                                   List<NamedList<Object>> parent, boolean outputSubClusters, int maxLabels) {
+    for (Cluster outCluster : outputClusters) {
+      NamedList<Object> cluster = new SimpleOrderedMap<Object>();
+      parent.add(cluster);
+
+      // Add labels
+      List<String> labels = outCluster.getPhrases();
+      if (labels.size() > maxLabels) {
+        labels = labels.subList(0, maxLabels);
+      }
+      cluster.add("labels", labels);
+
+      // Add cluster score
+      final Double score = outCluster.getScore();
+      if (score != null) {
+        cluster.add("score", score);
+      }
+
+      // Add other topics marker
+      if (outCluster.isOtherTopics()) {
+        cluster.add("other-topics", outCluster.isOtherTopics());
+      }
+
+      // Add documents
+      List<Document> docs = outputSubClusters ? outCluster.getDocuments() : outCluster.getAllDocuments();
+      List<Object> docList = Lists.newArrayList();
+      cluster.add("docs", docList);
+      for (Document doc : docs) {
+        docList.add(doc.getField(SOLR_DOCUMENT_ID));
+      }
+
+      // Add subclusters
+      if (outputSubClusters && !outCluster.getSubclusters().isEmpty()) {
+        List<NamedList<Object>> subclusters = Lists.newArrayList();
+        cluster.add("clusters", subclusters);
+        clustersToNamedList(outCluster.getSubclusters(), subclusters,
+                outputSubClusters, maxLabels);
+      }
+    }
+  }
+
+  /**
+   * Extracts parameters that can possibly match some attributes of Carrot2 algorithms.
+   */
+  private void extractCarrotAttributes(SolrParams solrParams,
+                                       Map<String, Object> attributes) {
+    // Extract all non-predefined parameters. This way, we'll be able to set all
+    // parameters of Carrot2 algorithms without defining their names as constants.
+    for (Iterator<String> paramNames = solrParams.getParameterNamesIterator(); paramNames
+            .hasNext();) {
+      String paramName = paramNames.next();
+      if (!CarrotParams.CARROT_PARAM_NAMES.contains(paramName)) {
+        attributes.put(paramName, solrParams.get(paramName));
+      }
     }
   }
 }

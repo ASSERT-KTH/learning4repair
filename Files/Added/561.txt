@@ -1,8 +1,8 @@
-Boolean.FALSE,
+Boolean.valueOf(opNode.getForQueryRewrite()),
 
 /*
 
-   Derby - Class org.apache.derby.impl.sql.compile.ValueNode
+   Derby - Class org.apache.derby.impl.sql.compile.Predicate
 
    Licensed to the Apache Software Foundation (ASF) under one or more
    contributor license agreements.  See the NOTICE file distributed with
@@ -23,151 +23,703 @@ Boolean.FALSE,
 
 package	org.apache.derby.impl.sql.compile;
 
-import java.util.Vector;
+import org.apache.derby.impl.sql.compile.ExpressionClassBuilder;
+import org.apache.derby.impl.sql.compile.ActivationClassBuilder;
+
+import org.apache.derby.iapi.sql.compile.C_NodeTypes;
+import org.apache.derby.iapi.sql.compile.Visitable;
+import org.apache.derby.iapi.sql.compile.Visitor;
+import org.apache.derby.iapi.sql.compile.OptimizablePredicate;
+import org.apache.derby.iapi.sql.compile.Optimizable;
+
+import org.apache.derby.iapi.sql.dictionary.DataDictionary;
+
+import org.apache.derby.iapi.store.access.ScanController;
 
 import org.apache.derby.iapi.error.StandardException;
-import org.apache.derby.iapi.reference.SQLState;
+
 import org.apache.derby.iapi.services.compiler.MethodBuilder;
-import org.apache.derby.iapi.services.i18n.MessageService;
+
 import org.apache.derby.iapi.services.sanity.SanityManager;
-import org.apache.derby.iapi.sql.compile.C_NodeTypes;
-import org.apache.derby.iapi.sql.compile.CompilerContext;
-import org.apache.derby.iapi.sql.compile.NodeFactory;
-import org.apache.derby.iapi.sql.compile.Optimizable;
-import org.apache.derby.iapi.sql.compile.TypeCompiler;
-import org.apache.derby.iapi.store.access.Qualifier;
-import org.apache.derby.iapi.types.DataTypeDescriptor;
-import org.apache.derby.iapi.types.DataValueFactory;
-import org.apache.derby.iapi.types.StringDataValue;
-import org.apache.derby.iapi.types.TypeId;
+
+import org.apache.derby.iapi.types.DataValueDescriptor;
+
 import org.apache.derby.iapi.util.JBitSet;
 
+import java.util.ArrayList;
+import java.util.Hashtable;
+
 /**
- * A ValueNode is an abstract class for all nodes that can represent data
- * values, that is, constants, columns, and expressions.
+ * A Predicate represents a top level predicate.
  *
  */
 
-public abstract class ValueNode extends QueryTreeNode
+public final class Predicate extends QueryTreeNode implements OptimizablePredicate,
+														Comparable
 {
-    /**
-     * The data type for this node.
-     */
-	private DataTypeDescriptor	dataTypeServices;
+	/* Top of the predicate */
+	AndNode		andNode;
+	boolean		pushable;
+	/* Bit map of referenced tables */
+	JBitSet		referencedSet;
+	/* Join clauses are placed into equivalence classes when applying transitive
+	 * closure for join clauses.  This is useful for eliminating redundant predicates.
+	 */
+	int			equivalenceClass = -1;
+	int			indexPosition;
+	protected boolean startKey;
+	protected boolean stopKey;
+	protected boolean isQualifier;
 
-	// Whether or not additional predicates have been created from this one.
-	boolean	transformed;
+	/* Hashtable used for tracking the search clause types that have been
+	 * pushed through this predicate (if an equijoin) via transitive closure.
+	 */
+	private Hashtable searchClauseHT;
+
+	// Whether or not this predicate has been scoped; see the
+	// getPredScopedForResultSet() method of this class for more.
+	private boolean scoped;
+
+	/**
+	 * Initializer.
+	 *
+	 * @param andNode		The top of the predicate	 
+	 * @param referencedSet	Bit map of referenced tables
+	 */
+
+	public void init(Object andNode, Object referencedSet)
+	{
+		this.andNode = (AndNode) andNode;
+		pushable = false;
+		this.referencedSet = (JBitSet) referencedSet;
+		scoped = false;
+	}
 
 	/*
-	** Constructor for untyped ValueNodes, for example, untyped NULLs
-	** and parameter nodes.
-	**
-	** Binding will replace all untyped ValueNodes with typed ValueNodes
-	** when it figures out what their types should be.
-	*/
-	public ValueNode()
-	{
-	}
-    
-    /**
-     * Set this node's type from type components.
-     */
-    final void setType(TypeId typeId,
-            boolean isNullable,
-            int maximumWidth)
-       throws StandardException
-       
-       {
-        setType(
-                new DataTypeDescriptor(
-                            (TypeId) typeId,
-                            isNullable,
-                            maximumWidth
-                        )
-                    );           
-       }
+	 *  Optimizable interface
+	 */
 
-    /**
-     * Set this node's type from type components.
-     */
-    final void setType(TypeId typeId,
-            int precision, int scale,
-            boolean isNullable,
-            int maximumWidth)
-       throws StandardException
+	/**
+	 * @see org.apache.derby.iapi.sql.compile.OptimizablePredicate#getReferencedMap
+	 */
+	public JBitSet getReferencedMap()
+	{
+		return referencedSet;
+	}
+
+	/**
+	 * @see org.apache.derby.iapi.sql.compile.OptimizablePredicate#hasSubquery
+	 */
+	public boolean hasSubquery()
+	{
+		/* RESOLVE - Currently, we record whether or not a predicate is pushable based
+		 * on whether or not it contains a subquery or method call, but we do not
+		 * record the underlying info.
+		 */
+		return ! pushable;
+	}
+
+	/**
+	 * @see org.apache.derby.iapi.sql.compile.OptimizablePredicate#hasMethodCall
+	 */
+	public boolean hasMethodCall()
+	{
+		/* RESOLVE - Currently, we record whether or not a predicate is pushable based
+		 * on whether or not it contains a subquery or method call, but we do not
+		 * record the underlying info.
+		 */
+		return ! pushable;
+	}
+
+	/** @see OptimizablePredicate#markStartKey */
+	public void markStartKey()
+	{
+		startKey = true;
+	}
+
+	/** @see OptimizablePredicate#isStartKey */
+	public boolean isStartKey()
+	{
+		return startKey;
+	}
+
+	/** @see OptimizablePredicate#markStopKey */
+	public void markStopKey()
+	{
+		stopKey = true;
+	}
+
+	/** @see OptimizablePredicate#isStopKey */
+	public boolean isStopKey()
+	{
+		return stopKey;
+	}
+
+	/** @see OptimizablePredicate#markQualifier */
+	public void markQualifier()
+	{
+		isQualifier = true;
+	}
+
+	/** @see OptimizablePredicate#isQualifier */
+	public boolean isQualifier()
+	{
+		return isQualifier;
+	}
+
+	/** @see OptimizablePredicate#compareWithKnownConstant */
+	public boolean compareWithKnownConstant(Optimizable optTable, boolean considerParameters)
+	{
+		boolean retval = false;
+		RelationalOperator relop = getRelop();
+
+		/* if this is for "in" operator node's dynamic start/stop key, relop is
+		 * null, and it's not comparing with constant, beetle 3858
+		 */
+		if (!isRelationalOpPredicate())
+			return false;
+
+		if (relop.compareWithKnownConstant(optTable, considerParameters))
+			retval = true;
+
+		return retval;
+	}
+
+	public int hasEqualOnColumnList(int[] baseColumnPositions,
+										Optimizable optTable)
+		throws StandardException
+	{
+		RelationalOperator relop = getRelop();
+
+		if (!isRelationalOpPredicate())
+			return -1;
+		
+		if (!(relop.getOperator() == RelationalOperator.EQUALS_RELOP))
+			return -1;
+			
+		for (int i = 0; i < baseColumnPositions.length; i++)
+		{
+			ColumnReference cr = relop.getColumnOperand(optTable, 
+														baseColumnPositions[i]);
+		
+			if (cr == null)
+				continue;
+			
+			if (relop.selfComparison(cr))
+				continue;
+
+			// If I made it thus far in the loop, we've found
+			// something.
+			return i;
+		}
+		
+		return -1;
+	}
+
+	/**
+	 * @see OptimizablePredicate#getCompareValue
+	 *
+	 * @exception StandardException		Thrown on error
+	 */
+	public DataValueDescriptor getCompareValue(Optimizable optTable)
+		throws StandardException
+	{
+		if (SanityManager.DEBUG)
+		{
+			SanityManager.ASSERT(compareWithKnownConstant(optTable, true),
+				"Cannot get the compare value if not comparing with a known constant.");
+		}
+
+		RelationalOperator relop = getRelop();
+
+		return relop.getCompareValue(optTable);
+	}
+
+	/** @see OptimizablePredicate#equalsComparisonWithConstantExpression */
+	public boolean equalsComparisonWithConstantExpression(Optimizable optTable)
+	{
+		boolean retval = false;
+
+		if (isRelationalOpPredicate())
+		{
+			retval = getRelop().equalsComparisonWithConstantExpression(optTable);
+		}
+
+		return retval;
+	}
+
+	/** @see OptimizablePredicate#selectivity */
+	public double selectivity(Optimizable optTable)
+	throws StandardException
+	{
+		return andNode.getLeftOperand().selectivity(optTable);
+	}
+
+	/** @see OptimizablePredicate#getIndexPosition */
+	public int getIndexPosition()
+	{
+		return indexPosition;
+	}
+
+
+	/* Comparable interface */
+
+	public int compareTo(Object other)
+	{
+		Predicate	otherPred = (Predicate) other;
+
+		/* Not all operators are "equal". If the predicates are on the
+		 * same key column, then a "=" opertor takes precedence over all
+		 * other operators.  This ensures that the "=" will be both the start
+		 * and stop predicates.  Otherwise, we could end up with it being one
+		 * but not the other and get incorrect results.
+		 *
+		 * Also, we want "<>" to come after all the other operators.
+		 * Other parts of the optimizer use the first predicate on an index
+		 * column to determine the cost of using the index, so we want the
+		 * "<>" to come last because it's not useful for limiting the scan.
+		 *
+		 * In other words, P1 is before() P2 if:
+		 *		o  The P1.indexPosition < P2.indexPosition
+		 *	or  o  P1.indexPosition == P2.indexPosition and
+		 *		   P1's operator is ("=" or IS NULL) and
+		 *		   P2's operator is not ("=" or IS NULL)
+		 * or	o  P1.indexPosition == P2.indexPosition and
+		 *		   P1's operator is not ("<>" or IS NOT NULL) and
+		 *		   P2's operator is ("<>" or IS NOT NULL)
+		 *
+		 * (We have to impose an arbitrary, but reproducible ordering
+		 * on the the "=" predicates on the same column, otherwise an
+		 * ASSERTion, that after the predicates are order, Pn+1 is not
+		 * before() Pn, will be violated.
+		 */
+
+		int otherIndexPosition = otherPred.getIndexPosition();
+
+		if (indexPosition < otherIndexPosition)
+			return -1;
+
+		if (indexPosition > otherIndexPosition)
+			return 1;
+
+		// initialize these flags as if they are for "in" operator, then
+		// change them if they are not
+		//
+		boolean thisIsEquals = false, otherIsEquals = false;
+		boolean thisIsNotEquals = true, otherIsNotEquals = true;
+
+		/* The call to "isRelationalOpPredicate()" will return false
+		 * for a "probe predicate" because a probe predicate is really
+		 * a disguised IN list. But when it comes to sorting, the probe
+		 * predicate (which is of the form "<col> = ?") should be treated
+		 * as an equality--i.e. it should have precedence over any non-
+		 * equals predicate, per the comment at the start of this
+		 * method.  So that's what we're checking here.
+		 */
+		if (this.isRelationalOpPredicate() || // this is not "in" or
+			this.isInListProbePredicate())    // this is a probe predicate
+		{
+			int thisOperator = ((RelationalOperator)andNode.getLeftOperand()).getOperator();
+			thisIsEquals = (thisOperator == RelationalOperator.EQUALS_RELOP ||
+								thisOperator == RelationalOperator.IS_NULL_RELOP);
+			thisIsNotEquals = (thisOperator == RelationalOperator.NOT_EQUALS_RELOP ||
+								   thisOperator == RelationalOperator.IS_NOT_NULL_RELOP);
+		}
+
+		if (otherPred.isRelationalOpPredicate() || // other is not "in" or
+			otherPred.isInListProbePredicate())    // other is a probe predicate
+		{
+			int	otherOperator = ((RelationalOperator)(otherPred.getAndNode().getLeftOperand())).getOperator();
+			otherIsEquals = (otherOperator == RelationalOperator.EQUALS_RELOP ||
+								 otherOperator == RelationalOperator.IS_NULL_RELOP);
+			otherIsNotEquals = (otherOperator == RelationalOperator.NOT_EQUALS_RELOP ||
+								 otherOperator == RelationalOperator.IS_NOT_NULL_RELOP);
+		}
+
+		boolean thisIsBefore = (thisIsEquals && ! otherIsEquals) || ( ! thisIsNotEquals && otherIsNotEquals);
+		if (thisIsBefore)
+			return -1;
+
+		boolean otherIsBefore = (otherIsEquals && ! thisIsEquals) || ( ! otherIsNotEquals && thisIsNotEquals);
+		if (otherIsBefore)
+			return 1;
+		return 0;
+	}
+
+	/**
+	 * Return the andNode.
+	 *
+	 * @return AndNode	The andNode.
+	 */
+	public AndNode getAndNode()
+	{
+		return andNode;
+	}
+
+	/**
+	 * Set the andNode.
+	 *
+	 * @param andNode	The new andNode.
+	 */
+	public void setAndNode(AndNode andNode)
+	{
+		this.andNode = andNode;
+	}
+
+	/**
+	 * Return the pushable.
+	 *
+	 * @return boolean	Whether or not the predicate is pushable.
+	 */
+	public boolean getPushable()
+	{
+		return pushable;
+	}
+
+	/**
+	 * Set whether or not this predicate is pushable.  This method
+	 * is intended for use when creating a copy of the predicate, ex
+	 * for predicate pushdown.  We choose not to add this assignment
+	 * to copyFields() because the comments for that method say that
+	 * it should copy all fields _except_ the two specified at init
+	 * time; "pushable" is one of the two specified at init time.
+	 *
+	 * @param pushable Whether or not the predicate is pushable.
+	 */
+	public void setPushable(boolean pushable) {
+		this.pushable = pushable;
+	}
+
+	/**
+	 * Return the referencedSet.
+	 *
+	 * @return JBitSet	The referencedSet.
+	 */
+	public JBitSet getReferencedSet()
+	{
+		return referencedSet;
+	}
+
+	/**
+	 * Set the equivalence class, if any, for this predicate.
+	 *
+	 * @param equivalenceClass	The equivalence class for this predicate.
+	 */
+	void setEquivalenceClass(int equivalenceClass)
+	{
+		this.equivalenceClass = equivalenceClass;
+	}
+
+	/**
+	 * Get the equivalenceClass for this predicate.
+	 *
+	 * @return The equivalenceClass for this predicate.
+	 */
+	int getEquivalenceClass()
+	{
+		return equivalenceClass;
+	}
+
+	/**
+	 * Categorize this predicate.  Initially, this means
+	 * building a bit map of the referenced tables for each predicate.
+	 *
+	 * @exception StandardException		Thrown on error
+	 */
+	public void categorize() throws StandardException
+	{
+		pushable = andNode.categorize(referencedSet, false);
+	}
+
+	/**
+	 * Get the RelationalOperator on the left side of the AND node, if
+	 * there is one.  If the left side is not a RelationalOperator, return
+	 * null.
+	 *
+	 * @return	The RelationalOperator on the left side of the AND node,
+	 *			if any.
+	 */
+	public RelationalOperator getRelop()
+	{
+		
+		if (andNode.getLeftOperand() instanceof RelationalOperator)
+		{
+			return (RelationalOperator) andNode.getLeftOperand();
+		}
+		else
+		{
+			return null;
+		}
+	}
+
+	public final boolean isOrList()
     {
-        setType(
-                new DataTypeDescriptor(
-                            (TypeId) typeId,
-                            precision,
-                            scale,
-                            isNullable,
-                            maximumWidth
-                        )
-                    );   
+        return(andNode.getLeftOperand() instanceof OrNode);
     }
 
-	/**
-	 * Initializer for numeric types.
-	 * 
-	 *
-	 * @param typeId	The TypeID of this new node
-	 * @param precision	The precision of this new node
-	 * @param scale		The scale of this new node
-	 * @param isNullable	The nullability of this new node
-	 * @param maximumWidth	The maximum width of this new node
-	 *
-	 * @exception StandardException
-	 */
+    /**
+     * Is this predicate a possible Qualifier for store?
+     * <p>
+     * Current 2 types of predicates can be pushed to store: 
+     *   1) RelationalOperator - 
+     *      represented with by left operand as instance of RelationalOperator.
+     *   2) A single And'd term of a list of OR terms
+     *      represented by left operand as instance of OrNode.
+     *
+     * More checking specific operator's terms to see if they are finally
+     * pushable to store.  In the final push at execution each term of the AND 
+     * or OR must be a Relational operator with a column reference on one side 
+     * and a constant on the other.
+     *
+     *
+	 * @return true if term is wither a AND of a RelationalOperator, or an
+     *              OR of one or more Relational Operators.
+     *
+     *
+	 * @exception  StandardException  Standard exception policy.
+     **/
+	public final boolean isStoreQualifier()
+    {
+		if ((andNode.getLeftOperand() instanceof RelationalOperator) ||
+		    (andNode.getLeftOperand() instanceof OrNode))
+		{
+            return(true);
+		}
+		else
+		{
+            return(false);
+		}
+    }
 
-	public void init(
-			Object typeId,
-			Object precision,
-			Object scale,
-			Object isNullable,
-			Object maximumWidth)
-		throws StandardException
+    /**
+     * Is this predicate an pushable OR list?
+     * <p>
+     * Does the predicate represent a AND'd list of OR term's, all of which
+     * are pushable.  To be pushable each of OR terms must be a legal 
+     * qualifier, which is a column reference on one side of a Relational
+     * operator and a constant on the other.
+     *
+	 * @return true if the predicate is a pushable set of OR clauses.
+     *
+     *
+	 * @exception  StandardException  Standard exception policy.
+     **/
+	public final boolean isPushableOrClause(Optimizable optTable)
+        throws StandardException
 	{
-		setType(
-			new DataTypeDescriptor(
-						(TypeId) typeId,
-						((Integer) precision).intValue(),
-						((Integer) scale).intValue(),
-						((Boolean) isNullable).booleanValue(),
-						((Integer) maximumWidth).intValue()
-					)
-				);
+        boolean ret_val = true;
+
+        if (andNode.getLeftOperand() instanceof OrNode)
+        {
+            QueryTreeNode node = andNode.getLeftOperand();
+
+            while (node instanceof OrNode)
+            {
+                OrNode or_node = (OrNode) node;
+
+                if (or_node.getLeftOperand() instanceof RelationalOperator)
+                {
+                    // if any term of the OR clause is not a qualifier, then
+                    // reject the entire OR clause.
+                    if (!((RelationalOperator) or_node.getLeftOperand()).
+                        isQualifier(optTable, true))
+                    {
+                        // one of the terms is not a pushable Qualifier.
+                        return(false);
+                    }
+
+                    node = or_node.getRightOperand();
+                }
+                else
+                {
+                    // one of the terms is not a RelationalOperator
+
+                    return(false);
+                }
+            }
+
+            return(true);
+        }
+        else
+        {
+            // Not an OR list
+            return(false);
+        }
 	}
 
 	/**
-	 * Initializer for non-numeric types.
-	 * 
+	 * Return whether or not this predicate has been used
+	 * to add a new search clause of the specified type via transitive closure.
+	 * NOTE: This can only be true if this is an equijoin
+	 * between 2 column references.
 	 *
-	 * @param tcf		The factory to get the
-	 *					DataTypeServicesFactory from
-	 * @param typeId	The TypeID of this new node
-	 * @param isNullable	The nullability of this new node
-	 * @param maximumWidth	The maximum width of this new node
+	 * @param ro	The search clause that we are currently considering
+	 *				as the source for transitive closure
 	 *
-	 * @exception StandardException
+	 * @return	Whether or not this predicate has been used
+	 *			to add a new search clause of the specified type via transitive 
+     *			closure.
 	 */
-
-	ValueNode(
-			Object tcf,
-			Object typeId,
-			Object isNullable,
-			Object maximumWidth)
-		throws StandardException
+	boolean transitiveSearchClauseAdded(RelationalOperator ro)
 	{
-		setType(new DataTypeDescriptor(
-						(TypeId) typeId,
-						((Boolean) isNullable).booleanValue(),
-						((Integer) maximumWidth).intValue()
-						)
-				);
+		if (searchClauseHT == null || 
+			searchClauseHT.get(new Integer(ro.getOperator())) == null)
+		{
+			return false;
+		}
+		else
+		{
+			return true;
+		}
 	}
 
-			
+	/**
+	 * Mark this predicate as having been used to add a new predicate
+	 * of the specified type via transitive closure on search clauses.
+	 *
+	 * @param ro	The search clause that we are currently considering
+	 *				as the source for transitive closure
+	 *
+	 */
+	void setTransitiveSearchClauseAdded(RelationalOperator ro)
+	{
+		if (searchClauseHT == null)
+		{
+			searchClauseHT = new Hashtable();
+		}
+		/* I have to remember that this ro has been added to this predicate as a
+		 * transitive search clause.
+		 */
+		Integer i = new Integer(ro.getOperator());
+		searchClauseHT.put(i, i);
+	}
+
+	/**
+	 * Get the start operator for this predicate for a scan.
+	 *
+	 * @param optTable	The optimizable table, so we can tell which side of
+	 *					the operator the search column is on.
+	 *
+	 * @return	The start operator for a start key on this column.
+	 */
+	int getStartOperator(Optimizable optTable)
+	{
+		if (SanityManager.DEBUG)
+		{
+			SanityManager.ASSERT(startKey, "Getting a start operator from a Predicate that's not a start key.");
+		}
+
+		/* if it's for "in" operator's dynamic start key, operator is GE,
+		 * beetle 3858
+		 */
+		if (andNode.getLeftOperand() instanceof InListOperatorNode)
+			return ScanController.GE;
+
+		return getRelop().getStartOperator(optTable);
+	}
+
+	int getStopOperator(Optimizable optTable)
+	{
+		if (SanityManager.DEBUG)
+		{
+			SanityManager.ASSERT(stopKey, "Getting a stop operator from a Predicate that's not a stop key.");
+		}
+
+		 /* if it's for "in" operator's dynamic stop key, operator is GT,
+		  * beetle 3858
+		  */
+		if (andNode.getLeftOperand() instanceof InListOperatorNode)
+			return ScanController.GT;
+
+		return getRelop().getStopOperator(optTable);
+	}
+
+	/**
+	 * Set the position of the index column that this predicate restricts
+	 *
+	 * @param indexPosition	The position of the index column that this
+	 *						predicate restricts.
+	 */
+	void setIndexPosition(int indexPosition)
+	{
+		this.indexPosition = indexPosition;
+	}
+
+	/**
+	 * Clear the start/stop position and qualifier flags
+	 */
+	void clearScanFlags()
+	{
+		startKey = false;
+		stopKey = false;
+		isQualifier = false;
+	}
+
+	/**
+	 * Clear the qualifier flag.
+	 */
+	void clearQualifierFlag()
+	{
+		isQualifier = false;
+	}
+
+	void generateExpressionOperand(Optimizable optTable,
+										int columnPosition,
+										ExpressionClassBuilder acb,
+										MethodBuilder mb)
+				throws StandardException
+	{
+		getRelop().generateExpressionOperand(optTable,
+													columnPosition,
+													acb,
+													mb);
+	}
+
+	void generateAbsoluteColumnId(MethodBuilder mb,
+										Optimizable optTable)
+	{
+		getRelop().generateAbsoluteColumnId(mb, optTable);
+	}
+
+	void generateRelativeColumnId(MethodBuilder mb,
+										Optimizable optTable)
+	{
+		getRelop().generateRelativeColumnId(mb, optTable);
+	}
+
+	void generateOperator(MethodBuilder mb,
+								Optimizable optTable)
+	{
+		getRelop().generateOperator(mb, optTable);
+	}
+
+	void generateQualMethod(ExpressionClassBuilder acb,
+								MethodBuilder mb,
+								Optimizable optTable)
+					throws StandardException
+	{
+		getRelop().generateQualMethod(acb, mb, optTable);
+	}
+
+	void generateOrderedNulls(MethodBuilder mb)
+	{
+		getRelop().generateOrderedNulls(mb);
+	}
+
+	void generateNegate(MethodBuilder mb,
+								Optimizable optTable)
+	{
+		getRelop().generateNegate(mb, optTable);
+	}
+
+	void generateOrderableVariantType(MethodBuilder mb,
+								Optimizable optTable)
+					throws StandardException
+	{
+		int variantType = getRelop().getOrderableVariantType(optTable);
+		mb.push(variantType);
+
+	}
 	/**
 	 * Convert this object to a String.  See comments in QueryTreeNode.java
 	 * for how this should be done for tree printing.
@@ -179,9 +731,9 @@ public abstract class ValueNode extends QueryTreeNode
 	{
 		if (SanityManager.DEBUG)
 		{
-			return "dataTypeServices: " +
-				( ( dataTypeServices != null) ?
-						dataTypeServices.toString() : "null" ) + "\n" +
+			return binaryRelOpColRefsToString() + "\nreferencedSet: " +
+				referencedSet  + "\n" + "pushable: " + pushable + "\n" +
+				"isQualifier: " + isQualifier + "\n" +
 				super.toString();
 		}
 		else
@@ -191,1236 +743,652 @@ public abstract class ValueNode extends QueryTreeNode
 	}
 
 	/**
-	 * Get the DataTypeServices from this ValueNode.
-	 *
-	 * @return	The DataTypeServices from this ValueNode.  This
-	 *		may be null if the node isn't bound yet.
+	 * Get a string version of the column references for this predicate
+	 * IF it's a binary relational operator.  We only print out the
+	 * names of the operands if they are column references; otherwise
+	 * we just print a dummy value.  This is for debugging purposes
+	 * only--it's a convenient way to see what columns the predicate
+	 * is referencing, especially when tracing through code and printing
+	 * assert failure.
 	 */
-	public DataTypeDescriptor getTypeServices()
+	public String binaryRelOpColRefsToString()
 	{
-		return dataTypeServices;
-	}
-    
-    /**
-     * Set the nullability of this value.
-     * @throws StandardException 
-     */
-    public void setNullability(boolean nullability) throws StandardException
-    {
-        setType(getTypeServices().getNullabilityType(nullability));
-    }
-    
-    /**
-     * Set the collation type and derivation of this node based upon
-     * the collation information in the passed in type. Note that the
-     * base type of this node is not changed (e.g. INTEGER), only its
-     * collation settings. This may result in a different object being
-     * returned from getTypeServices().
-     * 
-     * @param collationInfoType Type to take collation type and derivation from.
-     * @throws StandardException Error setting type.
-     */
-    public void setCollationInfo(DataTypeDescriptor collationInfoType)
-    throws StandardException
-    {
-        setCollationInfo(collationInfoType.getCollationType(),
-                collationInfoType.getCollationDerivation());
-    }
-
-    /**
-     * Set the collation type and derivation of this node based upon
-     * the collation information passed in.
-     * This may result in a different object being
-     * returned from getTypeServices().
-     * 
-     * @param collationType Collation type
-     * @param collationDerivation Collation derivation
-     * @throws StandardException Error setting type
-     */
-    public void setCollationInfo(int collationType, int collationDerivation)
-        throws StandardException
-    {
-        setType(getTypeServices().getCollatedType(
-                collationType, collationDerivation));
-    }
-
-	/**
-	 * Get the TypeId from this ValueNode.
-	 *
-	 * @return	The TypeId from this ValueNode.  This
-	 *		may be null if the node isn't bound yet.
-	 */
-	public TypeId getTypeId() throws StandardException
-	{
-        DataTypeDescriptor dtd = getTypeServices();
-        if (dtd != null)
-            return dtd.getTypeId();
-		return null;
-	}
-
-
-	/**
-		Return the DataValueFactory
-	*/
-	protected final DataValueFactory getDataValueFactory() {
-		return getLanguageConnectionContext().getDataValueFactory();
-	}
-
-	/**
-	 * Get the TypeCompiler from this ValueNode, based on its TypeId
-     * using getTypeId().
-	 *
-	 * @return	This ValueNode's TypeCompiler
-	 *
-	 */
-	public final TypeCompiler getTypeCompiler() throws StandardException
-	{
-		return getTypeCompiler(getTypeId());
-	}
-
-	/**
-	 * Set the DataTypeServices for this ValueNode.  This method is
-	 * overridden in ParameterNode.
-	 *
-	 * @param dataTypeServices	The DataTypeServices to set in this
-	 *				ValueNode
-	 */
-
-	public void setType(DataTypeDescriptor dataTypeServices) throws StandardException
-	{
-        // bind the type in case it is a user defined type. this will create a dependency on the udt.
-        if ( dataTypeServices != null )
-        {
-            dataTypeServices = bindUserType( dataTypeServices );
-        }
-
-		this.dataTypeServices = dataTypeServices;
-        
-        // create a dependency on this type if it is an ANSI UDT
-        if ( dataTypeServices != null ) { createTypeDependency( dataTypeServices ); }
-	}
-	
-	/**
-	 * Set the collation based upon the current schema with derivation
-	 * type implicit.
-	 * 
-	 * @throws StandardException
-	 */
-	protected final void setCollationUsingCompilationSchema()
-	throws StandardException {
-		setCollationUsingCompilationSchema(
-				StringDataValue.COLLATION_DERIVATION_IMPLICIT);
-	}	
-	
-	/**
-	 * There are many subclasses of ValueNode where we want the 
-	 * DataTypeDescriptor of the node to have the same collation type as the 
-	 * compilation schema's collation type. For that purpose, this method in 
-	 * the baseclass here can be utilized by the subclasses. In addition, the
-	 * subclasses can pass the collationDerivation that they expect the
-	 * DataTypeDescriptor to have.
-	 * 
-	 * @param collationDerivation This can be 
-	 * StringDataValue#COLLATION_DERIVATION_IMPLICIT
-	 * StringDataValue#COLLATION_DERIVATION_NONE
-	 * StringDataValue#COLLATION_DERIVATION_EXPLICIT
-	 * 
-	 * @throws StandardException
-	 */
-	protected final void setCollationUsingCompilationSchema(int collationDerivation)
-	throws StandardException {
-        setCollationInfo(
-                getSchemaDescriptor(null, false).getCollationType(),
-                collationDerivation);
-	}
-
-
-	/**
-	 * Get the source for this ValueNode.
-	 *
-	 * @return	The source of this ValueNode, null if this node
-     * is not sourced by a column.
-	 */
-
-	public ResultColumn getSourceResultColumn()
-	{
-		return null;
-	}
-
-	/**
-	 * Mark this predicate has having been transformed (other predicates
-	 * were generated from it).  This will help us with ensure that the
-	 * predicate does not get calculated into the selectivity multiple
-	 * times.
-	 */
-	void setTransformed()
-	{
-		transformed = true;
-	}
-
-	/** 
-	 * Return whether or not this predicate has been transformed.
-	 *
-	 * @return Whether or not this predicate has been transformed.
-	 */
-	boolean getTransformed()
-	{
-		return transformed;
-	}
-
-	
-	public ValueNode bindExpression(
-									FromList fromList, SubqueryList subqueryList,
-									Vector	aggregateVector)
-		throws StandardException
-	{
-		return bindExpression(fromList, subqueryList, aggregateVector,false);
-	}
-	
-
-	/**
-	 * Bind this expression.  This is a place-holder method - it should never
-	 * be called.
-	 *
-	 * @param fromList			The FROM list to use for binding
-	 * @param subqueryList		The SubqueryList we are building as we hit
-	 *							SubqueryNodes.
-	 * @param aggregateVector	The aggregate vector being built as we find AggregateNodes
-	 *
-	 * @return	The new top of the expression tree.
-	 *
-	 * @exception StandardException	Thrown on error
-	 */
-
-	public ValueNode bindExpression(
-			FromList fromList, SubqueryList subqueryList,
-			Vector aggregateVector, boolean forQueryRewrite) 
-				throws StandardException
-	{
-		/* There are a bizillion classes which extend ValueNode.  Here is info
-		 * on some of the classes that bindExpression() should not be called on
-		 * and why:
-		 *	o  BaseColumnNodes should only appear under the ResultColumnList
-		 *     in the FromBaseTable.  They are created/bound when binding the
-		 *     FromBaseTable.
-		 */
-		if (SanityManager.DEBUG)
+		// We only consider binary relational operators here.
+		if (!(getAndNode().getLeftOperand()
+			instanceof BinaryRelationalOperatorNode))
 		{
-			SanityManager.ASSERT(false, 
-						"bindExpression() not expected to be called on a " + 
-						this.getClass().toString());
+			return "";
 		}
 
-		return this;
+		final String DUMMY_VAL = "<expr>";
+		java.lang.StringBuffer sBuf = new java.lang.StringBuffer();
+		BinaryRelationalOperatorNode opNode =
+			(BinaryRelationalOperatorNode)getAndNode().getLeftOperand();
+
+		// Get left operand's name.
+		if (opNode.getLeftOperand() instanceof ColumnReference)
+		{
+			sBuf.append(
+				((ColumnReference)opNode.getLeftOperand()).getTableName() +
+				"." +
+				((ColumnReference)opNode.getLeftOperand()).getColumnName()
+			);
+		}
+		else
+			sBuf.append(DUMMY_VAL);
+
+		// Get the operator type.
+		sBuf.append(" " + opNode.operator + " ");
+
+		// Get right operand's name.
+		if (opNode.getRightOperand() instanceof ColumnReference) {
+			sBuf.append(
+				((ColumnReference)opNode.getRightOperand()).getTableName() +
+				"." +
+				((ColumnReference)opNode.getRightOperand()).getColumnName()
+			);
+		}
+		else
+			sBuf.append(DUMMY_VAL);
+
+		return sBuf.toString();
 	}
 
 	/**
-	 * Generate a SQL->Java->SQL conversion tree above the current node
-	 * and bind the new nodes individually.
-	 * This is useful when doing comparisons, built-in functions, etc. on
-	 * java types which have a direct mapping to system built-in types.
+	 * Prints the sub-nodes of this object.  See QueryTreeNode.java for
+	 * how tree printing is supposed to work.
 	 *
-	 * @return ValueNode	The new tree.
-	 *
-	 * @exception StandardException	Thrown on error
+	 * @param depth		The depth of this node in the tree
 	 */
-	public ValueNode genSQLJavaSQLTree()
-		throws StandardException
+
+	public void printSubNodes(int depth)
 	{
 		if (SanityManager.DEBUG)
 		{
-			SanityManager.ASSERT(getTypeId() != null,
-				"genSQLJavaSQLTree() only expected to be called on a bound node");
-			SanityManager.ASSERT(getTypeId().userType(),
-				"genSQLJavaSQLTree() only expected to be called on user types");
+			printLabel(depth, "andNode: ");
+			andNode.treePrint(depth + 1);
+			super.printSubNodes(depth);
+		}
+	}
+
+	/**
+	 * Accept the visitor for all visitable children of this node.
+	 * 
+	 * @param v the visitor
+	 *
+	 * @exception StandardException on error
+	 */
+	void acceptChildren(Visitor v)
+		throws StandardException
+	{
+		super.acceptChildren(v);
+
+		if (andNode != null)
+		{
+			andNode = (AndNode)andNode.accept(v);
+		}
+	}
+
+	/**
+	 * Copy all fields of this Predicate (except the two that
+	 * are set from 'init').
+	 *
+	 */
+
+	public void copyFields(Predicate otherPred) {
+
+		this.equivalenceClass = otherPred.getEquivalenceClass();
+		this.indexPosition = otherPred.getIndexPosition();
+		this.startKey = otherPred.isStartKey();
+		this.stopKey = otherPred.isStopKey();
+		this.isQualifier = otherPred.isQualifier();
+		this.searchClauseHT = otherPred.getSearchClauseHT();
+
+	}
+
+	/**
+	 * Get the search clause Hash Table.
+	 */
+
+	public Hashtable getSearchClauseHT() {
+		return searchClauseHT;
+	}
+
+	/**
+	 * Determine whether or not this predicate is eligible for
+	 * push-down into subqueries.  Right now the only predicates
+	 * we consider to be eligible are those which 1) are Binary
+	 * Relational operator nodes and 2) have a column reference
+	 * on BOTH sides, each of which has a reference to a base
+	 * table somewhere beneath it.
+	 *
+	 * @return Whether or not this predicate is eligible to be
+	 *  pushed into subqueries.
+	 */
+	protected boolean pushableToSubqueries()
+		throws StandardException
+	{
+		if (!isJoinPredicate())
+			return false;
+
+		// Make sure both column references ultimately point to base
+		// tables.  If, for example, either column reference points to a
+		// a literal or an aggregate, then we do not push the predicate.
+		// This is because pushing involves remapping the references--
+		// but if the reference doesn't have a base table beneath it,
+		// the notion of "remapping" it doesn't (seem to) apply.  RESOLVE:
+		// it might be okay to make the "remap" operation a no-op for
+		// such column references, but it's not clear whether that's
+		// always a safe option; further investigation required.
+
+		BinaryRelationalOperatorNode opNode =
+			(BinaryRelationalOperatorNode)getAndNode().getLeftOperand();
+
+		JBitSet tNums = new JBitSet(getReferencedSet().size());
+		BaseTableNumbersVisitor btnVis = new BaseTableNumbersVisitor(tNums);
+		opNode.getLeftOperand().accept(btnVis);
+		if (tNums.getFirstSetBit() == -1)
+			return false;
+
+		tNums.clearAll();
+		opNode.getRightOperand().accept(btnVis);
+		if (tNums.getFirstSetBit() == -1)
+			return false;
+
+		return true;
+	}
+
+	/**
+	 * Is this predicate a join predicate?  In order to be so,
+	 * it must be a binary relational operator node that has
+	 * a column reference on both sides.
+	 *
+	 * @return Whether or not this is a join predicate.
+	 */
+	protected boolean isJoinPredicate()
+	{
+		// If the predicate isn't a binary relational operator,
+		// then it's not a join predicate.
+		if (!(getAndNode().getLeftOperand()
+			instanceof BinaryRelationalOperatorNode))
+		{
+			return false;
 		}
 
-		JavaValueNode stjvn = (JavaValueNode) getNodeFactory().getNode(
-									C_NodeTypes.SQL_TO_JAVA_VALUE_NODE,
-									this,
-									getContextManager());
+		BinaryRelationalOperatorNode opNode =
+			(BinaryRelationalOperatorNode)getAndNode().getLeftOperand();
 
-		ValueNode jtsvn = (ValueNode) getNodeFactory().getNode(
-									C_NodeTypes.JAVA_TO_SQL_VALUE_NODE,
-									stjvn,
-									getContextManager());
-		jtsvn.setType(DataTypeDescriptor.getSQLDataTypeDescriptor(stjvn.getJavaTypeName()));
-		return jtsvn;
+		// If both sides are column references AND they point to different
+		// tables, then this is a join pred.
+		return ((opNode.getLeftOperand() instanceof ColumnReference) &&
+			(opNode.getRightOperand() instanceof ColumnReference) &&
+			(((ColumnReference)opNode.getLeftOperand()).getTableNumber() !=
+			((ColumnReference)opNode.getRightOperand()).getTableNumber()));
 	}
 
 	/**
-	 * Preprocess an expression tree.  We do a number of transformations
-	 * here (including subqueries, IN lists, LIKE and BETWEEN) plus
-	 * subquery flattening.
-	 * NOTE: This is done before the outer ResultSetNode is preprocessed.
+	 * If this predicate's operator is a BinaryRelationalOperatorNode,
+	 * then look at the operands and return a new, equivalent predicate
+	 * that is "scoped" to the received ResultSetNode.  By "scoped" we
+	 * mean that the operands, which shold be column references, have been
+	 * mapped to the appropriate result columns in the received RSN.
+	 * This is useful for pushing predicates from outer queries down
+	 * into inner queries, in which case the column references need
+	 * to be remapped.
 	 *
-	 * @param	numTables			Number of tables in the DML Statement
-	 * @param	outerFromList		FromList from outer query block
-	 * @param	outerSubqueryList	SubqueryList from outer query block
-	 * @param	outerPredicateList	PredicateList from outer query block
+	 * For example, let V1 represent
 	 *
-	 * @return		The modified expression
+	 *    select i,j from t1 UNION select i,j from t2
+	 * 
+	 * and V2 represent
 	 *
-	 * @exception StandardException		Thrown on error
+	 *    select a,b from t3 UNION select a,b from t4
+	 * 
+	 * Then assume we have the following query:
+	 *
+	 *    select * from V1, V2 where V1.j = V2.b
+	 *
+	 * Let's further assume that this Predicate object represents the
+	 * "V1.j = V2.b" operator and that the childRSN we received
+	 * as a parameter represents one of the subqueries to which we
+	 * want to push the predicate; let's say it's:
+	 *
+	 *    select i,j from t1
+	 *
+	 * Then this method will return a new predicate whose binary
+	 * operator represents the expression "T1.j = V2.b" (that is, V1.j
+	 * will be mapped to the corresponding column in T1).  For more on
+	 * how that mapping is made, see the "getScopedOperand()" method
+	 * in BinaryRelationalOperatorNode.java.
+	 *
+	 * ASSUMPTION: We should only get to this method if we know that
+	 * at least one operand in this predicate can and should be mapped
+	 * to the received childRSN.  For an example of where that check is
+	 * made, see the pushOptPredicate() method in SetOperatorNode.java.
+	 *
+	 * @param parentRSNsTables Set of all table numbers referenced by
+	 *  the ResultSetNode that is _parent_ to the received childRSN.
+	 *  We need this to make sure we don't scope the operands to a
+	 *  ResultSetNode to which they don't apply.
+	 * @param childRSN The result set node for which we want to create
+	 *  a scoped predicate.
+	 * @param whichRC If not -1 then this tells us which ResultColumn
+	 *  in the received childRSN we need to use for the scoped predicate;
+	 *  if -1 then the column position of the scoped column reference
+	 *  will be stored in this array and passed back to the caller.
+	 * @return A new predicate whose operands have been scoped to the
+	 *  received childRSN.
 	 */
-	public ValueNode preprocess(int numTables,
-								FromList outerFromList,
-								SubqueryList outerSubqueryList,
-								PredicateList outerPredicateList) 
-					throws StandardException
+	protected Predicate getPredScopedForResultSet(
+		JBitSet parentRSNsTables, ResultSetNode childRSN,
+		int [] whichRC) throws StandardException
 	{
-		return this;
-	}
-
-    /**
-     * If this node is known to always evaluate to the same value, return a
-     * node that represents that known value as a constant. Typically used to
-     * transform operators with constant operands into constants.
-     *
-     * @return a constant representing the value to which this node is
-     * guaranteed to evaluate, or {@code this} if the value is not known
-     * @throws StandardException if an error occurs during evaluation
-     * @see ConstantExpressionVisitor
-     */
-    ValueNode evaluateConstantExpressions() throws StandardException {
-        // We normally don't know what the node evaluates to up front, so
-        // don't do anything in the default implementation.
-        return this;
-    }
-
-	/**
-	 * Eliminate NotNodes in the current query block.  We traverse the tree, 
-	 * inverting ANDs and ORs and eliminating NOTs as we go.  We stop at 
-	 * ComparisonOperators and boolean expressions.  We invert 
-	 * ComparisonOperators and replace boolean expressions with 
-	 * boolean expression = false.
-	 * NOTE: Since we do not recurse under ComparisonOperators, there
-	 * still could be NotNodes left in the tree.
-	 *
-	 * @param	underNotNode		Whether or not we are under a NotNode.
-	 *							
-	 *
-	 * @return		The modified expression
-	 *
-	 * @exception StandardException		Thrown on error
-	 */
-	ValueNode eliminateNots(boolean underNotNode) 
-					throws StandardException
-	{
-		if (! underNotNode)
+		// We only deal with binary relational operators here.
+		if (!(getAndNode().getLeftOperand()
+			instanceof BinaryRelationalOperatorNode))
 		{
 			return this;
 		}
 
-		/* bind() has ensured that this node's type is SQLBoolean */
-		if (SanityManager.DEBUG)
-		SanityManager.ASSERT(
-				getTypeId().isBooleanTypeId(),
-					"Node's type (" +
-					getTypeId().getSQLTypeName() +
-					") is expected to be boolean");
+		// The predicate must have an AndNode in CNF, so we
+		// need to create an AndNode representing:
+		//    <scoped_bin_rel_op> AND TRUE
+		// First create the boolean constant for TRUE.
+		ValueNode trueNode = (ValueNode) getNodeFactory().getNode(
+			C_NodeTypes.BOOLEAN_CONSTANT_NODE,
+			Boolean.TRUE,
+			getContextManager());
 
-		/* Return ValueNode = false */
-		return genEqualsFalseTree();
+		BinaryRelationalOperatorNode opNode =
+			(BinaryRelationalOperatorNode)getAndNode().getLeftOperand();
+
+		// Create a new op node with left and right operands that point
+		// to the received result set's columns as appropriate.
+		BinaryRelationalOperatorNode newOpNode = 
+			(BinaryRelationalOperatorNode) getNodeFactory().getNode(
+				opNode.getNodeType(),
+				opNode.getScopedOperand(
+					BinaryRelationalOperatorNode.LEFT,
+					parentRSNsTables,
+					childRSN,
+					whichRC),
+				opNode.getScopedOperand(
+					BinaryRelationalOperatorNode.RIGHT,
+					parentRSNsTables,
+					childRSN,
+					whichRC),
+				getContextManager());
+
+		// Bind the new op node.
+		newOpNode.bindComparisonOperator();
+
+		// Create and bind a new AND node in CNF form,
+		// i.e. "<newOpNode> AND TRUE".
+		AndNode newAnd = (AndNode) getNodeFactory().getNode(
+			C_NodeTypes.AND_NODE,
+			newOpNode,
+			trueNode,
+			getContextManager());
+		newAnd.postBindFixup();
+
+		// Categorize the new AND node; among other things, this
+		// call sets up the new operators's referenced table map,
+		// which is important for correct pushing of the new
+		// predicate.
+		JBitSet tableMap = new JBitSet(
+			childRSN.getReferencedTableMap().size());
+		newAnd.categorize(tableMap, false);
+
+		// Now put the pieces together to get a new predicate.
+		Predicate newPred = (Predicate) getNodeFactory().getNode(
+			C_NodeTypes.PREDICATE,
+			newAnd,
+			tableMap,
+			getContextManager());
+
+		// Copy all of this predicates other fields into the new predicate.
+		newPred.clearScanFlags();
+		newPred.copyFields(this);
+		newPred.setPushable(getPushable());
+
+		// Take note of the fact that the new predicate is scoped for
+		// the sake of pushing; we need this information during optimization
+		// to figure out what we should and should not "pull" back up.
+		newPred.markAsScopedForPush();
+		return newPred;
 	}
 
 	/**
-	 * Transform this into this = false.  Useful for NOT elimination.
-	 *
-	 *
-	 * @return		The modified expression
-	 *
-	 * @exception StandardException		Thrown on error
+	 * Indicate that this predicate is a scoped copy of some other
+	 * predicate (i.e. it was created as the result of a call to
+	 * getPredScopedForResultSet() on some other predicate).
 	 */
-	public ValueNode genEqualsFalseTree()
-			throws StandardException
-	{
-		BinaryRelationalOperatorNode equalsNode;
-		BooleanConstantNode		 falseNode;
-		boolean 				nullableResult;
-		NodeFactory				nodeFactory = getNodeFactory();
-
-		falseNode = (BooleanConstantNode) nodeFactory.getNode(
-									C_NodeTypes.BOOLEAN_CONSTANT_NODE,
-									Boolean.FALSE,
-									getContextManager());
-		equalsNode = (BinaryRelationalOperatorNode)
-							nodeFactory.getNode(
-								C_NodeTypes.BINARY_EQUALS_OPERATOR_NODE,
-								this,
-								falseNode,
-								getContextManager());
-		nullableResult = getTypeServices().isNullable();
-		equalsNode.setType(new DataTypeDescriptor(
-									TypeId.BOOLEAN_ID,
-									nullableResult)
-						  );
-		return equalsNode;
+	protected void markAsScopedForPush() {
+		this.scoped = true;
 	}
 
 	/**
-	 * Transform this into this is null.  Useful for NOT elimination.
-	 *
-	 * @return		The modified expression
-	 *
-	 * @exception StandardException		Thrown on error
+	 * Return whether or not this predicate is a scoped copy of
+	 * another predicate.
 	 */
-	public ValueNode genIsNullTree()
-			throws StandardException
-	{
-		IsNullNode isNullNode;
-
-		isNullNode = (IsNullNode)
-							getNodeFactory().getNode(
-													C_NodeTypes.IS_NULL_NODE,
-													this,
-													getContextManager());
-		isNullNode.setType(new DataTypeDescriptor(
-									TypeId.BOOLEAN_ID,
-									false)
-						  );
-		return isNullNode;
+	protected boolean isScopedForPush() {
+		return scoped;
 	}
 
 	/**
-	 * Verify that eliminateNots() did its job correctly.  Verify that
-	 * there are no NotNodes above the top level comparison operators
-	 * and boolean expressions.
+	 * When remapping a "normal" (i.e. non-scoped) predicate both
+	 * of the predicate's operands are remapped and that's it.
+	 * But when remapping a scoped predicate, things are slightly
+	 * different.  This method handles remapping of scoped predicates.
 	 *
-	 * @return		Boolean which reflects validity of the tree.
-	 */
-	boolean verifyEliminateNots()
-	{
-		if (SanityManager.ASSERT)
-		{
-			return (! (this instanceof NotNode));
-		}
-		else
-		{
-			return true;
-		}
-	}
-
-	/**
-	 * Do the 1st step in putting an expression into conjunctive normal
-	 * form.  This step ensures that the top level of the expression is
-	 * a chain of AndNodes.
+	 * We know that, for a scoped predicate, exactly one operand has
+	 * been scoped for a specific target result set; the other operand
+	 * is pointing to some other instance of FromTable with which the
+	 * target result set is to be joined (see getScopedOperand() in
+	 * BinaryRelationalOperatorNode.java).  For every level of the
+	 * query through which the scoped predicate is pushed, we have
+	 * to perform a remap operation of the scoped operand.  We do
+	 * *not*, however, remap the non-scoped operand.  The reason
+	 * is that the non-scoped operand is already pointing to the
+	 * result set against which it must be evaluated.  As the scoped
+	 * predicate is pushed down the query tree, the non-scoped
+	 * operand should not change where it's pointing and thus should
+	 * not be remapped.  For example, assume we have a query whose
+	 * tree has the following form:
 	 *
-	 * @return		The modified expression
+	 *               SELECT[0] 
+	 *                /     \ 
+	 *              PRN      PRN 
+	 *               |        |
+	 *          SELECT[4]   UNION
+	 *           |           /   \ 
+	 *          PRN     SELECT[1]  SELECT[2] 
+	 *           |         |          | 
+	 *       <FBT:T1>     PRN        PRN 
+	 *                     |          |
+	 *                SELECT[3]  <FromBaseTable:T2> 
+	 *                     |
+	 *                    PRN
+	 *                     |
+	 *             <FromBaseTable:T3>
 	 *
-	 * @exception StandardException		Thrown on error
-	 */
-	public ValueNode putAndsOnTop() 
-					throws StandardException
-	{
-		NodeFactory		nodeFactory = getNodeFactory();
-
-        QueryTreeNode trueNode = (QueryTreeNode) nodeFactory.getNode(
-										C_NodeTypes.BOOLEAN_CONSTANT_NODE,
-										Boolean.TRUE,
-										getContextManager());
-		AndNode andNode = (AndNode) nodeFactory.getNode(
-										C_NodeTypes.AND_NODE,
-										this,
-										trueNode,
-										getContextManager());
-		andNode.postBindFixup();
-		return andNode;
-	}
-
-	/**
-	 * Verify that putAndsOnTop() did its job correctly.  Verify that the top level 
-	 * of the expression is a chain of AndNodes.
-	 *
-	 * @return		Boolean which reflects validity of the tree.
-	 */
-	public boolean verifyPutAndsOnTop()
-	{
-		return true;
-	}
-
-	/**
-	 * Finish putting an expression into conjunctive normal
-	 * form.  An expression tree in conjunctive normal form meets
-	 * the following criteria:
-	 *		o  If the expression tree is not null,
-	 *		   the top level will be a chain of AndNodes terminating
-	 *		   in a true BooleanConstantNode.
-	 *		o  The left child of an AndNode will never be an AndNode.
-	 *		o  Any right-linked chain that includes an AndNode will
-	 *		   be entirely composed of AndNodes terminated by a true BooleanConstantNode.
-	 *		o  The left child of an OrNode will never be an OrNode.
-	 *		o  Any right-linked chain that includes an OrNode will
-	 *		   be entirely composed of OrNodes terminated by a false BooleanConstantNode.
-	 *		o  ValueNodes other than AndNodes and OrNodes are considered
-	 *		   leaf nodes for purposes of expression normalization.
-	 *		   In other words, we won't do any normalization under
-	 *		   those nodes.
-	 *
-	 * In addition, we track whether or not we are under a top level AndNode.  
-	 * SubqueryNodes need to know this for subquery flattening.
-	 *
-	 * @param	underTopAndNode		Whether or not we are under a top level AndNode.
-	 *							
-	 *
-	 * @return		The modified expression
-	 *
-	 * @exception StandardException		Thrown on error
-	 */
-	public ValueNode changeToCNF(boolean underTopAndNode) 
-					throws StandardException
-	{
-		return this;
-	}
-
-	/**
-	 * Verify that changeToCNF() did its job correctly.  Verify that:
-	 *		o  AndNode  - rightOperand is not instanceof OrNode
-	 *				      leftOperand is not instanceof AndNode
-	 *		o  OrNode	- rightOperand is not instanceof AndNode
-	 *					  leftOperand is not instanceof OrNode
-	 *
-	 * @return		Boolean which reflects validity of the tree.
-	 */
-	public boolean verifyChangeToCNF()
-	{
-		return true;
-	}
-
-	/**
-	 * Categorize this predicate.  Initially, this means
-	 * building a bit map of the referenced tables for each predicate.
-	 * If the source of this ColumnReference (at the next underlying level) 
-	 * is not a ColumnReference or a VirtualColumnNode then this predicate
-	 * will not be pushed down.
-	 *
-	 * For example, in:
-	 *		select * from (select 1 from s) a (x) where x = 1
-	 * we will not push down x = 1.
-	 * NOTE: It would be easy to handle the case of a constant, but if the
-	 * inner SELECT returns an arbitrary expression, then we would have to copy
-	 * that tree into the pushed predicate, and that tree could contain
-	 * subqueries and method calls.
-	 * RESOLVE - revisit this issue once we have views.
-	 *
-	 * @param referencedTabs	JBitSet with bit map of referenced FromTables
-	 * @param simplePredsOnly	Whether or not to consider method
-	 *							calls, field references and conditional nodes
-	 *							when building bit map
-	 *
-	 * @return boolean		Whether or not source.expression is a ColumnReference
-	 *						or a VirtualColumnNode.
-	 *
-	 * @exception StandardException			Thrown on error
-	 */
-	public boolean categorize(JBitSet referencedTabs, boolean simplePredsOnly)
-		throws StandardException
-	{
-		return true;
-	}
-
-	/**
-	 * This returns the user-supplied schema name of the column.
-	 * At this class level, it simply returns null. But, the subclasses
-	 * of ValueNode will overwrite this method to return the
-	 * user-supplied schema name.
+	 * Assume also that we have some predicate "SELECT[4].i = <UNION>.j".
+	 * If the optimizer decides to push the predicate to the UNION
+	 * node, it (the predicate) will be scoped to the UNION's children,
+	 * yielding something like "SELECT[4].i = SELECT[1].j" for the
+	 * left child and "SELECT[4].i = SELECT[2].j" for the right child.
+	 * These scoped predicates will then be pushed to the PRNs above
+	 * SELECT[3] and T2, respectively.  As part of that pushing
+	 * process a call to PRN.pushOptPredicate() will occur, which
+	 * brings us to this method.  So let's assume we're here for
+	 * the scoped predicate "SELECT[4].i = SELECT[1].j".  Then we want
+	 * to remap the scoped operand, "SELECT[1].j", so that it will
+	 * point to the correct column in "SELECT[3]".  We do NOT, however,
+	 * want to remap the non-scoped operand "SELECT[4].i" because that
+	 * operand is already pointing to the correct result set--namely,
+	 * to a column in SELECT[4].  That non-scoped operand should not
+	 * change regardless of how far down the UNION subtree the scoped
+	 * predicate is pushed.
 	 * 
-	 * When the value node is in a result column of a select list,
-	 * the user can request metadata information. The result column
-	 * won't have a column descriptor, so we return some default
-	 * information through the expression. This lets expressions that
-	 * are simply columns return all of the info, and others use
-	 * this supertype's default values.
+	 * If we did try to remap the non-scoped operand, it would end up
+	 * pointing to result sets too low in the tree, which could lead to
+	 * execution-time errors.  So when we remap a scoped predicate, we
+	 * have to make sure we only remap the scoped operand.  That's what
+	 * this method does.
 	 *
-	 * @return the default schema name for an expression -- null
+	 * @return True if this predicate is a scoped predicate, in which
+	 *  case we performed a one-sided remap.  False if the predicate is
+	 *  not scoped; the caller can then make the calls to perform a
+	 *  "normal" remap on this predicate.
 	 */
-	public String getSchemaName() throws StandardException
+	protected boolean remapScopedPred()
 	{
-		return null;
-	}
+		if (!scoped)
+			return false;
 
-	/**
-	 * This returns the user-supplied table name of the column.
-	 * At this class level, it simply returns null. But, the subclasses
-	 * of ValueNode will overwrite this method to return the
-	 * user-supplied table name.
-	 *
-	 * When the value node is in a result column of a select list,
-	 * the user can request metadata information. The result column
-	 * won't have a column descriptor, so we return some default
-	 * information through the expression. This lets expressions that
-	 * are simply columns return all of the info, and others use
-	 * this supertype's default values.
-	 *
-	 * @return the default table name for an expression -- null
-	 */
-	public String getTableName()
-	{
-		return null;
-	}
-
-	/**
-	 * @return the default updatability for an expression - false
-	 */
-	public boolean updatableByCursor()
-	{
-		return false;
-	}
-
-	/**
-	 * This is null so that the caller will substitute in the resultset generated
-	 * name as needed.
-	 *
-	 * @return the default column name for an expression -- null.
-	 */
-	public String getColumnName()
-	{
-		return null;
-	}
-
-	/**
-	 * Get a bit map of table references in this expression
-	 *
-	 * @return	A bit map of table numbers referred to in this expression
-	 *
-	 * @exception StandardException			Thrown on error
-	 */
-	JBitSet getTablesReferenced()
-		throws StandardException
-	{
-		ReferencedTablesVisitor rtv = new ReferencedTablesVisitor(new JBitSet(0));
-		accept(rtv);
-		return rtv.getTableMap();
-	}
-
-	/**
-	 * Return whether or not this expression tree is cloneable.
-	 *
-	 * @return boolean	Whether or not this expression tree is cloneable.
-	 */
-	public boolean isCloneable()
-	{
-		return false;
-	}
-
-	/**
-	 * Return a clone of this node.
-	 *
-	 * @return ValueNode	A clone of this node.
-	 *
-	 * @exception StandardException			Thrown on error
-	 */
-	public ValueNode getClone() throws StandardException
-	{
-		if (SanityManager.DEBUG)
-		{
-			SanityManager.ASSERT(false,
-				"getClone() not expected to be called for " +
-				getClass().getName());
-		}
-		return null;
-	}
-
-	/**
-	 * Copy all of the "appropriate fields" for a shallow copy.
-	 *
-	 * @param oldVN		The ValueNode to copy from.
-	 *
-	 */
-	public void copyFields(ValueNode oldVN) throws StandardException
-	{
-		dataTypeServices = oldVN.getTypeServices();
-	}
-
-	/**
-	 * Remap all ColumnReferences in this tree to be clones of the
-	 * underlying expression.
-	 *
-	 * @return ValueNode			The remapped expression tree.
-	 *
-	 * @exception StandardException			Thrown on error
-	 */
-	public ValueNode remapColumnReferencesToExpressions() throws StandardException
-	{
-		return this;
-	}
-
-	/**
-	 * Return whether or not this expression tree represents a constant expression.
-	 *
-	 * @return	Whether or not this expression tree represents a constant expression.
-	 */
-	public boolean isConstantExpression()
-	{
-		return false;
-	}
-
-	/**
-	 * Return whether or not this expression tree represents a constant value.
-	 * In this case, "constant" means that it will always evaluate to the
-	 * same thing, even if it includes columns.  A column is constant if it
-	 * is compared to a constant expression.
-	 *
-	 * @return	True means this expression tree represents a constant value.
-	 */
-	public boolean constantExpression(PredicateList whereClause)
-	{
-		return false;
-	}
-
-	/**
-	 * Return the variant type for the underlying expression.
-	 * The variant type can be:
-	 *		VARIANT				- variant within a scan
-	 *							  (method calls and non-static field access)
-	 *		SCAN_INVARIANT		- invariant within a scan
-	 *							  (column references from outer tables)
-	 *		QUERY_INVARIANT		- invariant within the life of a query
-	 *							  (constant expressions)
-	 *
-	 * @return	The variant type for the underlying expression.
-	 * @exception StandardException		Thrown on error
-	 */
-	protected int getOrderableVariantType() throws StandardException
-	{
-		// The default is VARIANT
-		return Qualifier.VARIANT;
-	}
-
-
-	/**
-	  * Bind time logic. Raises an error if this ValueNode does not resolve to
-	  *	a boolean value. This method is called by WHERE clauses.
-	  *
-	  *	@return	bound coercion of this node to a builtin type as necessary
-	  *
-	  * @exception StandardException		Thrown on error
-	  */
-	public	ValueNode	checkIsBoolean()
-		throws StandardException
-	{
-		ValueNode	whereClause = this;
-
-		/*
-		** Is the datatype of the WHERE clause BOOLEAN?
-		**
-		** NOTE: This test is not necessary in SQL92 entry level, because
-		** it is syntactically impossible to have a non-Boolean WHERE clause
-		** in that level of the standard.  But we intend to extend the
-		** language to allow Boolean user functions in the WHERE clause,
-		** so we need to test for the error condition.
-		*/
-		TypeId whereTypeId = whereClause.getTypeId();
-
-		/* If the where clause is not a built-in type, then generate a bound 
-		 * conversion tree to a built-in type.
+		/* Note: right now the only predicates we scope are those
+		 * which are join predicates and all scoped predicates will
+		 * have the same relational operator as the predicates from
+		 * which they were scoped.  Thus if we get here, we know
+		 * that andNode's leftOperand must be an instance of
+		 * BinaryRelationalOperatorNode (and therefore the following
+		 * cast is safe).
 		 */
-		if (whereTypeId.userType())
+		BinaryRelationalOperatorNode binRelOp =
+			(BinaryRelationalOperatorNode)andNode.getLeftOperand();
+
+		ValueNode operand = null;
+
+		if (SanityManager.DEBUG)
 		{
-			whereClause = whereClause.genSQLJavaSQLTree();
-			whereTypeId = whereClause.getTypeId();
+			/* If this predicate is scoped then one (and only one) of
+			 * its operands should be scoped.  Note that it's possible
+			 * for an operand to be scoped to a non-ColumnReference
+			 * value; if either operand is not a ColumnReference, then
+			 * that operand must be the scoped operand.
+			 */
+			operand = binRelOp.getLeftOperand();
+			boolean leftIsScoped =
+				!(operand instanceof ColumnReference) ||
+					((ColumnReference)operand).isScoped();
+
+			operand = binRelOp.getRightOperand();
+			boolean rightIsScoped =
+				!(operand instanceof ColumnReference) ||
+					((ColumnReference)operand).isScoped();
+
+			SanityManager.ASSERT(leftIsScoped ^ rightIsScoped,
+				"All scoped predicates should have exactly one scoped " +
+				"operand, but '" + binaryRelOpColRefsToString() +
+				"' has " + (leftIsScoped ? "TWO" : "NONE") + ".");
 		}
 
-		if (! whereTypeId.equals(TypeId.BOOLEAN_ID))
+		// Find the scoped operand and remap it.
+		operand = binRelOp.getLeftOperand();
+		if ((operand instanceof ColumnReference) &&
+			((ColumnReference)operand).isScoped())
 		{
-			throw StandardException.newException(SQLState.LANG_NON_BOOLEAN_WHERE_CLAUSE, 
-				whereTypeId.getSQLTypeName()
-				);
+			// Left operand is the scoped operand.
+			((ColumnReference)operand).remapColumnReferences();
+		}
+		else
+		{
+			operand = binRelOp.getRightOperand();
+			if ((operand instanceof ColumnReference) &&
+				((ColumnReference)operand).isScoped())
+			{
+				// Right operand is the scoped operand.
+				((ColumnReference)operand).remapColumnReferences();
+			}
+
+			// Else scoped operand is not a ColumnReference, which
+			// means it can't (and doesn't need to) be remapped. So
+			// just fall through and return.
 		}
 
-		return	whereClause;
+		return true;
 	}
 
 	/**
-	 * Return an Object representing the bind time value of this
-	 * expression tree.  If the expression tree does not evaluate to
-	 * a constant at bind time then we return null.
-	 * This is useful for bind time resolution of VTIs.
-	 * RESOLVE: What do we do for primitives?
+	 * Return true if this predicate is scoped AND the scoped
+	 * operand is a ColumnReference that points to a source result
+	 * set.  If the scoped operand is not a ColumnReference that
+	 * points to a source result set then it must be pointing to
+	 * some kind of expression, such as a literal (ex. 'strlit'),
+	 * an aggregate value (ex. "count(*)"), or the result of a
+	 * function (ex. "sin(i)") or operator (ex. "i+1").
 	 *
-	 * @return	An Object representing the bind time value of this expression tree.
-	 *			(null if not a bind time constant.)
+	 * This method is used when pushing predicates to determine how
+	 * far down the query tree a scoped predicate needs to be pushed
+	 * to allow for successful evaluation of the scoped operand.  If
+	 * the scoped operand is not pointing to a source result set
+	 * then it should not be pushed any further down tree.  The reason
+	 * is that evaluation of the expression to which the operand is
+	 * pointing may depend on other values from the current level
+	 * in the tree (ex. "sin(i)" depends on the value of "i", which
+	 * could be a column at the predicate's current level).  If we
+	 * pushed the predicate further down, those values could become
+	 * inaccessible, leading to execution-time errors.
 	 *
-	 * @exception StandardException		Thrown on error
+	 * If, on the other hand, the scoped operand *is* pointing to
+	 * a source result set, then we want to push it further down
+	 * the tree until it reaches that result set, which allows
+	 * evaluation of this predicate to occur as close to store as
+	 * possible.  This method doesn't actually do the push, it just
+	 * returns "true" and then the caller can push as appropriate.
 	 */
-	Object getConstantValueAsObject()
+	protected boolean isScopedToSourceResultSet()
 		throws StandardException
 	{
+		if (!scoped)
+			return false;
+
+		/* Note: right now the only predicates we scope are those
+		 * which are join predicates and all scoped predicates will
+		 * have the same relational operator as the predicates from
+		 * which they were scoped.  Thus if we get here, we know
+		 * that andNode's leftOperand must be an instance of
+		 * BinaryRelationalOperatorNode (and therefore the following
+		 * cast is safe).
+		 */
+		BinaryRelationalOperatorNode binRelOp =
+			(BinaryRelationalOperatorNode)andNode.getLeftOperand();
+
+		ValueNode operand = binRelOp.getLeftOperand();
+
+		/* If operand isn't a ColumnReference then is must be the
+		 * scoped operand.  This is because both operands have to
+		 * be column references in order for scoping to occur (as
+		 * per pushableToSubqueries()) and only the scoped operand
+		 * can change (esp. can become a non-ColumnReference) as
+		 * part of the scoping process.  And since it's not a
+		 * ColumnReference it can't be "a ColumnReference that
+		 * points to a source result set", so return false.
+		 */
+		if (!(operand instanceof ColumnReference))
+			return false;
+
+		/* If the operand is a ColumnReference and is scoped,
+		 * then see if it is pointing to a ResultColumn whose
+		 * expression is either another a CR or a Virtual
+		 * ColumnNode.  If it is then that operand applies
+		 * to a source result set further down the tree and
+		 * thus we return true.
+		 */
+		ValueNode exp = null;
+		ColumnReference cRef = (ColumnReference)operand;
+		if (cRef.isScoped())
+		{
+			exp = cRef.getSource().getExpression();
+			return ((exp instanceof VirtualColumnNode) ||
+				(exp instanceof ColumnReference));
+		}
+
+		operand = binRelOp.getRightOperand();
+		if (!(operand instanceof ColumnReference))
+			return false;
+
+		cRef = (ColumnReference)operand;
+		if (SanityManager.DEBUG)
+		{
+			// If we got here then the left operand was NOT the scoped
+			// operand; make sure the right one is scoped, then.
+			SanityManager.ASSERT(cRef.isScoped(),
+				"All scoped predicates should have exactly one scoped " +
+				"operand, but '" + binaryRelOpColRefsToString() +
+				"has NONE.");
+		}
+
+		exp = cRef.getSource().getExpression();
+		return ((exp instanceof VirtualColumnNode) ||
+			(exp instanceof ColumnReference));
+	}
+
+	/**
+	 * Return whether or not this predicate corresponds to a legitimate
+	 * relational operator.
+	 *
+	 * @return False if there is no relational operator for this predicate
+	 *  OR if this predicate is an internal "probe predicate" (in which
+	 *  case it "looks" like we have a relational operator but in truth
+	 *  it's a disguised IN-list operator). True otherwise.
+	 */
+	protected boolean isRelationalOpPredicate()
+	{
+		/* The isRelationalOperator() method on the ValueNode
+		 * interface tells us what we need to know, so all we have
+		 * to do is call that method on the left child of our AND node.
+		 * Note that BinaryRelationalOperatorNode.isRelationalOperator()
+		 * includes logic to determine whether or not it (the BRON) is
+		 * really a disguised IN-list operator--and if so, it will
+		 * return false (which is what we want).
+		 */
+		return andNode.getLeftOperand().isRelationalOperator();
+	}
+
+	/**
+	 * Return whether or not this predicate is an IN-list probe
+	 * predicate.
+	 */
+	protected boolean isInListProbePredicate()
+	{
+		/* The isInListProbeNode() method on the ValueNode interface
+		 * tells us what we need to know, so all we have to do is call
+		 * that method on the left child of our AND node.
+		 */
+		return andNode.getLeftOperand().isInListProbeNode();
+	}
+
+	/**
+	 * If this predicate corresponds to an IN-list, return the underlying
+	 * InListOperatorNode from which it was built.  There are two forms
+	 * to check for:
+	 *
+	 *  1. This predicate is an IN-list "probe predicate", in which case
+	 *     the underlying InListOpNode is stored within the binary relational
+	 *     operator that is the left operand of this predicate's AND node.
+	 *
+	 *  2. This predicate corresponds to an IN-list that could _not_ be
+	 *     transformed into a "probe predicate" (i.e. the IN-list contains
+	 *     one or more non-parameter, non-constant values). In that case
+	 *     the underlying InListOpNode is simply the left operand of
+	 *     this predicate's AND node.
+	 *
+	 * If this predicate does not correspond to an IN-list in any way,
+	 * this method will return null.
+	 */
+	protected InListOperatorNode getSourceInList()
+	{
+		return getSourceInList(false);
+	}
+
+	/**
+	 * Does the work of getSourceInList() above, but can also be called
+	 * directly with an argument to indicate whether or not we should
+	 * limit ourselves to probe predicates.
+	 *
+	 * @param probePredOnly If true, only get the source IN list for this
+	 *   predicate *if* it is an IN-list probe predicate.  If false,
+	 *   return the underlying InListOperatorNode (if it exists) regardless
+	 *   of whether this is a probe predicate or an un-transformed IN-list
+	 *   pred.
+	 * 
+	 * @return Underlying InListOp for this predicate (depending on
+	 *   the value of probePredOnly), or null if this predicate does
+	 *   not correspond to an IN-list in any way.
+	 */
+	protected InListOperatorNode getSourceInList(boolean probePredOnly)
+	{
+		ValueNode vn = andNode.getLeftOperand();
+		if (isInListProbePredicate())
+			return ((BinaryRelationalOperatorNode)vn).getInListOp();
+
+		if (probePredOnly)
+			return null;
+
+		if (vn instanceof InListOperatorNode)
+			return (InListOperatorNode)vn;
+
 		return null;
 	}
-
-	/////////////////////////////////////////////////////////////////////////
-	//
-	//	The ValueNode defers its generate() work to a method that works on
-	//	ExpressionClassBuilders rather than ActivationClassBuilders. This
-	//	is so that expression generation can be shared by the Core compiler
-	//	AND the Replication Filter compiler.
-	//
-	/////////////////////////////////////////////////////////////////////////
-
-
-	/**
-	 * Do the code generation for this node.  Call the more general
-	 * routine that generates expressions.
-	 *
-	 * @param acb	The ActivationClassBuilder for the class being built
-	 * @param mb	The method the expression will go into
-	 *
-	 *
-	 * @exception StandardException		Thrown on error
-	 */
-
-	protected final	void generate(ActivationClassBuilder acb,
-										MethodBuilder mb)
-								throws StandardException
-	{
-		generateExpression( acb, mb );
-	}
-
-	/**
-	 * The only reason this routine exists is so that I don't have to change
-	 * the protection on generateExpression() and rototill all of QueryTree.
-	 *
-	 * @param ecb	The ExpressionClassBuilder for the class being built
-	 * @param mb	The method the expression will go into
-	 *
-	 *
-	 * @exception StandardException		Thrown on error
-	 */
-	public	void generateFilter(ExpressionClassBuilder ecb,
-										MethodBuilder mb)
-		throws StandardException
-	{
-		generateExpression( ecb, mb );
-	}
-	
-
-	/**
-	 * The default selectivity for value nodes is 50%.  This is overridden
-	 * in specific cases, such as the RelationalOperators.
-	 */
-	public double selectivity(Optimizable optTable)
-	throws StandardException
-	{
-		// Return 1 if additional predicates have been generated from this one.
-		if (transformed)
-		{
-			return 1.0;
-		}
-		else
-		{
-			return 0.5d;
-		}
-	}
-
-	/**
-	 * Update the array of columns in = conditions with expressions without
-	 * column references from the same table.  This is useful when doing
-	 * subquery flattening on the basis of an equality condition.
-	 * eqOuterCols or tableColMap may be null if the calling routine
-	 * doesn't need the information provided
-	 *
-	 * @param tableNumber	The tableNumber of the table from which
-	 *						the columns of interest come from.
-	 * @param eqOuterCols	Array of booleans for noting which columns
-	 *						are in = predicates without columns from the
-	 *						subquery block. May be null.
-	 * @param tableNumbers	Array of table numbers in this query block.
-	 * @param tableColMap	Array of bits for noting which columns
-	 *						are in = predicates for each table in the
-	 *						query block. May be null.
-	 * @param resultColTable True if tableNumber is the table containing result
-	 * 						columns
-	 *
-	 * @exception StandardException			Thrown on error
-	 * 
-	 */
-	void checkTopPredicatesForEqualsConditions(
-				int tableNumber, boolean[] eqOuterCols, int[] tableNumbers, 
-				JBitSet[] tableColMap, boolean resultColTable)
-		throws StandardException
-	{
-		for (ValueNode whereWalker = this; whereWalker instanceof AndNode; 
-			 whereWalker = ((AndNode) whereWalker).getRightOperand())
-		{
-			// See if this is a candidate =
-			AndNode and = (AndNode) whereWalker;
-
-			if (!and.getLeftOperand().isRelationalOperator() ||
-				!(((RelationalOperator)(and.getLeftOperand())).getOperator() == RelationalOperator.EQUALS_RELOP))
-			{
-				continue;
-			}
-
-			BinaryRelationalOperatorNode beon =
-					(BinaryRelationalOperatorNode) and.getLeftOperand();
-			ValueNode left = beon.getLeftOperand();
-			ValueNode right = beon.getRightOperand();
-			int resultTable = 0;
-			if (resultColTable)
-			{
-				for ( ; resultTable < tableNumbers.length; resultTable++)
-				{
-					if (tableNumbers[resultTable] == tableNumber)
-						break;
-				}
-			}
-			else
-				resultTable = -1;
-
-			/* Is this = of the right form? */
-			if ((left instanceof ColumnReference) &&
-				((ColumnReference) left).getTableNumber() == tableNumber)
-			{
-				updateMaps(tableColMap, eqOuterCols, tableNumbers, tableNumber,
-					resultTable, right, left);
-			}
-			else if ((right instanceof ColumnReference) &&
-					 ((ColumnReference) right).getTableNumber() == tableNumber)
-			{
-				updateMaps(tableColMap, eqOuterCols, tableNumbers, tableNumber,
-					resultTable, left, right);
-			}
-		}
-	}
-
-	/**
-	 * Does this represent a true constant.
-	 *
-	 * @return Whether or not this node represents a true constant.
-	 */
-	boolean isBooleanTrue()
-	{
-		return false;
-	}
-
-	/**
-	 * Does this represent a false constant.
-	 *
-	 * @return Whether or not this node represents a false constant.
-	 */
-	boolean isBooleanFalse()
-	{
-		return false;
-	}
-
-	/**
-	 * Generate code for this calculation.  This is a place-holder method -
-	 * it should not be called.
-	 *
-	 * @param acb	The ExpressionClassBuilder for the class being built
-	 * @param mb	The method the expression will go into
-	 *
-	 *
-	 * @exception StandardException		Thrown on error
-	 */
-
-	public void generateExpression(ExpressionClassBuilder acb,
-											MethodBuilder mb)
-						throws StandardException
-	{
-		if (SanityManager.DEBUG)
-		SanityManager.ASSERT(false, "Code generation for this type of ValueNode is unimplemented");
-	}
-
-	/**
-	 * Set the correct bits in tableColMap and set the boolean value in eqOuterCols 
-	 * given two arguments to an = predicate
-	 * tableColMap[t] - bit is set if the column is in an = predicate with a column 
-	 *					in table t, or a bit is set if the column is in an 
-	 *					= predicate with a constant,parameter or correlation variable 
-	 *				    (for all table t, if this tableColMap is not for the
-  	 *					table with the result columns)
-	 * eqOuterCols[c] - is true if the column is in an = predicate with a constant,
-	 *					parameter or correlation variable
-	 * 
-	 *
-	 * @param tableColMap	Array of bitmaps for noting which columns are in = 
-	 *						predicates with columns from each table
-	 * @param eqOuterCols	Array of booleans for noting which columns
-	 *						are in = predicates without columns from the
-	 *						subquery block.
-	 * @param tableNumber	table number for which we are setting up the Maps
-	 * @param resultTable	-1 if this table is not the result table; otherwise
-	 *						the index into tableNumbers for the result table
-	 * @param arg1			one side of the = predicate
-	 * @param arg2			other side of the = predicate
-	 *
-	 *
-	 * @exception StandardException		Thrown on error
-	 */
-	private void updateMaps(JBitSet[] tableColMap, boolean[] eqOuterCols,
-		int[] tableNumbers,  int tableNumber, int resultTable,
-		ValueNode arg1, ValueNode arg2)
-			throws StandardException
-	{
-		/* arg2 is a column from our table.  This
-		 * is a good = for both All tables and Outer arrays
-		 * if the right side is a constant or a parameter
-		 * or a column from an outer table.
-		 * It is a good = for only the All array if
-		 * the right side is a column from this query block.
-		 */
-		if ((arg1 instanceof ConstantNode) || (arg1.requiresTypeFromContext()))
-		{
-			setValueCols(tableColMap, eqOuterCols,
-				((ColumnReference) arg2).getColumnNumber(), resultTable);
-		}
-		else if((arg1 instanceof ColumnReference &&
-					((ColumnReference) arg1).getTableNumber() != tableNumber))
-		{
-			/* See if other columns is a correlation column */
-			int otherTN = ((ColumnReference) arg1).getTableNumber();
-			int index = 0;
-			int colNumber =	((ColumnReference) arg2).getColumnNumber();
-
-			for ( ; index < tableNumbers.length; index++)
-			{
-				if (otherTN == tableNumbers[index])
-				{
-					break;
-				}
-			}
-			/* Correlation column, so we can treat it as a constant */
-			if (index == tableNumbers.length)
-			{
-				setValueCols(tableColMap, eqOuterCols, colNumber, resultTable);
-			}
-			else if (tableColMap != null)
-			{
-				tableColMap[index].set(colNumber);
-			}
-
-		}
-		else
-		{
-			/* See if other side contains a column reference from the same table */
-			JBitSet referencedTables = arg1.getTablesReferenced();
-			/* See if other columns are all correlation columns */
-			int index = 0;
-			int colNumber =	((ColumnReference) arg2).getColumnNumber();
-			for ( ; index < tableNumbers.length; index++)
-			{
-				if (referencedTables.get(tableNumbers[index]))
-				{
-					break;
-				}
-			}
-			/* Correlation column, so we can treat it as a constant */
-			if (index == tableNumbers.length)
-			{
-				setValueCols(tableColMap, eqOuterCols, colNumber, resultTable);
-			}
-			else if (tableColMap != null && !referencedTables.get(tableNumber))
-			{
-				tableColMap[index].set(colNumber);
-			}
-		}
-	}
-	/**
-	 * Set eqOuterCols and the column in all the tables for constants,
-	 * parmeters and correlation columns
-	 * The column in the tableColMap is set only for the current table
-	 * if the table is the result column table.  For other tables in the
-	 * query we set the column for all the tables since the constant will
-	 * reduced the number of columns required in a unique multicolumn index for
-	 * distinctness.
-	 * For example, given an unique index on t1(a,b), setting b=1 means that
-	 * t1(a) is unique since there can be no duplicates for a where b=1 without
-	 * destroying the uniqueness of t1(a,b).  However, for the result columns
-	 * setting b=1, does not mean that a select list of t1.a is distinct if
-	 * t1.a is the only column used in joining with another table
-	 * e.g. select t1.a from t1, t2 where t1.a = t2.a and t1.b = 1;
-	 * 
-	 * 	t1			t2			result
-	 *	a	b		a			a
-	 *  1	1		1			1
-	 *  1 	2		2			1
-	 *	2	1
-	 * 
-	 *
-	 * @param tableColMap	Array of bitmaps for noting which columns are in = 
-	 *						predicates with columns from each table
-	 * @param eqOuterCols	Array of booleans for noting which columns
-	 *						are in = predicates without columns from the
-	 *						subquery block.
-	 * @param colReference	The column to set
-	 * @param resultTable	If -1 set all the bit for all the tables for that
-	 *						column; otherwise set the bit for the specified table
-	 *
-	 *
-	 */
-	private void setValueCols(JBitSet[] tableColMap, boolean[] eqOuterCols, 
-		int colReference, int resultTable)
-	{
-		if (eqOuterCols != null)
-			eqOuterCols[colReference] = true;
-
-		if (tableColMap != null)
-		{
-			if (resultTable == -1)
-			{
-				for (int i = 0; i < tableColMap.length; i++)
-					tableColMap[i].set(colReference);
-			}
-			else
-				tableColMap[resultTable].set(colReference);
-		}
-	}
-
-	/**
-	 * Returns true if this ValueNode is a relational operator. Relational
-	 * Operators are <, <=, =, >, >=, <> as well as IS NULL and IS NOT
-	 * NULL. This is the preferred way of figuring out if a ValueNode is
-	 * relational or not. 
-	 * @see RelationalOperator
-	 * @see BinaryRelationalOperatorNode
-	 * @see IsNullNode
-	*/
-	public boolean isRelationalOperator()
-	{
-		return false;
-	}
-	
-	/**
-	 * Returns true if this value node is a <em>equals</em> operator. 
-	 *
-	 * @see ValueNode#isRelationalOperator
-	 */
-	public boolean isBinaryEqualsOperatorNode()
-	{
-		return false;
-	}
-
-	/**
-	 * Returns true if this value node is an operator created
-	 * for optimized performance of an IN list.
-	 *
-	 * Or more specifically, returns true if this value node is
-	 * an equals operator of the form "col = ?" that we generated
-	 * during preprocessing to allow index multi-probing.
-	 */
-	public boolean isInListProbeNode()
-	{
-		return false;
-	}
-
-	/** Return true if the predicate represents an optimizable equality node.
-	 * an expression is considered to be an optimizable equality node if all the
-	 * following conditions are met:
-	 * <ol>
-	 * <li> the operator is an <em>=</em> or <em>IS NULL</em> operator </li>
-	 * <li> one of the operands is a column specified by optTable/columnNumber</li>
-	 * <li> Both operands are not the same column; i.e tab.col = tab.col </li>
-	 * <li> There are no implicit varchar comparisons of the operands; i.e
-	 * either both operands are string like (varchar, char, longvarchar) or
-	 * neither operand is string like </li>
-	 * </ol>
-	 * 
-	 * @param optTable	the table being optimized. Column reference must be from
-	 * this table.
-	 * @param columnNumber the column number. One of the operands of this
-	 * predicate must be the column number specified by optTable/columnNumber
-	 * @param isNullOkay if set to true we also consider IS NULL predicates;
-	 * otherwise consider only = predicates.
-	 */
-	public boolean optimizableEqualityNode(Optimizable optTable, 
-										   int columnNumber, 
-										   boolean isNullOkay)
-		throws StandardException
-	{
-		return false;
-	}
-
-	/**
-	 * Returns TRUE if the type of this node will be determined from the
-	 * context in which it is getting used. If true is returned then
-     * after bindExpression() is called on the node, its type
-     * must be set (from the relevant context) using setType().
-	 *
-	 * @return Whether this node's type will be determined from the context
-	 */
-	public boolean requiresTypeFromContext()
-	{
-		return false;
-	}
-
-	/**
-	 * Returns TRUE if this is a parameter node. We do lots of special things
-	 * with Parameter Nodes.
-	 *
-	 */
-	public boolean isParameterNode()
-	{
-		return false;
-	}
-	
-	/**
-	 * Tests if this node is equivalent to the specified ValueNode. Two 
-	 * ValueNodes are considered equivalent if they will evaluate to the same
-	 * value during query execution. 
-	 * <p> 
-	 * This method provides basic expression matching facility for the derived 
-	 * class of ValueNode and it is used by the language layer to compare the 
-	 * node structural form of the two expressions for equivalence at bind 
-	 * phase.  
-	 *  <p>
-	 * Note that it is not comparing the actual row values at runtime to produce 
-	 * a result; hence, when comparing SQL NULLs, they are considered to be 
-	 * equivalent and not unknown.  
-	 *  <p>
-	 * One usage case of this method in this context is to compare the select 
-	 * column expression against the group by expression to check if they are 
-	 * equivalent.  e.g.:
-	 *  <p>
-	 * SELECT c1+c2 FROM t1 GROUP BY c1+c2   
-	 *  <p>
-	 * In general, node equivalence is determined by the derived class of 
-	 * ValueNode.  But they generally abide to the rules below:
-	 *  <ul>
-	 * <li>The two ValueNodes must be of the same node type to be considered 
-	 *   equivalent.  e.g.:  CastNode vs. CastNode - equivalent (if their args 
-	 *   also match), ColumnReference vs CastNode - not equivalent.
-	 *   
-	 * <li>If node P contains other ValueNode(s) and so on, those node(s) must 
-	 *   also be of the same node type to be considered equivalent.
-	 *   
-	 * <li>If node P takes a parameter list, then the number of arguments and its 
-	 *   arguments for the two nodes must also match to be considered 
-	 *   equivalent.  e.g.:  CAST(c1 as INTEGER) vs CAST(c1 as SMALLINT), they 
-	 *   are not equivalent.
-	 *   
-	 * <li>When comparing SQL NULLs in this context, they are considered to be 
-	 *   equivalent.
-	 * 
-	 * <li>If this does not apply or it is determined that the two nodes are not 
-	 *   equivalent then the derived class of this method should return false; 
-	 *   otherwise, return true.
-	 * </ul>   
-	 *   
-	 * @param other the node to compare this ValueNode against.
-	 * @return <code>true</code> if the two nodes are equivalent, 
-	 * <code>false</code> otherwise.
-	 * 
-	 * @throws StandardException 
-	 */
-	protected abstract boolean isEquivalent(ValueNode other)
-		throws StandardException;
-
-	/**
-	 * Tests if this node is of the same type as the specified node as
-	 * reported by {@link QueryTreeNode#getNodeType()}.
-	 * 
-	 * @param other the node to compare this value node against. 
-	 * 
-	 * @return <code>true</code> if the two nodes are of the same type.  
-	 */
-	protected final boolean isSameNodeType(ValueNode other)
-	{
-		if (other != null) {
-			return other.getNodeType() == getNodeType();
-		}
-		return false;
-	}
-	
 }

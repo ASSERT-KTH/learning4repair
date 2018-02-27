@@ -20,357 +20,186 @@ package org.apache.lucene.index;
  */
 
 import java.io.IOException;
-import java.util.Collection;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Map;
 
-import org.apache.lucene.codecs.Codec;
-import org.apache.lucene.codecs.DocValuesConsumer;
-import org.apache.lucene.codecs.FieldInfosWriter;
-import org.apache.lucene.codecs.PerDocConsumer;
-import org.apache.lucene.index.DocumentsWriterPerThread.DocState;
-import org.apache.lucene.index.TypePromoter.TypeCompatibility;
-import org.apache.lucene.store.IOContext;
-import org.apache.lucene.util.ArrayUtil;
-import org.apache.lucene.util.IOUtils;
+import org.apache.lucene.search.SearcherManager; // javadocs
+import org.apache.lucene.util.Bits;
 
+/** {@code AtomicReader} is an abstract class, providing an interface for accessing an
+ index.  Search of an index is done entirely through this abstract interface,
+ so that any subclass which implements it is searchable. IndexReaders implemented
+ by this subclass do not consist of several sub-readers,
+ they are atomic. They support retrieval of stored fields, doc values, terms,
+ and postings.
 
-/**
- * This is a DocConsumer that gathers all fields under the
- * same name, and calls per-field consumers to process field
- * by field.  This class doesn't doesn't do any "real" work
- * of its own: it just forwards the fields to a
- * DocFieldConsumer.
- */
+ <p>For efficiency, in this API documents are often referred to via
+ <i>document numbers</i>, non-negative integers which each name a unique
+ document in the index.  These document numbers are ephemeral -- they may change
+ as documents are added to and deleted from an index.  Clients should thus not
+ rely on a given document having the same number between sessions.
 
-final class DocFieldProcessor extends DocConsumer {
+ <p>
+ <a name="thread-safety"></a><p><b>NOTE</b>: {@link
+ IndexReader} instances are completely thread
+ safe, meaning multiple threads can call any of its methods,
+ concurrently.  If your application requires external
+ synchronization, you should <b>not</b> synchronize on the
+ <code>IndexReader</code> instance; use your own
+ (non-Lucene) objects instead.
+*/
+public abstract class AtomicReader extends IndexReader {
 
-  final DocFieldConsumer consumer;
-  final StoredFieldsConsumer fieldsWriter;
-  final Codec codec;
-
-  // Holds all fields seen in current doc
-  DocFieldProcessorPerField[] fields = new DocFieldProcessorPerField[1];
-  int fieldCount;
-
-  // Hash table for all fields ever seen
-  DocFieldProcessorPerField[] fieldHash = new DocFieldProcessorPerField[2];
-  int hashMask = 1;
-  int totalFieldCount;
-
-  int fieldGen;
-  final DocumentsWriterPerThread.DocState docState;
-
-  public DocFieldProcessor(DocumentsWriterPerThread docWriter, DocFieldConsumer consumer) {
-    this.docState = docWriter.docState;
-    this.codec = docWriter.codec;
-    this.consumer = consumer;
-    fieldsWriter = new StoredFieldsConsumer(docWriter);
+  private final AtomicReaderContext readerContext = new AtomicReaderContext(this);
+  
+  /** Sole constructor. (For invocation by subclass 
+   *  constructors, typically implicit.) */
+  protected AtomicReader() {
+    super();
   }
 
   @Override
-  public void flush(SegmentWriteState state) throws IOException {
-
-    Map<String,DocFieldConsumerPerField> childFields = new HashMap<String,DocFieldConsumerPerField>();
-    Collection<DocFieldConsumerPerField> fields = fields();
-    for (DocFieldConsumerPerField f : fields) {
-      childFields.put(f.getFieldInfo().name, f);
-    }
-
-    fieldsWriter.flush(state);
-    consumer.flush(childFields, state);
-
-    for (DocValuesConsumerHolder consumer : docValues.values()) {
-      consumer.docValuesConsumer.finish(state.segmentInfo.getDocCount());
-    }
-    
-    // close perDocConsumer during flush to ensure all files are flushed due to PerCodec CFS
-    IOUtils.close(perDocConsumer);
-
-    // Important to save after asking consumer to flush so
-    // consumer can alter the FieldInfo* if necessary.  EG,
-    // FreqProxTermsWriter does this with
-    // FieldInfo.storePayload.
-    FieldInfosWriter infosWriter = codec.fieldInfosFormat().getFieldInfosWriter();
-    infosWriter.write(state.directory, state.segmentInfo.name, state.fieldInfos, IOContext.DEFAULT);
+  public final AtomicReaderContext getContext() {
+    ensureOpen();
+    return readerContext;
   }
 
-  @Override
-  public void abort() {
-    Throwable th = null;
-    
-    for (DocFieldProcessorPerField field : fieldHash) {
-      while (field != null) {
-        final DocFieldProcessorPerField next = field.next;
-        try {
-          field.abort();
-        } catch (Throwable t) {
-          if (th == null) {
-            th = t;
-          }
-        }
-        field = next;
-      }
-    }
-    IOUtils.closeWhileHandlingException(perDocConsumer);
-    // TODO add abort to PerDocConsumer!
-    
-    try {
-      fieldsWriter.abort();
-    } catch (Throwable t) {
-      if (th == null) {
-        th = t;
-      }
-    }
-    
-    try {
-      consumer.abort();
-    } catch (Throwable t) {
-      if (th == null) {
-        th = t;
-      }
-    }
-    
-    try {
-      if (perDocConsumer != null) {
-        perDocConsumer.abort();  
-      }
-    } catch (Throwable t) {
-      if (th == null) {
-        th = t;
-      }
-    }
-    
-    // If any errors occured, throw it.
-    if (th != null) {
-      if (th instanceof RuntimeException) throw (RuntimeException) th;
-      if (th instanceof Error) throw (Error) th;
-      // defensive code - we should not hit unchecked exceptions
-      throw new RuntimeException(th);
-    }
+  /** 
+   * Returns true if there are norms stored for this field.
+   * @deprecated (4.0) use {@link #getFieldInfos()} and check {@link FieldInfo#hasNorms()} 
+   *                   for the field instead.
+   */
+  @Deprecated
+  public final boolean hasNorms(String field) throws IOException {
+    ensureOpen();
+    // note: using normValues(field) != null would potentially cause i/o
+    FieldInfo fi = getFieldInfos().fieldInfo(field);
+    return fi != null && fi.hasNorms();
   }
 
-  @Override
-  public boolean freeRAM() {
-    return consumer.freeRAM();
-  }
-
-  public Collection<DocFieldConsumerPerField> fields() {
-    Collection<DocFieldConsumerPerField> fields = new HashSet<DocFieldConsumerPerField>();
-    for(int i=0;i<fieldHash.length;i++) {
-      DocFieldProcessorPerField field = fieldHash[i];
-      while(field != null) {
-        fields.add(field.consumer);
-        field = field.next;
-      }
-    }
-    assert fields.size() == totalFieldCount;
-    return fields;
-  }
-
-  /** In flush we reset the fieldHash to not maintain per-field state
-   *  across segments */
-  @Override
-  void doAfterFlush() {
-    fieldHash = new DocFieldProcessorPerField[2];
-    hashMask = 1;
-    totalFieldCount = 0;
-    perDocConsumer = null;
-    docValues.clear();
-  }
-
-  private void rehash() {
-    final int newHashSize = (fieldHash.length*2);
-    assert newHashSize > fieldHash.length;
-
-    final DocFieldProcessorPerField newHashArray[] = new DocFieldProcessorPerField[newHashSize];
-
-    // Rehash
-    int newHashMask = newHashSize-1;
-    for(int j=0;j<fieldHash.length;j++) {
-      DocFieldProcessorPerField fp0 = fieldHash[j];
-      while(fp0 != null) {
-        final int hashPos2 = fp0.fieldInfo.name.hashCode() & newHashMask;
-        DocFieldProcessorPerField nextFP0 = fp0.next;
-        fp0.next = newHashArray[hashPos2];
-        newHashArray[hashPos2] = fp0;
-        fp0 = nextFP0;
-      }
-    }
-
-    fieldHash = newHashArray;
-    hashMask = newHashMask;
-  }
-
-  @Override
-  public void processDocument(FieldInfos.Builder fieldInfos) throws IOException {
-
-    consumer.startDocument();
-    fieldsWriter.startDocument();
-
-    fieldCount = 0;
-
-    final int thisFieldGen = fieldGen++;
-
-    // Absorb any new fields first seen in this document.
-    // Also absorb any changes to fields we had already
-    // seen before (eg suddenly turning on norms or
-    // vectors, etc.):
-
-    for(IndexableField field : docState.doc) {
-      final String fieldName = field.name();
-
-      // Make sure we have a PerField allocated
-      final int hashPos = fieldName.hashCode() & hashMask;
-      DocFieldProcessorPerField fp = fieldHash[hashPos];
-      while(fp != null && !fp.fieldInfo.name.equals(fieldName)) {
-        fp = fp.next;
-      }
-
-      if (fp == null) {
-
-        // TODO FI: we need to genericize the "flags" that a
-        // field holds, and, how these flags are merged; it
-        // needs to be more "pluggable" such that if I want
-        // to have a new "thing" my Fields can do, I can
-        // easily add it
-        FieldInfo fi = fieldInfos.addOrUpdate(fieldName, field.fieldType());
-
-        fp = new DocFieldProcessorPerField(this, fi);
-        fp.next = fieldHash[hashPos];
-        fieldHash[hashPos] = fp;
-        totalFieldCount++;
-
-        if (totalFieldCount >= fieldHash.length/2) {
-          rehash();
-        }
-      } else {
-        fieldInfos.addOrUpdate(fp.fieldInfo.name, field.fieldType());
-      }
-
-      if (thisFieldGen != fp.lastGen) {
-
-        // First time we're seeing this field for this doc
-        fp.fieldCount = 0;
-
-        if (fieldCount == fields.length) {
-          final int newSize = fields.length*2;
-          DocFieldProcessorPerField newArray[] = new DocFieldProcessorPerField[newSize];
-          System.arraycopy(fields, 0, newArray, 0, fieldCount);
-          fields = newArray;
-        }
-
-        fields[fieldCount++] = fp;
-        fp.lastGen = thisFieldGen;
-      }
-
-      fp.addField(field);
-
-      if (field.fieldType().stored()) {
-        fieldsWriter.addField(field, fp.fieldInfo);
-      }
-      final DocValues.Type dvType = field.fieldType().docValueType();
-      if (dvType != null) {
-        DocValuesConsumerHolder docValuesConsumer = docValuesConsumer(dvType,
-            docState, fp.fieldInfo);
-        DocValuesConsumer consumer = docValuesConsumer.docValuesConsumer;
-        if (docValuesConsumer.compatibility == null) {
-          consumer.add(docState.docID, field);
-          docValuesConsumer.compatibility = new TypeCompatibility(dvType,
-              consumer.getValueSize());
-        } else if (docValuesConsumer.compatibility.isCompatible(dvType,
-            TypePromoter.getValueSize(dvType, field.binaryValue()))) {
-          consumer.add(docState.docID, field);
-        } else {
-          docValuesConsumer.compatibility.isCompatible(dvType,
-              TypePromoter.getValueSize(dvType, field.binaryValue()));
-          TypeCompatibility compatibility = docValuesConsumer.compatibility;
-          throw new IllegalArgumentException("Incompatible DocValues type: "
-              + dvType.name() + " size: "
-              + TypePromoter.getValueSize(dvType, field.binaryValue())
-              + " expected: " + " type: " + compatibility.getBaseType()
-              + " size: " + compatibility.getBaseSize());
-        }
-      }
-    }
-
-    // If we are writing vectors then we must visit
-    // fields in sorted order so they are written in
-    // sorted order.  TODO: we actually only need to
-    // sort the subset of fields that have vectors
-    // enabled; we could save [small amount of] CPU
-    // here.
-    ArrayUtil.quickSort(fields, 0, fieldCount, fieldsComp);
-    for(int i=0;i<fieldCount;i++) {
-      final DocFieldProcessorPerField perField = fields[i];
-      perField.consumer.processFields(perField.fields, perField.fieldCount);
-    }
-
-    if (docState.maxTermPrefix != null && docState.infoStream.isEnabled("IW")) {
-      docState.infoStream.message("IW", "WARNING: document contains at least one immense term (whose UTF8 encoding is longer than the max length " + DocumentsWriterPerThread.MAX_TERM_LENGTH_UTF8 + "), all of which were skipped.  Please correct the analyzer to not produce such terms.  The prefix of the first immense term is: '" + docState.maxTermPrefix + "...'");
-      docState.maxTermPrefix = null;
-    }
-  }
-
-  private static final Comparator<DocFieldProcessorPerField> fieldsComp = new Comparator<DocFieldProcessorPerField>() {
-    public int compare(DocFieldProcessorPerField o1, DocFieldProcessorPerField o2) {
-      return o1.fieldInfo.name.compareTo(o2.fieldInfo.name);
-    }
-  };
+  /**
+   * Returns {@link Fields} for this reader.
+   * This method may return null if the reader has no
+   * postings.
+   */
+  public abstract Fields fields() throws IOException;
   
   @Override
-  void finishDocument() throws IOException {
-    try {
-      fieldsWriter.finishDocument();
-    } finally {
-      consumer.finishDocument();
+  public final int docFreq(Term term) throws IOException {
+    final Fields fields = fields();
+    if (fields == null) {
+      return 0;
+    }
+    final Terms terms = fields.terms(term.field());
+    if (terms == null) {
+      return 0;
+    }
+    final TermsEnum termsEnum = terms.iterator(null);
+    if (termsEnum.seekExact(term.bytes(), true)) {
+      return termsEnum.docFreq();
+    } else {
+      return 0;
     }
   }
 
-  private static class DocValuesConsumerHolder {
-    // Only used to enforce that same DV field name is never
-    // added more than once per doc:
-    int docID;
-    final DocValuesConsumer docValuesConsumer;
-    TypeCompatibility compatibility;
-
-    public DocValuesConsumerHolder(DocValuesConsumer docValuesConsumer) {
-      this.docValuesConsumer = docValuesConsumer;
+  /** Returns the number of documents containing the term
+   * <code>t</code>.  This method returns 0 if the term or
+   * field does not exists.  This method does not take into
+   * account deleted documents that have not yet been merged
+   * away. */
+  public final long totalTermFreq(Term term) throws IOException {
+    final Fields fields = fields();
+    if (fields == null) {
+      return 0;
+    }
+    final Terms terms = fields.terms(term.field());
+    if (terms == null) {
+      return 0;
+    }
+    final TermsEnum termsEnum = terms.iterator(null);
+    if (termsEnum.seekExact(term.bytes(), true)) {
+      return termsEnum.totalTermFreq();
+    } else {
+      return 0;
     }
   }
 
-  final private Map<String, DocValuesConsumerHolder> docValues = new HashMap<String, DocValuesConsumerHolder>();
-  private PerDocConsumer perDocConsumer;
-
-  DocValuesConsumerHolder docValuesConsumer(DocValues.Type valueType, DocState docState, FieldInfo fieldInfo) 
-      throws IOException {
-    DocValuesConsumerHolder docValuesConsumerAndDocID = docValues.get(fieldInfo.name);
-    if (docValuesConsumerAndDocID != null) {
-      if (docState.docID == docValuesConsumerAndDocID.docID) {
-        throw new IllegalArgumentException("DocValuesField \"" + fieldInfo.name + "\" appears more than once in this document (only one value is allowed, per field)");
-      }
-      assert docValuesConsumerAndDocID.docID < docState.docID;
-      docValuesConsumerAndDocID.docID = docState.docID;
-      return docValuesConsumerAndDocID;
+  /** This may return null if the field does not exist.*/
+  public final Terms terms(String field) throws IOException {
+    final Fields fields = fields();
+    if (fields == null) {
+      return null;
     }
+    return fields.terms(field);
+  }
 
-    if (perDocConsumer == null) {
-      PerDocWriteState perDocWriteState = docState.docWriter.newPerDocWriteState("");
-      perDocConsumer = docState.docWriter.codec.docValuesFormat().docsConsumer(perDocWriteState);
-      if (perDocConsumer == null) {
-        throw new IllegalStateException("codec=" +  docState.docWriter.codec + " does not support docValues: from docValuesFormat().docsConsumer(...) returned null; field=" + fieldInfo.name);
+  /** Returns {@link DocsEnum} for the specified term.
+   *  This will return null if either the field or
+   *  term does not exist. 
+   *  @see TermsEnum#docs(Bits, DocsEnum) */
+  public final DocsEnum termDocsEnum(Term term) throws IOException {
+    assert term.field() != null;
+    assert term.bytes() != null;
+    final Fields fields = fields();
+    if (fields != null) {
+      final Terms terms = fields.terms(term.field());
+      if (terms != null) {
+        final TermsEnum termsEnum = terms.iterator(null);
+        if (termsEnum.seekExact(term.bytes(), true)) {
+          return termsEnum.docs(getLiveDocs(), null);
+        }
       }
     }
-    DocValuesConsumer docValuesConsumer = perDocConsumer.addValuesField(valueType, fieldInfo);
-    assert fieldInfo.getDocValuesType() == null || fieldInfo.getDocValuesType() == valueType;
-    fieldInfo.setDocValuesType(valueType);
+    return null;
+  }
 
-    docValuesConsumerAndDocID = new DocValuesConsumerHolder(docValuesConsumer);
-    docValuesConsumerAndDocID.docID = docState.docID;
-    docValues.put(fieldInfo.name, docValuesConsumerAndDocID);
-    return docValuesConsumerAndDocID;
+  /** Returns {@link DocsAndPositionsEnum} for the specified
+   *  term.  This will return null if the
+   *  field or term does not exist or positions weren't indexed. 
+   *  @see TermsEnum#docsAndPositions(Bits, DocsAndPositionsEnum) */
+  public final DocsAndPositionsEnum termPositionsEnum(Term term) throws IOException {
+    assert term.field() != null;
+    assert term.bytes() != null;
+    final Fields fields = fields();
+    if (fields != null) {
+      final Terms terms = fields.terms(term.field());
+      if (terms != null) {
+        final TermsEnum termsEnum = terms.iterator(null);
+        if (termsEnum.seekExact(term.bytes(), true)) {
+          return termsEnum.docsAndPositions(getLiveDocs(), null);
+        }
+      }
+    }
+    return null;
   }
   
+  /**
+   * Returns {@link DocValues} for this field.
+   * This method may return null if the reader has no per-document
+   * values stored.
+   */
+  public abstract DocValues docValues(String field) throws IOException;
+  
+  /**
+   * Returns {@link DocValues} for this field's normalization values.
+   * This method may return null if the field has no norms.
+   */
+  public abstract DocValues normValues(String field) throws IOException;
+
+  /**
+   * Get the {@link FieldInfos} describing all fields in
+   * this reader.
+   * @lucene.experimental
+   */
+  public abstract FieldInfos getFieldInfos();
+  
+  /** Returns the {@link Bits} representing live (not
+   *  deleted) docs.  A set bit indicates the doc ID has not
+   *  been deleted.  If this method returns null it means
+   *  there are no deleted documents (all documents are
+   *  live).
+   *
+   *  The returned instance has been safely published for
+   *  use by multiple threads without additional
+   *  synchronization.
+   */
+  public abstract Bits getLiveDocs();
 }

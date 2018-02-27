@@ -1,4 +1,4 @@
-if (logger_.isDebugEnabled())
+if (logger.isDebugEnabled())
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one
@@ -18,122 +18,167 @@ if (logger_.isDebugEnabled())
  * limitations under the License.
  */
 
-package org.apache.cassandra.net.io;
+package org.apache.cassandra.service;
 
+import java.io.File;
+import java.io.IOException;
 import java.net.InetSocketAddress;
-import java.nio.ByteBuffer;
-import java.nio.channels.FileChannel;
-import java.nio.channels.SocketChannel;
-import java.io.*;
+import java.util.Set;
 
-import org.apache.cassandra.db.Table;
 import org.apache.log4j.Logger;
+import org.apache.thrift.protocol.TBinaryProtocol;
+import org.apache.thrift.protocol.TProtocolFactory;
+import org.apache.thrift.server.TThreadPoolServer;
+import org.apache.thrift.transport.TServerSocket;
+import org.apache.thrift.transport.TTransportException;
+import org.apache.thrift.transport.TTransportFactory;
+import org.apache.thrift.TProcessorFactory;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.db.Table;
+import org.apache.cassandra.db.RecoveryManager;
+import org.apache.cassandra.db.CalloutManager;
 
 /**
- * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
+ * This class supports two methods for creating a Cassandra node daemon, 
+ * invoking the class's main method, and using the jsvc wrapper from 
+ * commons-daemon, (for more information on using this class with the 
+ * jsvc wrapper, see the 
+ * <a href="http://commons.apache.org/daemon/jsvc.html">Commons Daemon</a>
+ * documentation).
+ * 
+ * @author Eric Evans <eevans@racklabs.com>
+ * 
  */
 
+public class CassandraDaemon
+{
+    private static Logger logger = Logger.getLogger(CassandraDaemon.class);
+    private TThreadPoolServer serverEngine;
 
-class ContentStreamState extends StartState
-{       
-    private static Logger logger_ = Logger.getLogger(ContentStreamState.class);
-    private static long count_ = 64*1024*1024;
-    /* Return this byte array to exit event loop */
-    private static byte[] bytes_ = new byte[1];
-    private long bytesRead_ = 0L;
-    private FileChannel fc_;
-    private StreamContextManager.StreamContext streamContext_;
-    private StreamContextManager.StreamStatus streamStatus_;
-    
-    ContentStreamState(TcpReader stream)
+    private void setup() throws IOException, TTransportException
     {
-        super(stream); 
-        SocketChannel socketChannel = stream.getStream();
-        InetSocketAddress remoteAddress = (InetSocketAddress)socketChannel.socket().getRemoteSocketAddress();
-        String remoteHost = remoteAddress.getHostName();        
-        streamContext_ = StreamContextManager.getStreamContext(remoteHost);   
-        streamStatus_ = StreamContextManager.getStreamStatus(remoteHost);
-    }
-    
-    private void createFileChannel() throws IOException
-    {
-        if ( fc_ == null )
-        {
-            if (logger_.isDebugEnabled())
-              logger_.debug("Creating file for " + streamContext_.getTargetFile());
-            FileOutputStream fos = new FileOutputStream( streamContext_.getTargetFile(), true );
-            fc_ = fos.getChannel();            
-        }
-    }
-
-    public byte[] read() throws IOException, ReadNotCompleteException
-    {        
-        SocketChannel socketChannel = stream_.getStream();
-        InetSocketAddress remoteAddress = (InetSocketAddress)socketChannel.socket().getRemoteSocketAddress();
-        String remoteHost = remoteAddress.getHostName();  
-        createFileChannel();
-        if ( streamContext_ != null )
-        {  
-            try
-            {
-                bytesRead_ += fc_.transferFrom(socketChannel, bytesRead_, ContentStreamState.count_);
-                if ( bytesRead_ != streamContext_.getExpectedBytes() )
-                    throw new ReadNotCompleteException("Specified number of bytes have not been read from the Socket Channel");
-            }
-            catch ( IOException ex )
-            {
-                /* Ask the source node to re-stream this file. */
-                streamStatus_.setAction(StreamContextManager.StreamCompletionAction.STREAM);                
-                handleStreamCompletion(remoteHost);
-                /* Delete the orphaned file. */
-                File file = new File(streamContext_.getTargetFile());
-                file.delete();
-                throw ex;
-            }
-            if ( bytesRead_ == streamContext_.getExpectedBytes() )
-            {       
-                logger_.debug("Removing stream context " + streamContext_);                 
-                handleStreamCompletion(remoteHost);                              
-                bytesRead_ = 0L;
-                fc_.close();
-                morphState();
-            }                            
-        }
+        int listenPort = DatabaseDescriptor.getThriftPort();
+        String listenAddr = DatabaseDescriptor.getThriftAddress();
         
-        return new byte[0];
-    }
-    
-    private void handleStreamCompletion(String remoteHost) throws IOException
-    {
         /* 
-         * Streaming is complete. If all the data that has to be received inform the sender via 
-         * the stream completion callback so that the source may perform the requisite cleanup. 
-        */
-        IStreamComplete streamComplete = StreamContextManager.getStreamCompletionHandler(remoteHost);
-        if ( streamComplete != null )
-        {                    
-            streamComplete.onStreamCompletion(remoteHost, streamContext_, streamStatus_);                    
+         * If ThriftAddress was left completely unconfigured, then assume
+         * the same default as ListenAddress, (InetAddress.getLocalHost).
+         */
+        if (listenAddr == null)
+            listenAddr = FBUtilities.getHostAddress();
+        
+        Thread.setDefaultUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler()
+        {
+            public void uncaughtException(Thread t, Throwable e)
+            {
+                logger.error("Fatal exception in thread " + t, e);
+                if (e instanceof OutOfMemoryError)
+                {
+                    System.exit(100);
+                }
+            }
+        });
+
+        // initialize stuff
+        CalloutManager.instance().onStart();
+
+        Set<String> tables = DatabaseDescriptor.getTableToColumnFamilyMap().keySet();
+        for (String table : tables)
+        {
+            logger.debug("opening table " + table);
+            Table tbl = Table.open(table);
+            tbl.onStart();
         }
+
+        // replay the log if necessary
+        RecoveryManager recoveryMgr = RecoveryManager.instance();
+        recoveryMgr.doRecovery();
+
+        // now we start listening for clients
+        CassandraServer peerStorageServer = new CassandraServer();
+        peerStorageServer.start();
+        Cassandra.Processor processor = new Cassandra.Processor(peerStorageServer);
+
+        // Transport
+        TServerSocket tServerSocket = new TServerSocket(new InetSocketAddress(listenAddr, listenPort));
+        
+        if (logger.isDebugEnabled())
+            logger.debug(String.format("Binding thrift service to %s:%s", listenAddr, listenPort));
+
+        // Protocol factory
+        TProtocolFactory tProtocolFactory = new TBinaryProtocol.Factory();
+
+        // ThreadPool Server
+        TThreadPoolServer.Options options = new TThreadPoolServer.Options();
+        options.minWorkerThreads = 64;
+        serverEngine = new TThreadPoolServer(new TProcessorFactory(processor),
+                                             tServerSocket,
+                                             new TTransportFactory(),
+                                             new TTransportFactory(),
+                                             tProtocolFactory,
+                                             tProtocolFactory,
+                                             options);
     }
 
-    public void morphState() throws IOException
-    {        
-        /* We instantiate an array of size 1 so that we can exit the event loop of the read. */                
-        StartState nextState = stream_.getSocketState(TcpReader.TcpReaderState.DONE);
-        if ( nextState == null )
-        {
-            nextState = new DoneState(stream_, ContentStreamState.bytes_);
-            stream_.putSocketState( TcpReader.TcpReaderState.DONE, nextState );
-        }
-        else
-        {
-            nextState.setContextData(ContentStreamState.bytes_);
-        }
-        stream_.morphState( nextState );  
+    /** hook for JSVC */
+    public void init(String[] args) throws IOException, TTransportException
+    {  
+        setup();
+    }
+
+    /** hook for JSVC */
+    public void start()
+    {
+        logger.info("Cassandra starting up...");
+        serverEngine.serve();
+    }
+
+    /** hook for JSVC */
+    public void stop()
+    {
+        logger.info("Cassandra shutting down...");
+        serverEngine.stop();
     }
     
-    public void setContextData(Object data)
+    
+    /** hook for JSVC */
+    public void destroy()
+    {        
+    }
+    
+    public static void main(String[] args)
     {
-        throw new UnsupportedOperationException("This method is not supported in the ContentStreamState");
+        CassandraDaemon daemon = new CassandraDaemon();
+        String pidFile = System.getProperty("cassandra-pidfile");
+        
+        try
+        {   
+            daemon.setup();
+
+            if (pidFile != null)
+            {
+                new File(pidFile).deleteOnExit();
+            }
+
+            if (System.getProperty("cassandra-foreground") == null)
+            {
+                System.out.close();
+                System.err.close();
+            }
+
+            daemon.start();
+        }
+        catch (Exception e)
+        {
+            String msg = "Exception encountered during startup.";
+            logger.error(msg, e);
+
+            // try to warn user on stdout too, if we haven't already detached
+            System.out.println(msg);
+            e.printStackTrace();
+
+            System.exit(3);
+        }
     }
 }

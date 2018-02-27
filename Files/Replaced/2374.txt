@@ -1,13 +1,16 @@
-String getProperty(String key) throws IOException;
+//@Override -- not until Java 1.6
 
-/*
- * Copyright (c) OSGi Alliance (2009, 2010). All Rights Reserved.
+package org.apache.lucene.index;
+
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,548 +19,590 @@ String getProperty(String key) throws IOException;
  * limitations under the License.
  */
 
-package org.osgi.jmx.framework;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.FieldSelector;
+import org.apache.lucene.document.FieldSelectorResult;
+import org.apache.lucene.document.Fieldable;
+import org.apache.lucene.index.codecs.PerDocValues;
+import org.apache.lucene.index.values.IndexDocValues;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.MapBackedSet;
 
 import java.io.IOException;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
-import javax.management.openmbean.CompositeData;
-import javax.management.openmbean.CompositeType;
-import javax.management.openmbean.SimpleType;
 
-import org.osgi.jmx.Item;
-import org.osgi.jmx.JmxConstants;
-
-/**
- * The FrameworkMbean provides mechanisms to exert control over the framework.
- * For many operations, it provides a batch mechanism to avoid excessive message
- * passing when interacting remotely.
+/** An IndexReader which reads multiple, parallel indexes.  Each index added
+ * must have the same number of documents, but typically each contains
+ * different fields.  Each document contains the union of the fields of all
+ * documents with the same document number.  When searching, matches for a
+ * query term are from the first index added that has the field.
  *
- * @version $Revision$
- * @ThreadSafe
+ * <p>This is useful, e.g., with collections that have large fields which
+ * change rarely and small fields that change more frequently.  The smaller
+ * fields may be re-indexed in a new index and both indexes may be searched
+ * together.
+ *
+ * <p><strong>Warning:</strong> It is up to you to make sure all indexes
+ * are created and modified the same way. For example, if you add
+ * documents to one index, you need to add the same documents in the
+ * same order to the other indexes. <em>Failure to do so will result in
+ * undefined behavior</em>.
  */
-public interface FrameworkMBean {
-	/**
-	 * The fully qualified object name of this mbean.
-	 */
-	String			OBJECTNAME						= JmxConstants.OSGI_CORE
-															+ ":type=framework,version=1.7";
+public class ParallelReader extends IndexReader {
+  private List<IndexReader> readers = new ArrayList<IndexReader>();
+  private List<Boolean> decrefOnClose = new ArrayList<Boolean>(); // remember which subreaders to decRef on close
+  boolean incRefReaders = false;
+  private SortedMap<String,IndexReader> fieldToReader = new TreeMap<String,IndexReader>();
+  private Map<IndexReader,Collection<String>> readerToFields = new HashMap<IndexReader,Collection<String>>();
+  private List<IndexReader> storedFieldReaders = new ArrayList<IndexReader>();
+  private Map<String,byte[]> normsCache = new HashMap<String,byte[]>();
+  private final ReaderContext topLevelReaderContext = new AtomicReaderContext(this);
+  private int maxDoc;
+  private int numDocs;
+  private boolean hasDeletions;
 
-	/**
-	 * The SUCCESS, used in {@link #SUCCESS_ITEM}.
-	 */
-	String			SUCCESS							= "Success";
+  private final ParallelFields fields = new ParallelFields();
+  private final ParallelPerDocs perDocs = new ParallelPerDocs();
 
-	/**
-	 * The item that indicates if this operation was successful. The key is
-	 * {@link #SUCCESS} and the type is {@link SimpleType#BOOLEAN}. It is used
-	 * in {@link #BATCH_ACTION_RESULT_TYPE} and
-	 * {@link #BATCH_INSTALL_RESULT_TYPE}.
-	 */
-	Item			SUCCESS_ITEM					= new Item(
-															SUCCESS,
-															"Whether the operation was successful",
-															SimpleType.BOOLEAN);
+ /** Construct a ParallelReader. 
+  * <p>Note that all subreaders are closed if this ParallelReader is closed.</p>
+  */
+  public ParallelReader() throws IOException { this(true); }
+   
+ /** Construct a ParallelReader. 
+  * @param closeSubReaders indicates whether the subreaders should be closed
+  * when this ParallelReader is closed
+  */
+  public ParallelReader(boolean closeSubReaders) throws IOException {
+    super();
+    this.incRefReaders = !closeSubReaders;
+    readerFinishedListeners = new MapBackedSet<ReaderFinishedListener>(new ConcurrentHashMap<ReaderFinishedListener,Boolean>());
+  }
 
-	/**
-	 * The key ERROR, used in {@link #ERROR_ITEM}.
-	 */
-	String			ERROR							= "Error";
+  /** {@inheritDoc} */
+  @Override
+  public String toString() {
+    final StringBuilder buffer = new StringBuilder("ParallelReader(");
+    final Iterator<IndexReader> iter = readers.iterator();
+    if (iter.hasNext()) {
+      buffer.append(iter.next());
+    }
+    while (iter.hasNext()) {
+      buffer.append(", ").append(iter.next());
+    }
+    buffer.append(')');
+    return buffer.toString();
+  }
+  
+ /** Add an IndexReader.
+  * @throws IOException if there is a low-level IO error
+  */
+  public void add(IndexReader reader) throws IOException {
+    ensureOpen();
+    add(reader, false);
+  }
 
-	/**
-	 * The item containing the error message of the batch operation. The key is
-	 * {@link #ERROR} and the type is {@link SimpleType#STRING}. It is used in
-	 * {@link #BATCH_ACTION_RESULT_TYPE} and {@link #BATCH_INSTALL_RESULT_TYPE}.
-	 */
-	Item			ERROR_ITEM						= new Item(
-															ERROR,
-															"The error message if unsuccessful",
-															SimpleType.STRING);
+ /** Add an IndexReader whose stored fields will not be returned.  This can
+  * accelerate search when stored fields are only needed from a subset of
+  * the IndexReaders.
+  *
+  * @throws IllegalArgumentException if not all indexes contain the same number
+  *     of documents
+  * @throws IllegalArgumentException if not all indexes have the same value
+  *     of {@link IndexReader#maxDoc()}
+  * @throws IOException if there is a low-level IO error
+  */
+  public void add(IndexReader reader, boolean ignoreStoredFields)
+    throws IOException {
 
-	/**
-	 * The key COMPLETED, used in {@link #COMPLETED_ITEM}.
-	 */
-	String			COMPLETED						= "Completed";
+    ensureOpen();
+    if (readers.size() == 0) {
+      this.maxDoc = reader.maxDoc();
+      this.numDocs = reader.numDocs();
+      this.hasDeletions = reader.hasDeletions();
+    }
 
-	/**
-	 * The item containing the list of bundles completing the batch operation.
-	 * The key is {@link #COMPLETED} and the type is
-	 * {@link JmxConstants#LONG_ARRAY_TYPE}. It is used in
-	 * {@link #BATCH_ACTION_RESULT_TYPE} and {@link #BATCH_INSTALL_RESULT_TYPE}.
-	 */
-	Item			COMPLETED_ITEM					= new Item(
-															COMPLETED,
-															"The bundle ids of the successfully completed installs",
-															JmxConstants.LONG_ARRAY_TYPE);
+    if (reader.maxDoc() != maxDoc)                // check compatibility
+      throw new IllegalArgumentException
+        ("All readers must have same maxDoc: "+maxDoc+"!="+reader.maxDoc());
+    if (reader.numDocs() != numDocs)
+      throw new IllegalArgumentException
+        ("All readers must have same numDocs: "+numDocs+"!="+reader.numDocs());
 
-	/**
-	 * The key for BUNDLE_IN_ERROR. This key is used with two different items:
-	 * {@link #BUNDLE_IN_ERROR_ID_ITEM} and
-	 * {@link #BUNDLE_IN_ERROR_LOCATION_ITEM} that each have a different type
-	 * for this key. It is used in {@link #BATCH_ACTION_RESULT_TYPE} and
-	 * {@link #BATCH_INSTALL_RESULT_TYPE}.
-	 */
-	String			BUNDLE_IN_ERROR					= "BundleInError";
+    Collection<String> fields = reader.getFieldNames(IndexReader.FieldOption.ALL);
+    readerToFields.put(reader, fields);
+    for (final String field : fields) {               // update fieldToReader map
+      if (fieldToReader.get(field) == null) {
+        fieldToReader.put(field, reader);
+      }
+      this.fields.addField(field, reader);
+      this.perDocs.addField(field, reader);
+    }
 
-	/**
-	 * The item containing the bundle which caused the error during the batch
-	 * operation. This item describes the bundle in error as an id. The key is
-	 * {@link #BUNDLE_IN_ERROR} and the type is {@link SimpleType#LONG}. It is
-	 * used in {@link #BATCH_ACTION_RESULT_TYPE}.
-	 *
-	 * @see #BUNDLE_IN_ERROR_LOCATION_ITEM BUNDLE_IN_ERROR_LOCATION_ITEM for the
-	 *      item that has a location for the bundle in error.
-	 */
-	Item			BUNDLE_IN_ERROR_ID_ITEM			= new Item(
-															BUNDLE_IN_ERROR,
-															"The id of the bundle causing the error",
-															SimpleType.LONG);
+    if (!ignoreStoredFields)
+      storedFieldReaders.add(reader);             // add to storedFieldReaders
+    readers.add(reader);
+    
+    if (incRefReaders) {
+      reader.incRef();
+    }
+    decrefOnClose.add(Boolean.valueOf(incRefReaders));
+    synchronized(normsCache) {
+      normsCache.clear(); // TODO: don't need to clear this for all fields really?
+    }
+  }
 
-	/**
-	 * The key REMAINING, used in {@link #REMAINING_ID_ITEM} and
-	 * {@link #REMAINING_LOCATION_ITEM}.
-	 */
-	String			REMAINING						= "Remaining";
+  private class ParallelFieldsEnum extends FieldsEnum {
+    String currentField;
+    IndexReader currentReader;
+    Iterator<String> keys;
 
-	/**
-	 * The item containing the list of remaining bundles unprocessed by the
-	 * failing batch operation. The key is {@link #REMAINING} and the type is
-	 * {@link JmxConstants#LONG_ARRAY_TYPE}. It is used in
-	 * {@link #BATCH_ACTION_RESULT_TYPE} and {@link #BATCH_INSTALL_RESULT_TYPE}.
-	 */
-	Item			REMAINING_ID_ITEM				= new Item(
-															REMAINING,
-															"The ids of the remaining bundles",
-															JmxConstants.LONG_ARRAY_TYPE);
+    ParallelFieldsEnum() {
+      keys = fieldToReader.keySet().iterator();
+    }
 
-	/**
-	 * The Composite Type for a batch action result.
-	 * {@link #refreshBundle(long)} and {@link #refreshBundles(long[])}.
-	 * Notice that a batch action result returns uses an id for the
-	 * {@link #BUNDLE_IN_ERROR} while the {@link #BATCH_INSTALL_RESULT_TYPE}
-	 * uses a location.
-	 *
-	 * This Composite Type consists of the following items:
-	 * <ul>
-	 * <li>{@link #BUNDLE_IN_ERROR_ID_ITEM}</li>
-	 * <li>{@link #COMPLETED_ITEM}</li>
-	 * <li>{@link #ERROR_ITEM}</li>
-	 * <li>{@link #REMAINING_ID_ITEM}</li>
-	 * <li>{@link #SUCCESS_ITEM}</li>
-	 * </ul>
-	 */
-	CompositeType	BATCH_ACTION_RESULT_TYPE		= Item
-															.compositeType(
-																	"BUNDLE_ACTION_RESULT",
-																	"This type encapsulates a bundle batch install action result",
-																	BUNDLE_IN_ERROR_ID_ITEM,
-																	COMPLETED_ITEM,
-																	ERROR_ITEM,
-																	REMAINING_ID_ITEM,
-																	SUCCESS_ITEM
-															);
+    @Override
+    public String next() throws IOException {
+      if (keys.hasNext()) {
+        currentField = keys.next();
+        currentReader = fieldToReader.get(currentField);
+      } else {
+        currentField = null;
+        currentReader = null;
+      }
+      return currentField;
+    }
 
-	/**
-	 * The item containing the bundle which caused the error during the batch
-	 * operation. This item describes the bundle in error as a location. The key
-	 * is {@link #BUNDLE_IN_ERROR} and the type is {@link SimpleType#STRING}. It
-	 * is used in {@link #BATCH_INSTALL_RESULT_TYPE}.
-	 *
-	 * @see #BUNDLE_IN_ERROR_ID_ITEM BUNDLE_IN_ERROR_ID_ITEM for the item that
-	 *      has the id for the bundle in error.
-	 */
-	Item			BUNDLE_IN_ERROR_LOCATION_ITEM	= new Item(
-															BUNDLE_IN_ERROR,
-															"The location of the bundle causing the error",
-															SimpleType.STRING);
+    @Override
+    public TermsEnum terms() throws IOException {
+      assert currentReader != null;
+      Terms terms = MultiFields.getTerms(currentReader, currentField);
+      if (terms != null) {
+        return terms.iterator();
+      } else {
+        return TermsEnum.EMPTY;
+      }
+    }
 
-	/**
-	 * The item containing the list of remaining bundles unprocessed by the
-	 * failing batch operation. The key is {@link #REMAINING} and the type is
-	 * {@link JmxConstants#STRING_ARRAY_TYPE}. It is used in
-	 * {@link #BATCH_ACTION_RESULT_TYPE} and {@link #BATCH_INSTALL_RESULT_TYPE}.
-	 */
-	Item			REMAINING_LOCATION_ITEM			= new Item(
-															REMAINING,
-															"The locations of the remaining bundles",
-															JmxConstants.STRING_ARRAY_TYPE);
+  }
 
-	/**
-	 * The Composite Type which represents the result of a batch install
-	 * operation. It is used in {@link #installBundles(String[])} and
-	 * {@link #installBundlesFromURL(String[], String[])}.
-	 *
-	 * This Composite Type consists of the following items:
-	 * <ul>
-	 * <li>{@link #BUNDLE_IN_ERROR_LOCATION_ITEM}</li>
-	 * <li>{@link #COMPLETED_ITEM}</li>
-	 * <li>{@link #ERROR_ITEM}</li>
-	 * <li>{@link #REMAINING_LOCATION_ITEM P }</li>
-	 * <li>{@link #SUCCESS_ITEM}</li>
-	 * </ul>
-	 */
-	CompositeType	BATCH_INSTALL_RESULT_TYPE		= Item
-															.compositeType(
-																	"BATCH_INSTALL_RESULT",
-																	"This type encapsulates a bundle batch install action result",
-																	BUNDLE_IN_ERROR_LOCATION_ITEM,
-																	COMPLETED_ITEM,
-																	ERROR_ITEM,
-																	REMAINING_LOCATION_ITEM,
-																	SUCCESS_ITEM
-															);
+  // Single instance of this, per ParallelReader instance
+  private class ParallelFields extends Fields {
+    final HashMap<String,Terms> fields = new HashMap<String,Terms>();
 
-    /**
-     * The Composite Type which represents the result of a batch resolve
-     * operation. It is used in {@link #refreshBundlesAndWait(String[])}.
-     *
-     * This Composite Type consists of the following items:
-     * <ul>
-     * <li>{@link #COMPLETED_ITEM}</li>
-     * <li>{@link #SUCCESS_ITEM}</li>
-     * </ul>
-     */
-    CompositeType   BATCH_RESOLVE_RESULT_TYPE       = Item
-                                                            .compositeType(
-                                                                    "BATCH_RESOLVE_RESULT",
-                                                                    "This type encapsulates a bundle batch resolve action result",
-                                                                    COMPLETED_ITEM,
-                                                                    SUCCESS_ITEM);
+    public void addField(String field, IndexReader r) throws IOException {
+      Fields multiFields = MultiFields.getFields(r);
+      fields.put(field, multiFields.terms(field));
+    }
 
-    /**
-     * Returns the dependency closure for the specified bundles.
-     *
-     * <p>
-     * A graph of bundles is computed starting with the specified bundles. The
-     * graph is expanded by adding any bundle that is either wired to a package
-     * that is currently exported by a bundle in the graph or requires a bundle
-     * in the graph. The graph is fully constructed when there is no bundle
-     * outside the graph that is wired to a bundle in the graph. The graph may
-     * contain {@code UNINSTALLED} bundles that are
-     * {@link #getRemovalPendingBundles() removal pending}.
-     *
-     * @param bundles The initial bundles IDs for which to generate the dependency
-     *        closure.
-     * @return A bundle ID array containing a snapshot of the dependency closure of
-     *         the specified bundles, or an empty array if there were no
-     *         specified bundles.
-     * @throws IOException if the operation failed
-     */
-    long[] getDependencyClosure(long[] bundles) throws IOException;
+    @Override
+    public FieldsEnum iterator() throws IOException {
+      return new ParallelFieldsEnum();
+    }
+    @Override
+    public Terms terms(String field) throws IOException {
+      return fields.get(field);
+    }
+  }
+  
+   @Override
+  public Bits getDeletedDocs() {
+    return MultiFields.getDeletedDocs(readers.get(0));
+  }
 
-    /**
-	 * Retrieve the framework start level
-	 *
-	 * @return the framework start level
-	 * @throws IOException if the operation failed
-	 */
-	int getFrameworkStartLevel() throws IOException;
+  @Override
+  public Fields fields() {
+    return fields;
+  }
+  
+  @Override
+  public synchronized Object clone() {
+    try {
+      return doReopen(true);
+    } catch (Exception ex) {
+      throw new RuntimeException(ex);
+    }
+  }
+  
+  /**
+   * Tries to reopen the subreaders.
+   * <br>
+   * If one or more subreaders could be re-opened (i. e. subReader.reopen() 
+   * returned a new instance != subReader), then a new ParallelReader instance 
+   * is returned, otherwise this instance is returned.
+   * <p>
+   * A re-opened instance might share one or more subreaders with the old 
+   * instance. Index modification operations result in undefined behavior
+   * when performed before the old instance is closed.
+   * (see {@link IndexReader#reopen()}).
+   * <p>
+   * If subreaders are shared, then the reference count of those
+   * readers is increased to ensure that the subreaders remain open
+   * until the last referring reader is closed.
+   * 
+   * @throws CorruptIndexException if the index is corrupt
+   * @throws IOException if there is a low-level IO error 
+   */
+  @Override
+  public synchronized IndexReader reopen() throws CorruptIndexException, IOException {
+    return doReopen(false);
+  }
+    
+  protected IndexReader doReopen(boolean doClone) throws CorruptIndexException, IOException {
+    ensureOpen();
+    
+    boolean reopened = false;
+    List<IndexReader> newReaders = new ArrayList<IndexReader>();
+    
+    boolean success = false;
+    
+    try {
+      for (final IndexReader oldReader : readers) {
+        IndexReader newReader = null;
+        if (doClone) {
+          newReader = (IndexReader) oldReader.clone();
+        } else {
+          newReader = oldReader.reopen();
+        }
+        newReaders.add(newReader);
+        // if at least one of the subreaders was updated we remember that
+        // and return a new ParallelReader
+        if (newReader != oldReader) {
+          reopened = true;
+        }
+      }
+      success = true;
+    } finally {
+      if (!success && reopened) {
+        for (int i = 0; i < newReaders.size(); i++) {
+          IndexReader r = newReaders.get(i);
+          if (r != readers.get(i)) {
+            try {
+              r.close();
+            } catch (IOException ignore) {
+              // keep going - we want to clean up as much as possible
+            }
+          }
+        }
+      }
+    }
 
-	/**
-	 * Answer the initial start level assigned to a bundle when it is first
-	 * started
-	 *
-	 * @return the start level
-	 * @throws IOException if the operation failed
-	 */
-	int getInitialBundleStartLevel() throws IOException;
+    if (reopened) {
+      List<Boolean> newDecrefOnClose = new ArrayList<Boolean>();
+      // TODO: maybe add a special reopen-ctor for norm-copying?
+      ParallelReader pr = new ParallelReader();
+      for (int i = 0; i < readers.size(); i++) {
+        IndexReader oldReader = readers.get(i);
+        IndexReader newReader = newReaders.get(i);
+        if (newReader == oldReader) {
+          newDecrefOnClose.add(Boolean.TRUE);
+          newReader.incRef();
+        } else {
+          // this is a new subreader instance, so on close() we don't
+          // decRef but close it 
+          newDecrefOnClose.add(Boolean.FALSE);
+        }
+        pr.add(newReader, !storedFieldReaders.contains(oldReader));
+      }
+      pr.decrefOnClose = newDecrefOnClose;
+      pr.incRefReaders = incRefReaders;
+      return pr;
+    } else {
+      // No subreader was refreshed
+      return this;
+    }
+  }
 
-    /**
-     * Returns the value of the specified property. If the key is not found in
-     * the Framework properties, the system properties are then searched. The
-     * method returns {@code null} if the property is not found.
-     *
-     * @param key The name of the requested property.
-     * @return The value of the requested property, or {@code null} if the
-     *         property is undefined.
-     * @throws IOException if the operation failed
-     */
-    String getProperty(String key);
 
-	/**
-     * Returns the bundles IDs that have non-current, in use bundle wirings. This
-     * is typically the bundles which have been updated or uninstalled since the
-     * last call to {@link #refreshBundles(long[])}.
-     *
-     * @return A bundle ID array containing a snapshot of the bundles which
-     *         have non-current, in use bundle wirings, or an empty
-     *         array if there are no such bundles.
-     * @throws IOException if the operation failed
-     */
-    long[] getRemovalPendingBundles() throws IOException;
+  @Override
+  public int numDocs() {
+    // Don't call ensureOpen() here (it could affect performance)
+    return numDocs;
+  }
 
-	/**
-	 * Install the bundle indicated by the bundleLocations
-	 *
-	 * @param location the location of the bundle to install
-	 * @return the bundle id the installed bundle
-	 * @throws IOException if the operation does not succeed
-	 */
-	long installBundle(String location) throws IOException;
+  @Override
+  public int maxDoc() {
+    // Don't call ensureOpen() here (it could affect performance)
+    return maxDoc;
+  }
 
-	/**
-	 * Install the bundle indicated by the bundleLocations
-	 *
-	 * @param location the location to assign to the bundle
-	 * @param url the URL which will supply the bytes for the bundle
-	 * @return the bundle id the installed bundle
-	 * @throws IOException if the operation does not succeed
-	 */
-	long installBundleFromURL(String location, String url) throws IOException;
+  @Override
+  public boolean hasDeletions() {
+    // Don't call ensureOpen() here (it could affect performance)
+    return hasDeletions;
+  }
 
-	/**
-	 * Batch install the bundles indicated by the list of bundleLocationUrls
-	 *
-	 * @see #BATCH_INSTALL_RESULT_TYPE BATCH_INSTALL_RESULT_TYPE for the precise
-	 *      specification of the CompositeData type representing the returned
-	 *      result.
-	 *
-	 * @param locations the array of locations of the bundles to install
-	 * @return the resulting state from executing the operation
-	 * @throws IOException if the operation does not succeed
-	 */
-	CompositeData installBundles(String[] locations) throws IOException;
+  // delete in all readers
+  @Override
+  protected void doDelete(int n) throws CorruptIndexException, IOException {
+    for (final IndexReader reader : readers) {
+      reader.deleteDocument(n);
+    }
+    hasDeletions = true;
+  }
 
-	/**
-	 * Batch install the bundles indicated by the list of bundleLocationUrls
-	 *
-	 * @see #BATCH_INSTALL_RESULT_TYPE BATCH_INSTALL_RESULT_TYPE
-	 *      BatchBundleResult for the precise specification of the CompositeData
-	 *      type representing the returned result.
-	 *
-	 * @param locations the array of locations to assign to the installed
-	 *        bundles
-	 * @param urls the array of urls which supply the bundle bytes
-	 * @return the resulting state from executing the operation
-	 * @throws IOException if the operation does not succeed
-	 */
-	CompositeData installBundlesFromURL(String[] locations, String[] urls)
-			throws IOException;
+  // undeleteAll in all readers
+  @Override
+  protected void doUndeleteAll() throws CorruptIndexException, IOException {
+    for (final IndexReader reader : readers) {
+      reader.undeleteAll();
+    }
+    hasDeletions = false;
+  }
 
-	/**
-	 * Force the update, replacement or removal of the packages identified by
-	 * the specified bundle.
-	 *
-	 * @param bundleIdentifier the bundle identifier
-	 * @throws IOException if the operation failed
-	 */
-	void refreshBundle(long bundleIdentifier) throws IOException;
-	boolean refreshBundleAndWait(long bundleIdentifier) throws IOException;
+  // append fields from storedFieldReaders
+  @Override
+  public Document document(int n, FieldSelector fieldSelector) throws CorruptIndexException, IOException {
+    ensureOpen();
+    Document result = new Document();
+    for (final IndexReader reader: storedFieldReaders) {
 
-	/**
-	 * Force the update, replacement or removal of the packages identified by
-	 * the list of bundles.
-	 *
-	 * @param bundleIdentifiers The identifiers of the bundles to refresh, or
-	 *        <code>null</code> for all bundles with packages pending removal.
-	 * @throws IOException if the operation failed
-	 */
-	void refreshBundles(long[] bundleIdentifiers) throws IOException;
-	CompositeData refreshBundlesAndWait(long[] bundleIdentifiers) throws IOException;
+      boolean include = (fieldSelector==null);
+      if (!include) {
+        Collection<String> fields = readerToFields.get(reader);
+        for (final String field : fields)
+          if (fieldSelector.accept(field) != FieldSelectorResult.NO_LOAD) {
+            include = true;
+            break;
+          }
+      }
+      if (include) {
+        List<Fieldable> fields = reader.document(n, fieldSelector).getFields();
+        for (Fieldable field : fields) {
+          result.add(field);
+        }
+      }
+    }
+    return result;
+  }
 
-	/**
-	 * Resolve the bundle indicated by the unique symbolic name and version
-	 *
-	 * @param bundleIdentifier the bundle identifier
-	 * @return <code>true</code> if the bundle was resolved, false otherwise
-	 * @throws IOException if the operation does not succeed
-	 * @throws IllegalArgumentException if the bundle indicated does not exist
-	 */
-	boolean resolveBundle(long bundleIdentifier) throws IOException;
+  // get all vectors
+  @Override
+  public TermFreqVector[] getTermFreqVectors(int n) throws IOException {
+    ensureOpen();
+    ArrayList<TermFreqVector> results = new ArrayList<TermFreqVector>();
+    for (final Map.Entry<String,IndexReader> e: fieldToReader.entrySet()) {
 
-	/**
-	 * Batch resolve the bundles indicated by the list of bundle identifiers
-	 *
-	 * @param bundleIdentifiers The identifiers of the bundles to resolve, or
-	 *        <code>null</code> to resolve all unresolved bundles.
-	 * @return <code>true</code> if the bundles were resolved, false otherwise
-	 * @throws IOException if the operation does not succeed
-	 */
-	boolean resolveBundles(long[] bundleIdentifiers) throws IOException;
+      String field = e.getKey();
+      IndexReader reader = e.getValue();
+      TermFreqVector vector = reader.getTermFreqVector(n, field);
+      if (vector != null)
+        results.add(vector);
+    }
+    return results.toArray(new TermFreqVector[results.size()]);
+  }
 
-	/**
-	 * Same as {@link #resolveBundles(long[])} but with a more detailed return type.
-	 * @param bundleIdentifiers
-	 * @return
-	 * @throws IOException
-	 */
-	CompositeData resolve(long[] bundleIdentifiers) throws IOException;
+  @Override
+  public TermFreqVector getTermFreqVector(int n, String field)
+    throws IOException {
+    ensureOpen();
+    IndexReader reader = fieldToReader.get(field);
+    return reader==null ? null : reader.getTermFreqVector(n, field);
+  }
 
-	/**
-	 * Restart the framework by updating the system bundle
-	 *
-	 * @throws IOException if the operation failed
-	 */
-	void restartFramework() throws IOException;
 
-	/**
-	 * Set the start level for the bundle identifier
-	 *
-	 * @param bundleIdentifier the bundle identifier
-	 * @param newlevel the new start level for the bundle
-	 * @throws IOException if the operation failed
-	 */
-	void setBundleStartLevel(long bundleIdentifier, int newlevel)
-			throws IOException;
+  @Override
+  public void getTermFreqVector(int docNumber, String field, TermVectorMapper mapper) throws IOException {
+    ensureOpen();
+    IndexReader reader = fieldToReader.get(field);
+    if (reader != null) {
+      reader.getTermFreqVector(docNumber, field, mapper); 
+    }
+  }
 
-	/**
-	 * Set the start levels for the list of bundles.
-	 *
-	 * @see #BATCH_ACTION_RESULT_TYPE BATCH_ACTION_RESULT_TYPE for the precise
-	 *      specification of the CompositeData type representing the returned
-	 *      result.
-	 *
-	 * @param bundleIdentifiers the array of bundle identifiers
-	 * @param newlevels the array of new start level for the bundles
-	 * @return the resulting state from executing the operation
-	 * @throws IOException if the operation failed
-	 */
-	CompositeData setBundleStartLevels(long[] bundleIdentifiers, int[] newlevels)
-			throws IOException;
+  @Override
+  public void getTermFreqVector(int docNumber, TermVectorMapper mapper) throws IOException {
+    ensureOpen();
 
-	/**
-	 * Set the start level for the framework
-	 *
-	 * @param newlevel the new start level
-	 * @throws IOException if the operation failed
-	 */
-	void setFrameworkStartLevel(int newlevel) throws IOException;
+    for (final Map.Entry<String,IndexReader> e : fieldToReader.entrySet()) {
 
-	/**
-	 * Set the initial start level assigned to a bundle when it is first started
-	 *
-	 * @param newlevel the new start level
-	 * @throws IOException if the operation failed
-	 */
-	void setInitialBundleStartLevel(int newlevel) throws IOException;
+      String field = e.getKey();
+      IndexReader reader = e.getValue();
+      reader.getTermFreqVector(docNumber, field, mapper);
+    }
 
-	/**
-	 * Shutdown the framework by stopping the system bundle
-	 *
-	 * @throws IOException if the operation failed
-	 */
-	void shutdownFramework() throws IOException;
+  }
 
-	/**
-	 * Start the bundle indicated by the bundle identifier
-	 *
-	 * @param bundleIdentifier the bundle identifier
-	 * @throws IOException if the operation does not succeed
-	 * @throws IllegalArgumentException if the bundle indicated does not exist
-	 */
-	void startBundle(long bundleIdentifier) throws IOException;
+  @Override
+  public boolean hasNorms(String field) throws IOException {
+    ensureOpen();
+    IndexReader reader = fieldToReader.get(field);
+    return reader==null ? false : reader.hasNorms(field);
+  }
 
-	/**
-	 * Batch start the bundles indicated by the list of bundle identifier
-	 *
-	 * @see #BATCH_ACTION_RESULT_TYPE BATCH_ACTION_RESULT_TYPE for the precise
-	 *      specification of the CompositeData type representing the returned
-	 *      result.
-	 *
-	 * @param bundleIdentifiers the array of bundle identifiers
-	 * @return the resulting state from executing the operation
-	 * @throws IOException if the operation does not succeed
-	 */
-	CompositeData startBundles(long[] bundleIdentifiers) throws IOException;
+  @Override
+  public synchronized byte[] norms(String field) throws IOException {
+    ensureOpen();
+    IndexReader reader = fieldToReader.get(field);
 
-	/**
-	 * Stop the bundle indicated by the bundle identifier
-	 *
-	 * @param bundleIdentifier the bundle identifier
-	 * @throws IOException if the operation does not succeed
-	 * @throws IllegalArgumentException if the bundle indicated does not exist
-	 */
-	void stopBundle(long bundleIdentifier) throws IOException;
+    if (reader==null)
+      return null;
+    
+    byte[] bytes = normsCache.get(field);
+    if (bytes != null)
+      return bytes;
+    if (!hasNorms(field))
+      return null;
+    if (normsCache.containsKey(field)) // cached omitNorms, not missing key
+      return null;
 
-	/**
-	 * Batch stop the bundles indicated by the list of bundle identifier
-	 *
-	 * @see #BATCH_ACTION_RESULT_TYPE BATCH_ACTION_RESULT_TYPE for the precise
-	 *      specification of the CompositeData type representing the returned
-	 *      result.
-	 *
-	 * @param bundleIdentifiers the array of bundle identifiers
-	 * @return the resulting state from executing the operation
-	 * @throws IOException if the operation does not succeed
-	 */
-	CompositeData stopBundles(long[] bundleIdentifiers) throws IOException;
+    bytes = MultiNorms.norms(reader, field);
+    normsCache.put(field, bytes);
+    return bytes;
+  }
 
-	/**
-	 * Uninstall the bundle indicated by the bundle identifier
-	 *
-	 * @param bundleIdentifier the bundle identifier
-	 * @throws IOException if the operation does not succeed
-	 * @throws IllegalArgumentException if the bundle indicated does not exist
-	 */
-	void uninstallBundle(long bundleIdentifier) throws IOException;
+  @Override
+  protected void doSetNorm(int n, String field, byte value)
+    throws CorruptIndexException, IOException {
+    IndexReader reader = fieldToReader.get(field);
+    if (reader!=null) {
+      synchronized(normsCache) {
+        normsCache.remove(field);
+      }
+      reader.doSetNorm(n, field, value);
+    }
+  }
 
-	/**
-	 * Batch uninstall the bundles indicated by the list of bundle identifiers
-	 *
-	 * @see #BATCH_ACTION_RESULT_TYPE BATCH_ACTION_RESULT_TYPE for the precise
-	 *      specification of the CompositeData type representing the returned
-	 *      result.
-	 *
-	 * @param bundleIdentifiers the array of bundle identifiers
-	 * @return the resulting state from executing the operation
-	 * @throws IOException if the operation does not succeed
-	 */
-	CompositeData uninstallBundles(long[] bundleIdentifiers) throws IOException;
+  @Override
+  public int docFreq(Term term) throws IOException {
+    ensureOpen();
+    IndexReader reader = fieldToReader.get(term.field());
+    return reader==null ? 0 : reader.docFreq(term);
+  }
 
-	/**
-	 * Update the bundle indicated by the bundle identifier
-	 *
-	 * @param bundleIdentifier the bundle identifier
-	 * @throws IOException if the operation does not succeed
-	 * @throws IllegalArgumentException if the bundle indicated does not exist
-	 */
-	void updateBundle(long bundleIdentifier) throws IOException;
+  @Override
+  public int docFreq(String field, BytesRef term) throws IOException {
+    ensureOpen();
+    IndexReader reader = fieldToReader.get(field);
+    return reader == null? 0 : reader.docFreq(field, term);
+  }
 
-	/**
-	 * Update the bundle identified by the bundle identifier
-	 *
-	 * @param bundleIdentifier the bundle identifier
-	 * @param url the URL to use to update the bundle
-	 * @throws IOException if the operation does not succeed
-	 * @throws IllegalArgumentException if the bundle indicated does not exist
-	 */
-	void updateBundleFromURL(long bundleIdentifier, String url) throws IOException;
+  /**
+   * Checks recursively if all subreaders are up to date. 
+   */
+  @Override
+  public boolean isCurrent() throws CorruptIndexException, IOException {
+    for (final IndexReader reader : readers) {
+      if (!reader.isCurrent()) {
+        return false;
+      }
+    }
+    
+    // all subreaders are up to date
+    return true;
+  }
 
-	/**
-	 * Batch update the bundles indicated by the list of bundle identifier.
-	 *
-	 * @see #BATCH_ACTION_RESULT_TYPE BATCH_ACTION_RESULT_TYPE for the precise
-	 *      specification of the CompositeData type representing the returned
-	 *      result.
-	 *
-	 * @param bundleIdentifiers the array of bundle identifiers
-	 * @return the resulting state from executing the operation
-	 * @throws IOException if the operation does not succeed
-	 */
-	CompositeData updateBundles(long[] bundleIdentifiers) throws IOException;
+  /**
+   * Checks recursively if all subindexes are optimized 
+   */
+  @Override
+  public boolean isOptimized() {
+    for (final IndexReader reader : readers) {
+      if (!reader.isOptimized()) {
+        return false;
+      }
+    }
+    
+    // all subindexes are optimized
+    return true;
+  }
 
-	/**
-	 * Update the bundle uniquely identified by the bundle symbolic name and
-	 * version using the contents of the supplied urls.
-	 *
-	 * @see #BATCH_ACTION_RESULT_TYPE BATCH_ACTION_RESULT_TYPE for the precise
-	 *      specification of the CompositeData type representing the returned
-	 *      result.
-	 *
-	 * @param bundleIdentifiers the array of bundle identifiers
-	 * @param urls the array of URLs to use to update the bundles
-	 * @return the resulting state from executing the operation
-	 * @throws IOException if the operation does not succeed
-	 * @throws IllegalArgumentException if the bundle indicated does not exist
-	 */
-	CompositeData updateBundlesFromURL(long[] bundleIdentifiers, String[] urls)
-			throws IOException;
+  
+  /** Not implemented.
+   * @throws UnsupportedOperationException
+   */
+  @Override
+  public long getVersion() {
+    throw new UnsupportedOperationException("ParallelReader does not support this method.");
+  }
 
-	/**
-	 * Update the framework by updating the system bundle.
-	 *
-	 * @throws IOException if the operation failed
-	 */
-	void updateFramework() throws IOException;
+  // for testing
+  IndexReader[] getSubReaders() {
+    return readers.toArray(new IndexReader[readers.size()]);
+  }
 
- }
- No newline at end of file
+  @Override
+  protected void doCommit(Map<String,String> commitUserData) throws IOException {
+    for (final IndexReader reader : readers)
+      reader.commit(commitUserData);
+  }
+
+  @Override
+  protected synchronized void doClose() throws IOException {
+    for (int i = 0; i < readers.size(); i++) {
+      if (decrefOnClose.get(i).booleanValue()) {
+        readers.get(i).decRef();
+      } else {
+        readers.get(i).close();
+      }
+    }
+  }
+
+  @Override
+  public Collection<String> getFieldNames (IndexReader.FieldOption fieldNames) {
+    ensureOpen();
+    Set<String> fieldSet = new HashSet<String>();
+    for (final IndexReader reader : readers) {
+      Collection<String> names = reader.getFieldNames(fieldNames);
+      fieldSet.addAll(names);
+    }
+    return fieldSet;
+  }
+  @Override
+  public ReaderContext getTopReaderContext() {
+    return topLevelReaderContext;
+  }
+
+  @Override
+  public void addReaderFinishedListener(ReaderFinishedListener listener) {
+    super.addReaderFinishedListener(listener);
+    for (IndexReader reader : readers) {
+      reader.addReaderFinishedListener(listener);
+    }
+  }
+
+  @Override
+  public void removeReaderFinishedListener(ReaderFinishedListener listener) {
+    super.removeReaderFinishedListener(listener);
+    for (IndexReader reader : readers) {
+      reader.removeReaderFinishedListener(listener);
+    }
+  }
+
+  @Override
+  public PerDocValues perDocValues() throws IOException {
+    return perDocs;
+  }
+  
+  // Single instance of this, per ParallelReader instance
+  private static final class ParallelPerDocs extends PerDocValues {
+    final TreeMap<String,IndexDocValues> fields = new TreeMap<String,IndexDocValues>();
+
+    void addField(String field, IndexReader r) throws IOException {
+      PerDocValues perDocs = MultiPerDocValues.getPerDocs(r);
+      fields.put(field, perDocs.docValues(field));
+    }
+
+    @Override
+    public void close() throws IOException {
+      // nothing to do here
+    }
+
+    @Override
+    public IndexDocValues docValues(String field) throws IOException {
+      return fields.get(field);
+    }
+
+    @Override
+    public Collection<String> fields() {
+      return fields.keySet();
+    }
+  }
+}
+
+
+
+

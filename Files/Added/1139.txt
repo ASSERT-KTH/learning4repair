@@ -1,14 +1,13 @@
 @Override
 
-package org.apache.lucene.codecs.lucene40;
+package org.apache.lucene.search;
 
-/*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+/**
+ * Copyright 2004 The Apache Software Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -20,229 +19,282 @@ package org.apache.lucene.codecs.lucene40;
  */
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Iterator;
+import java.util.Set;
 
-import org.apache.lucene.codecs.CodecUtil;
-import org.apache.lucene.codecs.StoredFieldsReader;
-import org.apache.lucene.index.CorruptIndexException;
-import org.apache.lucene.index.FieldInfo;
-import org.apache.lucene.index.FieldInfos;
-import org.apache.lucene.index.IndexFileNames;
-import org.apache.lucene.index.SegmentInfo;
-import org.apache.lucene.index.StoredFieldVisitor;
-import org.apache.lucene.store.AlreadyClosedException;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.IOContext;
-import org.apache.lucene.store.IndexInput;
-import org.apache.lucene.util.IOUtils;
-
-import java.io.Closeable;
-
-import static org.apache.lucene.codecs.lucene40.Lucene40StoredFieldsWriter.*;
+import org.apache.lucene.index.AtomicReaderContext;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.util.Bits;
 
 /**
- * Class responsible for access to stored document fields.
- * <p/>
- * It uses &lt;segment&gt;.fdt and &lt;segment&gt;.fdx; files.
- * 
- * @see Lucene40StoredFieldsFormat
- * @lucene.internal
+ * A query that generates the union of documents produced by its subqueries, and that scores each document with the maximum
+ * score for that document as produced by any subquery, plus a tie breaking increment for any additional matching subqueries.
+ * This is useful when searching for a word in multiple fields with different boost factors (so that the fields cannot be
+ * combined equivalently into a single search field).  We want the primary score to be the one associated with the highest boost,
+ * not the sum of the field scores (as BooleanQuery would give).
+ * If the query is "albino elephant" this ensures that "albino" matching one field and "elephant" matching
+ * another gets a higher score than "albino" matching both fields.
+ * To get this result, use both BooleanQuery and DisjunctionMaxQuery:  for each term a DisjunctionMaxQuery searches for it in
+ * each field, while the set of these DisjunctionMaxQuery's is combined into a BooleanQuery.
+ * The tie breaker capability allows results that include the same term in multiple fields to be judged better than results that
+ * include this term in only the best of those multiple fields, without confusing this with the better case of two different terms
+ * in the multiple fields.
  */
-public final class Lucene40StoredFieldsReader extends StoredFieldsReader implements Cloneable, Closeable {
-  private final FieldInfos fieldInfos;
-  private final IndexInput fieldsStream;
-  private final IndexInput indexStream;
-  private int numTotalDocs;
-  private int size;
-  private boolean closed;
+public class DisjunctionMaxQuery extends Query implements Iterable<Query> {
 
-  /** Returns a cloned FieldsReader that shares open
-   *  IndexInputs with the original one.  It is the caller's
-   *  job not to close the original FieldsReader until all
-   *  clones are called (eg, currently SegmentReader manages
-   *  this logic). */
-  @Override
-  public Lucene40StoredFieldsReader clone() {
-    ensureOpen();
-    return new Lucene40StoredFieldsReader(fieldInfos, numTotalDocs, size, fieldsStream.clone(), indexStream.clone());
+  /* The subqueries */
+  private ArrayList<Query> disjuncts = new ArrayList<Query>();
+
+  /* Multiple of the non-max disjunct scores added into our final score.  Non-zero values support tie-breaking. */
+  private float tieBreakerMultiplier = 0.0f;
+
+  /** Creates a new empty DisjunctionMaxQuery.  Use add() to add the subqueries.
+   * @param tieBreakerMultiplier the score of each non-maximum disjunct for a document is multiplied by this weight
+   *        and added into the final score.  If non-zero, the value should be small, on the order of 0.1, which says that
+   *        10 occurrences of word in a lower-scored field that is also in a higher scored field is just as good as a unique
+   *        word in the lower scored field (i.e., one that is not in any higher scored field.
+   */
+  public DisjunctionMaxQuery(float tieBreakerMultiplier) {
+    this.tieBreakerMultiplier = tieBreakerMultiplier;
+  }
+
+  /**
+   * Creates a new DisjunctionMaxQuery
+   * @param disjuncts a {@code Collection<Query>} of all the disjuncts to add
+   * @param tieBreakerMultiplier   the weight to give to each matching non-maximum disjunct
+   */
+  public DisjunctionMaxQuery(Collection<Query> disjuncts, float tieBreakerMultiplier) {
+    this.tieBreakerMultiplier = tieBreakerMultiplier;
+    add(disjuncts);
+  }
+
+  /** Add a subquery to this disjunction
+   * @param query the disjunct added
+   */
+  public void add(Query query) {
+    disjuncts.add(query);
+  }
+
+  /** Add a collection of disjuncts to this disjunction
+   * via {@code Iterable<Query>}
+   * @param disjuncts a collection of queries to add as disjuncts.
+   */
+  public void add(Collection<Query> disjuncts) {
+    this.disjuncts.addAll(disjuncts);
+  }
+
+  /** @return An {@code Iterator<Query>} over the disjuncts */
+  public Iterator<Query> iterator() {
+    return disjuncts.iterator();
   }
   
-  /** Used only by clone. */
-  private Lucene40StoredFieldsReader(FieldInfos fieldInfos, int numTotalDocs, int size, IndexInput fieldsStream, IndexInput indexStream) {
-    this.fieldInfos = fieldInfos;
-    this.numTotalDocs = numTotalDocs;
-    this.size = size;
-    this.fieldsStream = fieldsStream;
-    this.indexStream = indexStream;
-  }
-
-  /** Sole constructor. */
-  public Lucene40StoredFieldsReader(Directory d, SegmentInfo si, FieldInfos fn, IOContext context) throws IOException {
-    final String segment = si.name;
-    boolean success = false;
-    fieldInfos = fn;
-    try {
-      fieldsStream = d.openInput(IndexFileNames.segmentFileName(segment, "", FIELDS_EXTENSION), context);
-      final String indexStreamFN = IndexFileNames.segmentFileName(segment, "", FIELDS_INDEX_EXTENSION);
-      indexStream = d.openInput(indexStreamFN, context);
-      
-      CodecUtil.checkHeader(indexStream, CODEC_NAME_IDX, VERSION_START, VERSION_CURRENT);
-      CodecUtil.checkHeader(fieldsStream, CODEC_NAME_DAT, VERSION_START, VERSION_CURRENT);
-      assert HEADER_LENGTH_DAT == fieldsStream.getFilePointer();
-      assert HEADER_LENGTH_IDX == indexStream.getFilePointer();
-      final long indexSize = indexStream.length() - HEADER_LENGTH_IDX;
-      this.size = (int) (indexSize >> 3);
-      // Verify two sources of "maxDoc" agree:
-      if (this.size != si.getDocCount()) {
-        throw new CorruptIndexException("doc counts differ for segment " + segment + ": fieldsReader shows " + this.size + " but segmentInfo shows " + si.getDocCount());
-      }
-      numTotalDocs = (int) (indexSize >> 3);
-      success = true;
-    } finally {
-      // With lock-less commits, it's entirely possible (and
-      // fine) to hit a FileNotFound exception above. In
-      // this case, we want to explicitly close any subset
-      // of things that were opened so that we don't have to
-      // wait for a GC to do so.
-      if (!success) {
-        try {
-          close();
-        } catch (Throwable t) {} // ensure we throw our original exception
-      }
-    }
-  }
-
   /**
-   * @throws AlreadyClosedException if this FieldsReader is closed
+   * @return the disjuncts.
    */
-  private void ensureOpen() throws AlreadyClosedException {
-    if (closed) {
-      throw new AlreadyClosedException("this FieldsReader is closed");
-    }
+  public ArrayList<Query> getDisjuncts() {
+    return disjuncts;
   }
 
   /**
-   * Closes the underlying {@link org.apache.lucene.store.IndexInput} streams.
-   * This means that the Fields values will not be accessible.
+   * @return tie breaker value for multiple matches.
+   */
+  public float getTieBreakerMultiplier() {
+    return tieBreakerMultiplier;
+  }
+
+  /**
+   * Expert: the Weight for DisjunctionMaxQuery, used to
+   * normalize, score and explain these queries.
    *
-   * @throws IOException If an I/O error occurs
+   * <p>NOTE: this API and implementation is subject to
+   * change suddenly in the next release.</p>
    */
-  public final void close() throws IOException {
-    if (!closed) {
-      IOUtils.close(fieldsStream, indexStream);
-      closed = true;
+  protected class DisjunctionMaxWeight extends Weight {
+
+    /** The Weights for our subqueries, in 1-1 correspondence with disjuncts */
+    protected ArrayList<Weight> weights = new ArrayList<Weight>();  // The Weight's for our subqueries, in 1-1 correspondence with disjuncts
+
+    /** Construct the Weight for this Query searched by searcher.  Recursively construct subquery weights. */
+    public DisjunctionMaxWeight(IndexSearcher searcher) throws IOException {
+      for (Query disjunctQuery : disjuncts) {
+        weights.add(disjunctQuery.createWeight(searcher));
+      }
     }
-  }
 
-  /** Returns number of documents. */
-  public final int size() {
-    return size;
-  }
+    /** Return our associated DisjunctionMaxQuery */
+    @Override
+    public Query getQuery() { return DisjunctionMaxQuery.this; }
 
-  private void seekIndex(int docID) throws IOException {
-    indexStream.seek(HEADER_LENGTH_IDX + docID * 8L);
-  }
+    /** Compute the sub of squared weights of us applied to our subqueries.  Used for normalization. */
+    @Override
+    public float getValueForNormalization() throws IOException {
+      float max = 0.0f, sum = 0.0f;
+      for (Weight currentWeight : weights) {
+        float sub = currentWeight.getValueForNormalization();
+        sum += sub;
+        max = Math.max(max, sub);
+        
+      }
+      float boost = getBoost();
+      return (((sum - max) * tieBreakerMultiplier * tieBreakerMultiplier) + max) * boost * boost;
+    }
 
+    /** Apply the computed normalization factor to our subqueries */
+    @Override
+    public void normalize(float norm, float topLevelBoost) {
+      topLevelBoost *= getBoost();  // Incorporate our boost
+      for (Weight wt : weights) {
+        wt.normalize(norm, topLevelBoost);
+      }
+    }
+
+    /** Create the scorer used to score our associated DisjunctionMaxQuery */
+    @Override
+    public Scorer scorer(AtomicReaderContext context, boolean scoreDocsInOrder,
+        boolean topScorer, Bits acceptDocs) throws IOException {
+      Scorer[] scorers = new Scorer[weights.size()];
+      int idx = 0;
+      for (Weight w : weights) {
+        // we will advance() subscorers
+        Scorer subScorer = w.scorer(context, true, false, acceptDocs);
+        if (subScorer != null) {
+          scorers[idx++] = subScorer;
+        }
+      }
+      if (idx == 0) return null; // all scorers did not have documents
+      DisjunctionMaxScorer result = new DisjunctionMaxScorer(this, tieBreakerMultiplier, scorers, idx);
+      return result;
+    }
+
+    /** Explain the score we computed for doc */
+    @Override
+    public Explanation explain(AtomicReaderContext context, int doc) throws IOException {
+      if (disjuncts.size() == 1) return weights.get(0).explain(context,doc);
+      ComplexExplanation result = new ComplexExplanation();
+      float max = 0.0f, sum = 0.0f;
+      result.setDescription(tieBreakerMultiplier == 0.0f ? "max of:" : "max plus " + tieBreakerMultiplier + " times others of:");
+      for (Weight wt : weights) {
+        Explanation e = wt.explain(context, doc);
+        if (e.isMatch()) {
+          result.setMatch(Boolean.TRUE);
+          result.addDetail(e);
+          sum += e.getValue();
+          max = Math.max(max, e.getValue());
+        }
+      }
+      result.setValue(max + (sum - max) * tieBreakerMultiplier);
+      return result;
+    }
+    
+  }  // end of DisjunctionMaxWeight inner class
+
+  /** Create the Weight used to score us */
   @Override
-  public final void visitDocument(int n, StoredFieldVisitor visitor) throws IOException {
-    seekIndex(n);
-    fieldsStream.seek(indexStream.readLong());
+  public Weight createWeight(IndexSearcher searcher) throws IOException {
+    return new DisjunctionMaxWeight(searcher);
+  }
 
-    final int numFields = fieldsStream.readVInt();
-    for (int fieldIDX = 0; fieldIDX < numFields; fieldIDX++) {
-      int fieldNumber = fieldsStream.readVInt();
-      FieldInfo fieldInfo = fieldInfos.fieldInfo(fieldNumber);
-      
-      int bits = fieldsStream.readByte() & 0xFF;
-      assert bits <= (FIELD_IS_NUMERIC_MASK | FIELD_IS_BINARY): "bits=" + Integer.toHexString(bits);
-
-      switch(visitor.needsField(fieldInfo)) {
-        case YES:
-          readField(visitor, fieldInfo, bits);
-          break;
-        case NO: 
-          skipField(bits);
-          break;
-        case STOP: 
-          return;
+  /** Optimize our representation and our subqueries representations
+   * @param reader the IndexReader we query
+   * @return an optimized copy of us (which may not be a copy if there is nothing to optimize) */
+  @Override
+  public Query rewrite(IndexReader reader) throws IOException {
+    int numDisjunctions = disjuncts.size();
+    if (numDisjunctions == 1) {
+      Query singleton = disjuncts.get(0);
+      Query result = singleton.rewrite(reader);
+      if (getBoost() != 1.0f) {
+        if (result == singleton) result = result.clone();
+        result.setBoost(getBoost() * result.getBoost());
       }
+      return result;
+    }
+    DisjunctionMaxQuery clone = null;
+    for (int i = 0 ; i < numDisjunctions; i++) {
+      Query clause = disjuncts.get(i);
+      Query rewrite = clause.rewrite(reader);
+      if (rewrite != clause) {
+        if (clone == null) clone = this.clone();
+        clone.disjuncts.set(i, rewrite);
+      }
+    }
+    if (clone != null) return clone;
+    else return this;
+  }
+
+  /** Create a shallow copy of us -- used in rewriting if necessary
+   * @return a copy of us (but reuse, don't copy, our subqueries) */
+  @Override @SuppressWarnings("unchecked")
+  public DisjunctionMaxQuery clone() {
+    DisjunctionMaxQuery clone = (DisjunctionMaxQuery)super.clone();
+    clone.disjuncts = (ArrayList<Query>) this.disjuncts.clone();
+    return clone;
+  }
+
+  // inherit javadoc
+  @Override
+  public void extractTerms(Set<Term> terms) {
+    for (Query query : disjuncts) {
+      query.extractTerms(terms);
     }
   }
 
-  private void readField(StoredFieldVisitor visitor, FieldInfo info, int bits) throws IOException {
-    final int numeric = bits & FIELD_IS_NUMERIC_MASK;
-    if (numeric != 0) {
-      switch(numeric) {
-        case FIELD_IS_NUMERIC_INT:
-          visitor.intField(info, fieldsStream.readInt());
-          return;
-        case FIELD_IS_NUMERIC_LONG:
-          visitor.longField(info, fieldsStream.readLong());
-          return;
-        case FIELD_IS_NUMERIC_FLOAT:
-          visitor.floatField(info, Float.intBitsToFloat(fieldsStream.readInt()));
-          return;
-        case FIELD_IS_NUMERIC_DOUBLE:
-          visitor.doubleField(info, Double.longBitsToDouble(fieldsStream.readLong()));
-          return;
-        default:
-          throw new CorruptIndexException("Invalid numeric type: " + Integer.toHexString(numeric));
+  /** Prettyprint us.
+   * @param field the field to which we are applied
+   * @return a string that shows what we do, of the form "(disjunct1 | disjunct2 | ... | disjunctn)^boost"
+   */
+  @Override
+  public String toString(String field) {
+    StringBuilder buffer = new StringBuilder();
+    buffer.append("(");
+    int numDisjunctions = disjuncts.size();
+    for (int i = 0 ; i < numDisjunctions; i++) {
+      Query subquery = disjuncts.get(i);
+      if (subquery instanceof BooleanQuery) {   // wrap sub-bools in parens
+        buffer.append("(");
+        buffer.append(subquery.toString(field));
+        buffer.append(")");
       }
-    } else { 
-      final int length = fieldsStream.readVInt();
-      byte bytes[] = new byte[length];
-      fieldsStream.readBytes(bytes, 0, length);
-      if ((bits & FIELD_IS_BINARY) != 0) {
-        visitor.binaryField(info, bytes);
-      } else {
-        visitor.stringField(info, new String(bytes, 0, bytes.length, IOUtils.CHARSET_UTF_8));
-      }
+      else buffer.append(subquery.toString(field));
+      if (i != numDisjunctions-1) buffer.append(" | ");
     }
-  }
-  
-  private void skipField(int bits) throws IOException {
-    final int numeric = bits & FIELD_IS_NUMERIC_MASK;
-    if (numeric != 0) {
-      switch(numeric) {
-        case FIELD_IS_NUMERIC_INT:
-        case FIELD_IS_NUMERIC_FLOAT:
-          fieldsStream.readInt();
-          return;
-        case FIELD_IS_NUMERIC_LONG:
-        case FIELD_IS_NUMERIC_DOUBLE:
-          fieldsStream.readLong();
-          return;
-        default: 
-          throw new CorruptIndexException("Invalid numeric type: " + Integer.toHexString(numeric));
-      }
-    } else {
-      final int length = fieldsStream.readVInt();
-      fieldsStream.seek(fieldsStream.getFilePointer() + length);
+    buffer.append(")");
+    if (tieBreakerMultiplier != 0.0f) {
+      buffer.append("~");
+      buffer.append(tieBreakerMultiplier);
     }
+    if (getBoost() != 1.0) {
+      buffer.append("^");
+      buffer.append(getBoost());
+    }
+    return buffer.toString();
   }
 
-  /** Returns the length in bytes of each raw document in a
-   *  contiguous range of length numDocs starting with
-   *  startDocID.  Returns the IndexInput (the fieldStream),
-   *  already seeked to the starting point for startDocID.*/
-  public final IndexInput rawDocs(int[] lengths, int startDocID, int numDocs) throws IOException {
-    seekIndex(startDocID);
-    long startOffset = indexStream.readLong();
-    long lastOffset = startOffset;
-    int count = 0;
-    while (count < numDocs) {
-      final long offset;
-      final int docID = startDocID + count + 1;
-      assert docID <= numTotalDocs;
-      if (docID < numTotalDocs) 
-        offset = indexStream.readLong();
-      else
-        offset = fieldsStream.length();
-      lengths[count++] = (int) (offset-lastOffset);
-      lastOffset = offset;
-    }
-
-    fieldsStream.seek(startOffset);
-
-    return fieldsStream;
+  /** Return true iff we represent the same query as o
+   * @param o another object
+   * @return true iff o is a DisjunctionMaxQuery with the same boost and the same subqueries, in the same order, as us
+   */
+  @Override
+  public boolean equals(Object o) {
+    if (! (o instanceof DisjunctionMaxQuery) ) return false;
+    DisjunctionMaxQuery other = (DisjunctionMaxQuery)o;
+    return this.getBoost() == other.getBoost()
+            && this.tieBreakerMultiplier == other.tieBreakerMultiplier
+            && this.disjuncts.equals(other.disjuncts);
   }
+
+  /** Compute a hash code for hashing us
+   * @return the hash code
+   */
+  @Override
+  public int hashCode() {
+    return Float.floatToIntBits(getBoost())
+            + Float.floatToIntBits(tieBreakerMultiplier)
+            + disjuncts.hashCode();
+  }
+
+
 }

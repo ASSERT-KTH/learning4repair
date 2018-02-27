@@ -16,123 +16,139 @@ package org.apache.lucene.search;
  * limitations under the License.
  */
 
-import org.apache.lucene.analysis.Analyzer;
-import org.apache.lucene.analysis.Token;
-import org.apache.lucene.analysis.TokenStream;
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.TermFreqVector;
-
 import java.io.IOException;
-import java.io.StringReader;
-import java.util.*;
 
-/**
- *
- *
- **/
-public class QueryTermVector implements TermFreqVector {
-  private String [] terms = new String[0];
-  private int [] termFreqs = new int[0];
+import org.apache.lucene.util.*;
+import org.apache.lucene.index.*;
 
-  public String getField() { return null;  }
+abstract class PhraseScorer extends Scorer {
+  private Weight weight;
+  protected byte[] norms;
+  protected float value;
 
-  /**
-   * 
-   * @param queryTerms The original list of terms from the query, can contain duplicates
-   */ 
-  public QueryTermVector(String [] queryTerms) {
+  private boolean firstTime = true;
+  private boolean more = true;
+  protected PhraseQueue pq;
+  protected PhrasePositions first, last;
 
-    processTerms(queryTerms);
+  private float freq;
+
+  PhraseScorer(Weight weight, TermPositions[] tps, Similarity similarity,
+               byte[] norms) throws IOException {
+    super(similarity);
+    this.norms = norms;
+    this.weight = weight;
+    this.value = weight.getValue();
+
+    // convert tps to a list
+    for (int i = 0; i < tps.length; i++) {
+      PhrasePositions pp = new PhrasePositions(tps[i], i);
+      if (last != null) {			  // add next to end of list
+        last.next = pp;
+      } else
+        first = pp;
+      last = pp;
+    }
+
+    pq = new PhraseQueue(tps.length);             // construct empty pq
+
   }
 
-  public QueryTermVector(String queryString, Analyzer analyzer) {    
-    if (analyzer != null)
-    {
-      TokenStream stream = analyzer.tokenStream("", new StringReader(queryString));
-      if (stream != null)
-      {
-        Token next = null;
-        List terms = new ArrayList();
-        try {
-          while ((next = stream.next()) != null)
-          {
-            terms.add(next.termText());
-          }
-          processTerms((String[])terms.toArray(new String[terms.size()]));
-        } catch (IOException e) {
-        }
-      }
-    }                                                              
+  public int doc() { return first.doc; }
+
+  public boolean next() throws IOException {
+    if (firstTime) {
+      init();
+      firstTime = false;
+    } else if (more) {
+      more = last.next();                         // trigger further scanning
+    }
+    return doNext();
   }
   
-  private void processTerms(String[] queryTerms) {
-    if (queryTerms != null) {
-      Arrays.sort(queryTerms);
-      Map tmpSet = new HashMap(queryTerms.length);
-      //filter out duplicates
-      List tmpList = new ArrayList(queryTerms.length);
-      List tmpFreqs = new ArrayList(queryTerms.length);
-      int j = 0;
-      for (int i = 0; i < queryTerms.length; i++) {
-        String term = queryTerms[i];
-        Integer position = (Integer)tmpSet.get(term);
-        if (position == null) {
-          tmpSet.put(term, new Integer(j++));
-          tmpList.add(term);
-          tmpFreqs.add(new Integer(1));
-        }       
-        else {
-          Integer integer = (Integer)tmpFreqs.get(position.intValue());
-          tmpFreqs.set(position.intValue(), new Integer(integer.intValue() + 1));          
-        }
+  // next without initial increment
+  private boolean doNext() throws IOException {
+    while (more) {
+      while (more && first.doc < last.doc) {      // find doc w/ all the terms
+        more = first.skipTo(last.doc);            // skip first upto last
+        firstToLast();                            // and move it to the end
       }
-      terms = (String[])tmpList.toArray(terms);
-      //termFreqs = (int[])tmpFreqs.toArray(termFreqs);
-      termFreqs = new int[tmpFreqs.size()];
-      int i = 0;
-      for (Iterator iter = tmpFreqs.iterator(); iter.hasNext();) {
-        Integer integer = (Integer) iter.next();
-        termFreqs[i++] = integer.intValue();
+
+      if (more) {
+        // found a doc with all of the terms
+        freq = phraseFreq();                      // check for phrase
+        if (freq == 0.0f)                         // no match
+          more = last.next();                     // trigger further scanning
+        else
+          return true;                            // found a match
       }
     }
+    return false;                                 // no more matches
+  }
+
+  public float score() throws IOException {
+    //System.out.println("scoring " + first.doc);
+    float raw = getSimilarity().tf(freq) * value; // raw score
+    return raw * Similarity.decodeNorm(norms[first.doc]); // normalize
+  }
+
+  public boolean skipTo(int target) throws IOException {
+    for (PhrasePositions pp = first; more && pp != null; pp = pp.next) {
+      more = pp.skipTo(target);
+    }
+    if (more)
+      sort();                                     // re-sort
+    return doNext();
+  }
+
+  protected abstract float phraseFreq() throws IOException;
+
+  private void init() throws IOException {
+    for (PhrasePositions pp = first; more && pp != null; pp = pp.next) 
+      more = pp.next();
+    if(more)
+      sort();
   }
   
-  public final String toString() {
-        StringBuffer sb = new StringBuffer();
-        sb.append('{');
-        for (int i=0; i<terms.length; i++) {
-            if (i>0) sb.append(", ");
-            sb.append(terms[i]).append('/').append(termFreqs[i]);
-        }
-        sb.append('}');
-        return sb.toString();
+  private void sort() {
+    pq.clear();
+    for (PhrasePositions pp = first; pp != null; pp = pp.next)
+      pq.put(pp);
+    pqToList();
+  }
+
+  protected final void pqToList() {
+    last = first = null;
+    while (pq.top() != null) {
+      PhrasePositions pp = (PhrasePositions) pq.pop();
+      if (last != null) {			  // add next to end of list
+        last.next = pp;
+      } else
+        first = pp;
+      last = pp;
+      pp.next = null;
     }
-  
-
-  public int size() {
-    return terms.length;
   }
 
-  public String[] getTerms() {
-    return terms;
+  protected final void firstToLast() {
+    last.next = first;			  // move first to end of list
+    last = first;
+    first = first.next;
+    last.next = null;
   }
 
-  public int[] getTermFrequencies() {
-    return termFreqs;
+  public Explanation explain(final int doc) throws IOException {
+    Explanation tfExplanation = new Explanation();
+
+    while (next() && doc() < doc) {}
+
+    float phraseFreq = (doc() == doc) ? freq : 0.0f;
+    tfExplanation.setValue(getSimilarity().tf(phraseFreq));
+    tfExplanation.setDescription("tf(phraseFreq=" + phraseFreq + ")");
+
+    return tfExplanation;
   }
 
-  public int indexOf(String term) {
-    int res = Arrays.binarySearch(terms, term);
-        return res >= 0 ? res : -1;
-  }
-
-  public int[] indexesOf(String[] terms, int start, int len) {
-    int res[] = new int[len];
-
-    for (int i=0; i < len; i++) {
-        res[i] = indexOf(terms[i]);
-    }
-    return res;                  
-  }
+  public String toString() { return "scorer(" + weight + ")"; }
 
 }

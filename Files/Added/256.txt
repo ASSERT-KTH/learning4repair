@@ -21,143 +21,114 @@ if (logger_.isDebugEnabled())
 package org.apache.cassandra.db;
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.locks.Condition;
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReentrantLock;
-
-import org.apache.cassandra.io.SSTable;
-import org.apache.cassandra.service.StorageService;
 
 import org.apache.log4j.Logger;
-import org.cliffc.high_scale_lib.NonBlockingHashMap;
+
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.utils.BasicUtilities;
 
 /**
  * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
  */
 
-public class BinaryMemtable
+public class SystemTable
 {
-    private static Logger logger_ = Logger.getLogger( Memtable.class );
-    private int threshold_ = 512*1024*1024;
-    private AtomicInteger currentSize_ = new AtomicInteger(0);
+    private static Logger logger_ = Logger.getLogger(SystemTable.class);
+    public static final String LOCATION_CF = "LocationInfo";
+    private static final String LOCATION_KEY = "L"; // only one row in Location CF
+    private static final String TOKEN = "Token";
+    private static final String GENERATION = "Generation";
 
-    /* Table and ColumnFamily name are used to determine the ColumnFamilyStore */
-    private String table_;
-    private String cfName_;
-    private boolean isFrozen_ = false;
-    private Map<String, byte[]> columnFamilies_ = new NonBlockingHashMap<String, byte[]>();
-    /* Lock and Condition for notifying new clients about Memtable switches */
-    Lock lock_ = new ReentrantLock();
-    Condition condition_;
-
-    BinaryMemtable(String table, String cfName) throws IOException
+    /*
+     * This method is used to update the SystemTable with the new token.
+    */
+    public static void updateToken(Token token) throws IOException
     {
-        condition_ = lock_.newCondition();
-        table_ = table;
-        cfName_ = cfName;
-    }
-
-    public int getMemtableThreshold()
-    {
-        return currentSize_.get();
-    }
-
-    void resolveSize(int oldSize, int newSize)
-    {
-        currentSize_.addAndGet(newSize - oldSize);
-    }
-
-
-    boolean isThresholdViolated()
-    {
-        if (currentSize_.get() >= threshold_ || columnFamilies_.size() > 50000)
-        {
-            logger_.debug("CURRENT SIZE:" + currentSize_.get());
-        	return true;
-        }
-        return false;
-    }
-
-    String getColumnFamily()
-    {
-    	return cfName_;
+        IPartitioner p = StorageService.getPartitioner();
+        Table table = Table.open(Table.SYSTEM_TABLE);
+        /* Retrieve the "LocationInfo" column family */
+        ColumnFamily cf = table.getColumnFamilyStore(LOCATION_CF).getColumnFamily(LOCATION_KEY, LOCATION_KEY + ":" + TOKEN, new IdentityFilter());
+        long oldTokenColumnTimestamp = cf.getColumn(SystemTable.TOKEN).timestamp();
+        /* create the "Token" whose value is the new token. */
+        IColumn tokenColumn = new Column(SystemTable.TOKEN, p.getTokenFactory().toByteArray(token), oldTokenColumnTimestamp + 1);
+        /* replace the old "Token" column with this new one. */
+        logger_.debug("Replacing old token " + p.getTokenFactory().fromByteArray(cf.getColumn(SystemTable.TOKEN).value()) + " with " + token);
+        RowMutation rm = new RowMutation(Table.SYSTEM_TABLE, LOCATION_KEY);
+        cf.addColumn(tokenColumn);
+        rm.add(cf);
+        rm.apply();
     }
 
     /*
-     * This version is used by the external clients to put data into
-     * the memtable. This version will respect the threshold and flush
-     * the memtable to disk when the size exceeds the threshold.
+     * This method reads the system table and retrieves the metadata
+     * associated with this storage instance. Currently we store the
+     * metadata in a Column Family called LocatioInfo which has two
+     * columns namely "Token" and "Generation". This is the token that
+     * gets gossiped around and the generation info is used for FD.
     */
-    void put(String key, byte[] buffer) throws IOException
+    public static StorageMetadata initMetadata() throws IOException
     {
-        if (isThresholdViolated() )
+        /* Read the system table to retrieve the storage ID and the generation */
+        Table table = Table.open(Table.SYSTEM_TABLE);
+        ColumnFamily cf = table.getColumnFamilyStore(LOCATION_CF).getColumnFamily(LOCATION_KEY, LOCATION_KEY + ":" + GENERATION, new IdentityFilter());
+
+        IPartitioner p = StorageService.getPartitioner();
+        if (cf == null)
         {
-            lock_.lock();
-            try
-            {
-                ColumnFamilyStore cfStore = Table.open(table_).getColumnFamilyStore(cfName_);
-                if (!isFrozen_)
-                {
-                    isFrozen_ = true;
-                    BinaryMemtableManager.instance().submit(cfStore.getColumnFamilyName(), this);
-                    cfStore.switchBinaryMemtable(key, buffer);
-                }
-                else
-                {
-                    cfStore.applyBinary(key, buffer);
-                }
-            }
-            finally
-            {
-                lock_.unlock();
-            }
+            Token token = p.getDefaultToken();
+            int generation = 1;
+
+            RowMutation rm = new RowMutation(Table.SYSTEM_TABLE, LOCATION_KEY);
+            cf = ColumnFamily.create(Table.SYSTEM_TABLE, SystemTable.LOCATION_CF);
+            cf.addColumn(new Column(TOKEN, p.getTokenFactory().toByteArray(token)));
+            cf.addColumn(new Column(GENERATION, BasicUtilities.intToByteArray(generation)) );
+            rm.add(cf);
+            rm.apply();
+            return new StorageMetadata(token, generation);
         }
-        else
-        {
-            resolve(key, buffer);
-        }
+
+        /* we crashed and came back up need to bump generation # */
+        IColumn tokenColumn = cf.getColumn(TOKEN);
+        Token token = p.getTokenFactory().fromByteArray(tokenColumn.value());
+
+        IColumn generation = cf.getColumn(GENERATION);
+        int gen = BasicUtilities.byteArrayToInt(generation.value()) + 1;
+
+        RowMutation rm = new RowMutation(Table.SYSTEM_TABLE, LOCATION_KEY);
+        cf = ColumnFamily.create(Table.SYSTEM_TABLE, SystemTable.LOCATION_CF);
+        Column generation2 = new Column(GENERATION, BasicUtilities.intToByteArray(gen), generation.timestamp() + 1);
+        cf.addColumn(generation2);
+        rm.add(cf);
+        rm.apply();
+        return new StorageMetadata(token, gen);
     }
 
-    private void resolve(String key, byte[] buffer)
+    public static class StorageMetadata
     {
-            columnFamilies_.put(key, buffer);
-            currentSize_.addAndGet(buffer.length + key.length());
-    }
+        private Token myToken;
+        private int generation_;
 
-
-    /*
-     * 
-    */
-    void flush() throws IOException
-    {
-        if ( columnFamilies_.size() == 0 )
-            return;
-
-        /*
-         * Use the SSTable to write the contents of the TreeMap
-         * to disk.
-        */
-        ColumnFamilyStore cfStore = Table.open(table_).getColumnFamilyStore(cfName_);
-        List<String> keys = new ArrayList<String>( columnFamilies_.keySet() );
-        SSTable ssTable = new SSTable(cfStore.getTempSSTablePath(), keys.size(), StorageService.getPartitioner());
-        Collections.sort(keys);
-        /* Use this BloomFilter to decide if a key exists in a SSTable */
-        for ( String key : keys )
-        {           
-            byte[] bytes = columnFamilies_.get(key);
-            if ( bytes.length > 0 )
-            {            	
-                /* Now write the key and value to disk */
-                ssTable.append(key, bytes);
-            }
+        StorageMetadata(Token storageId, int generation)
+        {
+            myToken = storageId;
+            generation_ = generation;
         }
-        ssTable.close();
-        cfStore.storeLocation(ssTable);
-        columnFamilies_.clear();       
+
+        public Token getStorageId()
+        {
+            return myToken;
+        }
+
+        public void setStorageId(Token storageId)
+        {
+            myToken = storageId;
+        }
+
+        public int getGeneration()
+        {
+            return generation_;
+        }
     }
 }

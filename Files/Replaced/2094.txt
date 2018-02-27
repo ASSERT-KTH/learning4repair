@@ -1,6 +1,6 @@
-newIndexWriter(core, true, false);
+Integer enabledOp = OPERATORS.get(operation.trim().toUpperCase(Locale.ROOT));
 
-package org.apache.solr.update;
+package org.apache.solr.search;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,277 +19,192 @@ package org.apache.solr.update;
  * limitations under the License.
  */
 
-import java.io.IOException;
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReentrantLock;
+import org.apache.lucene.analysis.Analyzer;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.queryparser.simple.SimpleQueryParser;
+import org.apache.lucene.search.BooleanClause;
+import org.apache.lucene.search.BooleanQuery;
+import org.apache.lucene.search.PrefixQuery;
+import org.apache.lucene.search.Query;
+import org.apache.solr.common.params.CommonParams;
+import org.apache.solr.common.params.SimpleParams;
+import org.apache.solr.common.params.SolrParams;
+import org.apache.solr.common.util.NamedList;
+import org.apache.solr.parser.QueryParser;
+import org.apache.solr.request.SolrQueryRequest;
+import org.apache.solr.schema.FieldType;
+import org.apache.solr.schema.IndexSchema;
+import org.apache.solr.schema.TextField;
+import org.apache.solr.util.SolrPluginUtils;
 
-import org.apache.lucene.index.IndexWriter;
-import org.apache.lucene.store.AlreadyClosedException;
-import org.apache.solr.cloud.RecoveryStrategy;
-import org.apache.solr.common.SolrException;
-import org.apache.solr.common.SolrException.ErrorCode;
-import org.apache.solr.core.CoreContainer;
-import org.apache.solr.core.CoreDescriptor;
-import org.apache.solr.core.DirectoryFactory;
-import org.apache.solr.core.SolrCore;
-import org.apache.solr.util.RefCounted;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import java.util.HashMap;
+import java.util.Locale;
+import java.util.Map;
 
-public final class DefaultSolrCoreState extends SolrCoreState implements RecoveryStrategy.RecoveryListener {
-  public static Logger log = LoggerFactory.getLogger(DefaultSolrCoreState.class);
-  
-  private final boolean SKIP_AUTO_RECOVERY = Boolean.getBoolean("solrcloud.skip.autorecovery");
-  
-  private final Object recoveryLock = new Object();
-  
-  // protects pauseWriter and writerFree
-  private final Object writerPauseLock = new Object();
-  
-  private SolrIndexWriter indexWriter = null;
-  private DirectoryFactory directoryFactory;
+/**
+ * Create a query from the input value that will be parsed by Lucene's SimpleQueryParser.
+ * See {@link org.apache.lucene.queryparser.simple.SimpleQueryParser} for details on the exact syntax allowed
+ * to be used for queries.
+ * <br>
+ * The following options may be applied for parsing the query.
+ * <ul>
+ *   <li>
+ *     q.operations - Used to enable specific operations for parsing.  The operations that can be enabled are
+ *                    and, not, or, prefix, phrase, precedence, escape, and whitespace.  By default all operations
+ *                    are enabled.  All operations can be disabled by passing in an empty string to this parameter.
+ *   </li>
+ *   <li>
+ *     q.op - Used to specify the operator to be used if whitespace is a delimiter. Either 'AND' or 'OR'
+ *            can be specified for this parameter.  Any other string will cause an exception to be thrown.
+ *            If this parameter is not specified 'OR' will be used by default.
+ *   </li>
+ *   <li>
+ *     qf - The list of query fields and boosts to use when building the simple query.  The format is the following:
+ *          <code>fieldA^1.0 fieldB^2.2</code>.  A field can also be specified without a boost by simply listing the
+ *          field as <code>fieldA fieldB</code>.  Any field without a boost will default to use a boost of 1.0.
+ *   </li>
+ *   <li>
+ *     df - An override for the default field specified in the schema or a default field if one is not specified
+ *          in the schema.  If qf is not specified the default field will be used as the field to run the query
+ *          against.
+ *   </li>
+ * </ul>
+ */
+public class SimpleQParserPlugin extends QParserPlugin {
+  /** The name that can be used to specify this plugin should be used to parse the query. */
+  public static String NAME = "simple";
 
-  private volatile boolean recoveryRunning;
-  private RecoveryStrategy recoveryStrat;
-  private volatile boolean closed = false;
+  /** Enables {@code AND} operator (+) */
+  private static final String AND_OPERATOR         = "AND";
+  /** Enables {@code NOT} operator (-) */
+  private static final String NOT_OPERATOR         = "NOT";
+  /** Enables {@code OR} operator (|) */
+  private static final String OR_OPERATOR          = "OR";
+  /** Enables {@code PREFIX} operator (*) */
+  private static final String PREFIX_OPERATOR      = "PREFIX";
+  /** Enables {@code PHRASE} operator (") */
+  private static final String PHRASE_OPERATOR      = "PHRASE";
+  /** Enables {@code PRECEDENCE} operators: {@code (} and {@code )} */
+  private static final String PRECEDENCE_OPERATORS = "PRECEDENCE";
+  /** Enables {@code ESCAPE} operator (\) */
+  private static final String ESCAPE_OPERATOR      = "ESCAPE";
+  /** Enables {@code WHITESPACE} operators: ' ' '\n' '\r' '\t' */
+  private static final String WHITESPACE_OPERATOR  = "WHITESPACE";
 
-  private RefCounted<IndexWriter> refCntWriter;
+  /** Map of string operators to their int counterparts in SimpleQueryParser. */
+  private static final Map<String, Integer> OPERATORS = new HashMap<String, Integer>();
 
-  private boolean pauseWriter;
-  private boolean writerFree = true;
-  
-  protected final ReentrantLock commitLock = new ReentrantLock();
-
-  public DefaultSolrCoreState(DirectoryFactory directoryFactory) {
-    this.directoryFactory = directoryFactory;
+  /* Setup the map of possible operators. */
+  static {
+    OPERATORS.put(AND_OPERATOR,         SimpleQueryParser.AND_OPERATOR);
+    OPERATORS.put(NOT_OPERATOR,         SimpleQueryParser.NOT_OPERATOR);
+    OPERATORS.put(OR_OPERATOR,          SimpleQueryParser.OR_OPERATOR);
+    OPERATORS.put(PREFIX_OPERATOR,      SimpleQueryParser.PREFIX_OPERATOR);
+    OPERATORS.put(PHRASE_OPERATOR,      SimpleQueryParser.PHRASE_OPERATOR);
+    OPERATORS.put(PRECEDENCE_OPERATORS, SimpleQueryParser.PRECEDENCE_OPERATORS);
+    OPERATORS.put(ESCAPE_OPERATOR,      SimpleQueryParser.ESCAPE_OPERATOR);
+    OPERATORS.put(WHITESPACE_OPERATOR,  SimpleQueryParser.WHITESPACE_OPERATOR);
   }
-  
-  private void closeIndexWriter(IndexWriterCloser closer) {
-    try {
-      log.info("SolrCoreState ref count has reached 0 - closing IndexWriter");
-      if (closer != null) {
-        log.info("closing IndexWriter with IndexWriterCloser");
-        closer.closeWriter(indexWriter);
-      } else if (indexWriter != null) {
-        log.info("closing IndexWriter...");
-        indexWriter.close();
-      }
-    } catch (Throwable t) {
-      log.error("Error during shutdown of writer.", t);
-    } 
-  }
-  
+
+  /** No initialization is necessary so this method is empty. */
   @Override
-  public RefCounted<IndexWriter> getIndexWriter(SolrCore core)
-      throws IOException {
-    
-    if (closed) {
-      throw new SolrException(ErrorCode.SERVICE_UNAVAILABLE, "SolrCoreState already closed");
-    }
-    
-    synchronized (writerPauseLock) {
-      if (core == null) {
-        // core == null is a signal to just return the current writer, or null
-        // if none.
-        if (refCntWriter != null) refCntWriter.incref();
-        return refCntWriter;
-      }
-      
-      while (pauseWriter) {
-        try {
-          writerPauseLock.wait(100);
-        } catch (InterruptedException e) {}
-        
-        if (closed) {
-          throw new SolrException(ErrorCode.SERVICE_UNAVAILABLE, "Already closed");
-        }
-      }
-      
-      if (indexWriter == null) {
-        indexWriter = createMainIndexWriter(core, "DirectUpdateHandler2", false);
-      }
-      initRefCntWriter();
-      writerFree = false;
-      writerPauseLock.notifyAll();
-      refCntWriter.incref();
-      return refCntWriter;
-    }
+  public void init(NamedList args) {
   }
 
-  private void initRefCntWriter() {
-    if (refCntWriter == null) {
-      refCntWriter = new RefCounted<IndexWriter>(indexWriter) {
-        @Override
-        public void close() {
-          synchronized (writerPauseLock) {
-            writerFree = true;
-            writerPauseLock.notifyAll();
-          }
-        }
-      };
-    }
-  }
-
+  /** Returns a QParser that will create a query by using Lucene's SimpleQueryParser. */
   @Override
-  public synchronized void newIndexWriter(SolrCore core, boolean rollback, boolean forceNewDir) throws IOException {
-    if (closed) {
-      throw new AlreadyClosedException("SolrCoreState already closed");
-    }
-    log.info("Creating new IndexWriter...");
-    String coreName = core.getName();
-    synchronized (writerPauseLock) {
-      // we need to wait for the Writer to fall out of use
-      // first lets stop it from being lent out
-      pauseWriter = true;
-      // then lets wait until its out of use
-      log.info("Waiting until IndexWriter is unused... core=" + coreName);
-      
-      while (!writerFree) {
-        try {
-          writerPauseLock.wait(100);
-        } catch (InterruptedException e) {}
-        
-        if (closed) {
-          throw new SolrException(ErrorCode.SERVICE_UNAVAILABLE, "SolrCoreState already closed");
-        }
+  public QParser createParser(String qstr, SolrParams localParams, SolrParams params, SolrQueryRequest req) {
+    // Some of the parameters may come in through localParams, so combine them with params.
+    SolrParams defaultParams = SolrParams.wrapDefaults(localParams, params);
+
+    // This will be used to specify what fields and boosts will be used by SimpleQueryParser.
+    Map<String, Float> queryFields = SolrPluginUtils.parseFieldBoosts(defaultParams.get(SimpleParams.QF));
+
+    if (queryFields.isEmpty()) {
+      // It qf is not specified setup up the queryFields map to use the defaultField.
+      String defaultField = QueryParsing.getDefaultField(req.getSchema(), defaultParams.get(CommonParams.DF));
+
+      if (defaultField == null) {
+        // A query cannot be run without having a field or set of fields to run against.
+        throw new IllegalStateException("Neither " + SimpleParams.QF + ", " + CommonParams.DF
+            + ", nor the default search field are present.");
       }
 
-      try {
-        if (indexWriter != null) {
-          if (!rollback) {
-            try {
-              log.info("Closing old IndexWriter... core=" + coreName);
-              indexWriter.close();
-            } catch (Throwable t) {
-              SolrException.log(log, "Error closing old IndexWriter. core="
-                  + coreName, t);
-            }
+      queryFields.put(defaultField, 1.0F);
+    }
+    else {
+      for (Map.Entry<String, Float> queryField : queryFields.entrySet()) {
+        if (queryField.getValue() == null) {
+          // Some fields may be specified without a boost, so default the boost to 1.0 since a null value
+          // will not be accepted by SimpleQueryParser.
+          queryField.setValue(1.0F);
+        }
+      }
+    }
+
+    // Setup the operations that are enabled for the query.
+    int enabledOps = 0;
+    String opParam = defaultParams.get(SimpleParams.QO);
+
+    if (opParam == null) {
+      // All operations will be enabled.
+      enabledOps = -1;
+    } else {
+      // Parse the specified enabled operations to be used by the query.
+      String[] operations = opParam.split(",");
+
+      for (String operation : operations) {
+        Integer enabledOp = OPERATORS.get(operation.trim().toUpperCase(Locale.getDefault()));
+
+        if (enabledOp != null) {
+          enabledOps |= enabledOp;
+        }
+      }
+    }
+
+    // Create a SimpleQueryParser using the analyzer from the schema.
+    final IndexSchema schema = req.getSchema();
+    final SimpleQueryParser parser = new SimpleQueryParser(req.getSchema().getAnalyzer(), queryFields, enabledOps) {
+      // Override newPrefixQuery to provide a multi term analyzer for prefix queries run against TextFields.
+      @Override
+      protected Query newPrefixQuery(String text) {
+        BooleanQuery bq = new BooleanQuery(true);
+
+        for (Map.Entry<String, Float> entry : weights.entrySet()) {
+          String field = entry.getKey();
+          FieldType type = schema.getFieldType(field);
+          Query prefix;
+
+          if (type instanceof TextField) {
+            // If the field type is a TextField then use the multi term analyzer.
+            Analyzer analyzer = ((TextField)type).getMultiTermAnalyzer();
+            String term = TextField.analyzeMultiTerm(field, text, analyzer).utf8ToString();
+            prefix = new PrefixQuery(new Term(field, term));
           } else {
-            try {
-              log.info("Rollback old IndexWriter... core=" + coreName);
-              indexWriter.rollback();
-            } catch (Throwable t) {
-              SolrException.log(log, "Error rolling back old IndexWriter. core="
-                  + coreName, t);
-            }
+            // If the type is *not* a TextField don't do any analysis.
+            prefix = new PrefixQuery(new Term(entry.getKey(), text));
           }
+
+          prefix.setBoost(entry.getValue());
+          bq.add(prefix, BooleanClause.Occur.SHOULD);
         }
-        indexWriter = createMainIndexWriter(core, "DirectUpdateHandler2", forceNewDir);
-        log.info("New IndexWriter is ready to be used.");
-        // we need to null this so it picks up the new writer next get call
-        refCntWriter = null;
-      } finally {
-        
-        pauseWriter = false;
-        writerPauseLock.notifyAll();
+
+        return simplify(bq);
       }
-    }
-  }
+    };
 
-  @Override
-  public synchronized void rollbackIndexWriter(SolrCore core) throws IOException {
-    newIndexWriter(core, true, true);
-  }
-  
-  protected SolrIndexWriter createMainIndexWriter(SolrCore core, String name, boolean forceNewDirectory) throws IOException {
-    return SolrIndexWriter.create(name, core.getNewIndexDir(),
-        core.getDirectoryFactory(), false, core.getSchema(),
-        core.getSolrConfig().indexConfig, core.getDeletionPolicy(), core.getCodec(), forceNewDirectory);
-  }
+    // Set the default operator to be either 'AND' or 'OR' for the query.
+    QueryParser.Operator defaultOp = QueryParsing.getQueryParserDefaultOperator(req.getSchema(), defaultParams.get(QueryParsing.OP));
 
-  @Override
-  public DirectoryFactory getDirectoryFactory() {
-    return directoryFactory;
-  }
+    if (defaultOp == QueryParser.Operator.AND) {
+      parser.setDefaultOperator(BooleanClause.Occur.MUST);
+    }
 
-  @Override
-  public void doRecovery(CoreContainer cc, CoreDescriptor cd) {
-    if (SKIP_AUTO_RECOVERY) {
-      log.warn("Skipping recovery according to sys prop solrcloud.skip.autorecovery");
-      return;
-    }
-    
-    // check before we grab the lock
-    if (cc.isShutDown()) {
-      log.warn("Skipping recovery because Solr is shutdown");
-      return;
-    }
-    
-    synchronized (recoveryLock) {
-      // to be air tight we must also check after lock
-      if (cc.isShutDown()) {
-        log.warn("Skipping recovery because Solr is shutdown");
-        return;
+    // Return a QParser that wraps a SimpleQueryParser.
+    return new QParser(qstr, localParams, params, req) {
+      public Query parse() throws SyntaxError {
+        return parser.parse(qstr);
       }
-      log.info("Running recovery - first canceling any ongoing recovery");
-      cancelRecovery();
-      
-      while (recoveryRunning) {
-        try {
-          recoveryLock.wait(1000);
-        } catch (InterruptedException e) {
-
-        }
-        // check again for those that were waiting
-        if (cc.isShutDown()) {
-          log.warn("Skipping recovery because Solr is shutdown");
-          return;
-        }
-        if (closed) return;
-      }
-
-      // if true, we are recovering after startup and shouldn't have (or be receiving) additional updates (except for local tlog recovery)
-      boolean recoveringAfterStartup = recoveryStrat == null;
-
-      recoveryStrat = new RecoveryStrategy(cc, cd, this);
-      recoveryStrat.setRecoveringAfterStartup(recoveringAfterStartup);
-      recoveryStrat.start();
-      recoveryRunning = true;
-    }
-    
+    };
   }
-  
-  @Override
-  public void cancelRecovery() {
-    synchronized (recoveryLock) {
-      if (recoveryStrat != null && recoveryRunning) {
-        recoveryStrat.close();
-        while (true) {
-          try {
-            recoveryStrat.join();
-          } catch (InterruptedException e) {
-            // not interruptible - keep waiting
-            continue;
-          }
-          break;
-        }
-        
-        recoveryRunning = false;
-        recoveryLock.notifyAll();
-      }
-    }
-  }
-
-  @Override
-  public void recovered() {
-    recoveryRunning = false;
-  }
-
-  @Override
-  public void failed() {
-    recoveryRunning = false;
-  }
-
-  @Override
-  public synchronized void close(IndexWriterCloser closer) {
-    closed = true;
-    cancelRecovery();
-    closeIndexWriter(closer);
-  }
-  
-  @Override
-  public Lock getCommitLock() {
-    return commitLock;
-  }
-  
 }

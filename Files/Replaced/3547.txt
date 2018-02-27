@@ -21,113 +21,112 @@ package org.apache.lucene.search;
 
 import java.io.IOException;
 
-import org.apache.lucene.analysis.Analyzer;
-import org.apache.lucene.analysis.MockAnalyzer;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.StringField;
-import org.apache.lucene.document.TextField;
-import org.apache.lucene.document.Field.Store;
 import org.apache.lucene.index.AtomicReaderContext;
-import org.apache.lucene.index.FieldInvertState;
 import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.RandomIndexWriter;
 import org.apache.lucene.index.Term;
-import org.apache.lucene.search.similarities.Similarity;
 import org.apache.lucene.store.Directory;
-import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.LuceneTestCase;
 
-public class TestConjunctions extends LuceneTestCase {
-  Analyzer analyzer;
-  Directory dir;
-  IndexReader reader;
-  IndexSearcher searcher;
+public class TestScoreCachingWrappingScorer extends LuceneTestCase {
+
+  private static final class SimpleScorer extends Scorer {
+    private int idx = 0;
+    private int doc = -1;
+    
+    public SimpleScorer(Weight weight) {
+      super(weight);
+    }
+    
+    @Override public float score() {
+      // advance idx on purpose, so that consecutive calls to score will get
+      // different results. This is to emulate computation of a score. If
+      // ScoreCachingWrappingScorer is used, this should not be called more than
+      // once per document.
+      return idx == scores.length ? Float.NaN : scores[idx++];
+    }
+    
+    @Override public int freq() throws IOException {
+      return 1;
+    }
+
+    @Override public int docID() { return doc; }
+
+    @Override public int nextDoc() {
+      return ++doc < scores.length ? doc : NO_MORE_DOCS;
+    }
+    
+    @Override public int advance(int target) {
+      doc = target;
+      return doc < scores.length ? doc : NO_MORE_DOCS;
+    }
+    
+    @Override
+    public long cost() {
+      return scores.length;
+    }
+  }
   
-  static final String F1 = "title";
-  static final String F2 = "body";
+  private static final class ScoreCachingCollector extends SimpleCollector {
+
+    private int idx = 0;
+    private Scorer scorer;
+    float[] mscores;
+    
+    public ScoreCachingCollector(int numToCollect) {
+      mscores = new float[numToCollect];
+    }
+    
+    @Override public void collect(int doc) throws IOException {
+      // just a sanity check to avoid IOOB.
+      if (idx == mscores.length) {
+        return; 
+      }
+      
+      // just call score() a couple of times and record the score.
+      mscores[idx] = scorer.score();
+      mscores[idx] = scorer.score();
+      mscores[idx] = scorer.score();
+      ++idx;
+    }
+
+    @Override public void setScorer(Scorer scorer) {
+      this.scorer = new ScoreCachingWrappingScorer(scorer);
+    }
+    
+    @Override public boolean acceptsDocsOutOfOrder() {
+      return true;
+    }
+
+  }
+
+  private static final float[] scores = new float[] { 0.7767749f, 1.7839992f,
+      8.9925785f, 7.9608946f, 0.07948637f, 2.6356435f, 7.4950366f, 7.1490803f,
+      8.108544f, 4.961808f, 2.2423935f, 7.285586f, 4.6699767f };
   
-  @Override
-  public void setUp() throws Exception {
-    super.setUp();
-    analyzer = new MockAnalyzer(random());
-    dir = newDirectory();
-    IndexWriterConfig config = newIndexWriterConfig(TEST_VERSION_CURRENT, analyzer);
-    config.setMergePolicy(newLogMergePolicy()); // we will use docids to validate
-    RandomIndexWriter writer = new RandomIndexWriter(random(), dir, config);
-    writer.addDocument(doc("lucene", "lucene is a very popular search engine library"));
-    writer.addDocument(doc("solr", "solr is a very popular search server and is using lucene"));
-    writer.addDocument(doc("nutch", "nutch is an internet search engine with web crawler and is using lucene and hadoop"));
-    reader = writer.getReader();
+  public void testGetScores() throws Exception {
+    Directory directory = newDirectory();
+    RandomIndexWriter writer = new RandomIndexWriter(random(), directory);
+    writer.commit();
+    IndexReader ir = writer.getReader();
     writer.close();
-    searcher = newSearcher(reader);
-    searcher.setSimilarity(new TFSimilarity());
-  }
-  
-  static Document doc(String v1, String v2) {
-    Document doc = new Document();
-    doc.add(new StringField(F1, v1, Store.YES));
-    doc.add(new TextField(F2, v2, Store.YES));
-    return doc;
-  }
-  
-  public void testTermConjunctionsWithOmitTF() throws Exception {
-    BooleanQuery bq = new BooleanQuery();
-    bq.add(new TermQuery(new Term(F1, "nutch")), BooleanClause.Occur.MUST);
-    bq.add(new TermQuery(new Term(F2, "is")), BooleanClause.Occur.MUST);
-    TopDocs td = searcher.search(bq, 3);
-    assertEquals(1, td.totalHits);
-    assertEquals(3F, td.scoreDocs[0].score, 0.001F); // f1:nutch + f2:is + f2:is
-  }
-  
-  @Override
-  public void tearDown() throws Exception {
-    reader.close();
-    dir.close();
-    super.tearDown();
-  }
-  
-  // Similarity that returns the TF as score
-  private static class TFSimilarity extends Similarity {
-
-    @Override
-    public long computeNorm(FieldInvertState state) {
-      return 1; // we dont care
+    IndexSearcher searcher = newSearcher(ir);
+    Weight fake = new TermQuery(new Term("fake", "weight")).createWeight(searcher);
+    Scorer s = new SimpleScorer(fake);
+    ScoreCachingCollector scc = new ScoreCachingCollector(scores.length);
+    scc.setScorer(s);
+    
+    // We need to iterate on the scorer so that its doc() advances.
+    int doc;
+    while ((doc = s.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+      scc.collect(doc);
     }
-
-    @Override
-    public SimWeight computeWeight(float queryBoost,
-        CollectionStatistics collectionStats, TermStatistics... termStats) {
-      return new SimWeight() {
-        @Override
-        public float getValueForNormalization() {
-          return 1; // we don't care
-        }
-        @Override
-        public void normalize(float queryNorm, float topLevelBoost) {
-          // we don't care
-        }
-      };
+    
+    for (int i = 0; i < scores.length; i++) {
+      assertEquals(scores[i], scc.mscores[i], 0f);
     }
-
-    @Override
-    public SimScorer simScorer(SimWeight weight, AtomicReaderContext context) throws IOException {
-      return new SimScorer() {
-        @Override
-        public float score(int doc, float freq) {
-          return freq;
-        }
-        
-        @Override
-        public float computeSlopFactor(int distance) {
-          return 1F;
-        }
-
-        @Override
-        public float computePayloadFactor(int doc, int start, int end, BytesRef payload) {
-          return 1F;
-        }
-      };
-    }
+    ir.close();
+    directory.close();
   }
+  
 }

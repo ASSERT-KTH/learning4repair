@@ -1,7 +1,6 @@
-public abstract void build(SolrCore core, SolrIndexSearcher searcher) throws IOException;
+throw new IllegalStateException("No clusters found. Check your -c path.");
 
-package org.apache.solr.spelling;
-/*
+/**
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -18,187 +17,60 @@ package org.apache.solr.spelling;
  * limitations under the License.
  */
 
-import org.apache.lucene.analysis.Analyzer;
-import org.apache.lucene.analysis.Token;
-import org.apache.lucene.analysis.core.WhitespaceAnalyzer;
-import org.apache.lucene.search.spell.LevensteinDistance;
-import org.apache.lucene.search.spell.StringDistance;
-import org.apache.lucene.search.spell.SuggestWord;
-import org.apache.lucene.search.spell.SuggestWordQueue;
-import org.apache.solr.client.solrj.response.SpellCheckResponse;
-import org.apache.solr.common.params.SpellingParams;
-import org.apache.solr.common.util.NamedList;
-import org.apache.solr.core.SolrCore;
-import org.apache.solr.handler.component.SpellCheckMergeData;
-import org.apache.solr.schema.FieldType;
-import org.apache.solr.search.SolrIndexSearcher;
+package org.apache.mahout.clustering.fuzzykmeans;
 
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
 
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.io.WritableComparable;
+import org.apache.hadoop.mapreduce.Mapper;
+import org.apache.mahout.clustering.ClusterObservations;
+import org.apache.mahout.math.VectorWritable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-/**
- * <p>
- * Refer to <a href="http://wiki.apache.org/solr/SpellCheckComponent">SpellCheckComponent</a>
- * for more details.
- * </p>
- * 
- * @since solr 1.3
- */
-public abstract class SolrSpellChecker {
-  public static final String DICTIONARY_NAME = "name";
-  public static final String DEFAULT_DICTIONARY_NAME = "default";
-  public static final String FIELD = "field";
-  public static final String FIELD_TYPE = "fieldType";
-  /** Dictionary name */
-  protected String name;
-  protected Analyzer analyzer;
-  protected String field;
-  protected String fieldTypeName;
+public class FuzzyKMeansMapper extends Mapper<WritableComparable<?>,VectorWritable,Text,ClusterObservations> {
+  
+  private static final Logger log = LoggerFactory.getLogger(FuzzyKMeansMapper.class);
+  
+  private final List<SoftCluster> clusters = new ArrayList<SoftCluster>();
+  private FuzzyKMeansClusterer clusterer;
 
-  public String init(NamedList config, SolrCore core) {
-    name = (String) config.get(DICTIONARY_NAME);
-    if (name == null) {
-      name = DEFAULT_DICTIONARY_NAME;
-    }
-    field = (String)config.get(FIELD);
-    if (field != null && core.getSchema().getFieldTypeNoEx(field) != null)  {
-      analyzer = core.getSchema().getFieldType(field).getQueryAnalyzer();
-    }
-    fieldTypeName = (String) config.get(FIELD_TYPE);
-    if (core.getSchema().getFieldTypes().containsKey(fieldTypeName))  {
-      FieldType fieldType = core.getSchema().getFieldTypes().get(fieldTypeName);
-      analyzer = fieldType.getQueryAnalyzer();
-    }
-    if (analyzer == null)   {
-      analyzer = new WhitespaceAnalyzer(core.getSolrConfig().luceneMatchVersion);
-    }
-    return name;
+  @Override
+  protected void map(WritableComparable<?> key, VectorWritable point, Context context) throws IOException, InterruptedException {
+    clusterer.emitPointProbToCluster(point.get(), clusters, context);
   }
+
+  @Override
+  protected void setup(Context context) throws IOException, InterruptedException {
+    super.setup(context);
+    Configuration job = context.getConfiguration();
+    clusterer = new FuzzyKMeansClusterer(job);
+    
+    log.info("In Mapper Configure:");
+    
+    String clusterPath = job.get(FuzzyKMeansConfigKeys.CLUSTER_PATH_KEY);
+    if ((clusterPath != null) && (clusterPath.length() > 0)) {
+      FuzzyKMeansUtil.configureWithClusterInfo(new Path(clusterPath), clusters);
+    }
+    
+    if (clusters.isEmpty()) {
+      throw new IllegalStateException("Cluster is empty!!!");
+    }
+  }
+
   /**
-   * Integrate spelling suggestions from the various shards in a distributed environment.
+   * Configure the mapper by providing its clusters. Used by unit tests.
    * 
-   * @param mergeData
-   * @param numSug
-   * @param count
-   * @param extendedResults
+   * @param clusters
+   *          a List<Cluster>
    */
-  public SpellingResult mergeSuggestions(SpellCheckMergeData mergeData, int numSug, int count, boolean extendedResults) {
-    float min = 0.5f;
-    try {
-      min = getAccuracy();
-    } catch(UnsupportedOperationException uoe) {
-      //just use .5 as a default
-    }
-    
-    StringDistance sd = null;
-    try {
-      sd = getStringDistance() == null ? new LevensteinDistance() : getStringDistance();    
-    } catch(UnsupportedOperationException uoe) {
-      sd = new LevensteinDistance();
-    }
-    
-    SpellingResult result = new SpellingResult();
-    for (Map.Entry<String, HashSet<String>> entry : mergeData.origVsSuggested.entrySet()) {
-      String original = entry.getKey();
-      
-      //Only use this suggestion if all shards reported it as misspelled.
-      Integer numShards = mergeData.origVsShards.get(original);
-      if(numShards<mergeData.totalNumberShardResponses) {
-        continue;
-      }
-      
-      HashSet<String> suggested = entry.getValue();
-      SuggestWordQueue sugQueue = new SuggestWordQueue(numSug);
-      for (String suggestion : suggested) {
-        SuggestWord sug = mergeData.suggestedVsWord.get(suggestion);
-        sug.score = sd.getDistance(original, sug.string);
-        if (sug.score < min) continue;
-        sugQueue.insertWithOverflow(sug);
-        if (sugQueue.size() == numSug) {
-          // if queue full, maintain the minScore score
-          min = sugQueue.top().score;
-        }
-      }
-
-      // create token
-      SpellCheckResponse.Suggestion suggestion = mergeData.origVsSuggestion.get(original);
-      Token token = new Token(original, suggestion.getStartOffset(), suggestion.getEndOffset());
-
-      // get top 'count' suggestions out of 'sugQueue.size()' candidates
-      SuggestWord[] suggestions = new SuggestWord[Math.min(count, sugQueue.size())];
-      // skip the first sugQueue.size() - count elements
-      for (int k=0; k < sugQueue.size() - count; k++) sugQueue.pop();
-      // now collect the top 'count' responses
-      for (int k = Math.min(count, sugQueue.size()) - 1; k >= 0; k--)  {
-        suggestions[k] = sugQueue.pop();
-      }
-
-      if (extendedResults) {
-        Integer o = mergeData.origVsFreq.get(original);
-        if (o != null) result.addFrequency(token, o);
-        for (SuggestWord word : suggestions)
-          result.add(token, word.string, word.freq);
-      } else {
-        List<String> words = new ArrayList<String>(sugQueue.size());
-        for (SuggestWord word : suggestions) words.add(word.string);
-        result.add(token, words);
-      }
-    }
-    return result;
-  }
-  
-  public Analyzer getQueryAnalyzer() {
-    return analyzer;
-  }
-
-  public String getDictionaryName() {
-    return name;
-  }
-
-  /**
-   * Reloads the index.  Useful if an external process is responsible for building the spell checker.
-   *
-   * @throws java.io.IOException
-   */
-  public abstract void reload(SolrCore core, SolrIndexSearcher searcher) throws IOException;
-
-  /**
-   * (re)Builds the spelling index.  May be a NOOP if the implementation doesn't require building, or can't be rebuilt.
-   */
-  public abstract void build(SolrCore core, SolrIndexSearcher searcher);
-  
-  /**
-   * Get the value of {@link SpellingParams#SPELLCHECK_ACCURACY} if supported.  
-   * Otherwise throws UnsupportedOperationException.
-   */
-  protected float getAccuracy() {
-    throw new UnsupportedOperationException();
-  }
-  
-  /**
-   * Get the distance implementation used by this spellchecker, or NULL if not applicable.
-   */
-  protected StringDistance getStringDistance()  {
-    throw new UnsupportedOperationException();
-  }
-
-
-  /**
-   * Get suggestions for the given query.  Tokenizes the query using a field appropriate Analyzer.
-   * The {@link SpellingResult#getSuggestions()} suggestions must be ordered by best suggestion first.
-   * <p/>
-   *
-   * @param options The {@link SpellingOptions} to use
-   * @return The {@link SpellingResult} suggestions
-   * @throws IOException if there is an error producing suggestions
-   */
-  public abstract SpellingResult getSuggestions(SpellingOptions options) throws IOException;
-  
-  public boolean isSuggestionsMayOverlap() {
-    return false;
-  }
+  void config(List<SoftCluster> clusters) {
+    this.clusters.clear();
+    this.clusters.addAll(clusters);
+  }  
 }

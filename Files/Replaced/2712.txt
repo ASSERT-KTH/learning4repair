@@ -1,596 +1,523 @@
-}, "PERIODIC-COMMIT-LOG-SYNCER").start();
+new Lock.With(directory.makeLock("commit.lock"), COMMIT_LOCK_TIMEOUT) {
+
+package org.apache.lucene.index;
+
+/* ====================================================================
+ * The Apache Software License, Version 1.1
+ *
+ * Copyright (c) 2001 The Apache Software Foundation.  All rights
+ * reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in
+ *    the documentation and/or other materials provided with the
+ *    distribution.
+ *
+ * 3. The end-user documentation included with the redistribution,
+ *    if any, must include the following acknowledgment:
+ *       "This product includes software developed by the
+ *        Apache Software Foundation (http://www.apache.org/)."
+ *    Alternately, this acknowledgment may appear in the software itself,
+ *    if and wherever such third-party acknowledgments normally appear.
+ *
+ * 4. The names "Apache" and "Apache Software Foundation" and
+ *    "Apache Lucene" must not be used to endorse or promote products
+ *    derived from this software without prior written permission. For
+ *    written permission, please contact apache@apache.org.
+ *
+ * 5. Products derived from this software may not be called "Apache",
+ *    "Apache Lucene", nor may "Apache" appear in their name, without
+ *    prior written permission of the Apache Software Foundation.
+ *
+ * THIS SOFTWARE IS PROVIDED ``AS IS'' AND ANY EXPRESSED OR IMPLIED
+ * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+ * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED.  IN NO EVENT SHALL THE APACHE SOFTWARE FOUNDATION OR
+ * ITS CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF
+ * USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
+ * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ * ====================================================================
+ *
+ * This software consists of voluntary contributions made by many
+ * individuals on behalf of the Apache Software Foundation.  For more
+ * information on the Apache Software Foundation, please see
+ * <http://www.apache.org/>.
+ */
+
+import java.io.IOException;
+import java.io.File;
+import java.io.PrintStream;
+import java.util.Vector;
+
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.RAMDirectory;
+import org.apache.lucene.store.FSDirectory;
+import org.apache.lucene.store.Lock;
+import org.apache.lucene.store.InputStream;
+import org.apache.lucene.store.OutputStream;
+import org.apache.lucene.search.Similarity;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.analysis.Analyzer;
+
 
 /**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+  An IndexWriter creates and maintains an index.
 
-package org.apache.cassandra.db;
+  The third argument to the <a href="#IndexWriter"><b>constructor</b></a>
+  determines whether a new index is created, or whether an existing index is
+  opened for the addition of new documents.
 
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.io.BufferedRandomAccessFile;
-import org.apache.cassandra.io.DataInputBuffer;
-import org.apache.cassandra.io.DataOutputBuffer;
-import org.apache.cassandra.utils.FBUtilities;
-import org.apache.cassandra.utils.FileUtils;
-import org.apache.commons.lang.StringUtils;
-import org.apache.log4j.Logger;
+  In either case, documents are added with the <a
+  href="#addDocument"><b>addDocument</b></a> method.  When finished adding
+  documents, <a href="#close"><b>close</b></a> should be called.
 
-import java.io.*;
-import java.util.*;
-import java.util.concurrent.Callable;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReentrantLock;
+  If an index will not have more documents added for a while and optimal search
+  performance is desired, then the <a href="#optimize"><b>optimize</b></a>
+  method should be called before the index is closed.
+  */
 
-import org.apache.commons.lang.StringUtils;
+public class IndexWriter {
+  public static long WRITE_LOCK_TIMEOUT = 1000;
+  public static long COMMIT_LOCK_TIMEOUT = 10000;
 
-/*
- * Commit Log tracks every write operation into the system. The aim
- * of the commit log is to be able to successfully recover data that was
- * not stored to disk via the Memtable. Every Commit Log maintains a
- * header represented by the abstraction CommitLogHeader. The header
- * contains a bit array and an array of longs and both the arrays are
- * of size, #column families for the Table, the Commit Log represents.
- *
- * Whenever a ColumnFamily is written to, for the first time its bit flag
- * is set to one in the CommitLogHeader. When it is flushed to disk by the
- * Memtable its corresponding bit in the header is set to zero. This helps
- * track which CommitLogs can be thrown away as a result of Memtable flushes.
- * Additionally, when a ColumnFamily is flushed and written to disk, its
- * entry in the array of longs is updated with the offset in the Commit Log
- * file where it was written. This helps speed up recovery since we can seek
- * to these offsets and start processing the commit log.
- *
- * Every Commit Log is rolled over everytime it reaches its threshold in size;
- * the new log inherits the "dirty" bits from the old.
- *
- * Over time there could be a number of commit logs that would be generated.
- * To allow cleaning up non-active commit logs, whenever we flush a column family and update its bit flag in
- * the active CL, we take the dirty bit array and bitwise & it with the headers of the older logs.
- * If the result is 0, then it is safe to remove the older file.  (Since the new CL
- * inherited the old's dirty bitflags, getting a zero for any given bit in the anding
- * means that either the CF was clean in the old CL or it has been flushed since the
- * switch in the new.)
- *
- * The CommitLog class itself is "mostly a singleton."  open() always returns one
- * instance, but log replay will bypass that.
- */
-public class CommitLog
-{
-    private static volatile int SEGMENT_SIZE = 128*1024*1024; // roll after log gets this big
-    private static volatile CommitLog instance_;
-    private static Lock lock_ = new ReentrantLock();
-    private static Logger logger_ = Logger.getLogger(CommitLog.class);
-    private static Map<String, CommitLogHeader> clHeaders_ = new HashMap<String, CommitLogHeader>();
+  public static final String WRITE_LOCK_NAME = "write.lock";
+  public static final String COMMIT_LOCK_NAME = "commit.lock";
+  
+  private Directory directory;			  // where this index resides
+  private Analyzer analyzer;			  // how to analyze text
 
-    private ExecutorService executor;
+  private Similarity similarity = Similarity.getDefault(); // how to normalize
 
+  private SegmentInfos segmentInfos = new SegmentInfos(); // the segments
+  private final Directory ramDirectory = new RAMDirectory(); // for temp segs
 
-    public static final class CommitLogContext
-    {
-        static CommitLogContext NULL = new CommitLogContext(null, -1L);
-        /* Commit Log associated with this operation */
-        public final String file;
-        /* Offset within the Commit Log where this row as added */
-        public final long position;
+  private Lock writeLock;
 
-        public CommitLogContext(String file, long position)
-        {
-            this.file = file;
-            this.position = position;
-        }
+  /** Use compound file setting. Defaults to false to maintain multiple files 
+   *  per segment behavior.
+   */  
+  private boolean useCompoundFile = false;
+  
+  
+  /** Setting to turn on usage of a compound file. When on, multiple files
+   *  for each segment are merged into a single file once the segment creation
+   *  is finished. This is done regardless of what directory is in use.
+   */
+  public boolean getUseCompoundFile() {
+    return useCompoundFile;
+  }
+  
+  /** Setting to turn on usage of a compound file. When on, multiple files
+   *  for each segment are merged into a single file once the segment creation
+   *  is finished. This is done regardless of what directory is in use.
+   */
+  public void setUseCompoundFile(boolean value) {
+    useCompoundFile = value;
+  }
 
-        boolean isValidContext()
-        {
-            return (position != -1L);
-        }
+  
+    /** Expert: Set the Similarity implementation used by this IndexWriter.
+   *
+   * @see Similarity#setDefault(Similarity)
+   */
+  public void setSimilarity(Similarity similarity) {
+    this.similarity = similarity;
+  }
+
+  /** Expert: Return the Similarity implementation used by this IndexWriter.
+   *
+   * <p>This defaults to the current value of {@link Similarity#getDefault()}.
+   */
+  public Similarity getSimilarity() {
+    return this.similarity;
+  }
+
+  /** Constructs an IndexWriter for the index in <code>path</code>.  Text will
+    be analyzed with <code>a</code>.  If <code>create</code> is true, then a
+    new, empty index will be created in <code>path</code>, replacing the index
+    already there, if any. */
+  public IndexWriter(String path, Analyzer a, boolean create)
+       throws IOException {
+    this(FSDirectory.getDirectory(path, create), a, create);
+  }
+
+  /** Constructs an IndexWriter for the index in <code>path</code>.  Text will
+    be analyzed with <code>a</code>.  If <code>create</code> is true, then a
+    new, empty index will be created in <code>path</code>, replacing the index
+    already there, if any. */
+  public IndexWriter(File path, Analyzer a, boolean create)
+       throws IOException {
+    this(FSDirectory.getDirectory(path, create), a, create);
+  }
+
+  /** Constructs an IndexWriter for the index in <code>d</code>.  Text will be
+    analyzed with <code>a</code>.  If <code>create</code> is true, then a new,
+    empty index will be created in <code>d</code>, replacing the index already
+    there, if any. */
+  public IndexWriter(Directory d, Analyzer a, final boolean create)
+       throws IOException {
+    directory = d;
+    analyzer = a;
+
+    Lock writeLock = directory.makeLock(IndexWriter.WRITE_LOCK_NAME);
+    if (!writeLock.obtain(WRITE_LOCK_TIMEOUT)) // obtain write lock
+      throw new IOException("Index locked for write: " + writeLock);
+    this.writeLock = writeLock;                   // save it
+
+    synchronized (directory) {			  // in- & inter-process sync
+      new Lock.With(directory.makeLock(IndexWriter.COMMIT_LOCK_NAME), COMMIT_LOCK_TIMEOUT) {
+          public Object doBody() throws IOException {
+            if (create)
+              segmentInfos.write(directory);
+            else
+              segmentInfos.read(directory);
+            return null;
+          }
+        }.run();
     }
+  }
 
-    public static class CommitLogFileComparator implements Comparator<String>
-    {
-        public int compare(String f, String f2)
-        {
-            return (int)(getCreationTime(f) - getCreationTime(f2));
-        }
+  /** Flushes all changes to an index, closes all associated files, and closes
+    the directory that the index is stored in. */
+  public synchronized void close() throws IOException {
+    flushRamSegments();
+    ramDirectory.close();
+    writeLock.release();                          // release write lock
+    writeLock = null;
+    directory.close();
+  }
+
+  /** Release the write lock, if needed. */
+  protected void finalize() throws IOException {
+    if (writeLock != null) {
+      writeLock.release();                        // release write lock
+      writeLock = null;
     }
+  }
 
-    public static void setSegmentSize(int size)
-    {
-        SEGMENT_SIZE = size;
+  /** Returns the analyzer used by this index. */
+  public Analyzer getAnalyzer() {
+      return analyzer;
+  }
+
+
+  /** Returns the number of documents currently in this index. */
+  public synchronized int docCount() {
+    int count = 0;
+    for (int i = 0; i < segmentInfos.size(); i++) {
+      SegmentInfo si = segmentInfos.info(i);
+      count += si.docCount;
     }
+    return count;
+  }
 
-    static int getSegmentCount()
-    {
-        return clHeaders_.size();
+  /**
+   * The maximum number of terms that will be indexed for a single field in a
+   * document.  This limits the amount of memory required for indexing, so that
+   * collections with very large files will not crash the indexing process by
+   * running out of memory.<p/>
+   * Note that this effectively truncates large documents, excluding from the
+   * index terms that occur further in the document.  If you know your source
+   * documents are large, be sure to set this value high enough to accomodate
+   * the expected size.  If you set it to Integer.MAX_VALUE, then the only limit
+   * is your memory, but you should anticipate an OutOfMemoryError.<p/>
+   * By default, no more than 10,000 terms will be indexed for a field.
+  */
+  public int maxFieldLength = 10000;
+
+  /**
+   * Adds a document to this index.  If the document contains more than
+   * {@link #maxFieldLength} terms for a given field, the remainder are
+   * discarded.
+   */
+  public void addDocument(Document doc) throws IOException {
+    addDocument(doc, analyzer);
+  }
+
+  /**
+   * Adds a document to this index, using the provided analyzer instead of the
+   * value of {@link #getAnalyzer()}.  If the document contains more than
+   * {@link #maxFieldLength} terms for a given field, the remainder are
+   * discarded.
+   */
+  public void addDocument(Document doc, Analyzer analyzer) throws IOException {
+    DocumentWriter dw =
+      new DocumentWriter(ramDirectory, analyzer, similarity, maxFieldLength);
+    String segmentName = newSegmentName();
+    dw.addDocument(segmentName, doc);
+    synchronized (this) {
+      segmentInfos.addElement(new SegmentInfo(segmentName, 1, ramDirectory));
+      maybeMergeSegments();
     }
+  }
 
-    static long getCreationTime(String file)
-    {
-        String[] entries = FBUtilities.strip(file, "-.");
-        return Long.parseLong(entries[entries.length - 2]);
+  private final synchronized String newSegmentName() {
+    return "_" + Integer.toString(segmentInfos.counter++, Character.MAX_RADIX);
+  }
+
+  /** Determines how often segment indices are merged by addDocument().  With
+   * smaller values, less RAM is used while indexing, and searches on
+   * unoptimized indices are faster, but indexing speed is slower.  With larger
+   * values, more RAM is used during indexing, and while searches on unoptimized
+   * indices are slower, indexing is faster.  Thus larger values (> 10) are best
+   * for batch index creation, and smaller values (< 10) for indices that are
+   * interactively maintained.
+   *
+   * <p>This must never be less than 2.  The default value is 10.*/
+  public int mergeFactor = 10;
+  
+  /** Determines the minimal number of documents required before the buffered
+   * in-memory documents are merging and a new Segment is created.
+   * Since Documents are merged in a {@link org.apache.lucene.store.RAMDirectory},
+   * large value gives faster indexing.  At the same time, mergeFactor limits
+   * the number of files open in a FSDirectory.
+   * 
+   * <p> The default value is 10.*/
+  public int minMergeDocs = 10;
+
+
+  /** Determines the largest number of documents ever merged by addDocument().
+   * Small values (e.g., less than 10,000) are best for interactive indexing,
+   * as this limits the length of pauses while indexing to a few seconds.
+   * Larger values are best for batched indexing and speedier searches.
+   *
+   * <p>The default value is {@link Integer#MAX_VALUE}. */
+  public int maxMergeDocs = Integer.MAX_VALUE;
+
+  /** If non-null, information about merges will be printed to this. */
+  public PrintStream infoStream = null;
+
+  /** Merges all segments together into a single segment, optimizing an index
+      for search. */
+  public synchronized void optimize() throws IOException {
+    flushRamSegments();
+    while (segmentInfos.size() > 1 ||
+           (segmentInfos.size() == 1 &&
+            (SegmentReader.hasDeletions(segmentInfos.info(0)) ||
+             (useCompoundFile && 
+              !SegmentReader.usesCompoundFile(segmentInfos.info(0))) ||
+              segmentInfos.info(0).dir != directory))) {
+      int minSegment = segmentInfos.size() - mergeFactor;
+      mergeSegments(minSegment < 0 ? 0 : minSegment);
+    }    
+  }
+
+  /** Merges all segments from an array of indexes into this index.
+   *
+   * <p>This may be used to parallelize batch indexing.  A large document
+   * collection can be broken into sub-collections.  Each sub-collection can be
+   * indexed in parallel, on a different thread, process or machine.  The
+   * complete index can then be created by merging sub-collection indexes
+   * with this method.
+   *
+   * <p>After this completes, the index is optimized. */
+  public synchronized void addIndexes(Directory[] dirs)
+      throws IOException {
+    optimize();					  // start with zero or 1 seg
+    for (int i = 0; i < dirs.length; i++) {
+      SegmentInfos sis = new SegmentInfos();	  // read infos from dir
+      sis.read(dirs[i]);
+      for (int j = 0; j < sis.size(); j++) {
+        segmentInfos.addElement(sis.info(j));	  // add each info
+      }
     }
+    optimize();					  // final cleanup
+  }
 
-    private static BufferedRandomAccessFile createWriter(String file) throws IOException
-    {        
-        return new BufferedRandomAccessFile(file, "rw");
+  /** Merges the provided indexes into this index.
+   * <p>After this completes, the index is optimized. */
+  public synchronized void addIndexes(IndexReader[] readers)
+    throws IOException {
+
+    optimize();					  // start with zero or 1 seg
+
+    String mergedName = newSegmentName();
+    SegmentMerger merger = new SegmentMerger(directory, mergedName, false);
+
+    if (segmentInfos.size() == 1)                 // add existing index, if any
+      merger.add(new SegmentReader(segmentInfos.info(0)));
+
+    for (int i = 0; i < readers.length; i++)      // add new indexes
+      merger.add(readers[i]);
+
+    int docCount = merger.merge();                // merge 'em
+
+    segmentInfos.setSize(0);                      // pop old infos & add new
+    segmentInfos.addElement(new SegmentInfo(mergedName, docCount, directory));
+
+    synchronized (directory) {			  // in- & inter-process sync
+      new Lock.With(directory.makeLock("commit.lock")) {
+	  public Object doBody() throws IOException {
+	    segmentInfos.write(directory);	  // commit changes
+	    return null;
+	  }
+	}.run();
     }
+  }
 
-    static CommitLog open() throws IOException
-    {
-        if ( instance_ == null )
-        {
-            CommitLog.lock_.lock();
-            try
-            {
-
-                if ( instance_ == null )
-                {
-                    instance_ = new CommitLog(false);
-                }
-            }
-            finally
-            {
-                CommitLog.lock_.unlock();
-            }
-        }
-        return instance_;
+  /** Merges all RAM-resident segments. */
+  private final void flushRamSegments() throws IOException {
+    int minSegment = segmentInfos.size()-1;
+    int docCount = 0;
+    while (minSegment >= 0 &&
+           (segmentInfos.info(minSegment)).dir == ramDirectory) {
+      docCount += segmentInfos.info(minSegment).docCount;
+      minSegment--;
     }
+    if (minSegment < 0 ||			  // add one FS segment?
+        (docCount + segmentInfos.info(minSegment).docCount) > mergeFactor ||
+        !(segmentInfos.info(segmentInfos.size()-1).dir == ramDirectory))
+      minSegment++;
+    if (minSegment >= segmentInfos.size())
+      return;					  // none to merge
+    mergeSegments(minSegment);
+  }
 
-    /* Current commit log file */
-    private String logFile_;
-    /* header for current commit log */
-    private CommitLogHeader clHeader_;
-    private BufferedRandomAccessFile logWriter_;
+  /** Incremental segment merger.  */
+  private final void maybeMergeSegments() throws IOException {
+    long targetMergeDocs = minMergeDocs;
+    while (targetMergeDocs <= maxMergeDocs) {
+      // find segments smaller than current target size
+      int minSegment = segmentInfos.size();
+      int mergeDocs = 0;
+      while (--minSegment >= 0) {
+        SegmentInfo si = segmentInfos.info(minSegment);
+        if (si.docCount >= targetMergeDocs)
+          break;
+        mergeDocs += si.docCount;
+      }
 
-    /*
-     * Generates a file name of the format CommitLog-<table>-<timestamp>.log in the
-     * directory specified by the Database Descriptor.
-    */
-    private void setNextFileName()
-    {
-        logFile_ = DatabaseDescriptor.getLogFileLocation() + File.separator +
-                   "CommitLog-" + System.currentTimeMillis() + ".log";
+      if (mergeDocs >= targetMergeDocs)		  // found a merge to do
+        mergeSegments(minSegment+1);
+      else
+        break;
+
+      targetMergeDocs *= mergeFactor;		  // increase target size
     }
+  }
 
-    /*
-     * param @ table - name of table for which we are maintaining
-     *                 this commit log.
-     * param @ recoverymode - is commit log being instantiated in
-     *                        in recovery mode.
-    */
-    CommitLog(boolean recoveryMode) throws IOException
-    {
-        if (!recoveryMode)
-        {
-            executor = new CommitLogExecutorService();
-            setNextFileName();
-            logWriter_ = CommitLog.createWriter(logFile_);
-            writeCommitLogHeader();
-
-            if (DatabaseDescriptor.getCommitLogSync() == DatabaseDescriptor.CommitLogSync.periodic)
-            {
-                final Runnable syncer = new Runnable()
-                {
-                    public void run()
-                    {
-                        try
-                        {
-                            sync();
-                        }
-                        catch (IOException e)
-                        {
-                            throw new RuntimeException(e);
-                        }
-                    }
-                };
-
-                new Thread(new Runnable()
-                {
-                    public void run()
-                    {
-                        while (true)
-                        {
-                            executor.submit(syncer);
-                            try
-                            {
-                                Thread.sleep(DatabaseDescriptor.getCommitLogSyncPeriod());
-                            }
-                            catch (InterruptedException e)
-                            {
-                                throw new RuntimeException(e);
-                            }
-                        }
-                    }
-                }).start();
-            }
-        }
-    }
-
-    /*
-     * This ctor is currently used only for debugging. We
-     * are now using it to modify the header so that recovery
-     * can be tested in as many scenarios as we could imagine.
-     *
-     * param @ logFile - logfile which we wish to modify.
-    */
-    CommitLog(File logFile) throws IOException
-    {
-        logFile_ = logFile.getAbsolutePath();
-        logWriter_ = CommitLog.createWriter(logFile_);
-    }
-
-    String getLogFile()
-    {
-        return logFile_;
+  /** Pops segments off of segmentInfos stack down to minSegment, merges them,
+    and pushes the merged index onto the top of the segmentInfos stack. */
+  private final void mergeSegments(int minSegment)
+      throws IOException {
+    String mergedName = newSegmentName();
+    if (infoStream != null) infoStream.print("merging segments");
+    SegmentMerger merger = 
+        new SegmentMerger(directory, mergedName, useCompoundFile);
+        
+    final Vector segmentsToDelete = new Vector();
+    for (int i = minSegment; i < segmentInfos.size(); i++) {
+      SegmentInfo si = segmentInfos.info(i);
+      if (infoStream != null)
+	infoStream.print(" " + si.name + " (" + si.docCount + " docs)");
+      IndexReader reader = new SegmentReader(si);
+      merger.add(reader);
+      if ((reader.directory()==this.directory) || // if we own the directory
+          (reader.directory()==this.ramDirectory))
+	segmentsToDelete.addElement(reader);	  // queue segment for deletion
     }
     
-    private CommitLogHeader readCommitLogHeader(BufferedRandomAccessFile logReader) throws IOException
-    {
-        int size = (int)logReader.readLong();
-        byte[] bytes = new byte[size];
-        logReader.read(bytes);
-        ByteArrayInputStream byteStream = new ByteArrayInputStream(bytes);
-        return CommitLogHeader.serializer().deserialize(new DataInputStream(byteStream));
-    }
-
-    /*
-     * This is invoked on startup via the ctor. It basically
-     * writes a header with all bits set to zero.
-    */
-    private void writeCommitLogHeader() throws IOException
-    {
-        int cfSize = Table.TableMetadata.getColumnFamilyCount();
-        clHeader_ = new CommitLogHeader(cfSize);
-        writeCommitLogHeader(logWriter_, clHeader_.toByteArray());
-    }
-
-    /** writes header at the beginning of the file, then seeks back to current position */
-    private void seekAndWriteCommitLogHeader(byte[] bytes) throws IOException
-    {
-        long currentPos = logWriter_.getFilePointer();
-        logWriter_.seek(0);
-
-        writeCommitLogHeader(logWriter_, bytes);
-
-        logWriter_.seek(currentPos);
-    }
-
-    private static void writeCommitLogHeader(RandomAccessFile logWriter, byte[] bytes) throws IOException
-    {
-        logWriter.writeLong(bytes.length);
-        logWriter.write(bytes);
-    }
-
-    void recover(File[] clogs) throws IOException
-    {
-        DataInputBuffer bufIn = new DataInputBuffer();
-
-        for (File file : clogs)
-        {
-            int bufferSize = (int)Math.min(file.length(), 32 * 1024 * 1024);
-            BufferedRandomAccessFile reader = new BufferedRandomAccessFile(file.getAbsolutePath(), "r", bufferSize);
-            CommitLogHeader clHeader = readCommitLogHeader(reader);
-            /* seek to the lowest position where any CF has non-flushed data */
-            int lowPos = CommitLogHeader.getLowestPosition(clHeader);
-            if (lowPos == 0)
-                break;
-
-            reader.seek(lowPos);
-            if (logger_.isDebugEnabled())
-                logger_.debug("Replaying " + file + " starting at " + lowPos);
-
-            Set<Table> tablesRecovered = new HashSet<Table>();
-
-            /* read the logs populate RowMutation and apply */
-            while (!reader.isEOF())
-            {
-                if (logger_.isDebugEnabled())
-                    logger_.debug("Reading mutation at " + reader.getFilePointer());
-
-                byte[] bytes;
-                try
-                {
-                    bytes = new byte[(int) reader.readLong()]; // readlong can throw EOFException too
-                    if (reader.read(bytes) < bytes.length)
-                    {
-                        throw new EOFException();
-                    }
-                }
-                catch (EOFException e)
-                {
-                    // last CL entry didn't get completely written.  that's ok.
-                    break;
-                }
-                bufIn.reset(bytes, bytes.length);
-
-                /* read the commit log entry */
-                Row row = Row.serializer().deserialize(bufIn);
-                if (logger_.isDebugEnabled())
-                    logger_.debug(String.format("replaying mutation for %s.%s: %s",
-                                                row.getTable(),
-                                                row.key(),
-                                                "{" + StringUtils.join(row.getColumnFamilies(), ", ") + "}"));
-                Table table = Table.open(row.getTable());
-                tablesRecovered.add(table);
-                Collection<ColumnFamily> columnFamilies = new ArrayList<ColumnFamily>(row.getColumnFamilies());
-                /* remove column families that have already been flushed */
-                for (ColumnFamily columnFamily : columnFamilies)
-                {
-                    int id = table.getColumnFamilyId(columnFamily.name());
-                    if (!clHeader.isDirty(id) || reader.getFilePointer() < clHeader.getPosition(id))
-                    {
-                        row.removeColumnFamily(columnFamily);
-                    }
-                }
-                if (!row.isEmpty())
-                {
-                    table.applyNow(row);
-                }
-            }
-            reader.close();
-            /* apply the rows read -- success will result in the CL file being discarded */
-            for (Table table : tablesRecovered)
-            {
-                table.flush(true);
-            }
-        }
-    }
-
-    /*
-     * Update the header of the commit log if a new column family
-     * is encountered for the first time.
-    */
-    private void maybeUpdateHeader(Row row) throws IOException
-    {
-        Table table = Table.open(row.getTable());
-        for (ColumnFamily columnFamily : row.getColumnFamilies())
-        {
-            int id = table.getColumnFamilyId(columnFamily.name());
-            if (!clHeader_.isDirty(id) || (clHeader_.isDirty(id) && clHeader_.getPosition(id) == 0))
-            {
-                clHeader_.turnOn(id, logWriter_.getFilePointer());
-                seekAndWriteCommitLogHeader(clHeader_.toByteArray());
-            }
-        }
+    int mergedDocCount = merger.merge();
+    
+    if (infoStream != null) {
+      infoStream.println();
+      infoStream.println(" into "+mergedName+" ("+mergedDocCount+" docs)");
     }
     
-    CommitLogContext getContext() throws IOException
-    {
-        Callable<CommitLogContext> task = new Callable<CommitLogContext>()
-        {
-            public CommitLogContext call() throws Exception
-            {
-                return new CommitLogContext(logFile_, logWriter_.getFilePointer());
-            }
-        };
-        try
-        {
-            return executor.submit(task).get();
-        }
-        catch (InterruptedException e)
-        {
-            throw new RuntimeException(e);
-        }
-        catch (ExecutionException e)
-        {
-            throw new RuntimeException(e);
-        }
+    segmentInfos.setSize(minSegment);		  // pop old infos & add new
+    segmentInfos.addElement(new SegmentInfo(mergedName, mergedDocCount,
+                                            directory));
+
+    synchronized (directory) {			  // in- & inter-process sync
+      new Lock.With(directory.makeLock(IndexWriter.COMMIT_LOCK_NAME), COMMIT_LOCK_TIMEOUT) {
+          public Object doBody() throws IOException {
+            segmentInfos.write(directory);	  // commit before deleting
+            deleteSegments(segmentsToDelete);	  // delete now-unused segments
+            return null;
+          }
+        }.run();
+    }
+  }
+
+  /* Some operating systems (e.g. Windows) don't permit a file to be deleted
+     while it is opened for read (e.g. by another process or thread).  So we
+     assume that when a delete fails it is because the file is open in another
+     process, and queue the file for subsequent deletion. */
+
+  private final void deleteSegments(Vector segments) throws IOException {
+    Vector deletable = new Vector();
+
+    deleteFiles(readDeleteableFiles(), deletable); // try to delete deleteable
+
+    for (int i = 0; i < segments.size(); i++) {
+      SegmentReader reader = (SegmentReader)segments.elementAt(i);
+      if (reader.directory() == this.directory)
+	deleteFiles(reader.files(), deletable);	  // try to delete our files
+      else
+	deleteFiles(reader.files(), reader.directory()); // delete other files
     }
 
-    /*
-     * Adds the specified row to the commit log. This method will reset the
-     * file offset to what it is before the start of the operation in case
-     * of any problems. This way we can assume that the subsequent commit log
-     * entry will override the garbage left over by the previous write.
-    */
-    CommitLogContext add(final Row row) throws IOException
-    {
-        Callable<CommitLogContext> task = new LogRecordAdder(row);
+    writeDeleteableFiles(deletable);		  // note files we can't delete
+  }
 
-        try
-        {
-            return executor.submit(task).get();
+  private final void deleteFiles(Vector files, Directory directory)
+       throws IOException {
+    for (int i = 0; i < files.size(); i++)
+      directory.deleteFile((String)files.elementAt(i));
+  }
+
+  private final void deleteFiles(Vector files, Vector deletable)
+       throws IOException {
+    for (int i = 0; i < files.size(); i++) {
+      String file = (String)files.elementAt(i);
+      try {
+        directory.deleteFile(file);		  // try to delete each file
+      } catch (IOException e) {			  // if delete fails
+        if (directory.fileExists(file)) {
+          if (infoStream != null)
+            infoStream.println(e.getMessage() + "; Will re-try later.");
+          deletable.addElement(file);		  // add to deletable
         }
-        catch (InterruptedException e)
-        {
-            throw new RuntimeException(e);
-        }
-        catch (ExecutionException e)
-        {
-            throw new RuntimeException(e);
-        }
+      }
     }
+  }
 
-    /*
-     * This is called on Memtable flush to add to the commit log
-     * a token indicating that this column family has been flushed.
-     * The bit flag associated with this column family is set in the
-     * header and this is used to decide if the log file can be deleted.
-    */
-    void onMemtableFlush(final String tableName, final String cf, final CommitLog.CommitLogContext cLogCtx) throws IOException
-    {
-        Callable task = new Callable()
-        {
-            public Object call() throws IOException
-            {
-                Table table = Table.open(tableName);
-                int id = table.getColumnFamilyId(cf);
-                discardCompletedSegments(cLogCtx, id);
-                return null;
-            }
-        };
-        try
-        {
-            executor.submit(task).get();
-        }
-        catch (InterruptedException e)
-        {
-            throw new RuntimeException(e);
-        }
-        catch (ExecutionException e)
-        {
-            throw new RuntimeException(e);
-        }
+  private final Vector readDeleteableFiles() throws IOException {
+    Vector result = new Vector();
+    if (!directory.fileExists("deletable"))
+      return result;
+
+    InputStream input = directory.openFile("deletable");
+    try {
+      for (int i = input.readInt(); i > 0; i--)	  // read file names
+        result.addElement(input.readString());
+    } finally {
+      input.close();
     }
+    return result;
+  }
 
-    /*
-     * Delete log segments whose contents have been turned into SSTables.
-     *
-     * param @ cLogCtx The commitLog context .
-     * param @ id id of the columnFamily being flushed to disk.
-     *
-    */
-    private void discardCompletedSegments(CommitLog.CommitLogContext cLogCtx, int id) throws IOException
-    {
-        /* retrieve the commit log header associated with the file in the context */
-        CommitLogHeader commitLogHeader = clHeaders_.get(cLogCtx.file);
-        if(commitLogHeader == null )
-        {
-            if( logFile_.equals(cLogCtx.file) )
-            {
-                /* this means we are dealing with the current commit log. */
-                commitLogHeader = clHeader_;
-                clHeaders_.put(cLogCtx.file, clHeader_);
-            }
-            else
-                return;
-        }
-
-        /*
-         * log replay assumes that we only have to look at entries past the last
-         * flush position, so verify that this flush happens after the last.
-         * (Currently Memtables are flushed on a single thread so this should be fine.)
-        */
-        assert cLogCtx.position >= commitLogHeader.getPosition(id);
-
-        commitLogHeader.turnOff(id);
-        /* Sort the commit logs based on creation time */
-        List<String> oldFiles = new ArrayList<String>(clHeaders_.keySet());
-        Collections.sort(oldFiles, new CommitLogFileComparator());
-        List<String> listOfDeletedFiles = new ArrayList<String>();
-        /*
-         * Loop through all the commit log files in the history. Now process
-         * all files that are older than the one in the context. For each of
-         * these files the header needs to modified by performing a bitwise &
-         * of the header with the header of the file in the context. If we
-         * encounter the file in the context in our list of old commit log files
-         * then we update the header and write it back to the commit log.
-        */
-        for (String oldFile : oldFiles)
-        {
-            if (oldFile.equals(cLogCtx.file))
-            {
-                /*
-                 * We need to turn on again. This is because we always keep
-                 * the bit turned on and the position indicates from where the
-                 * commit log needs to be read. When a flush occurs we turn off
-                 * perform & operation and then turn on with the new position.
-                */
-                commitLogHeader.turnOn(id, cLogCtx.position);
-                seekAndWriteCommitLogHeader(commitLogHeader.toByteArray());
-                break;
-            }
-            else
-            {
-                CommitLogHeader oldCommitLogHeader = clHeaders_.get(oldFile);
-                oldCommitLogHeader.and(commitLogHeader);
-                if (oldCommitLogHeader.isSafeToDelete())
-                {
-                    if (logger_.isDebugEnabled())
-                      logger_.debug("Deleting commit log:" + oldFile);
-                    FileUtils.deleteAsync(oldFile);
-                    listOfDeletedFiles.add(oldFile);
-                }
-                else
-                {
-                    RandomAccessFile logWriter = CommitLog.createWriter(oldFile);
-                    writeCommitLogHeader(logWriter, oldCommitLogHeader.toByteArray());
-                    logWriter.close();
-                }
-            }
-        }
-
-        for ( String deletedFile : listOfDeletedFiles)
-        {
-            clHeaders_.remove(deletedFile);
-        }
+  private final void writeDeleteableFiles(Vector files) throws IOException {
+    OutputStream output = directory.createFile("deleteable.new");
+    try {
+      output.writeInt(files.size());
+      for (int i = 0; i < files.size(); i++)
+        output.writeString((String)files.elementAt(i));
+    } finally {
+      output.close();
     }
-
-    private boolean maybeRollLog() throws IOException
-    {
-        if (logWriter_.length() >= SEGMENT_SIZE)
-        {
-            /* Rolls the current log file over to a new one. */
-            setNextFileName();
-            String oldLogFile = logWriter_.getPath();
-            logWriter_.close();
-
-            /* point reader/writer to a new commit log file. */
-            logWriter_ = CommitLog.createWriter(logFile_);
-            /* squirrel away the old commit log header */
-            clHeaders_.put(oldLogFile, new CommitLogHeader(clHeader_));
-            // we leave the old 'dirty' bits alone, so we can test for
-            // whether it's safe to remove a given log segment by and-ing its dirty
-            // with the current one.
-            clHeader_.zeroPositions();
-            writeCommitLogHeader(logWriter_, clHeader_.toByteArray());
-            return true;
-        }
-        return false;
-    }
-
-    void sync() throws IOException
-    {
-        logWriter_.sync();
-    }
-
-    class LogRecordAdder implements Callable<CommitLog.CommitLogContext>
-    {
-        Row row;
-
-        LogRecordAdder(Row row)
-        {
-            this.row = row;
-        }
-
-        public CommitLog.CommitLogContext call() throws Exception
-        {
-            long currentPosition = -1L;
-            DataOutputBuffer cfBuffer = new DataOutputBuffer();
-            try
-            {
-                /* serialize the row */
-                Row.serializer().serialize(row, cfBuffer);
-                currentPosition = logWriter_.getFilePointer();
-                CommitLogContext cLogCtx = new CommitLogContext(logFile_, currentPosition);
-                /* Update the header */
-                maybeUpdateHeader(row);
-                logWriter_.writeLong(cfBuffer.getLength());
-                logWriter_.write(cfBuffer.getData(), 0, cfBuffer.getLength());
-                maybeRollLog();
-                return cLogCtx;
-            }
-            catch (IOException e)
-            {
-                if ( currentPosition != -1 )
-                    logWriter_.seek(currentPosition);
-                throw e;
-            }
-        }
-    }
+    directory.renameFile("deleteable.new", "deletable");
+  }
 }

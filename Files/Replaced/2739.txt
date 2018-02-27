@@ -1,6 +1,28 @@
-return getValues(reader);
+samplingParams.setSamplingThreshold(11000); //force sampling
 
-/**
+package org.apache.lucene.facet.search.sampling;
+
+import java.util.List;
+import java.util.Random;
+
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.search.Query;
+import org.apache.lucene.search.TermQuery;
+
+import org.apache.lucene.search.MultiCollector;
+import org.apache.lucene.facet.search.BaseTestTopK;
+import org.apache.lucene.facet.search.FacetsAccumulator;
+import org.apache.lucene.facet.search.FacetsCollector;
+import org.apache.lucene.facet.search.ScoredDocIDs;
+import org.apache.lucene.facet.search.ScoredDocIdCollector;
+import org.apache.lucene.facet.search.params.FacetRequest;
+import org.apache.lucene.facet.search.params.FacetRequest.ResultMode;
+import org.apache.lucene.facet.search.params.FacetSearchParams;
+import org.apache.lucene.facet.search.results.FacetResult;
+import org.apache.lucene.facet.taxonomy.TaxonomyReader;
+
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -17,137 +39,119 @@ return getValues(reader);
  * limitations under the License.
  */
 
-package org.apache.solr.search.function;
-
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.search.*;
-import org.apache.solr.search.function.DocValues;
-
-import java.io.IOException;
-import java.io.Serializable;
-import java.util.IdentityHashMap;
-import java.util.Map;
-
-/**
- * Instantiates {@link org.apache.solr.search.function.DocValues} for a particular reader.
- * <br>
- * Often used when creating a {@link FunctionQuery}.
- *
- * @version $Id$
- */
-public abstract class ValueSource implements Serializable {
-
-  @Deprecated
-  public DocValues getValues(IndexReader reader) throws IOException {
-    return getValues(null, reader);
+public abstract class BaseSampleTestTopK extends BaseTestTopK {
+  
+  /** Number of top results */
+  protected static final int K = 2; 
+  
+  /** since there is a chance that this test would fail even if the code is correct, retry the sampling */
+  protected static final int RETRIES = 10;
+  
+  @Override
+  protected FacetSearchParams searchParamsWithRequests(int numResults, int partitionSize) {
+    FacetSearchParams res = super.searchParamsWithRequests(numResults, partitionSize);
+    for (FacetRequest req : res.getFacetRequests()) {
+      // randomize the way we aggregate results
+      if (random().nextBoolean()) {
+        req.setResultMode(ResultMode.GLOBAL_FLAT);
+      } else {
+        req.setResultMode(ResultMode.PER_NODE_IN_TREE);
+      }
+    }
+    return res;
   }
-
-  /** Gets the values for this reader and the context that was previously
-   * passed to createWeight()
+  
+  protected abstract FacetsAccumulator getSamplingAccumulator(Sampler sampler,
+      TaxonomyReader taxoReader, IndexReader indexReader,
+      FacetSearchParams searchParams);
+  
+  /**
+   * Try out faceted search with sampling enabled and complements either disabled or enforced
+   * Lots of randomly generated data is being indexed, and later on a "90% docs" faceted search
+   * is performed. The results are compared to non-sampled ones.
    */
-  public DocValues getValues(Map context, IndexReader reader) throws IOException {
-    return null;
-  }
-
-  public abstract boolean equals(Object o);
-
-  public abstract int hashCode();
-
-  /** description of field, used in explain() */
-  public abstract String description();
-
-  public String toString() {
-    return description();
-  }
-
-  /** Implementations should propagate createWeight to sub-ValueSources which can optionally store
-   * weight info in the context. The context object will be passed to getValues()
-   * where this info can be retrieved. */
-  public void createWeight(Map context, Searcher searcher) throws IOException {
-  }
-
-  /** Returns a new non-threadsafe context map. */
-  public static Map newContext() {
-    return new IdentityHashMap();
-  }
-}
-
-
-class ValueSourceScorer extends Scorer {
-  protected IndexReader reader;
-  private int doc = -1;
-  protected final int maxDoc;
-  protected final DocValues values;
-  protected boolean checkDeletes;
-
-  protected ValueSourceScorer(IndexReader reader, DocValues values) {
-    super(null);
-    this.reader = reader;
-    this.maxDoc = reader.maxDoc();
-    this.values = values;
-    setCheckDeletes(true);
-  }
-
-  public IndexReader getReader() { return reader; }
-
-  public void setCheckDeletes(boolean checkDeletes) {
-    this.checkDeletes = checkDeletes && reader.hasDeletions();
-  }
-
-  public boolean matches(int doc) {
-    return (!checkDeletes || !reader.isDeleted(doc)) && matchesValue(doc);
-  }
-
-  public boolean matchesValue(int doc) {
-    return true;
-  }
-
-  @Override
-  public int docID() {
-    return doc;
-  }
-
-  @Override
-  public int nextDoc() throws IOException {
-    for(;;) {
-      doc++;
-      if (doc >= maxDoc) return doc=NO_MORE_DOCS;
-      if (matches(doc)) return doc;
+  public void testCountUsingSampling() throws Exception {
+    boolean useRandomSampler = random().nextBoolean();
+    for (int partitionSize : partitionSizes) {
+      try {
+        initIndex(partitionSize);
+        // Get all of the documents and run the query, then do different
+        // facet counts and compare to control
+        Query q = new TermQuery(new Term(CONTENT_FIELD, BETA)); // 90% of the docs
+        ScoredDocIdCollector docCollector = ScoredDocIdCollector.create(indexReader.maxDoc(), false);
+        
+        FacetSearchParams expectedSearchParams = searchParamsWithRequests(K, partitionSize); 
+        FacetsCollector fc = new FacetsCollector(expectedSearchParams, indexReader, taxoReader);
+        
+        searcher.search(q, MultiCollector.wrap(docCollector, fc));
+        
+        List<FacetResult> expectedResults = fc.getFacetResults();
+        
+        FacetSearchParams samplingSearchParams = searchParamsWithRequests(K, partitionSize); 
+        
+        // try several times in case of failure, because the test has a chance to fail 
+        // if the top K facets are not sufficiently common with the sample set
+        for (int nTrial=0; nTrial<RETRIES; nTrial++) {
+          try {
+            // complement with sampling!
+            final Sampler sampler = createSampler(nTrial, docCollector.getScoredDocIDs(), useRandomSampler);
+            
+            assertSampling(expectedResults, q, sampler, samplingSearchParams, false);
+            assertSampling(expectedResults, q, sampler, samplingSearchParams, true);
+            
+            break; // succeeded
+          } catch (NotSameResultError e) {
+            if (nTrial>=RETRIES-1) {
+              throw e; // no more retries allowed, must fail
+            }
+          }
+        }
+      } finally { 
+        closeAll();
+      }
     }
   }
-
-  @Override
-  public int advance(int target) throws IOException {
-    // also works fine when target==NO_MORE_DOCS
-    doc = target-1;
-    return nextDoc();
+  
+  private void assertSampling(List<FacetResult> expected, Query q, Sampler sampler, FacetSearchParams params, boolean complement) throws Exception {
+    FacetsCollector samplingFC = samplingCollector(complement, sampler, params);
+    
+    searcher.search(q, samplingFC);
+    List<FacetResult> sampledResults = samplingFC.getFacetResults();
+    
+    assertSameResults(expected, sampledResults);
   }
-
-  public int doc() {
-    return doc;
+  
+  private FacetsCollector samplingCollector(
+      final boolean complement,
+      final Sampler sampler,
+      FacetSearchParams samplingSearchParams) {
+    FacetsCollector samplingFC = new FacetsCollector(samplingSearchParams, indexReader, taxoReader) {
+      @Override
+      protected FacetsAccumulator initFacetsAccumulator(
+          FacetSearchParams facetSearchParams, IndexReader indexReader,
+          TaxonomyReader taxonomyReader) {
+        FacetsAccumulator acc = getSamplingAccumulator(sampler, taxonomyReader, indexReader, facetSearchParams);
+        acc.setComplementThreshold(complement ? FacetsAccumulator.FORCE_COMPLEMENT : FacetsAccumulator.DISABLE_COMPLEMENT);
+        return acc;
+      }
+    };
+    return samplingFC;
   }
+  
+  private Sampler createSampler(int nTrial, ScoredDocIDs scoredDocIDs, boolean useRandomSampler) {
+    SamplingParams samplingParams = new SamplingParams();
+    
+    final double retryFactor = Math.pow(1.01, nTrial);
+    samplingParams.setSampleRatio(0.8 * retryFactor);
+    samplingParams.setMinSampleSize((int) (100 * retryFactor));
+    samplingParams.setMaxSampleSize((int) (10000 * retryFactor));
+    samplingParams.setOversampleFactor(5.0 * retryFactor);
 
-  public boolean next() {
-    for(;;) {
-      doc++;
-      if (doc >= maxDoc) return false;
-      if (matches(doc)) return true;
-    }
-  }
-
-  public boolean skipTo(int target) {
-    doc = target-1;
-    return next();
-  }
-
-
-  public float score() throws IOException {
-    return values.floatVal(doc);
-  }
-
-  public Explanation explain(int doc) throws IOException {
-    return values.explain(doc);
+    samplingParams.setSampingThreshold(11000); //force sampling 
+    Sampler sampler = useRandomSampler ? 
+        new RandomSampler(samplingParams, new Random(random().nextLong())) :
+          new RepeatableSampler(samplingParams);
+    assertTrue("must enable sampling for this test!",sampler.shouldSample(scoredDocIDs));
+    return sampler;
   }
 }
-
-

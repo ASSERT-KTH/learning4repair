@@ -1,13 +1,14 @@
-List<InetAddress> preferred = DatabaseDescriptor.getEndpointSnitch().getSortedListByProximity(address, rangeAddresses.get(range));
+total += info.sizeInBytes(true);
 
- /**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+package org.apache.lucene.index;
+
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,240 +19,309 @@ List<InetAddress> preferred = DatabaseDescriptor.getEndpointSnitch().getSortedLi
  * limitations under the License.
  */
 
-package org.apache.cassandra.dht;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.util.SetOnce;
+import org.apache.lucene.util.SetOnce.AlreadySetException;
 
- import java.util.*;
- import java.util.concurrent.locks.Condition;
- import java.io.IOException;
- import java.io.UnsupportedEncodingException;
- import java.net.InetAddress;
+import java.io.IOException;
+import java.util.List;
+import java.util.ArrayList;
+import java.util.Set;
 
- import org.apache.commons.lang.StringUtils;
- import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+/**
+ * <p>Expert: a MergePolicy determines the sequence of
+ * primitive merge operations to be used for overall merge
+ * and optimize operations.</p>
+ * 
+ * <p>Whenever the segments in an index have been altered by
+ * {@link IndexWriter}, either the addition of a newly
+ * flushed segment, addition of many segments from
+ * addIndexes* calls, or a previous merge that may now need
+ * to cascade, {@link IndexWriter} invokes {@link
+ * #findMerges} to give the MergePolicy a chance to pick
+ * merges that are now required.  This method returns a
+ * {@link MergeSpecification} instance describing the set of
+ * merges that should be done, or null if no merges are
+ * necessary.  When IndexWriter.optimize is called, it calls
+ * {@link #findMergesForOptimize} and the MergePolicy should
+ * then return the necessary merges.</p>
+ *
+ * <p>Note that the policy can return more than one merge at
+ * a time.  In this case, if the writer is using {@link
+ * SerialMergeScheduler}, the merges will be run
+ * sequentially but if it is using {@link
+ * ConcurrentMergeScheduler} they will be run concurrently.</p>
+ * 
+ * <p>The default MergePolicy is {@link
+ * LogByteSizeMergePolicy}.</p>
+ *
+ * @lucene.experimental
+ */
 
- import org.apache.commons.lang.ArrayUtils;
+public abstract class MergePolicy implements java.io.Closeable {
 
- import org.apache.cassandra.locator.TokenMetadata;
- import org.apache.cassandra.locator.AbstractReplicationStrategy;
- import org.apache.cassandra.net.*;
- import org.apache.cassandra.service.StorageService;
- import org.apache.cassandra.streaming.StreamIn;
- import org.apache.cassandra.utils.SimpleCondition;
- import org.apache.cassandra.utils.FBUtilities;
- import org.apache.cassandra.config.DatabaseDescriptor;
- import org.apache.cassandra.gms.FailureDetector;
- import org.apache.cassandra.gms.IFailureDetector;
- import com.google.common.collect.Multimap;
- import com.google.common.collect.ArrayListMultimap;
+  /** OneMerge provides the information necessary to perform
+   *  an individual primitive merge operation, resulting in
+   *  a single new segment.  The merge spec includes the
+   *  subset of segments to be merged as well as whether the
+   *  new segment should use the compound file format. */
 
+  public static class OneMerge {
 
-public class BootStrapper
-{
-    private static final Logger logger = LoggerFactory.getLogger(BootStrapper.class);
+    SegmentInfo info;               // used by IndexWriter
+    boolean mergeDocStores;         // used by IndexWriter
+    boolean optimize;               // used by IndexWriter
+    boolean registerDone;           // used by IndexWriter
+    long mergeGen;                  // used by IndexWriter
+    boolean isExternal;             // used by IndexWriter
+    int maxNumSegmentsOptimize;     // used by IndexWriter
+    SegmentReader[] readers;        // used by IndexWriter
+    SegmentReader[] readersClone;   // used by IndexWriter
+    public final SegmentInfos segments;
+    boolean aborted;
+    Throwable error;
+    boolean paused;
 
-    /* endpoints that need to be bootstrapped */
-    protected final InetAddress address;
-    /* tokens of the nodes being bootstrapped. */
-    protected final Token token;
-    protected final TokenMetadata tokenMetadata;
+    public OneMerge(SegmentInfos segments) {
+      if (0 == segments.size())
+        throw new RuntimeException("segments must include at least one segment");
+      this.segments = segments;
+    }
 
-    public BootStrapper(InetAddress address, Token token, TokenMetadata tmd)
-    {
-        assert address != null;
-        assert token != null;
+    /** Record that an exception occurred while executing
+     *  this merge */
+    synchronized void setException(Throwable error) {
+      this.error = error;
+    }
 
-        this.address = address;
-        this.token = token;
-        tokenMetadata = tmd;
+    /** Retrieve previous exception set by {@link
+     *  #setException}. */
+    synchronized Throwable getException() {
+      return error;
+    }
+
+    /** Mark this merge as aborted.  If this is called
+     *  before the merge is committed then the merge will
+     *  not be committed. */
+    synchronized void abort() {
+      aborted = true;
+      notifyAll();
+    }
+
+    /** Returns true if this merge was aborted. */
+    synchronized boolean isAborted() {
+      return aborted;
+    }
+
+    synchronized void checkAborted(Directory dir) throws MergeAbortedException {
+      if (aborted) {
+        throw new MergeAbortedException("merge is aborted: " + segString(dir));
+      }
+
+      while (paused) {
+        try {
+          // In theory we could wait() indefinitely, but we
+          // do 1000 msec, defensively
+          wait(1000);
+        } catch (InterruptedException ie) {
+          throw new RuntimeException(ie);
+        }
+        if (aborted) {
+          throw new MergeAbortedException("merge is aborted: " + segString(dir));
+        }
+      }
+    }
+
+    synchronized public void setPause(boolean paused) {
+      this.paused = paused;
+      if (!paused) {
+        // Wakeup merge thread, if it's waiting
+        notifyAll();
+      }
+    }
+
+    synchronized public boolean getPause() {
+      return paused;
+    }
+
+    public String segString(Directory dir) {
+      StringBuilder b = new StringBuilder();
+      final int numSegments = segments.size();
+      for(int i=0;i<numSegments;i++) {
+        if (i > 0) b.append(' ');
+        b.append(segments.info(i).toString(dir, 0));
+      }
+      if (info != null)
+        b.append(" into ").append(info.name);
+      if (optimize)
+        b.append(" [optimize]");
+      if (mergeDocStores) {
+        b.append(" [mergeDocStores]");
+      }
+      if (aborted) {
+        b.append(" [ABORTED]");
+      }
+      return b.toString();
     }
     
-    public void startBootstrap() throws IOException
-    {
-        if (logger.isDebugEnabled())
-            logger.debug("Beginning bootstrap process");
-        for (String table : DatabaseDescriptor.getNonSystemTables())
-        {
-            Multimap<Range, InetAddress> rangesWithSourceTarget = getRangesWithSources(table);
-            /* Send messages to respective folks to stream data over to me */
-            for (Map.Entry<InetAddress, Collection<Range>> entry : getWorkMap(rangesWithSourceTarget).asMap().entrySet())
-            {
-                InetAddress source = entry.getKey();
-                StorageService.instance.addBootstrapSource(source, table);
-                if (logger.isDebugEnabled())
-                    logger.debug("Requesting from " + source + " ranges " + StringUtils.join(entry.getValue(), ", "));
-                StreamIn.requestRanges(source, table, entry.getValue());
-            }
-        }
+    /**
+     * Returns the total size in bytes of this merge. Note that this does not
+     * indicate the size of the merged segment, but the input total size.
+     * */
+    public long totalBytesSize() throws IOException {
+      long total = 0;
+      for (SegmentInfo info : segments) {
+        total += info.sizeInBytes();
+      }
+      return total;
     }
 
     /**
-     * if initialtoken was specified, use that.
-     * otherwise, pick a token to assume half the load of the most-loaded node.
+     * Returns the total number of documents that are included with this merge.
+     * Note that this does not indicate the number of documents after the merge.
+     * */
+    public int totalNumDocs() throws IOException {
+      int total = 0;
+      for (SegmentInfo info : segments) {
+        total += info.docCount;
+      }
+      return total;
+    }
+  }
+
+  /**
+   * A MergeSpecification instance provides the information
+   * necessary to perform multiple merges.  It simply
+   * contains a list of {@link OneMerge} instances.
+   */
+
+  public static class MergeSpecification {
+
+    /**
+     * The subset of segments to be included in the primitive merge.
      */
-    public static Token getBootstrapToken(final TokenMetadata metadata, final Map<InetAddress, Double> load) throws IOException
-    {
-        if (DatabaseDescriptor.getInitialToken() != null)
-        {
-            logger.debug("token manually specified as " + DatabaseDescriptor.getInitialToken());
-            return StorageService.getPartitioner().getTokenFactory().fromString(DatabaseDescriptor.getInitialToken());
-        }
 
-        return getBalancedToken(metadata, load);
+    public final List<OneMerge> merges = new ArrayList<OneMerge>();
+
+    public void add(OneMerge merge) {
+      merges.add(merge);
     }
 
-    public static Token getBalancedToken(TokenMetadata metadata, Map<InetAddress, Double> load)
-    {
-        InetAddress maxEndpoint = getBootstrapSource(metadata, load);
-        Token<?> t = getBootstrapTokenFrom(maxEndpoint);
-        logger.info("New token will be " + t + " to assume load from " + maxEndpoint);
-        return t;
+    public String segString(Directory dir) {
+      StringBuilder b = new StringBuilder();
+      b.append("MergeSpec:\n");
+      final int count = merges.size();
+      for(int i=0;i<count;i++)
+        b.append("  ").append(1 + i).append(": ").append(merges.get(i).segString(dir));
+      return b.toString();
+    }
+  }
+
+  /** Exception thrown if there are any problems while
+   *  executing a merge. */
+  public static class MergeException extends RuntimeException {
+    private Directory dir;
+
+    public MergeException(String message, Directory dir) {
+      super(message);
+      this.dir = dir;
     }
 
-    static InetAddress getBootstrapSource(final TokenMetadata metadata, final Map<InetAddress, Double> load)
-    {
-        // sort first by number of nodes already bootstrapping into a source node's range, then by load.
-        List<InetAddress> endpoints = new ArrayList<InetAddress>(load.size());
-        for (InetAddress endpoint : load.keySet())
-        {
-            if (!metadata.isMember(endpoint))
-                continue;
-            endpoints.add(endpoint);
-        }
-
-        if (endpoints.isEmpty())
-            throw new RuntimeException("No other nodes seen!  Unable to bootstrap");
-        Collections.sort(endpoints, new Comparator<InetAddress>()
-        {
-            public int compare(InetAddress ia1, InetAddress ia2)
-            {
-                int n1 = metadata.pendingRangeChanges(ia1);
-                int n2 = metadata.pendingRangeChanges(ia2);
-                if (n1 != n2)
-                    return -(n1 - n2); // more targets = _less_ priority!
-
-                double load1 = load.get(ia1);
-                double load2 = load.get(ia2);
-                if (load1 == load2)
-                    return 0;
-                return load1 < load2 ? -1 : 1;
-            }
-        });
-
-        InetAddress maxEndpoint = endpoints.get(endpoints.size() - 1);
-        assert !maxEndpoint.equals(FBUtilities.getLocalAddress());
-        return maxEndpoint;
+    public MergeException(Throwable exc, Directory dir) {
+      super(exc);
+      this.dir = dir;
     }
-
-    /** get potential sources for each range, ordered by proximity (as determined by EndPointSnitch) */
-    Multimap<Range, InetAddress> getRangesWithSources(String table)
-    {
-        assert tokenMetadata.sortedTokens().size() > 0;
-        final AbstractReplicationStrategy strat = StorageService.instance.getReplicationStrategy(table);
-        Collection<Range> myRanges = strat.getPendingAddressRanges(tokenMetadata, token, address, table);
-
-        Multimap<Range, InetAddress> myRangeAddresses = ArrayListMultimap.create();
-        Multimap<Range, InetAddress> rangeAddresses = strat.getRangeAddresses(tokenMetadata, table);
-        for (Range myRange : myRanges)
-        {
-            for (Range range : rangeAddresses.keySet())
-            {
-                if (range.contains(myRange))
-                {
-                    List<InetAddress> preferred = DatabaseDescriptor.getEndPointSnitch().getSortedListByProximity(address, rangeAddresses.get(range));
-                    myRangeAddresses.putAll(myRange, preferred);
-                    break;
-                }
-            }
-            assert myRangeAddresses.keySet().contains(myRange);
-        }
-        return myRangeAddresses;
+    /** Returns the {@link Directory} of the index that hit
+     *  the exception. */
+    public Directory getDirectory() {
+      return dir;
     }
+  }
 
-    private static Token<?> getBootstrapTokenFrom(InetAddress maxEndpoint)
-    {
-        Message message = new Message(FBUtilities.getLocalAddress(), "", StorageService.Verb.BOOTSTRAP_TOKEN, ArrayUtils.EMPTY_BYTE_ARRAY);
-        BootstrapTokenCallback btc = new BootstrapTokenCallback();
-        MessagingService.instance.sendRR(message, maxEndpoint, btc);
-        return btc.getToken();
+  public static class MergeAbortedException extends IOException {
+    public MergeAbortedException() {
+      super("merge is aborted");
     }
-
-    static Multimap<InetAddress, Range> getWorkMap(Multimap<Range, InetAddress> rangesWithSourceTarget)
-    {
-        return getWorkMap(rangesWithSourceTarget, FailureDetector.instance);
+    public MergeAbortedException(String message) {
+      super(message);
     }
+  }
 
-    static Multimap<InetAddress, Range> getWorkMap(Multimap<Range, InetAddress> rangesWithSourceTarget, IFailureDetector failureDetector)
-    {
-        /*
-         * Map whose key is the source node and the value is a map whose key is the
-         * target and value is the list of ranges to be sent to it.
-        */
-        Multimap<InetAddress, Range> sources = ArrayListMultimap.create();
+  protected final SetOnce<IndexWriter> writer;
 
-        // TODO look for contiguous ranges and map them to the same source
-        for (Range range : rangesWithSourceTarget.keySet())
-        {
-            for (InetAddress source : rangesWithSourceTarget.get(range))
-            {
-                if (failureDetector.isAlive(source))
-                {
-                    sources.put(source, range);
-                    break;
-                }
-            }
-        }
-        return sources;
-    }
+  /**
+   * Creates a new merge policy instance. Note that if you intend to use it
+   * without passing it to {@link IndexWriter}, you should call
+   * {@link #setIndexWriter(IndexWriter)}.
+   */
+  public MergePolicy() {
+    writer = new SetOnce<IndexWriter>();
+  }
 
-    public static class BootstrapTokenVerbHandler implements IVerbHandler
-    {
-        public void doVerb(Message message)
-        {
-            StorageService ss = StorageService.instance;
-            String tokenString = ss.getBootstrapToken().toString();
-            Message response;
-            try
-            {
-                response = message.getReply(FBUtilities.getLocalAddress(), tokenString.getBytes("UTF-8"));
-            }
-            catch (UnsupportedEncodingException e)
-            {
-                throw new AssertionError();
-            }
-            MessagingService.instance.sendOneWay(response, message.getFrom());
-        }
-    }
+  /**
+   * Sets the {@link IndexWriter} to use by this merge policy. This method is
+   * allowed to be called only once, and is usually set by IndexWriter. If it is
+   * called more than once, {@link AlreadySetException} is thrown.
+   * 
+   * @see SetOnce
+   */
+  public void setIndexWriter(IndexWriter writer) {
+    this.writer.set(writer);
+  }
+  
+  /**
+   * Determine what set of merge operations are now necessary on the index.
+   * {@link IndexWriter} calls this whenever there is a change to the segments.
+   * This call is always synchronized on the {@link IndexWriter} instance so
+   * only one thread at a time will call this method.
+   * 
+   * @param segmentInfos
+   *          the total set of segments in the index
+   */
+  public abstract MergeSpecification findMerges(SegmentInfos segmentInfos)
+      throws CorruptIndexException, IOException;
 
-    private static class BootstrapTokenCallback implements IAsyncCallback
-    {
-        private volatile Token<?> token;
-        private final Condition condition = new SimpleCondition();
+  /**
+   * Determine what set of merge operations is necessary in order to optimize
+   * the index. {@link IndexWriter} calls this when its
+   * {@link IndexWriter#optimize()} method is called. This call is always
+   * synchronized on the {@link IndexWriter} instance so only one thread at a
+   * time will call this method.
+   * 
+   * @param segmentInfos
+   *          the total set of segments in the index
+   * @param maxSegmentCount
+   *          requested maximum number of segments in the index (currently this
+   *          is always 1)
+   * @param segmentsToOptimize
+   *          contains the specific SegmentInfo instances that must be merged
+   *          away. This may be a subset of all SegmentInfos.
+   */
+  public abstract MergeSpecification findMergesForOptimize(
+      SegmentInfos segmentInfos, int maxSegmentCount, Set<SegmentInfo> segmentsToOptimize)
+      throws CorruptIndexException, IOException;
 
-        public Token<?> getToken()
-        {
-            try
-            {
-                condition.await();
-            }
-            catch (InterruptedException e)
-            {
-                throw new RuntimeException(e);
-            }
-            return token;
-        }
+  /**
+   * Determine what set of merge operations is necessary in order to expunge all
+   * deletes from the index.
+   * 
+   * @param segmentInfos
+   *          the total set of segments in the index
+   */
+  public abstract MergeSpecification findMergesToExpungeDeletes(
+      SegmentInfos segmentInfos) throws CorruptIndexException, IOException;
 
-        public void response(Message msg)
-        {
-            try
-            {
-                token = StorageService.getPartitioner().getTokenFactory().fromString(new String(msg.getMessageBody(), "UTF-8"));
-            }
-            catch (UnsupportedEncodingException e)
-            {
-                throw new AssertionError();
-            }
-            condition.signalAll();
-        }
-    }
+  /**
+   * Release all resources for the policy.
+   */
+  public abstract void close();
+
+  /** Returns true if a new segment (regardless of its origin) should use the compound file format. */
+  public abstract boolean useCompoundFile(SegmentInfos segments, SegmentInfo newSegment) throws IOException;
+
+  /**
+   * Returns true if the doc store files should use the
+   * compound file format.
+   */
+  public abstract boolean useCompoundDocStore(SegmentInfos segments);
 }

@@ -1,6 +1,6 @@
-DocsAndFreqs[] docsAndFreqs) {
+void startDocument() {
 
-package org.apache.lucene.search;
+package org.apache.lucene.index;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -20,96 +20,168 @@ package org.apache.lucene.search;
  */
 
 import java.io.IOException;
-import java.util.Comparator;
+import java.util.Map;
 
-import org.apache.lucene.index.DocsEnum;
-import org.apache.lucene.search.similarities.Similarity.ExactSimScorer;
+import org.apache.lucene.codecs.TermVectorsWriter;
+import org.apache.lucene.store.FlushInfo;
+import org.apache.lucene.store.IOContext;
 import org.apache.lucene.util.ArrayUtil;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.IOUtils;
+import org.apache.lucene.util.RamUsageEstimator;
 
-/** Scorer for conjunctions, sets of terms, all of which are required. */
-class ConjunctionTermScorer extends Scorer {
-  protected final float coord;
-  protected int lastDoc = -1;
-  protected final DocsAndFreqs[] docsAndFreqs;
-  private final DocsAndFreqs lead;
+final class TermVectorsConsumer extends TermsHashConsumer {
 
-  ConjunctionTermScorer(Weight weight, float coord,
-      DocsAndFreqs[] docsAndFreqs) throws IOException {
-    super(weight);
-    this.coord = coord;
-    this.docsAndFreqs = docsAndFreqs;
-    // Sort the array the first time to allow the least frequent DocsEnum to
-    // lead the matching.
-    ArrayUtil.mergeSort(docsAndFreqs, new Comparator<DocsAndFreqs>() {
-      public int compare(DocsAndFreqs o1, DocsAndFreqs o2) {
-        return o1.docFreq - o2.docFreq;
+  TermVectorsWriter writer;
+  final DocumentsWriterPerThread docWriter;
+  int freeCount;
+  int lastDocID;
+
+  final DocumentsWriterPerThread.DocState docState;
+  final BytesRef flushTerm = new BytesRef();
+
+  // Used by perField when serializing the term vectors
+  final ByteSliceReader vectorSliceReaderPos = new ByteSliceReader();
+  final ByteSliceReader vectorSliceReaderOff = new ByteSliceReader();
+  boolean hasVectors;
+
+  public TermVectorsConsumer(DocumentsWriterPerThread docWriter) {
+    this.docWriter = docWriter;
+    docState = docWriter.docState;
+  }
+
+  @Override
+  void flush(Map<String, TermsHashConsumerPerField> fieldsToFlush, final SegmentWriteState state) throws IOException {
+    if (writer != null) {
+      int numDocs = state.segmentInfo.getDocCount();
+      // At least one doc in this run had term vectors enabled
+      try {
+        fill(numDocs);
+        assert state.segmentInfo != null;
+        writer.finish(state.fieldInfos, numDocs);
+      } finally {
+        IOUtils.close(writer);
+        writer = null;
+
+        lastDocID = 0;
+        hasVectors = false;
       }
-    });
-
-    lead = docsAndFreqs[0]; // least frequent DocsEnum leads the intersection
-  }
-
-  private int doNext(int doc) throws IOException {
-    do {
-      if (lead.doc == DocIdSetIterator.NO_MORE_DOCS) {
-        return NO_MORE_DOCS;
-      }
-      advanceHead: do {
-        for (int i = 1; i < docsAndFreqs.length; i++) {
-          if (docsAndFreqs[i].doc < doc) {
-            docsAndFreqs[i].doc = docsAndFreqs[i].docs.advance(doc);
-          }
-          if (docsAndFreqs[i].doc > doc) {
-            // DocsEnum beyond the current doc - break and advance lead
-            break advanceHead;
-          }
-        }
-        // success - all DocsEnums are on the same doc
-        return doc;
-      } while (true);
-      // advance head for next iteration
-      doc = lead.doc = lead.docs.nextDoc();  
-    } while (true);
-  }
-
-  @Override
-  public int advance(int target) throws IOException {
-    lead.doc = lead.docs.advance(target);
-    return lastDoc = doNext(lead.doc);
-  }
-
-  @Override
-  public int docID() {
-    return lastDoc;
-  }
-
-  @Override
-  public int nextDoc() throws IOException {
-    lead.doc = lead.docs.nextDoc();
-    return lastDoc = doNext(lead.doc);
-  }
-
-  @Override
-  public float score() throws IOException {
-    float sum = 0.0f;
-    for (DocsAndFreqs docs : docsAndFreqs) {
-      sum += docs.docScorer.score(lastDoc, docs.docs.freq());
     }
-    return sum * coord;
-  }
 
-  static final class DocsAndFreqs {
-    final DocsEnum docsAndFreqs;
-    final DocsEnum docs;
-    final int docFreq;
-    final ExactSimScorer docScorer;
-    int doc = -1;
-
-    DocsAndFreqs(DocsEnum docsAndFreqs, DocsEnum docs, int docFreq, ExactSimScorer docScorer) {
-      this.docsAndFreqs = docsAndFreqs;
-      this.docs = docs;
-      this.docFreq = docFreq;
-      this.docScorer = docScorer;
+    for (final TermsHashConsumerPerField field : fieldsToFlush.values() ) {
+      TermVectorsConsumerPerField perField = (TermVectorsConsumerPerField) field;
+      perField.termsHashPerField.reset();
+      perField.shrinkHash();
     }
   }
+
+  /** Fills in no-term-vectors for all docs we haven't seen
+   *  since the last doc that had term vectors. */
+  void fill(int docID) throws IOException {
+    while(lastDocID < docID) {
+      writer.startDocument(0);
+      lastDocID++;
+    }
+  }
+
+  private final void initTermVectorsWriter() throws IOException {
+    if (writer == null) {
+      IOContext context = new IOContext(new FlushInfo(docWriter.getNumDocsInRAM(), docWriter.bytesUsed()));
+      writer = docWriter.codec.termVectorsFormat().vectorsWriter(docWriter.directory, docWriter.getSegmentInfo(), context);
+      lastDocID = 0;
+    }
+  }
+
+  @Override
+  void finishDocument(TermsHash termsHash) throws IOException {
+
+    assert docWriter.writer.testPoint("TermVectorsTermsWriter.finishDocument start");
+
+    if (!hasVectors) {
+      return;
+    }
+
+    initTermVectorsWriter();
+
+    fill(docState.docID);
+
+    // Append term vectors to the real outputs:
+    writer.startDocument(numVectorFields);
+    for (int i = 0; i < numVectorFields; i++) {
+      perFields[i].finishDocument();
+    }
+
+    assert lastDocID == docState.docID: "lastDocID=" + lastDocID + " docState.docID=" + docState.docID;
+
+    lastDocID++;
+
+    termsHash.reset();
+    reset();
+    assert docWriter.writer.testPoint("TermVectorsTermsWriter.finishDocument end");
+  }
+
+  @Override
+  public void abort() {
+    hasVectors = false;
+
+    if (writer != null) {
+      writer.abort();
+      writer = null;
+    }
+
+    lastDocID = 0;
+
+    reset();
+  }
+
+  int numVectorFields;
+
+  TermVectorsConsumerPerField[] perFields;
+
+  void reset() {
+    numVectorFields = 0;
+    perFields = new TermVectorsConsumerPerField[1];
+  }
+
+  @Override
+  public TermsHashConsumerPerField addField(TermsHashPerField termsHashPerField, FieldInfo fieldInfo) {
+    return new TermVectorsConsumerPerField(termsHashPerField, this, fieldInfo);
+  }
+
+  void addFieldToFlush(TermVectorsConsumerPerField fieldToFlush) {
+    if (numVectorFields == perFields.length) {
+      int newSize = ArrayUtil.oversize(numVectorFields + 1, RamUsageEstimator.NUM_BYTES_OBJECT_REF);
+      TermVectorsConsumerPerField[] newArray = new TermVectorsConsumerPerField[newSize];
+      System.arraycopy(perFields, 0, newArray, 0, numVectorFields);
+      perFields = newArray;
+    }
+
+    perFields[numVectorFields++] = fieldToFlush;
+  }
+
+  @Override
+  void startDocument() throws IOException {
+    assert clearLastVectorFieldName();
+    reset();
+  }
+
+  // Called only by assert
+  final boolean clearLastVectorFieldName() {
+    lastVectorFieldName = null;
+    return true;
+  }
+
+  // Called only by assert
+  String lastVectorFieldName;
+  final boolean vectorFieldsInOrder(FieldInfo fi) {
+    try {
+      if (lastVectorFieldName != null)
+        return lastVectorFieldName.compareTo(fi.name) < 0;
+      else
+        return true;
+    } finally {
+      lastVectorFieldName = fi.name;
+    }
+  }
+
 }

@@ -1,6 +1,6 @@
 @Override
 
-package org.apache.lucene.search;
+package org.apache.lucene.index;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,385 +19,538 @@ package org.apache.lucene.search;
  * limitations under the License.
  */
 
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.util.ThreadInterruptedException;
+import org.apache.lucene.util.CollectionUtil;
+
 import java.io.IOException;
+import java.util.List;
 import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Set;
+import java.util.Comparator;
 
-import org.apache.lucene.index.AtomicReaderContext;
-import org.apache.lucene.index.DocsAndPositionsEnum;
-import org.apache.lucene.index.DocsEnum;
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.AtomicReader;
-import org.apache.lucene.index.IndexReaderContext;
-import org.apache.lucene.index.Term;
-import org.apache.lucene.index.TermContext;
-import org.apache.lucene.index.TermState;
-import org.apache.lucene.index.Terms;
-import org.apache.lucene.index.TermsEnum;
-import org.apache.lucene.search.similarities.Similarity.SloppySimScorer;
-import org.apache.lucene.search.similarities.Similarity;
-import org.apache.lucene.util.ArrayUtil;
-import org.apache.lucene.util.Bits;
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.ToStringUtils;
+/** A {@link MergeScheduler} that runs each merge using a
+ *  separate thread.
+ *
+ *  <p>Specify the max number of threads that may run at
+ *  once with {@link #setMaxThreadCount}.</p>
+ *
+ *  <p>Separately specify the maximum number of simultaneous
+ *  merges with {@link #setMaxMergeCount}.  If the number of
+ *  merges exceeds the max number of threads then the
+ *  largest merges are paused until one of the smaller
+ *  merges completes.</p>
+ *
+ *  <p>If more than {@link #getMaxMergeCount} merges are
+ *  requested then this class will forcefully throttle the
+ *  incoming threads by pausing until one more more merges
+ *  complete.</p>
+ */ 
+public class ConcurrentMergeScheduler extends MergeScheduler {
 
-/** A Query that matches documents containing a particular sequence of terms.
- * A PhraseQuery is built by QueryParser for input like <code>"new york"</code>.
- * 
- * <p>This query may be combined with other terms or queries with a {@link BooleanQuery}.
- */
-public class PhraseQuery extends Query {
-  private String field;
-  private ArrayList<Term> terms = new ArrayList<Term>(4);
-  private ArrayList<Integer> positions = new ArrayList<Integer>(4);
-  private int maxPosition = 0;
-  private int slop = 0;
+  private int mergeThreadPriority = -1;
 
-  /** Constructs an empty phrase query. */
-  public PhraseQuery() {}
+  /** List of currently active {@link MergeThread}s. */
+  protected List<MergeThread> mergeThreads = new ArrayList<MergeThread>();
 
-  /** Sets the number of other words permitted between words in query phrase.
-    If zero, then this is an exact phrase search.  For larger values this works
-    like a <code>WITHIN</code> or <code>NEAR</code> operator.
+  // Max number of merge threads allowed to be running at
+  // once.  When there are more merges then this, we
+  // forcefully pause the larger ones, letting the smaller
+  // ones run, up until maxMergeCount merges at which point
+  // we forcefully pause incoming threads (that presumably
+  // are the ones causing so much merging).  We dynamically
+  // default this from 1 to 3, depending on how many cores
+  // you have:
+  private int maxThreadCount = Math.max(1, Math.min(3, Runtime.getRuntime().availableProcessors()/2));
 
-    <p>The slop is in fact an edit-distance, where the units correspond to
-    moves of terms in the query phrase out of position.  For example, to switch
-    the order of two words requires two moves (the first move places the words
-    atop one another), so to permit re-orderings of phrases, the slop must be
-    at least two.
+  // Max number of merges we accept before forcefully
+  // throttling the incoming threads
+  private int maxMergeCount = maxThreadCount+2;
 
-    <p>More exact matches are scored higher than sloppier matches, thus search
-    results are sorted by exactness.
+  /** {@link Directory} that holds the index. */
+  protected Directory dir;
 
-    <p>The slop is zero by default, requiring exact matches.*/
-  public void setSlop(int s) { slop = s; }
-  /** Returns the slop.  See setSlop(). */
-  public int getSlop() { return slop; }
+  /** {@link IndexWriter} that owns this instance. */
+  protected IndexWriter writer;
 
-  /**
-   * Adds a term to the end of the query phrase.
-   * The relative position of the term is the one immediately after the last term added.
-   */
-  public void add(Term term) {
-    int position = 0;
-    if(positions.size() > 0)
-        position = positions.get(positions.size()-1).intValue() + 1;
+  /** How many {@link MergeThread}s have kicked off (this is use
+   *  to name them). */
+  protected int mergeThreadCount;
 
-    add(term, position);
+  /** Sole constructor, with all settings set to default
+   *  values. */
+  public ConcurrentMergeScheduler() {
   }
 
+  /** Sets the max # simultaneous merge threads that should
+   *  be running at once.  This must be <= {@link
+   *  #setMaxMergeCount}. */
+  public void setMaxThreadCount(int count) {
+    if (count < 1) {
+      throw new IllegalArgumentException("count should be at least 1");
+    }
+    if (count > maxMergeCount) {
+      throw new IllegalArgumentException("count should be <= maxMergeCount (= " + maxMergeCount + ")");
+    }
+    maxThreadCount = count;
+  }
+
+  /** Returns {@code maxThreadCount}.
+   *
+   * @see #setMaxThreadCount(int) */
+  public int getMaxThreadCount() {
+    return maxThreadCount;
+  }
+
+  /** Sets the max # simultaneous merges that are allowed.
+   *  If a merge is necessary yet we already have this many
+   *  threads running, the incoming thread (that is calling
+   *  add/updateDocument) will block until a merge thread
+   *  has completed.  Note that we will only run the
+   *  smallest {@link #setMaxThreadCount} merges at a time. */
+  public void setMaxMergeCount(int count) {
+    if (count < 1) {
+      throw new IllegalArgumentException("count should be at least 1");
+    }
+    if (count < maxThreadCount) {
+      throw new IllegalArgumentException("count should be >= maxThreadCount (= " + maxThreadCount + ")");
+    }
+    maxMergeCount = count;
+  }
+
+  /** See {@link #setMaxMergeCount}. */
+  public int getMaxMergeCount() {
+    return maxMergeCount;
+  }
+
+  /** Return the priority that merge threads run at.  By
+   *  default the priority is 1 plus the priority of (ie,
+   *  slightly higher priority than) the first thread that
+   *  calls merge. */
+  public synchronized int getMergeThreadPriority() {
+    initMergeThreadPriority();
+    return mergeThreadPriority;
+  }
+
+  /** Set the base priority that merge threads run at.
+   *  Note that CMS may increase priority of some merge
+   *  threads beyond this base priority.  It's best not to
+   *  set this any higher than
+   *  Thread.MAX_PRIORITY-maxThreadCount, so that CMS has
+   *  room to set relative priority among threads.  */
+  public synchronized void setMergeThreadPriority(int pri) {
+    if (pri > Thread.MAX_PRIORITY || pri < Thread.MIN_PRIORITY)
+      throw new IllegalArgumentException("priority must be in range " + Thread.MIN_PRIORITY + " .. " + Thread.MAX_PRIORITY + " inclusive");
+    mergeThreadPriority = pri;
+    updateMergeThreads();
+  }
+
+  /** Sorts {@link MergeThread}s; larger merges come first. */
+  protected static final Comparator<MergeThread> compareByMergeDocCount = new Comparator<MergeThread>() {
+    public int compare(MergeThread t1, MergeThread t2) {
+      final MergePolicy.OneMerge m1 = t1.getCurrentMerge();
+      final MergePolicy.OneMerge m2 = t2.getCurrentMerge();
+      
+      final int c1 = m1 == null ? Integer.MAX_VALUE : m1.totalDocCount;
+      final int c2 = m2 == null ? Integer.MAX_VALUE : m2.totalDocCount;
+
+      return c2 - c1;
+    }
+  };
+
   /**
-   * Adds a term to the end of the query phrase.
-   * The relative position of the term within the phrase is specified explicitly.
-   * This allows e.g. phrases with more than one term at the same position
-   * or phrases with gaps (e.g. in connection with stopwords).
-   * 
+   * Called whenever the running merges have changed, to pause & unpause
+   * threads. This method sorts the merge threads by their merge size in
+   * descending order and then pauses/unpauses threads from first to last --
+   * that way, smaller merges are guaranteed to run before larger ones.
    */
-  public void add(Term term, int position) {
-    if (terms.size() == 0) {
-      field = term.field();
-    } else if (!term.field().equals(field)) {
-      throw new IllegalArgumentException("All phrase terms must be in the same field: " + term);
+  protected synchronized void updateMergeThreads() {
+
+    // Only look at threads that are alive & not in the
+    // process of stopping (ie have an active merge):
+    final List<MergeThread> activeMerges = new ArrayList<MergeThread>();
+
+    int threadIdx = 0;
+    while (threadIdx < mergeThreads.size()) {
+      final MergeThread mergeThread = mergeThreads.get(threadIdx);
+      if (!mergeThread.isAlive()) {
+        // Prune any dead threads
+        mergeThreads.remove(threadIdx);
+        continue;
+      }
+      if (mergeThread.getCurrentMerge() != null) {
+        activeMerges.add(mergeThread);
+      }
+      threadIdx++;
     }
 
-    terms.add(term);
-    positions.add(Integer.valueOf(position));
-    if (position > maxPosition) maxPosition = position;
-  }
+    // Sort the merge threads in descending order.
+    CollectionUtil.mergeSort(activeMerges, compareByMergeDocCount);
+    
+    int pri = mergeThreadPriority;
+    final int activeMergeCount = activeMerges.size();
+    for (threadIdx=0;threadIdx<activeMergeCount;threadIdx++) {
+      final MergeThread mergeThread = activeMerges.get(threadIdx);
+      final MergePolicy.OneMerge merge = mergeThread.getCurrentMerge();
+      if (merge == null) { 
+        continue;
+      }
 
-  /** Returns the set of terms in this phrase. */
-  public Term[] getTerms() {
-    return terms.toArray(new Term[0]);
+      // pause the thread if maxThreadCount is smaller than the number of merge threads.
+      final boolean doPause = threadIdx < activeMergeCount - maxThreadCount;
+
+      if (verbose()) {
+        if (doPause != merge.getPause()) {
+          if (doPause) {
+            message("pause thread " + mergeThread.getName());
+          } else {
+            message("unpause thread " + mergeThread.getName());
+          }
+        }
+      }
+      if (doPause != merge.getPause()) {
+        merge.setPause(doPause);
+      }
+
+      if (!doPause) {
+        if (verbose()) {
+          message("set priority of merge thread " + mergeThread.getName() + " to " + pri);
+        }
+        mergeThread.setThreadPriority(pri);
+        pri = Math.min(Thread.MAX_PRIORITY, 1+pri);
+      }
+    }
   }
 
   /**
-   * Returns the relative positions of terms in this phrase.
+   * Returns true if verbosing is enabled. This method is usually used in
+   * conjunction with {@link #message(String)}, like that:
+   * 
+   * <pre class="prettyprint">
+   * if (verbose()) {
+   *   message(&quot;your message&quot;);
+   * }
+   * </pre>
    */
-  public int[] getPositions() {
-      int[] result = new int[positions.size()];
-      for(int i = 0; i < positions.size(); i++)
-          result[i] = positions.get(i).intValue();
-      return result;
+  protected boolean verbose() {
+    return writer != null && writer.infoStream.isEnabled("CMS");
+  }
+  
+  /**
+   * Outputs the given message - this method assumes {@link #verbose()} was
+   * called and returned true.
+   */
+  protected void message(String message) {
+    writer.infoStream.message("CMS", message);
+  }
+
+  private synchronized void initMergeThreadPriority() {
+    if (mergeThreadPriority == -1) {
+      // Default to slightly higher priority than our
+      // calling thread
+      mergeThreadPriority = 1+Thread.currentThread().getPriority();
+      if (mergeThreadPriority > Thread.MAX_PRIORITY)
+        mergeThreadPriority = Thread.MAX_PRIORITY;
+    }
   }
 
   @Override
-  public Query rewrite(IndexReader reader) throws IOException {
-    if (terms.isEmpty()) {
-      BooleanQuery bq = new BooleanQuery();
-      bq.setBoost(getBoost());
-      return bq;
-    } else if (terms.size() == 1) {
-      TermQuery tq = new TermQuery(terms.get(0));
-      tq.setBoost(getBoost());
-      return tq;
-    } else
-      return super.rewrite(reader);
+  public void close() {
+    sync();
   }
 
-  static class PostingsAndFreq implements Comparable<PostingsAndFreq> {
-    final DocsAndPositionsEnum postings;
-    final int docFreq;
-    final int position;
-    final Term[] terms;
-    final int nTerms; // for faster comparisons
-
-    public PostingsAndFreq(DocsAndPositionsEnum postings, int docFreq, int position, Term... terms) {
-      this.postings = postings;
-      this.docFreq = docFreq;
-      this.position = position;
-      nTerms = terms==null ? 0 : terms.length;
-      if (nTerms>0) {
-        if (terms.length==1) {
-          this.terms = terms;
-        } else {
-          Term[] terms2 = new Term[terms.length];
-          System.arraycopy(terms, 0, terms2, 0, terms.length);
-          Arrays.sort(terms2);
-          this.terms = terms2;
+  /** Wait for any running merge threads to finish. This call is not interruptible as used by {@link #close()}. */
+  public void sync() {
+    boolean interrupted = false;
+    try {
+      while (true) {
+        MergeThread toSync = null;
+        synchronized (this) {
+          for (MergeThread t : mergeThreads) {
+            if (t.isAlive()) {
+              toSync = t;
+              break;
+            }
+          }
         }
-      } else {
-        this.terms = null;
+        if (toSync != null) {
+          try {
+            toSync.join();
+          } catch (InterruptedException ie) {
+            // ignore this Exception, we will retry until all threads are dead
+            interrupted = true;
+          }
+        } else {
+          break;
+        }
       }
-    }
-
-    public int compareTo(PostingsAndFreq other) {
-      if (docFreq != other.docFreq) {
-        return docFreq - other.docFreq;
-      }
-      if (position != other.position) {
-        return position - other.position;
-      }
-      if (nTerms != other.nTerms) {
-        return nTerms - other.nTerms;
-      }
-      if (nTerms == 0) {
-        return 0;
-      }
-      for (int i=0; i<terms.length; i++) {
-        int res = terms[i].compareTo(other.terms[i]);
-        if (res!=0) return res;
-      }
-      return 0;
-    }
-
-    @Override
-    public int hashCode() {
-      final int prime = 31;
-      int result = 1;
-      result = prime * result + docFreq;
-      result = prime * result + position;
-      for (int i=0; i<nTerms; i++) {
-        result = prime * result + terms[i].hashCode(); 
-      }
-      return result;
-    }
-
-    @Override
-    public boolean equals(Object obj) {
-      if (this == obj) return true;
-      if (obj == null) return false;
-      if (getClass() != obj.getClass()) return false;
-      PostingsAndFreq other = (PostingsAndFreq) obj;
-      if (docFreq != other.docFreq) return false;
-      if (position != other.position) return false;
-      if (terms == null) return other.terms == null;
-      return Arrays.equals(terms, other.terms);
+    } finally {
+      // finally, restore interrupt status:
+      if (interrupted) Thread.currentThread().interrupt();
     }
   }
 
-  private class PhraseWeight extends Weight {
-    private final Similarity similarity;
-    private final Similarity.SimWeight stats;
-    private transient TermContext states[];
-
-    public PhraseWeight(IndexSearcher searcher)
-      throws IOException {
-      this.similarity = searcher.getSimilarity();
-      final IndexReaderContext context = searcher.getTopReaderContext();
-      states = new TermContext[terms.size()];
-      TermStatistics termStats[] = new TermStatistics[terms.size()];
-      for (int i = 0; i < terms.size(); i++) {
-        final Term term = terms.get(i);
-        states[i] = TermContext.build(context, term, true);
-        termStats[i] = searcher.termStatistics(term, states[i]);
+  /**
+   * Returns the number of merge threads that are alive. Note that this number
+   * is &le; {@link #mergeThreads} size.
+   */
+  protected synchronized int mergeThreadCount() {
+    int count = 0;
+    for (MergeThread mt : mergeThreads) {
+      if (mt.isAlive() && mt.getCurrentMerge() != null) {
+        count++;
       }
-      stats = similarity.computeWeight(getBoost(), searcher.collectionStatistics(field), termStats);
     }
+    return count;
+  }
 
-    @Override
-    public String toString() { return "weight(" + PhraseQuery.this + ")"; }
+  @Override
+  public synchronized void merge(IndexWriter writer) throws IOException {
 
-    @Override
-    public Query getQuery() { return PhraseQuery.this; }
+    assert !Thread.holdsLock(writer);
 
-    @Override
-    public float getValueForNormalization() {
-      return stats.getValueForNormalization();
-    }
+    this.writer = writer;
 
-    @Override
-    public void normalize(float queryNorm, float topLevelBoost) {
-      stats.normalize(queryNorm, topLevelBoost);
-    }
+    initMergeThreadPriority();
 
-    @Override
-    public Scorer scorer(AtomicReaderContext context, boolean scoreDocsInOrder,
-        boolean topScorer, Bits acceptDocs) throws IOException {
-      assert !terms.isEmpty();
-      final AtomicReader reader = context.reader();
-      final Bits liveDocs = acceptDocs;
-      PostingsAndFreq[] postingsFreqs = new PostingsAndFreq[terms.size()];
+    dir = writer.getDirectory();
 
-      final Terms fieldTerms = reader.terms(field);
-      if (fieldTerms == null) {
-        return null;
-      }
+    // First, quickly run through the newly proposed merges
+    // and add any orthogonal merges (ie a merge not
+    // involving segments already pending to be merged) to
+    // the queue.  If we are way behind on merging, many of
+    // these newly proposed merges will likely already be
+    // registered.
 
-      // Reuse single TermsEnum below:
-      final TermsEnum te = fieldTerms.iterator(null);
-      
-      for (int i = 0; i < terms.size(); i++) {
-        final Term t = terms.get(i);
-        final TermState state = states[i].get(context.ord);
-        if (state == null) { /* term doesnt exist in this segment */
-          assert termNotInReader(reader, t): "no termstate found but term exists in reader";
-          return null;
-        }
-        te.seekExact(t.bytes(), state);
-        DocsAndPositionsEnum postingsEnum = te.docsAndPositions(liveDocs, null, DocsEnum.FLAG_NONE);
-
-        // PhraseQuery on a field that did not index
-        // positions.
-        if (postingsEnum == null) {
-          assert te.seekExact(t.bytes(), false) : "termstate found but no term exists in reader";
-          // term does exist, but has no positions
-          throw new IllegalStateException("field \"" + t.field() + "\" was indexed without position data; cannot run PhraseQuery (term=" + t.text() + ")");
-        }
-        postingsFreqs[i] = new PostingsAndFreq(postingsEnum, te.docFreq(), positions.get(i).intValue(), t);
-      }
-
-      // sort by increasing docFreq order
-      if (slop == 0) {
-        ArrayUtil.mergeSort(postingsFreqs);
-      }
-
-      if (slop == 0) {  // optimize exact case
-        ExactPhraseScorer s = new ExactPhraseScorer(this, postingsFreqs, similarity.exactSimScorer(stats, context));
-        if (s.noDocs) {
-          return null;
-        } else {
-          return s;
-        }
-      } else {
-        return
-          new SloppyPhraseScorer(this, postingsFreqs, slop, similarity.sloppySimScorer(stats, context));
-      }
+    if (verbose()) {
+      message("now merge");
+      message("  index: " + writer.segString());
     }
     
-    // only called from assert
-    private boolean termNotInReader(AtomicReader reader, Term term) throws IOException {
-      return reader.docFreq(term) == 0;
+    // Iterate, pulling from the IndexWriter's queue of
+    // pending merges, until it's empty:
+    while (true) {
+
+      long startStallTime = 0;
+      while (writer.hasPendingMerges() && mergeThreadCount() >= maxMergeCount) {
+        // This means merging has fallen too far behind: we
+        // have already created maxMergeCount threads, and
+        // now there's at least one more merge pending.
+        // Note that only maxThreadCount of
+        // those created merge threads will actually be
+        // running; the rest will be paused (see
+        // updateMergeThreads).  We stall this producer
+        // thread to prevent creation of new segments,
+        // until merging has caught up:
+        startStallTime = System.currentTimeMillis();
+        if (verbose()) {
+          message("    too many merges; stalling...");
+        }
+        try {
+          wait();
+        } catch (InterruptedException ie) {
+          throw new ThreadInterruptedException(ie);
+        }
+      }
+
+      if (verbose()) {
+        if (startStallTime != 0) {
+          message("  stalled for " + (System.currentTimeMillis()-startStallTime) + " msec");
+        }
+      }
+
+      MergePolicy.OneMerge merge = writer.getNextMerge();
+      if (merge == null) {
+        if (verbose()) {
+          message("  no more merges pending; now return");
+        }
+        return;
+      }
+
+      boolean success = false;
+      try {
+        if (verbose()) {
+          message("  consider merge " + writer.segString(merge.segments));
+        }
+
+        // OK to spawn a new merge thread to handle this
+        // merge:
+        final MergeThread merger = getMergeThread(writer, merge);
+        mergeThreads.add(merger);
+        if (verbose()) {
+          message("    launch new thread [" + merger.getName() + "]");
+        }
+
+        merger.start();
+
+        // Must call this after starting the thread else
+        // the new thread is removed from mergeThreads
+        // (since it's not alive yet):
+        updateMergeThreads();
+
+        success = true;
+      } finally {
+        if (!success) {
+          writer.mergeFinish(merge);
+        }
+      }
+    }
+  }
+
+  /** Does the actual merge, by calling {@link IndexWriter#merge} */
+  protected void doMerge(MergePolicy.OneMerge merge) throws IOException {
+    writer.merge(merge);
+  }
+
+  /** Create and return a new MergeThread */
+  protected synchronized MergeThread getMergeThread(IndexWriter writer, MergePolicy.OneMerge merge) throws IOException {
+    final MergeThread thread = new MergeThread(writer, merge);
+    thread.setThreadPriority(mergeThreadPriority);
+    thread.setDaemon(true);
+    thread.setName("Lucene Merge Thread #" + mergeThreadCount++);
+    return thread;
+  }
+
+  /** Runs a merge thread, which may run one or more merges
+   *  in sequence. */
+  protected class MergeThread extends Thread {
+
+    IndexWriter tWriter;
+    MergePolicy.OneMerge startMerge;
+    MergePolicy.OneMerge runningMerge;
+    private volatile boolean done;
+
+    /** Sole constructor. */
+    public MergeThread(IndexWriter writer, MergePolicy.OneMerge startMerge) {
+      this.tWriter = writer;
+      this.startMerge = startMerge;
+    }
+
+    /** Record the currently running merge. */
+    public synchronized void setRunningMerge(MergePolicy.OneMerge merge) {
+      runningMerge = merge;
+    }
+
+    /** Return the currently running merge. */
+    public synchronized MergePolicy.OneMerge getRunningMerge() {
+      return runningMerge;
+    }
+
+    /** Return the current merge, or null if this {@code
+     *  MergeThread} is done. */
+    public synchronized MergePolicy.OneMerge getCurrentMerge() {
+      if (done) {
+        return null;
+      } else if (runningMerge != null) {
+        return runningMerge;
+      } else {
+        return startMerge;
+      }
+    }
+
+    /** Set the priority of this thread. */
+    public void setThreadPriority(int pri) {
+      try {
+        setPriority(pri);
+      } catch (NullPointerException npe) {
+        // Strangely, Sun's JDK 1.5 on Linux sometimes
+        // throws NPE out of here...
+      } catch (SecurityException se) {
+        // Ignore this because we will still run fine with
+        // normal thread priority
+      }
     }
 
     @Override
-    public Explanation explain(AtomicReaderContext context, int doc) throws IOException {
-      Scorer scorer = scorer(context, true, false, context.reader().getLiveDocs());
-      if (scorer != null) {
-        int newDoc = scorer.advance(doc);
-        if (newDoc == doc) {
-          float freq = slop == 0 ? scorer.freq() : ((SloppyPhraseScorer)scorer).sloppyFreq();
-          SloppySimScorer docScorer = similarity.sloppySimScorer(stats, context);
-          ComplexExplanation result = new ComplexExplanation();
-          result.setDescription("weight("+getQuery()+" in "+doc+") [" + similarity.getClass().getSimpleName() + "], result of:");
-          Explanation scoreExplanation = docScorer.explain(doc, new Explanation(freq, "phraseFreq=" + freq));
-          result.addDetail(scoreExplanation);
-          result.setValue(scoreExplanation.getValue());
-          result.setMatch(true);
-          return result;
+    public void run() {
+      
+      // First time through the while loop we do the merge
+      // that we were started with:
+      MergePolicy.OneMerge merge = this.startMerge;
+      
+      try {
+
+        if (verbose()) {
+          message("  merge thread: start");
+        }
+
+        while(true) {
+          setRunningMerge(merge);
+          doMerge(merge);
+
+          // Subsequent times through the loop we do any new
+          // merge that writer says is necessary:
+          merge = tWriter.getNextMerge();
+          if (merge != null) {
+            updateMergeThreads();
+            if (verbose()) {
+              message("  merge thread: do another merge " + tWriter.segString(merge.segments));
+            }
+          } else {
+            break;
+          }
+        }
+
+        if (verbose()) {
+          message("  merge thread: done");
+        }
+
+      } catch (Throwable exc) {
+
+        // Ignore the exception if it was due to abort:
+        if (!(exc instanceof MergePolicy.MergeAbortedException)) {
+          //System.out.println(Thread.currentThread().getName() + ": CMS: exc");
+          //exc.printStackTrace(System.out);
+          if (!suppressExceptions) {
+            // suppressExceptions is normally only set during
+            // testing.
+            handleMergeException(exc);
+          }
+        }
+      } finally {
+        done = true;
+        synchronized(ConcurrentMergeScheduler.this) {
+          updateMergeThreads();
+          ConcurrentMergeScheduler.this.notifyAll();
         }
       }
-      
-      return new ComplexExplanation(false, 0.0f, "no matching term");
     }
   }
 
-  @Override
-  public Weight createWeight(IndexSearcher searcher) throws IOException {
-    return new PhraseWeight(searcher);
-  }
-
-  /**
-   * @see org.apache.lucene.search.Query#extractTerms(Set)
-   */
-  @Override
-  public void extractTerms(Set<Term> queryTerms) {
-    queryTerms.addAll(terms);
-  }
-
-  /** Prints a user-readable version of this query. */
-  @Override
-  public String toString(String f) {
-    StringBuilder buffer = new StringBuilder();
-    if (field != null && !field.equals(f)) {
-      buffer.append(field);
-      buffer.append(":");
+  /** Called when an exception is hit in a background merge
+   *  thread */
+  protected void handleMergeException(Throwable exc) {
+    try {
+      // When an exception is hit during merge, IndexWriter
+      // removes any partial files and then allows another
+      // merge to run.  If whatever caused the error is not
+      // transient then the exception will keep happening,
+      // so, we sleep here to avoid saturating CPU in such
+      // cases:
+      Thread.sleep(250);
+    } catch (InterruptedException ie) {
+      throw new ThreadInterruptedException(ie);
     }
-
-    buffer.append("\"");
-    String[] pieces = new String[maxPosition + 1];
-    for (int i = 0; i < terms.size(); i++) {
-      int pos = positions.get(i).intValue();
-      String s = pieces[pos];
-      if (s == null) {
-        s = (terms.get(i)).text();
-      } else {
-        s = s + "|" + (terms.get(i)).text();
-      }
-      pieces[pos] = s;
-    }
-    for (int i = 0; i < pieces.length; i++) {
-      if (i > 0) {
-        buffer.append(' ');
-      }
-      String s = pieces[i];
-      if (s == null) {
-        buffer.append('?');
-      } else {
-        buffer.append(s);
-      }
-    }
-    buffer.append("\"");
-
-    if (slop != 0) {
-      buffer.append("~");
-      buffer.append(slop);
-    }
-
-    buffer.append(ToStringUtils.boost(getBoost()));
-
-    return buffer.toString();
+    throw new MergePolicy.MergeException(exc, dir);
   }
 
-  /** Returns true iff <code>o</code> is equal to this. */
+  private boolean suppressExceptions;
+
+  /** Used for testing */
+  void setSuppressExceptions() {
+    suppressExceptions = true;
+  }
+
+  /** Used for testing */
+  void clearSuppressExceptions() {
+    suppressExceptions = false;
+  }
+  
   @Override
-  public boolean equals(Object o) {
-    if (!(o instanceof PhraseQuery))
-      return false;
-    PhraseQuery other = (PhraseQuery)o;
-    return (this.getBoost() == other.getBoost())
-      && (this.slop == other.slop)
-      &&  this.terms.equals(other.terms)
-      && this.positions.equals(other.positions);
+  public String toString() {
+    StringBuilder sb = new StringBuilder(getClass().getSimpleName() + ": ");
+    sb.append("maxThreadCount=").append(maxThreadCount).append(", ");    
+    sb.append("maxMergeCount=").append(maxMergeCount).append(", ");    
+    sb.append("mergeThreadPriority=").append(mergeThreadPriority);
+    return sb.toString();
   }
-
-  /** Returns a hash code value for this object.*/
-  @Override
-  public int hashCode() {
-    return Float.floatToIntBits(getBoost())
-      ^ slop
-      ^ terms.hashCode()
-      ^ positions.hashCode();
-  }
-
 }

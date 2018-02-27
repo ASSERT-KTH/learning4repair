@@ -1,14 +1,13 @@
-MockDirectoryWrapper dir = newMockDirectory();
+minCheckMs = Math.min(minCheckMs, cfs.getMemtableFlushAfterMins() * 60 * 1000);
 
-package org.apache.lucene.index;
-
-/*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -19,405 +18,654 @@ package org.apache.lucene.index;
  * limitations under the License.
  */
 
+package org.apache.cassandra.db;
+
+import java.io.File;
+import java.io.IOError;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
-import java.util.Iterator;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.SortedSet;
+import java.util.TreeSet;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
-import org.apache.lucene.analysis.MockAnalyzer;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.index.DocumentsWriterPerThreadPool.ThreadState;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.MockDirectoryWrapper;
-import org.apache.lucene.util.LineFileDocs;
-import org.apache.lucene.util.LuceneTestCase;
-import org.junit.AfterClass;
-import org.junit.BeforeClass;
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.commitlog.CommitLog;
+import org.apache.cassandra.db.filter.QueryFilter;
+import org.apache.cassandra.db.filter.QueryPath;
+import org.apache.cassandra.dht.LocalToken;
+import org.apache.cassandra.io.ICompactionInfo;
+import org.apache.cassandra.io.sstable.ReducingKeyIterator;
+import org.apache.cassandra.io.sstable.SSTableDeletingReference;
+import org.apache.cassandra.io.sstable.SSTableReader;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.FBUtilities;
+import org.cliffc.high_scale_lib.NonBlockingHashMap;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-public class TestFlushByRamOrCountsPolicy extends LuceneTestCase {
+import com.google.common.base.Function;
+import com.google.common.collect.Iterables;
 
-  private static LineFileDocs lineDocFile;
+public class Table
+{
+    public static final String SYSTEM_TABLE = "system";
 
-  @BeforeClass
-  public static void beforeClass() throws Exception {
-    lineDocFile = new LineFileDocs(random(), defaultCodecSupportsDocValues());
-  }
-  
-  @AfterClass
-  public static void afterClass() throws Exception {
-    lineDocFile.close();
-    lineDocFile = null;
-  }
+    private static final Logger logger = LoggerFactory.getLogger(Table.class);
+    private static final String SNAPSHOT_SUBDIR_NAME = "snapshots";
 
-  public void testFlushByRam() throws IOException, InterruptedException {
-    final double ramBuffer = (TEST_NIGHTLY ? 1 : 10) + atLeast(2)
-        + random().nextDouble();
-    runFlushByRam(1 + random().nextInt(TEST_NIGHTLY ? 5 : 1), ramBuffer, false);
-  }
-  
-  public void testFlushByRamLargeBuffer() throws IOException, InterruptedException {
-    // with a 256 mb ram buffer we should never stall
-    runFlushByRam(1 + random().nextInt(TEST_NIGHTLY ? 5 : 1), 256.d, true);
-  }
+    /**
+     * accesses to CFS.memtable should acquire this for thread safety.
+     * Table.maybeSwitchMemtable should aquire the writeLock; see that method for the full explanation.
+     */
+    static final ReentrantReadWriteLock flusherLock = new ReentrantReadWriteLock(true);
 
-  protected void runFlushByRam(int numThreads, double maxRamMB,
-      boolean ensureNotStalled) throws IOException, InterruptedException {
-    final int numDocumentsToIndex = 10 + atLeast(30);
-    AtomicInteger numDocs = new AtomicInteger(numDocumentsToIndex);
-    Directory dir = newDirectory();
-    MockDefaultFlushPolicy flushPolicy = new MockDefaultFlushPolicy();
-    IndexWriterConfig iwc = newIndexWriterConfig(TEST_VERSION_CURRENT,
-        new MockAnalyzer(random())).setFlushPolicy(flushPolicy);
-    final int numDWPT = 1 + atLeast(2);
-    DocumentsWriterPerThreadPool threadPool = new ThreadAffinityDocumentsWriterThreadPool(
-        numDWPT);
-    iwc.setIndexerThreadPool(threadPool);
-    iwc.setRAMBufferSizeMB(maxRamMB);
-    iwc.setMaxBufferedDocs(IndexWriterConfig.DISABLE_AUTO_FLUSH);
-    iwc.setMaxBufferedDeleteTerms(IndexWriterConfig.DISABLE_AUTO_FLUSH);
-    IndexWriter writer = new IndexWriter(dir, iwc);
-    flushPolicy = (MockDefaultFlushPolicy) writer.getConfig().getFlushPolicy();
-    assertFalse(flushPolicy.flushOnDocCount());
-    assertFalse(flushPolicy.flushOnDeleteTerms());
-    assertTrue(flushPolicy.flushOnRAM());
-    DocumentsWriter docsWriter = writer.getDocsWriter();
-    assertNotNull(docsWriter);
-    DocumentsWriterFlushControl flushControl = docsWriter.flushControl;
-    assertEquals(" bytes must be 0 after init", 0, flushControl.flushBytes());
-
-    IndexThread[] threads = new IndexThread[numThreads];
-    for (int x = 0; x < threads.length; x++) {
-      threads[x] = new IndexThread(numDocs, numThreads, writer, lineDocFile,
-          false);
-      threads[x].start();
+    // It is possible to call Table.open without a running daemon, so it makes sense to ensure
+    // proper directories here as well as in CassandraDaemon.
+    static
+    {
+        try
+        {
+            DatabaseDescriptor.createAllDirectories();
+        }
+        catch (IOException ex)
+        {
+            throw new IOError(ex);
+        }
     }
 
-    for (int x = 0; x < threads.length; x++) {
-      threads[x].join();
-    }
-    final long maxRAMBytes = (long) (iwc.getRAMBufferSizeMB() * 1024. * 1024.);
-    assertEquals(" all flushes must be due numThreads=" + numThreads, 0,
-        flushControl.flushBytes());
-    assertEquals(numDocumentsToIndex, writer.numDocs());
-    assertEquals(numDocumentsToIndex, writer.maxDoc());
-    assertTrue("peak bytes without flush exceeded watermark",
-        flushPolicy.peakBytesWithoutFlush <= maxRAMBytes);
-    assertActiveBytesAfter(flushControl);
-    if (flushPolicy.hasMarkedPending) {
-      assertTrue(maxRAMBytes < flushControl.peakActiveBytes);
-    }
-    if (ensureNotStalled) {
-      assertFalse(docsWriter.flushControl.stallControl.wasStalled());
-    }
-    writer.close();
-    assertEquals(0, flushControl.activeBytes());
-    dir.close();
-  }
+    /** Table objects, one per keyspace.  only one instance should ever exist for any given keyspace. */
+    private static final Map<String, Table> instances = new NonBlockingHashMap<String, Table>();
 
-  public void testFlushDocCount() throws IOException, InterruptedException {
-    int[] numThreads = new int[] { 2 + atLeast(1), 1 };
-    for (int i = 0; i < numThreads.length; i++) {
+    /* Table name. */
+    public final String name;
+    /* ColumnFamilyStore per column family */
+    public final Map<Integer, ColumnFamilyStore> columnFamilyStores = new HashMap<Integer, ColumnFamilyStore>(); // TODO make private again
+    private final Object[] indexLocks;
+    private ScheduledFuture<?> flushTask;
 
-      final int numDocumentsToIndex =  50 + atLeast(30);
-      AtomicInteger numDocs = new AtomicInteger(numDocumentsToIndex);
-      Directory dir = newDirectory();
-      MockDefaultFlushPolicy flushPolicy = new MockDefaultFlushPolicy();
-      IndexWriterConfig iwc = newIndexWriterConfig(TEST_VERSION_CURRENT,
-          new MockAnalyzer(random())).setFlushPolicy(flushPolicy);
+    public static Table open(String table)
+    {
+        Table tableInstance = instances.get(table);
+        if (tableInstance == null)
+        {
+            // instantiate the Table.  we could use putIfAbsent but it's important to making sure it is only done once
+            // per keyspace, so we synchronize and re-check before doing it.
+            synchronized (Table.class)
+            {
+                tableInstance = instances.get(table);
+                if (tableInstance == null)
+                {
+                    // open and store the table
+                    tableInstance = new Table(table);
+                    instances.put(table, tableInstance);
 
-      final int numDWPT = 1 + atLeast(2);
-      DocumentsWriterPerThreadPool threadPool = new ThreadAffinityDocumentsWriterThreadPool(
-          numDWPT);
-      iwc.setIndexerThreadPool(threadPool);
-      iwc.setMaxBufferedDocs(2 + atLeast(10));
-      iwc.setRAMBufferSizeMB(IndexWriterConfig.DISABLE_AUTO_FLUSH);
-      iwc.setMaxBufferedDeleteTerms(IndexWriterConfig.DISABLE_AUTO_FLUSH);
-      IndexWriter writer = new IndexWriter(dir, iwc);
-      flushPolicy = (MockDefaultFlushPolicy) writer.getConfig().getFlushPolicy();
-      assertTrue(flushPolicy.flushOnDocCount());
-      assertFalse(flushPolicy.flushOnDeleteTerms());
-      assertFalse(flushPolicy.flushOnRAM());
-      DocumentsWriter docsWriter = writer.getDocsWriter();
-      assertNotNull(docsWriter);
-      DocumentsWriterFlushControl flushControl = docsWriter.flushControl;
-      assertEquals(" bytes must be 0 after init", 0, flushControl.flushBytes());
-
-      IndexThread[] threads = new IndexThread[numThreads[i]];
-      for (int x = 0; x < threads.length; x++) {
-        threads[x] = new IndexThread(numDocs, numThreads[i], writer,
-            lineDocFile, false);
-        threads[x].start();
-      }
-
-      for (int x = 0; x < threads.length; x++) {
-        threads[x].join();
-      }
-
-      assertEquals(" all flushes must be due numThreads=" + numThreads[i], 0,
-          flushControl.flushBytes());
-      assertEquals(numDocumentsToIndex, writer.numDocs());
-      assertEquals(numDocumentsToIndex, writer.maxDoc());
-      assertTrue("peak bytes without flush exceeded watermark",
-          flushPolicy.peakDocCountWithoutFlush <= iwc.getMaxBufferedDocs());
-      assertActiveBytesAfter(flushControl);
-      writer.close();
-      assertEquals(0, flushControl.activeBytes());
-      dir.close();
-    }
-  }
-
-  public void testRandom() throws IOException, InterruptedException {
-    final int numThreads = 1 + random().nextInt(8);
-    final int numDocumentsToIndex = 50 + atLeast(70);
-    AtomicInteger numDocs = new AtomicInteger(numDocumentsToIndex);
-    Directory dir = newDirectory();
-    IndexWriterConfig iwc = newIndexWriterConfig(TEST_VERSION_CURRENT,
-        new MockAnalyzer(random()));
-    MockDefaultFlushPolicy flushPolicy = new MockDefaultFlushPolicy();
-    iwc.setFlushPolicy(flushPolicy);
-
-    final int numDWPT = 1 + random().nextInt(8);
-    DocumentsWriterPerThreadPool threadPool = new ThreadAffinityDocumentsWriterThreadPool(
-        numDWPT);
-    iwc.setIndexerThreadPool(threadPool);
-
-    IndexWriter writer = new IndexWriter(dir, iwc);
-    flushPolicy = (MockDefaultFlushPolicy) writer.getConfig().getFlushPolicy();
-    DocumentsWriter docsWriter = writer.getDocsWriter();
-    assertNotNull(docsWriter);
-    DocumentsWriterFlushControl flushControl = docsWriter.flushControl;
-
-    assertEquals(" bytes must be 0 after init", 0, flushControl.flushBytes());
-
-    IndexThread[] threads = new IndexThread[numThreads];
-    for (int x = 0; x < threads.length; x++) {
-      threads[x] = new IndexThread(numDocs, numThreads, writer, lineDocFile,
-          true);
-      threads[x].start();
-    }
-
-    for (int x = 0; x < threads.length; x++) {
-      threads[x].join();
-    }
-    assertEquals(" all flushes must be due", 0, flushControl.flushBytes());
-    assertEquals(numDocumentsToIndex, writer.numDocs());
-    assertEquals(numDocumentsToIndex, writer.maxDoc());
-    if (flushPolicy.flushOnRAM() && !flushPolicy.flushOnDocCount()
-        && !flushPolicy.flushOnDeleteTerms()) {
-      final long maxRAMBytes = (long) (iwc.getRAMBufferSizeMB() * 1024. * 1024.);
-      assertTrue("peak bytes without flush exceeded watermark",
-          flushPolicy.peakBytesWithoutFlush <= maxRAMBytes);
-      if (flushPolicy.hasMarkedPending) {
-        assertTrue("max: " + maxRAMBytes + " " + flushControl.peakActiveBytes,
-            maxRAMBytes <= flushControl.peakActiveBytes);
-      }
-    }
-    assertActiveBytesAfter(flushControl);
-    writer.commit();
-    assertEquals(0, flushControl.activeBytes());
-    IndexReader r = DirectoryReader.open(dir);
-    assertEquals(numDocumentsToIndex, r.numDocs());
-    assertEquals(numDocumentsToIndex, r.maxDoc());
-    if (!flushPolicy.flushOnRAM()) {
-      assertFalse("never stall if we don't flush on RAM", docsWriter.flushControl.stallControl.wasStalled());
-      assertFalse("never block if we don't flush on RAM", docsWriter.flushControl.stallControl.hasBlocked());
-    }
-    r.close();
-    writer.close();
-    dir.close();
-  }
-
-  public void testStallControl() throws InterruptedException, IOException {
-
-    int[] numThreads = new int[] { 4 + random().nextInt(8), 1 };
-    final int numDocumentsToIndex = 50 + random().nextInt(50);
-    for (int i = 0; i < numThreads.length; i++) {
-      AtomicInteger numDocs = new AtomicInteger(numDocumentsToIndex);
-      MockDirectoryWrapper dir = newDirectory();
-      // mock a very slow harddisk sometimes here so that flushing is very slow
-      dir.setThrottling(MockDirectoryWrapper.Throttling.SOMETIMES);
-      IndexWriterConfig iwc = newIndexWriterConfig(TEST_VERSION_CURRENT,
-          new MockAnalyzer(random()));
-      iwc.setMaxBufferedDocs(IndexWriterConfig.DISABLE_AUTO_FLUSH);
-      iwc.setMaxBufferedDeleteTerms(IndexWriterConfig.DISABLE_AUTO_FLUSH);
-      FlushPolicy flushPolicy = new FlushByRamOrCountsPolicy();
-      iwc.setFlushPolicy(flushPolicy);
-      
-      DocumentsWriterPerThreadPool threadPool = new ThreadAffinityDocumentsWriterThreadPool(
-          numThreads[i]== 1 ? 1 : 2);
-      iwc.setIndexerThreadPool(threadPool);
-      // with such a small ram buffer we should be stalled quiet quickly
-      iwc.setRAMBufferSizeMB(0.25);
-      IndexWriter writer = new IndexWriter(dir, iwc);
-      IndexThread[] threads = new IndexThread[numThreads[i]];
-      for (int x = 0; x < threads.length; x++) {
-        threads[x] = new IndexThread(numDocs, numThreads[i], writer,
-            lineDocFile, false);
-        threads[x].start();
-      }
-
-      for (int x = 0; x < threads.length; x++) {
-        threads[x].join();
-      }
-      DocumentsWriter docsWriter = writer.getDocsWriter();
-      assertNotNull(docsWriter);
-      DocumentsWriterFlushControl flushControl = docsWriter.flushControl;
-      assertEquals(" all flushes must be due", 0, flushControl.flushBytes());
-      assertEquals(numDocumentsToIndex, writer.numDocs());
-      assertEquals(numDocumentsToIndex, writer.maxDoc());
-      if (numThreads[i] == 1) {
-        assertFalse(
-            "single thread must not block numThreads: " + numThreads[i],
-            docsWriter.flushControl.stallControl.hasBlocked());
-      }
-      if (docsWriter.flushControl.peakNetBytes > (2.d * iwc.getRAMBufferSizeMB() * 1024.d * 1024.d)) {
-        assertTrue(docsWriter.flushControl.stallControl.wasStalled());
-      }
-      assertActiveBytesAfter(flushControl);
-      writer.close(true);
-      dir.close();
-    }
-  }
-
-  protected void assertActiveBytesAfter(DocumentsWriterFlushControl flushControl) {
-    Iterator<ThreadState> allActiveThreads = flushControl.allActiveThreadStates();
-    long bytesUsed = 0;
-    while (allActiveThreads.hasNext()) {
-      bytesUsed += allActiveThreads.next().dwpt.bytesUsed();
-    }
-    assertEquals(bytesUsed, flushControl.activeBytes());
-  }
-
-  public class IndexThread extends Thread {
-    IndexWriter writer;
-    LiveIndexWriterConfig iwc;
-    LineFileDocs docs;
-    private AtomicInteger pendingDocs;
-    private final boolean doRandomCommit;
-
-    public IndexThread(AtomicInteger pendingDocs, int numThreads,
-        IndexWriter writer, LineFileDocs docs, boolean doRandomCommit) {
-      this.pendingDocs = pendingDocs;
-      this.writer = writer;
-      iwc = writer.getConfig();
-      this.docs = docs;
-      this.doRandomCommit = doRandomCommit;
-    }
-
-    public void run() {
-      try {
-        long ramSize = 0;
-        while (pendingDocs.decrementAndGet() > -1) {
-          Document doc = docs.nextDoc();
-          writer.addDocument(doc);
-          long newRamSize = writer.ramSizeInBytes();
-          if (newRamSize != ramSize) {
-            ramSize = newRamSize;
-          }
-          if (doRandomCommit) {
-            if (rarely()) {
-              writer.commit();
+                    //table has to be constructed and in the cache before cacheRow can be called
+                    for (ColumnFamilyStore cfs : tableInstance.getColumnFamilyStores())
+                        cfs.initRowCache();
+                }
             }
-          }
         }
-        writer.commit();
-      } catch (Throwable ex) {
-        System.out.println("FAILED exc:");
-        ex.printStackTrace(System.out);
-        throw new RuntimeException(ex);
-      }
+        return tableInstance;
     }
-  }
 
-  private static class MockDefaultFlushPolicy extends FlushByRamOrCountsPolicy {
-    long peakBytesWithoutFlush = Integer.MIN_VALUE;
-    long peakDocCountWithoutFlush = Integer.MIN_VALUE;
-    boolean hasMarkedPending = false;
-
-    @Override
-    public void onDelete(DocumentsWriterFlushControl control, ThreadState state) {
-      final ArrayList<ThreadState> pending = new ArrayList<DocumentsWriterPerThreadPool.ThreadState>();
-      final ArrayList<ThreadState> notPending = new ArrayList<DocumentsWriterPerThreadPool.ThreadState>();
-      findPending(control, pending, notPending);
-      final boolean flushCurrent = state.flushPending;
-      final ThreadState toFlush;
-      if (state.flushPending) {
-        toFlush = state;
-      } else if (flushOnDeleteTerms()
-          && state.dwpt.pendingDeletes.numTermDeletes.get() >= indexWriterConfig
-              .getMaxBufferedDeleteTerms()) {
-        toFlush = state;
-      } else {
-        toFlush = null;
-      }
-      super.onDelete(control, state);
-      if (toFlush != null) {
-        if (flushCurrent) {
-          assertTrue(pending.remove(toFlush));
-        } else {
-          assertTrue(notPending.remove(toFlush));
+    public static Table clear(String table) throws IOException
+    {
+        synchronized (Table.class)
+        {
+            Table t = instances.remove(table);
+            if (t != null)
+            {
+                t.flushTask.cancel(false);
+                for (ColumnFamilyStore cfs : t.getColumnFamilyStores())
+                    t.unloadCf(cfs);
+            }
+            return t;
         }
-        assertTrue(toFlush.flushPending);
-        hasMarkedPending = true;
-      }
-
-      for (ThreadState threadState : notPending) {
-        assertFalse(threadState.flushPending);
-      }
+    }
+    
+    public Collection<ColumnFamilyStore> getColumnFamilyStores()
+    {
+        return Collections.unmodifiableCollection(columnFamilyStores.values());
     }
 
-    @Override
-    public void onInsert(DocumentsWriterFlushControl control, ThreadState state) {
-      final ArrayList<ThreadState> pending = new ArrayList<DocumentsWriterPerThreadPool.ThreadState>();
-      final ArrayList<ThreadState> notPending = new ArrayList<DocumentsWriterPerThreadPool.ThreadState>();
-      findPending(control, pending, notPending);
-      final boolean flushCurrent = state.flushPending;
-      long activeBytes = control.activeBytes();
-      final ThreadState toFlush;
-      if (state.flushPending) {
-        toFlush = state;
-      } else if (flushOnDocCount()
-          && state.dwpt.getNumDocsInRAM() >= indexWriterConfig
-              .getMaxBufferedDocs()) {
-        toFlush = state;
-      } else if (flushOnRAM()
-          && activeBytes >= (long) (indexWriterConfig.getRAMBufferSizeMB() * 1024. * 1024.)) {
-        toFlush = findLargestNonPendingWriter(control, state);
-        assertFalse(toFlush.flushPending);
-      } else {
-        toFlush = null;
-      }
-      super.onInsert(control, state);
-      if (toFlush != null) {
-        if (flushCurrent) {
-          assertTrue(pending.remove(toFlush));
-        } else {
-          assertTrue(notPending.remove(toFlush));
+    public ColumnFamilyStore getColumnFamilyStore(String cfName)
+    {
+        Integer id = CFMetaData.getId(name, cfName);
+        if (id == null)
+            throw new IllegalArgumentException(String.format("Unknown table/cf pair (%s.%s)", name, cfName));
+        return columnFamilyStores.get(id);
+    }
+
+    /**
+     * Do a cleanup of keys that do not belong locally.
+     */
+    public void forceCleanup() throws IOException, ExecutionException, InterruptedException
+    {
+        if (name.equals(SYSTEM_TABLE))
+            throw new RuntimeException("Cleanup of the system table is neither necessary nor wise");
+
+        for (ColumnFamilyStore cfStore : columnFamilyStores.values())
+            cfStore.forceCleanup();
+    }
+
+    /**
+     * Take a snapshot of the entire set of column families with a given timestamp.
+     * 
+     * @param clientSuppliedName the tag associated with the name of the snapshot.  This
+     *                           value can be null.
+     */
+    public void snapshot(String clientSuppliedName)
+    {
+        String snapshotName = getTimestampedSnapshotName(clientSuppliedName);
+
+        for (ColumnFamilyStore cfStore : columnFamilyStores.values())
+        {
+            cfStore.snapshot(snapshotName);
         }
-        assertTrue(toFlush.flushPending);
-        hasMarkedPending = true;
-      } else {
-        peakBytesWithoutFlush = Math.max(activeBytes, peakBytesWithoutFlush);
-        peakDocCountWithoutFlush = Math.max(state.dwpt.getNumDocsInRAM(),
-            peakDocCountWithoutFlush);
-      }
-
-      for (ThreadState threadState : notPending) {
-        assertFalse(threadState.flushPending);
-      }
     }
-  }
 
-  static void findPending(DocumentsWriterFlushControl flushControl,
-      ArrayList<ThreadState> pending, ArrayList<ThreadState> notPending) {
-    Iterator<ThreadState> allActiveThreads = flushControl.allActiveThreadStates();
-    while (allActiveThreads.hasNext()) {
-      ThreadState next = allActiveThreads.next();
-      if (next.flushPending) {
-        pending.add(next);
-      } else {
-        notPending.add(next);
-      }
+    /**
+     * @param clientSuppliedName; may be null.
+     * @return
+     */
+    public static String getTimestampedSnapshotName(String clientSuppliedName)
+    {
+        String snapshotName = Long.toString(System.currentTimeMillis());
+        if (clientSuppliedName != null && !clientSuppliedName.equals(""))
+        {
+            snapshotName = snapshotName + "-" + clientSuppliedName;
+        }
+        return snapshotName;
     }
-  }
+
+
+    /**
+     * Clear all the snapshots for a given table.
+     */
+    public void clearSnapshot() throws IOException
+    {
+        for (String dataDirPath : DatabaseDescriptor.getAllDataFileLocations())
+        {
+            String snapshotPath = dataDirPath + File.separator + name + File.separator + SNAPSHOT_SUBDIR_NAME;
+            File snapshotDir = new File(snapshotPath);
+            if (snapshotDir.exists())
+            {
+                if (logger.isDebugEnabled())
+                    logger.debug("Removing snapshot directory " + snapshotPath);
+                FileUtils.deleteRecursive(snapshotDir);
+            }
+        }
+    }
+    
+    /*
+     * This method is an ADMIN operation to force compaction
+     * of all SSTables on disk. 
+     */
+    public void forceCompaction() throws IOException, ExecutionException, InterruptedException
+    {
+        for (ColumnFamilyStore cfStore : columnFamilyStores.values())
+            CompactionManager.instance.performMajor(cfStore);
+    }
+
+    /**
+     * @return A list of open SSTableReaders (TODO: ensure that the caller doesn't modify these).
+     */
+    public List<SSTableReader> getAllSSTables()
+    {
+        List<SSTableReader> list = new ArrayList<SSTableReader>();
+        for (ColumnFamilyStore cfStore : columnFamilyStores.values())
+            list.addAll(cfStore.getSSTables());
+        return list;
+    }
+
+    private Table(String table)
+    {
+        name = table;
+        indexLocks = new Object[DatabaseDescriptor.getConcurrentWriters() * 8];
+        for (int i = 0; i < indexLocks.length; i++)
+            indexLocks[i] = new Object();
+        // create data directories.
+        for (String dataDir : DatabaseDescriptor.getAllDataFileLocations())
+        {
+            try
+            {
+                String keyspaceDir = dataDir + File.separator + table;
+                FileUtils.createDirectory(keyspaceDir);
+    
+                // remove the deprecated streaming directory.
+                File streamingDir = new File(keyspaceDir, "stream");
+                if (streamingDir.exists())
+                    FileUtils.deleteRecursive(streamingDir);
+            }
+            catch (IOException ex)
+            {
+                throw new IOError(ex);
+            }
+        }
+
+        for (CFMetaData cfm : new ArrayList<CFMetaData>(DatabaseDescriptor.getTableDefinition(table).cfMetaData().values()))
+        {
+            logger.debug("Initializing {}.{}", name, cfm.cfName);
+            initCf(cfm.cfId, cfm.cfName);
+        }
+
+        // check 10x as often as the shortest lifetime, so we can exceed all lifetimes by 10% at most
+        int minCheckMs = Integer.MAX_VALUE;
+        for (ColumnFamilyStore cfs : columnFamilyStores.values())
+        {
+            minCheckMs = Math.min(minCheckMs, cfs.metadata.memtableFlushAfterMins * 60 * 1000);
+        }
+
+        Runnable runnable = new Runnable()
+        {
+            public void run()
+            {
+                for (ColumnFamilyStore cfs : columnFamilyStores.values())
+                {
+                    cfs.forceFlushIfExpired();
+                }
+            }
+        };
+        flushTask = StorageService.scheduledTasks.scheduleWithFixedDelay(runnable, minCheckMs, minCheckMs, TimeUnit.MILLISECONDS);
+    }
+    
+    // best invoked on the compaction mananger.
+    public void dropCf(Integer cfId) throws IOException
+    {
+        assert columnFamilyStores.containsKey(cfId);
+        ColumnFamilyStore cfs = columnFamilyStores.remove(cfId);
+        if (cfs == null)
+            return;
+        
+        unloadCf(cfs);
+        cfs.removeAllSSTables();
+    }
+    
+    // disassociate a cfs from this table instance.
+    private void unloadCf(ColumnFamilyStore cfs) throws IOException
+    {
+        try
+        {
+            cfs.forceBlockingFlush();
+        }
+        catch (ExecutionException e)
+        {
+            throw new IOException(e);
+        }
+        catch (InterruptedException e)
+        {
+            throw new IOException(e);
+        }
+        cfs.unregisterMBean();
+    }
+    
+    /** adds a cf to internal structures, ends up creating disk files). */
+    public void initCf(Integer cfId, String cfName)
+    {
+        assert !columnFamilyStores.containsKey(cfId) : String.format("tried to init %s as %s, but already used by %s",
+                                                                     cfName, cfId, columnFamilyStores.get(cfId));
+        columnFamilyStores.put(cfId, ColumnFamilyStore.createColumnFamilyStore(this, cfName));
+    }
+    
+    public void reloadCf(Integer cfId) throws IOException
+    {
+        ColumnFamilyStore cfs = columnFamilyStores.remove(cfId);
+        assert cfs != null;
+        unloadCf(cfs);
+        initCf(cfId, cfs.getColumnFamilyName());
+    }
+    
+    /** basically a combined drop and add */
+    public void renameCf(Integer cfId, String newName) throws IOException
+    {
+        assert columnFamilyStores.containsKey(cfId);
+        ColumnFamilyStore cfs = columnFamilyStores.remove(cfId);
+        unloadCf(cfs);
+        cfs.renameSSTables(newName);
+        initCf(cfId, newName);
+    }
+
+    public Row getRow(QueryFilter filter) throws IOException
+    {
+        ColumnFamilyStore cfStore = getColumnFamilyStore(filter.getColumnFamilyName());
+        ColumnFamily columnFamily = cfStore.getColumnFamily(filter);
+        return new Row(filter.key, columnFamily);
+    }
+
+    /**
+     * This method adds the row to the Commit Log associated with this table.
+     * Once this happens the data associated with the individual column families
+     * is also written to the column family store's memtable.
+    */
+    public void apply(RowMutation mutation, Object serializedMutation, boolean writeCommitLog) throws IOException
+    {
+        List<Memtable> memtablesToFlush = Collections.emptyList();
+
+        // write the mutation to the commitlog and memtables
+        flusherLock.readLock().lock();
+        try
+        {
+            if (writeCommitLog)
+                CommitLog.instance.add(mutation, serializedMutation);
+        
+            DecoratedKey key = StorageService.getPartitioner().decorateKey(mutation.key());
+            for (ColumnFamily cf : mutation.getColumnFamilies())
+            {
+                ColumnFamilyStore cfs = columnFamilyStores.get(cf.id());
+                if (cfs == null)
+                {
+                    logger.error("Attempting to mutate non-existant column family " + cf.id());
+                    continue;
+                }
+
+                SortedSet<ByteBuffer> mutatedIndexedColumns = null;
+                for (ByteBuffer column : cfs.getIndexedColumns())
+                {
+                    if (cf.getColumnNames().contains(column) || cf.isMarkedForDelete())
+                    {
+                        if (mutatedIndexedColumns == null)
+                            mutatedIndexedColumns = new TreeSet<ByteBuffer>();
+                        mutatedIndexedColumns.add(column);
+                    }
+                }
+
+                synchronized (indexLockFor(mutation.key()))
+                {
+                    ColumnFamily oldIndexedColumns = null;
+                    if (mutatedIndexedColumns != null)
+                    {
+                        // with the raw data CF, we can just apply every update in any order and let
+                        // read-time resolution throw out obsolete versions, thus avoiding read-before-write.
+                        // but for indexed data we need to make sure that we're not creating index entries
+                        // for obsolete writes.
+                        oldIndexedColumns = readCurrentIndexedColumns(key, cfs, mutatedIndexedColumns);
+                        ignoreObsoleteMutations(cf, mutatedIndexedColumns, oldIndexedColumns);
+                    }
+
+                    Memtable fullMemtable = cfs.apply(key, cf);
+                    if (fullMemtable != null)
+                        memtablesToFlush = addFullMemtable(memtablesToFlush, fullMemtable);
+
+                    if (mutatedIndexedColumns != null)
+                    {
+                        // ignore full index memtables -- we flush those when the "master" one is full
+                        applyIndexUpdates(mutation.key(), cf, cfs, mutatedIndexedColumns, oldIndexedColumns);
+                    }
+                }
+            }
+        }
+        finally
+        {
+            flusherLock.readLock().unlock();
+        }
+
+        // flush memtables that got filled up outside the readlock (maybeSwitchMemtable acquires writeLock).
+        // usually mTF will be empty and this will be a no-op.
+        for (Memtable memtable : memtablesToFlush)
+            memtable.cfs.maybeSwitchMemtable(memtable, writeCommitLog);
+    }
+
+    private static List<Memtable> addFullMemtable(List<Memtable> memtablesToFlush, Memtable fullMemtable)
+    {
+        if (memtablesToFlush.isEmpty())
+            memtablesToFlush = new ArrayList<Memtable>(2);
+        memtablesToFlush.add(fullMemtable);
+        return memtablesToFlush;
+    }
+
+    private static void ignoreObsoleteMutations(ColumnFamily cf, SortedSet<ByteBuffer> mutatedIndexedColumns, ColumnFamily oldIndexedColumns)
+    {
+        if (oldIndexedColumns == null)
+            return;
+
+        ColumnFamily cf2 = cf.cloneMe();
+        for (IColumn oldColumn : oldIndexedColumns)
+        {
+            cf2.addColumn(oldColumn);
+        }
+        ColumnFamily resolved = ColumnFamilyStore.removeDeleted(cf2, Integer.MAX_VALUE);
+
+        for (IColumn oldColumn : oldIndexedColumns)
+        {
+            IColumn resolvedColumn = resolved == null ? null : resolved.getColumn(oldColumn.name());
+            if (resolvedColumn != null && resolvedColumn.equals(oldColumn))
+            {
+                cf.remove(oldColumn.name());
+                mutatedIndexedColumns.remove(oldColumn.name());
+                oldIndexedColumns.remove(oldColumn.name());
+            }
+        }
+    }
+
+    private static ColumnFamily readCurrentIndexedColumns(DecoratedKey key, ColumnFamilyStore cfs, SortedSet<ByteBuffer> mutatedIndexedColumns)
+    {
+        QueryFilter filter = QueryFilter.getNamesFilter(key, new QueryPath(cfs.getColumnFamilyName()), mutatedIndexedColumns);
+        return cfs.getColumnFamily(filter);
+    }
+
+    /**
+     * removes obsolete index entries and creates new ones for the given row key and mutated columns.
+     * @return list of full (index CF) memtables
+     */
+    private static List<Memtable> applyIndexUpdates(ByteBuffer key,
+                                                    ColumnFamily cf,
+                                                    ColumnFamilyStore cfs,
+                                                    SortedSet<ByteBuffer> mutatedIndexedColumns,
+                                                    ColumnFamily oldIndexedColumns)
+    {
+        List<Memtable> fullMemtables = Collections.emptyList();
+
+        // add new index entries
+        for (ByteBuffer columnName : mutatedIndexedColumns)
+        {
+            IColumn column = cf.getColumn(columnName);
+            if (column == null || column.isMarkedForDelete())
+                continue; // null column == row deletion
+
+            DecoratedKey<LocalToken> valueKey = cfs.getIndexKeyFor(columnName, column.value());
+            ColumnFamily cfi = cfs.newIndexedColumnFamily(columnName);
+            if (column instanceof ExpiringColumn)
+            {
+                ExpiringColumn ec = (ExpiringColumn)column;
+                cfi.addColumn(new ExpiringColumn(key, FBUtilities.EMPTY_BYTE_BUFFER, ec.timestamp, ec.getTimeToLive(), ec.getLocalDeletionTime()));
+            }
+            else
+            {
+                cfi.addColumn(new Column(key, FBUtilities.EMPTY_BYTE_BUFFER, column.timestamp()));
+            }
+            Memtable fullMemtable = cfs.getIndexedColumnFamilyStore(columnName).apply(valueKey, cfi);
+            if (fullMemtable != null)
+                fullMemtables = addFullMemtable(fullMemtables, fullMemtable);
+        }
+
+        // remove the old index entries
+        if (oldIndexedColumns != null)
+        {
+            int localDeletionTime = (int) (System.currentTimeMillis() / 1000);
+            for (Map.Entry<ByteBuffer, IColumn> entry : oldIndexedColumns.getColumnsMap().entrySet())
+            {
+                ByteBuffer columnName = entry.getKey();
+                IColumn column = entry.getValue();
+                if (column.isMarkedForDelete())
+                    continue;
+                DecoratedKey<LocalToken> valueKey = cfs.getIndexKeyFor(columnName, column.value());
+                ColumnFamily cfi = cfs.newIndexedColumnFamily(columnName);
+                cfi.addTombstone(key, localDeletionTime, column.timestamp());
+                Memtable fullMemtable = cfs.getIndexedColumnFamilyStore(columnName).apply(valueKey, cfi);
+                if (fullMemtable != null)
+                    fullMemtables = addFullMemtable(fullMemtables, fullMemtable);
+            }
+        }
+
+        return fullMemtables;
+    }
+
+    public IndexBuilder createIndexBuilder(ColumnFamilyStore cfs, SortedSet<ByteBuffer> columns, ReducingKeyIterator iter)
+    {
+        return new IndexBuilder(cfs, columns, iter);
+    }
+
+    public class IndexBuilder implements ICompactionInfo
+    {
+        private final ColumnFamilyStore cfs;
+        private final SortedSet<ByteBuffer> columns;
+        private final ReducingKeyIterator iter;
+
+        public IndexBuilder(ColumnFamilyStore cfs, SortedSet<ByteBuffer> columns, ReducingKeyIterator iter)
+        {
+            this.cfs = cfs;
+            this.columns = columns;
+            this.iter = iter;
+        }
+
+        public void build()
+        {
+            while (iter.hasNext())
+            {
+                DecoratedKey key = iter.next();
+                logger.debug("Indexing row {} ", key);
+                List<Memtable> memtablesToFlush = Collections.emptyList();
+                flusherLock.readLock().lock();
+                try
+                {
+                    synchronized (indexLockFor(key.key))
+                    {
+                        ColumnFamily cf = readCurrentIndexedColumns(key, cfs, columns);
+                        if (cf != null)
+                            memtablesToFlush = applyIndexUpdates(key.key, cf, cfs, cf.getColumnNames(), null);
+                    }
+                }
+                finally
+                {
+                    flusherLock.readLock().unlock();
+                }
+
+                // during index build, we do flush index memtables separately from master; otherwise we could OOM
+                for (Memtable memtable : memtablesToFlush)
+                    memtable.cfs.maybeSwitchMemtable(memtable, false);
+            }
+
+            try
+            {
+                iter.close();
+            }
+            catch (IOException e)
+            {
+                throw new RuntimeException(e);
+            }
+        }
+
+        public long getTotalBytes()
+        {
+            return iter.getTotalBytes();
+        }
+
+        public long getBytesRead()
+        {
+            return iter.getBytesRead();
+        }
+
+        public String getTaskType()
+        {
+            return "Secondary index build";
+        }
+    }
+
+    private Object indexLockFor(ByteBuffer key)
+    {
+        return indexLocks[Math.abs(key.hashCode() % indexLocks.length)];
+    }
+
+    public List<Future<?>> flush() throws IOException
+    {
+        List<Future<?>> futures = new ArrayList<Future<?>>();
+        for (Integer cfId : columnFamilyStores.keySet())
+        {
+            Future<?> future = columnFamilyStores.get(cfId).forceFlush();
+            if (future != null)
+                futures.add(future);
+        }
+        return futures;
+    }
+
+    // for binary load path.  skips commitlog.
+    void load(RowMutation rowMutation) throws IOException
+    {
+        DecoratedKey key = StorageService.getPartitioner().decorateKey(rowMutation.key());
+        for (ColumnFamily columnFamily : rowMutation.getColumnFamilies())
+        {
+            Collection<IColumn> columns = columnFamily.getSortedColumns();
+            for (IColumn column : columns)
+            {
+                ColumnFamilyStore cfStore = columnFamilyStores.get(FBUtilities.byteBufferToInt(column.name()));
+                cfStore.applyBinary(key, column.value());
+            }
+        }
+    }
+
+    public String getDataFileLocation(long expectedCompactedFileSize)
+    {
+        String path = DatabaseDescriptor.getDataFileLocationForTable(name, expectedCompactedFileSize);
+        if (path == null)
+        {
+            // retry after GCing to force unmap of compacted SSTables so they can be deleted
+            StorageService.instance.requestGC();
+            try
+            {
+                Thread.sleep(SSTableDeletingReference.RETRY_DELAY * 2);
+            }
+            catch (InterruptedException e)
+            {
+                throw new AssertionError(e);
+            }
+            path = DatabaseDescriptor.getDataFileLocationForTable(name, expectedCompactedFileSize);
+        }
+        return path;
+    }
+
+    public static String getSnapshotPath(String dataDirPath, String tableName, String snapshotName)
+    {
+        return dataDirPath + File.separator + tableName + File.separator + SNAPSHOT_SUBDIR_NAME + File.separator + snapshotName;
+    }
+
+    public static Iterable<Table> all()
+    {
+        Function<String, Table> transformer = new Function<String, Table>()
+        {
+            public Table apply(String tableName)
+            {
+                return Table.open(tableName);
+            }
+        };
+        return Iterables.transform(DatabaseDescriptor.getTables(), transformer);
+    }
+
+    /**
+     * Performs a synchronous truncate operation, effectively deleting all data
+     * from the column family cfname
+     * @param cfname
+     * @throws IOException
+     * @throws ExecutionException
+     * @throws InterruptedException
+     */
+    public void truncate(String cfname) throws InterruptedException, ExecutionException, IOException
+    {
+        logger.debug("Truncating...");
+        ColumnFamilyStore cfs = getColumnFamilyStore(cfname);
+        // truncate, blocking
+        cfs.truncate().get();
+        logger.debug("Truncation done.");
+    }
 }

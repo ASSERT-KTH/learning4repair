@@ -1,4 +1,4 @@
-private SimpleAutomatonTermsEnum(TermsEnum tenum) {
+public void setNextEnum(TermsEnum termsEnum) {
 
 package org.apache.lucene.search;
 
@@ -20,148 +20,203 @@ package org.apache.lucene.search;
  */
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
 
-import org.apache.lucene.analysis.MockAnalyzer;
-import org.apache.lucene.analysis.MockTokenizer;
-import org.apache.lucene.codecs.Codec;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.Field;
-import org.apache.lucene.index.FilteredTermsEnum;
 import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.RandomIndexWriter;
 import org.apache.lucene.index.Term;
-import org.apache.lucene.index.Terms;
+import org.apache.lucene.index.TermContext;
+import org.apache.lucene.index.TermState;
 import org.apache.lucene.index.TermsEnum;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.util.AttributeSource;
+import org.apache.lucene.util.ArrayUtil;
+import org.apache.lucene.util.ByteBlockPool;
 import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.CharsRef;
-import org.apache.lucene.util.LuceneTestCase;
-import org.apache.lucene.util.UnicodeUtil;
-import org.apache.lucene.util._TestUtil;
-import org.apache.lucene.util.automaton.Automaton;
-import org.apache.lucene.util.automaton.AutomatonTestUtil;
-import org.apache.lucene.util.automaton.CharacterRunAutomaton;
-import org.apache.lucene.util.automaton.RegExp;
+import org.apache.lucene.util.BytesRefHash;
+import org.apache.lucene.util.RamUsageEstimator;
+import org.apache.lucene.util.BytesRefHash.DirectBytesStartArray;
 
-/**
- * Create an index with random unicode terms
- * Generates random regexps, and validates against a simple impl.
- */
-public class TestRegexpRandom2 extends LuceneTestCase {
-  protected IndexSearcher searcher1;
-  protected IndexSearcher searcher2;
-  private IndexReader reader;
-  private Directory dir;
-  protected String fieldName;
+class ConstantScoreAutoRewrite extends TermCollectingRewrite<BooleanQuery> {
 
-  @Override
-  public void setUp() throws Exception {
-    super.setUp();
-    dir = newDirectory();
-    fieldName = random().nextBoolean() ? "field" : ""; // sometimes use an empty string as field name
-    RandomIndexWriter writer = new RandomIndexWriter(random(), dir, 
-        newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random(), MockTokenizer.KEYWORD, false))
-        .setMaxBufferedDocs(_TestUtil.nextInt(random(), 50, 1000)));
-    Document doc = new Document();
-    Field field = newStringField(fieldName, "", Field.Store.NO);
-    doc.add(field);
-    List<String> terms = new ArrayList<String>();
-    int num = atLeast(200);
-    for (int i = 0; i < num; i++) {
-      String s = _TestUtil.randomUnicodeString(random());
-      field.setStringValue(s);
-      terms.add(s);
-      writer.addDocument(doc);
-    }
+  // Defaults derived from rough tests with a 20.0 million
+  // doc Wikipedia index.  With more than 350 terms in the
+  // query, the filter method is fastest:
+  public static int DEFAULT_TERM_COUNT_CUTOFF = 350;
 
-    if (VERBOSE) {
-      // utf16 order
-      Collections.sort(terms);
-      System.out.println("UTF16 order:");
-      for(String s : terms) {
-        System.out.println("  " + UnicodeUtil.toHexString(s));
-      }
-    }
-    
-    reader = writer.getReader();
-    searcher1 = newSearcher(reader);
-    searcher2 = newSearcher(reader);
-    writer.close();
+  // If the query will hit more than 1 in 1000 of the docs
+  // in the index (0.1%), the filter method is fastest:
+  public static double DEFAULT_DOC_COUNT_PERCENT = 0.1;
+
+  private int termCountCutoff = DEFAULT_TERM_COUNT_CUTOFF;
+  private double docCountPercent = DEFAULT_DOC_COUNT_PERCENT;
+
+  /** If the number of terms in this query is equal to or
+   *  larger than this setting then {@link
+   *  MultiTermQuery#CONSTANT_SCORE_FILTER_REWRITE} is used. */
+  public void setTermCountCutoff(int count) {
+    termCountCutoff = count;
+  }
+
+  /** @see #setTermCountCutoff */
+  public int getTermCountCutoff() {
+    return termCountCutoff;
+  }
+
+  /** If the number of documents to be visited in the
+   *  postings exceeds this specified percentage of the
+   *  maxDoc() for the index, then {@link
+   *  MultiTermQuery#CONSTANT_SCORE_FILTER_REWRITE} is used.
+   *  @param percent 0.0 to 100.0 */
+  public void setDocCountPercent(double percent) {
+    docCountPercent = percent;
+  }
+
+  /** @see #setDocCountPercent */
+  public double getDocCountPercent() {
+    return docCountPercent;
   }
 
   @Override
-  public void tearDown() throws Exception {
-    reader.close();
-    dir.close();
-    super.tearDown();
+  protected BooleanQuery getTopLevelQuery() {
+    return new BooleanQuery(true);
   }
   
-  /** a stupid regexp query that just blasts thru the terms */
-  private class DumbRegexpQuery extends MultiTermQuery {
-    private final Automaton automaton;
-    
-    DumbRegexpQuery(Term term, int flags) {
-      super(term.field());
-      RegExp re = new RegExp(term.text(), flags);
-      automaton = re.toAutomaton();
+  @Override
+  protected void addClause(BooleanQuery topLevel, Term term, int docFreq, float boost /*ignored*/, TermContext states) {
+    topLevel.add(new TermQuery(term, states), BooleanClause.Occur.SHOULD);
+  }
+
+  @Override
+  public Query rewrite(final IndexReader reader, final MultiTermQuery query) throws IOException {
+
+    // Get the enum and start visiting terms.  If we
+    // exhaust the enum before hitting either of the
+    // cutoffs, we use ConstantBooleanQueryRewrite; else,
+    // ConstantFilterRewrite:
+    final int docCountCutoff = (int) ((docCountPercent / 100.) * reader.maxDoc());
+    final int termCountLimit = Math.min(BooleanQuery.getMaxClauseCount(), termCountCutoff);
+
+    final CutOffTermCollector col = new CutOffTermCollector(docCountCutoff, termCountLimit);
+    collectTerms(reader, query, col);
+    final int size = col.pendingTerms.size();
+    if (col.hasCutOff) {
+      return MultiTermQuery.CONSTANT_SCORE_FILTER_REWRITE.rewrite(reader, query);
+    } else if (size == 0) {
+      return getTopLevelQuery();
+    } else {
+      final BooleanQuery bq = getTopLevelQuery();
+      final BytesRefHash pendingTerms = col.pendingTerms;
+      final int sort[] = pendingTerms.sort(col.termsEnum.getComparator());
+      for(int i = 0; i < size; i++) {
+        final int pos = sort[i];
+        // docFreq is not used for constant score here, we pass 1
+        // to explicitely set a fake value, so it's not calculated
+        addClause(bq, new Term(query.field, pendingTerms.get(pos, new BytesRef())), 1, 1.0f, col.array.termState[pos]);
+      }
+      // Strip scores
+      final Query result = new ConstantScoreQuery(bq);
+      result.setBoost(query.getBoost());
+      return result;
     }
-    
+  }
+  
+  static final class CutOffTermCollector extends TermCollector {
+    CutOffTermCollector(int docCountCutoff, int termCountLimit) {
+      this.docCountCutoff = docCountCutoff;
+      this.termCountLimit = termCountLimit;
+    }
+  
     @Override
-    protected TermsEnum getTermsEnum(Terms terms, AttributeSource atts) throws IOException {
-      return new SimpleAutomatonTermsEnum(terms.iterator(null));
+    public void setNextEnum(TermsEnum termsEnum) throws IOException {
+      this.termsEnum = termsEnum;
     }
-
-    private class SimpleAutomatonTermsEnum extends FilteredTermsEnum {
-      CharacterRunAutomaton runAutomaton = new CharacterRunAutomaton(automaton);
-      CharsRef utf16 = new CharsRef(10);
-
-      private SimpleAutomatonTermsEnum(TermsEnum tenum) throws IOException {
-        super(tenum);
-        setInitialSeekTerm(new BytesRef(""));
+      
+    @Override
+    public boolean collect(BytesRef bytes) throws IOException {
+      int pos = pendingTerms.add(bytes);
+      docVisitCount += termsEnum.docFreq();
+      if (pendingTerms.size() >= termCountLimit || docVisitCount >= docCountCutoff) {
+        hasCutOff = true;
+        return false;
       }
       
-      @Override
-      protected AcceptStatus accept(BytesRef term) throws IOException {
-        UnicodeUtil.UTF8toUTF16(term.bytes, term.offset, term.length, utf16);
-        return runAutomaton.run(utf16.chars, 0, utf16.length) ? 
-            AcceptStatus.YES : AcceptStatus.NO;
+      final TermState termState = termsEnum.termState();
+      assert termState != null;
+      if (pos < 0) {
+        pos = (-pos)-1;
+        array.termState[pos].register(termState, readerContext.ord, termsEnum.docFreq(), termsEnum.totalTermFreq());
+      } else {
+        array.termState[pos] = new TermContext(topReaderContext, termState, readerContext.ord, termsEnum.docFreq(), termsEnum.totalTermFreq());
       }
+      return true;
+    }
+    
+    int docVisitCount = 0;
+    boolean hasCutOff = false;
+    TermsEnum termsEnum;
+
+    final int docCountCutoff, termCountLimit;
+    final TermStateByteStart array = new TermStateByteStart(16);
+    final BytesRefHash pendingTerms = new BytesRefHash(new ByteBlockPool(new ByteBlockPool.DirectAllocator()), 16, array);
+  }
+
+  @Override
+  public int hashCode() {
+    final int prime = 1279;
+    return (int) (prime * termCountCutoff + Double.doubleToLongBits(docCountPercent));
+  }
+
+  @Override
+  public boolean equals(Object obj) {
+    if (this == obj)
+      return true;
+    if (obj == null)
+      return false;
+    if (getClass() != obj.getClass())
+      return false;
+
+    ConstantScoreAutoRewrite other = (ConstantScoreAutoRewrite) obj;
+    if (other.termCountCutoff != termCountCutoff) {
+      return false;
+    }
+
+    if (Double.doubleToLongBits(other.docCountPercent) != Double.doubleToLongBits(docCountPercent)) {
+      return false;
+    }
+    
+    return true;
+  }
+  
+  /** Special implementation of BytesStartArray that keeps parallel arrays for {@link TermContext} */
+  static final class TermStateByteStart extends DirectBytesStartArray  {
+    TermContext[] termState;
+    
+    public TermStateByteStart(int initSize) {
+      super(initSize);
     }
 
     @Override
-    public String toString(String field) {
-      return field.toString() + automaton.toString();
+    public int[] init() {
+      final int[] ord = super.init();
+      termState = new TermContext[ArrayUtil.oversize(ord.length, RamUsageEstimator.NUM_BYTES_OBJECT_REF)];
+      assert termState.length >= ord.length;
+      return ord;
     }
-  }
-  
-  /** test a bunch of random regular expressions */
-  public void testRegexps() throws Exception {
-    // we generate aweful regexps: good for testing.
-    // but for preflex codec, the test can be very slow, so use less iterations.
-    int num = Codec.getDefault().getName().equals("Lucene3x") ? 100 * RANDOM_MULTIPLIER : atLeast(1000);
-    for (int i = 0; i < num; i++) {
-      String reg = AutomatonTestUtil.randomRegexp(random());
-      if (VERBOSE) {
-        System.out.println("TEST: regexp=" + reg);
-      }
-      assertSame(reg);
-    }
-  }
-  
-  /** check that the # of hits is the same as from a very
-   * simple regexpquery implementation.
-   */
-  protected void assertSame(String regexp) throws IOException {   
-    RegexpQuery smart = new RegexpQuery(new Term(fieldName, regexp), RegExp.NONE);
-    DumbRegexpQuery dumb = new DumbRegexpQuery(new Term(fieldName, regexp), RegExp.NONE);
-   
-    TopDocs smartDocs = searcher1.search(smart, 25);
-    TopDocs dumbDocs = searcher2.search(dumb, 25);
 
-    CheckHits.checkEqual(smart, smartDocs.scoreDocs, dumbDocs.scoreDocs);
+    @Override
+    public int[] grow() {
+      final int[] ord = super.grow();
+      if (termState.length < ord.length) {
+        TermContext[] tmpTermState = new TermContext[ArrayUtil.oversize(ord.length, RamUsageEstimator.NUM_BYTES_OBJECT_REF)];
+        System.arraycopy(termState, 0, tmpTermState, 0, termState.length);
+        termState = tmpTermState;
+      }      
+      assert termState.length >= ord.length;
+      return ord;
+    }
+
+    @Override
+    public int[] clear() {
+     termState = null;
+     return super.clear();
+    }
+    
   }
 }

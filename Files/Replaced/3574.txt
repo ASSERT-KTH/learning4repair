@@ -1,6 +1,6 @@
-w.shutdown();
+writer.shutdown();
 
-package org.apache.lucene.search;
+package org.apache.lucene.index;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,103 +19,84 @@ package org.apache.lucene.search;
  * limitations under the License.
  */
 
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
-
+import org.apache.lucene.analysis.MockAnalyzer;
+import org.apache.lucene.analysis.MockTokenizer;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.RandomIndexWriter;
-import org.apache.lucene.index.Term;
+import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.TermRangeQuery;
+import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.store.Directory;
-import org.apache.lucene.util.LuceneTestCase.SuppressCodecs;
 import org.apache.lucene.util.LuceneTestCase;
+import org.apache.lucene.util.TestUtil;
 
-@SuppressCodecs({ "SimpleText", "Memory", "Direct" })
-public class TestSearchWithThreads extends LuceneTestCase {
-  int NUM_DOCS;
-  final int NUM_SEARCH_THREADS = 5;
-  int RUN_TIME_MSEC;
-  
+public class TestReaderClosed extends LuceneTestCase {
+  private IndexReader reader;
+  private Directory dir;
+
   @Override
   public void setUp() throws Exception {
     super.setUp();
-    NUM_DOCS = atLeast(10000);
-    RUN_TIME_MSEC = atLeast(1000);
+    dir = newDirectory();
+    RandomIndexWriter writer = new RandomIndexWriter(random(), dir, 
+        newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random(), MockTokenizer.KEYWORD, false))
+        .setMaxBufferedDocs(TestUtil.nextInt(random(), 50, 1000)));
+    
+    Document doc = new Document();
+    Field field = newStringField("field", "", Field.Store.NO);
+    doc.add(field);
+
+    // we generate aweful prefixes: good for testing.
+    // but for preflex codec, the test can be very slow, so use less iterations.
+    int num = atLeast(10);
+    for (int i = 0; i < num; i++) {
+      field.setStringValue(TestUtil.randomUnicodeString(random(), 10));
+      writer.addDocument(doc);
+    }
+    reader = writer.getReader();
+    writer.close();
+  }
+  
+  public void test() throws Exception {
+    assertTrue(reader.getRefCount() > 0);
+    IndexSearcher searcher = newSearcher(reader);
+    TermRangeQuery query = TermRangeQuery.newStringRange("field", "a", "z", true, true);
+    searcher.search(query, 5);
+    reader.close();
+    try {
+      searcher.search(query, 5);
+    } catch (AlreadyClosedException ace) {
+      // expected
+    }
   }
 
-  public void test() throws Exception {
-    final Directory dir = newDirectory();
-    final RandomIndexWriter w = new RandomIndexWriter(random(), dir);
+  // LUCENE-3800
+  public void testReaderChaining() throws Exception {
+    assertTrue(reader.getRefCount() > 0);
+    IndexReader wrappedReader = SlowCompositeReaderWrapper.wrap(reader);
+    wrappedReader = new ParallelAtomicReader((AtomicReader) wrappedReader);
 
-    final long startTime = System.currentTimeMillis();
+    IndexSearcher searcher = newSearcher(wrappedReader);
 
-    // TODO: replace w/ the @nightly test data; make this
-    // into an optional @nightly stress test
-    final Document doc = new Document();
-    final Field body = newTextField("body", "", Field.Store.NO);
-    doc.add(body);
-    final StringBuilder sb = new StringBuilder();
-    for(int docCount=0;docCount<NUM_DOCS;docCount++) {
-      final int numTerms = random().nextInt(10);
-      for(int termCount=0;termCount<numTerms;termCount++) {
-        sb.append(random().nextBoolean() ? "aaa" : "bbb");
-        sb.append(' ');
-      }
-      body.setStringValue(sb.toString());
-      w.addDocument(doc);
-      sb.delete(0, sb.length());
+    TermRangeQuery query = TermRangeQuery.newStringRange("field", "a", "z", true, true);
+    searcher.search(query, 5);
+    reader.close(); // close original child reader
+    try {
+      searcher.search(query, 5);
+    } catch (AlreadyClosedException ace) {
+      assertEquals(
+        "this IndexReader cannot be used anymore as one of its child readers was closed",
+        ace.getMessage()
+      );
+    } finally {
+      // shutdown executor: in case of wrap-wrap-wrapping
+      searcher.getIndexReader().close();
     }
-    final IndexReader r = w.getReader();
-    w.close();
-
-    final long endTime = System.currentTimeMillis();
-    if (VERBOSE) System.out.println("BUILD took " + (endTime-startTime));
-
-    final IndexSearcher s = newSearcher(r);
-
-    final AtomicBoolean failed = new AtomicBoolean();
-    final AtomicLong netSearch = new AtomicLong();
-
-    Thread[] threads = new Thread[NUM_SEARCH_THREADS];
-    for (int threadID = 0; threadID < NUM_SEARCH_THREADS; threadID++) {
-      threads[threadID] = new Thread() {
-        TotalHitCountCollector col = new TotalHitCountCollector();
-          @Override
-          public void run() {
-            try {
-              long totHits = 0;
-              long totSearch = 0;
-              long stopAt = System.currentTimeMillis() + RUN_TIME_MSEC;
-              while(System.currentTimeMillis() < stopAt && !failed.get()) {
-                s.search(new TermQuery(new Term("body", "aaa")), col);
-                totHits += col.getTotalHits();
-                s.search(new TermQuery(new Term("body", "bbb")), col);
-                totHits += col.getTotalHits();
-                totSearch++;
-              }
-              assertTrue(totSearch > 0 && totHits > 0);
-              netSearch.addAndGet(totSearch);
-            } catch (Exception exc) {
-              failed.set(true);
-              throw new RuntimeException(exc);
-            }
-          }
-        };
-      threads[threadID].setDaemon(true);
-    }
-
-    for (Thread t : threads) {
-      t.start();
-    }
-    
-    for (Thread t : threads) {
-      t.join();
-    }
-    
-    if (VERBOSE) System.out.println(NUM_SEARCH_THREADS + " threads did " + netSearch.get() + " searches");
-
-    r.close();
+  }
+  
+  @Override
+  public void tearDown() throws Exception {
     dir.close();
+    super.tearDown();
   }
 }

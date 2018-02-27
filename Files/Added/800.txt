@@ -1,6 +1,4 @@
-dir.clearCrash();
-
-package org.apache.lucene.index;
+job.setJarByClass(CDInfosTool.class);
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,189 +17,243 @@ package org.apache.lucene.index;
  * limitations under the License.
  */
 
+package org.apache.mahout.ga.watchmaker.cd.tool;
+
+import java.io.BufferedWriter;
 import java.io.IOException;
-import java.util.Random;
+import java.io.OutputStreamWriter;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.Scanner;
 
-import org.apache.lucene.util.LuceneTestCase;
-import org.apache.lucene.store.MockDirectoryWrapper;
-import org.apache.lucene.store.NoLockFactory;
-import org.apache.lucene.analysis.MockAnalyzer;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.Field;
+import org.apache.commons.cli2.CommandLine;
+import org.apache.commons.cli2.Group;
+import org.apache.commons.cli2.Option;
+import org.apache.commons.cli2.OptionException;
+import org.apache.commons.cli2.builder.ArgumentBuilder;
+import org.apache.commons.cli2.builder.DefaultOptionBuilder;
+import org.apache.commons.cli2.builder.GroupBuilder;
+import org.apache.commons.cli2.commandline.Parser;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FSDataInputStream;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.LongWritable;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.io.SequenceFile.Reader;
+import org.apache.hadoop.io.SequenceFile.Sorter;
+import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.input.TextInputFormat;
+import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+import org.apache.hadoop.mapreduce.lib.output.SequenceFileOutputFormat;
+import org.apache.mahout.common.CommandLineUtil;
+import org.apache.mahout.common.StringUtils;
+import org.apache.mahout.common.commandline.DefaultOptionCreator;
+import org.apache.mahout.ga.watchmaker.OutputUtils;
+import org.apache.mahout.ga.watchmaker.cd.FileInfoParser;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-public class TestCrash extends LuceneTestCase {
+/**
+ * Gathers additional information about a given dataset. Takes a descriptor
+ * about the attributes, and generates a description for each one.
+ */
+public final class CDInfosTool {
 
-  private IndexWriter initIndex(Random random, boolean initialCommit) throws IOException {
-    return initIndex(random, newDirectory(), initialCommit);
+  private static final Logger log = LoggerFactory.getLogger(CDInfosTool.class);
+
+  private CDInfosTool() {
   }
 
-  private IndexWriter initIndex(Random random, MockDirectoryWrapper dir, boolean initialCommit) throws IOException {
-    dir.setLockFactory(NoLockFactory.getNoLockFactory());
+  /**
+   * Uses Mahout to gather the information about a dataset.
+   * 
+   * @param descriptors about the available attributes
+   * @param inpath input path (the dataset)
+   * @param descriptions <code>List&lt;String&gt;</code> that contains the
+   *        generated descriptions for each non ignored attribute
+   * @throws IOException
+   * @throws ClassNotFoundException 
+   * @throws InterruptedException 
+   */
+  public static void gatherInfos(Descriptors descriptors, Path inpath, Path output, List<String> descriptions) throws IOException,
+      InterruptedException, ClassNotFoundException {
+    Configuration conf = new Configuration();
+    Job job = new Job(conf);
+    FileSystem fs = FileSystem.get(inpath.toUri(), conf);
 
-    IndexWriter writer  = new IndexWriter(dir, newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random))
-        .setMaxBufferedDocs(10).setMergeScheduler(new ConcurrentMergeScheduler()));
-    ((ConcurrentMergeScheduler) writer.getConfig().getMergeScheduler()).setSuppressExceptions();
-    if (initialCommit) {
-      writer.commit();
+    // check the input
+    if (!fs.exists(inpath) || !fs.getFileStatus(inpath).isDir()) {
+      throw new IllegalArgumentException("Input path not found or is not a directory");
     }
-    
-    Document doc = new Document();
-    doc.add(newField("content", "aaa", Field.Store.YES, Field.Index.ANALYZED));
-    doc.add(newField("id", "0", Field.Store.YES, Field.Index.ANALYZED));
-    for(int i=0;i<157;i++)
-      writer.addDocument(doc);
 
-    return writer;
+    configureJob(job, descriptors, inpath, output);
+    job.waitForCompletion(true);
+
+    importDescriptions(fs, conf, output, descriptions);
   }
 
-  private void crash(final IndexWriter writer) throws IOException {
-    final MockDirectoryWrapper dir = (MockDirectoryWrapper) writer.getDirectory();
-    ConcurrentMergeScheduler cms = (ConcurrentMergeScheduler) writer.getConfig().getMergeScheduler();
-    cms.sync();
-    dir.crash();
-    cms.sync();
-    dir.clearCrash();
+  /**
+   * Configure the job
+   * 
+   * @param job
+   * @param descriptors attributes's descriptors
+   * @param inpath input <code>Path</code>
+   * @param outpath output <code>Path</code>
+   * @throws IOException 
+   */
+  private static void configureJob(Job job, Descriptors descriptors, Path inpath, Path outpath) throws IOException {
+    FileInputFormat.setInputPaths(job, inpath);
+    FileOutputFormat.setOutputPath(job, outpath);
+
+    job.setOutputKeyClass(LongWritable.class);
+    job.setOutputValueClass(Text.class);
+
+    job.setMapperClass(ToolMapper.class);
+    job.setCombinerClass(ToolCombiner.class);
+    job.setReducerClass(ToolReducer.class);
+
+    job.setInputFormatClass(TextInputFormat.class);
+    job.setOutputFormatClass(SequenceFileOutputFormat.class);
+
+    // store the stringified descriptors
+    job.getConfiguration().set(ToolMapper.ATTRIBUTES, StringUtils.toString(descriptors.getChars()));
   }
 
-  public void testCrashWhileIndexing() throws IOException {
-    // This test relies on being able to open a reader before any commit
-    // happened, so we must create an initial commit just to allow that, but
-    // before any documents were added.
-    IndexWriter writer = initIndex(random, true);
-    MockDirectoryWrapper dir = (MockDirectoryWrapper) writer.getDirectory();
-    crash(writer);
-    IndexReader reader = IndexReader.open(dir, false);
-    assertTrue(reader.numDocs() < 157);
+  /**
+   * Reads back the descriptions.
+   * 
+   * @param fs file system
+   * @param conf job configuration
+   * @param outpath output <code>Path</code>
+   * @param descriptions List of attribute's descriptions
+   * @throws IOException
+   */
+  private static void importDescriptions(FileSystem fs, Configuration conf, Path outpath, List<String> descriptions)
+      throws IOException {
+    Sorter sorter = new Sorter(fs, LongWritable.class, Text.class, conf);
+
+    // merge and sort the outputs
+    Path[] outfiles = OutputUtils.listOutputFiles(fs, outpath);
+    Path output = new Path(outpath, "output.sorted");
+    sorter.merge(outfiles, output);
+
+    // import the descriptions
+    LongWritable key = new LongWritable();
+    Text value = new Text();
+    Reader reader = new Reader(fs, output, conf);
+
+    while (reader.next(key, value)) {
+      descriptions.add(value.toString());
+    }
+
     reader.close();
-    dir.close();
   }
 
-  public void testWriterAfterCrash() throws IOException {
-    // This test relies on being able to open a reader before any commit
-    // happened, so we must create an initial commit just to allow that, but
-    // before any documents were added.
-    IndexWriter writer = initIndex(random, true);
-    MockDirectoryWrapper dir = (MockDirectoryWrapper) writer.getDirectory();
-    dir.setPreventDoubleWrite(false);
-    crash(writer);
-    writer = initIndex(random, dir, false);
-    writer.close();
+  /**
+   * Load the dataset's attributes descriptors from an .info file
+   * 
+   * @param inpath dataset path
+   */
+  private static Descriptors loadDescriptors(FileSystem fs, Path inpath) throws IOException {
+    // TODO should become part of FileInfoParser
 
-    IndexReader reader = IndexReader.open(dir, false);
-    assertTrue(reader.numDocs() < 314);
-    reader.close();
-    dir.close();
+    Path infpath = FileInfoParser.getInfoFile(fs, inpath);
+
+    FSDataInputStream input = fs.open(infpath);
+    Scanner reader = new Scanner(input);
+
+    List<Character> descriptors = new ArrayList<Character>();
+
+    while (reader.hasNextLine()) {
+      String c = reader.nextLine();
+      descriptors.add(c.toUpperCase(Locale.ENGLISH).charAt(0));
+    }
+
+    if (descriptors.isEmpty()) {
+      throw new IllegalArgumentException("Infos file is empty");
+    }
+
+    char[] desc = new char[descriptors.size()];
+    for (int index = 0; index < descriptors.size(); index++) {
+      desc[index] = descriptors.get(index);
+    }
+
+    return new Descriptors(desc);
   }
 
-  public void testCrashAfterReopen() throws IOException {
-    IndexWriter writer = initIndex(random, false);
-    MockDirectoryWrapper dir = (MockDirectoryWrapper) writer.getDirectory();
-    writer.close();
-    writer = initIndex(random, dir, false);
-    assertEquals(314, writer.maxDoc());
-    crash(writer);
+  private static void storeDescriptions(FileSystem fs, Path inpath, Descriptors descriptors, List<String> descriptions)
+      throws IOException {
+    // TODO should become part of FileInfoParser
 
-    /*
-    System.out.println("\n\nTEST: open reader");
-    String[] l = dir.list();
-    Arrays.sort(l);
-    for(int i=0;i<l.length;i++)
-      System.out.println("file " + i + " = " + l[i] + " " +
-    dir.fileLength(l[i]) + " bytes");
-    */
+    Path infpath = FileInfoParser.getInfoFile(fs, inpath);
 
-    IndexReader reader = IndexReader.open(dir, false);
-    assertTrue(reader.numDocs() >= 157);
-    reader.close();
-    dir.close();
+    BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(fs.create(infpath)));
+    try {
+      int aindex = 0;
+      for (int index = 0; index < descriptors.size(); index++) {
+        if (descriptors.isLabel(index)) {
+          writer.write(FileInfoParser.LABEL_TOKEN + ", ");
+          writer.write(descriptions.get(aindex++));
+        } else if (descriptors.isNumerical(index)) {
+          writer.write(FileInfoParser.NUMERICAL_TOKEN + ", ");
+          writer.write(descriptions.get(aindex++));
+        } else if (descriptors.isNominal(index)) {
+          writer.write(FileInfoParser.NOMINAL_TOKEN + ", ");
+          writer.write(descriptions.get(aindex++));
+        } else {
+          writer.write(FileInfoParser.IGNORED_TOKEN);
+        }
+
+        writer.newLine();
+      }
+    } finally {
+      writer.close();
+    }
   }
 
-  public void testCrashAfterClose() throws IOException {
-    
-    IndexWriter writer = initIndex(random, false);
-    MockDirectoryWrapper dir = (MockDirectoryWrapper) writer.getDirectory();
+  public static void main(String[] args) throws IOException, InterruptedException, ClassNotFoundException {
+    DefaultOptionBuilder obuilder = new DefaultOptionBuilder();
+    ArgumentBuilder abuilder = new ArgumentBuilder();
+    GroupBuilder gbuilder = new GroupBuilder();
 
-    writer.close();
-    dir.crash();
+    Option inputOpt = obuilder.withLongName("input").withRequired(true).withShortName("i").withArgument(
+        abuilder.withName("input").withMinimum(1).withMaximum(1).create()).withDescription("The Path for input data directory.")
+        .create();
 
-    /*
-    String[] l = dir.list();
-    Arrays.sort(l);
-    for(int i=0;i<l.length;i++)
-      System.out.println("file " + i + " = " + l[i] + " " + dir.fileLength(l[i]) + " bytes");
-    */
+    Option helpOpt = DefaultOptionCreator.helpOption();
 
-    IndexReader reader = IndexReader.open(dir, false);
-    assertEquals(157, reader.numDocs());
-    reader.close();
-    dir.close();
-  }
+    Group group = gbuilder.withName("Options").withOption(inputOpt).withOption(helpOpt).create();
 
-  public void testCrashAfterCloseNoWait() throws IOException {
-    
-    IndexWriter writer = initIndex(random, false);
-    MockDirectoryWrapper dir = (MockDirectoryWrapper) writer.getDirectory();
+    Parser parser = new Parser();
+    parser.setGroup(group);
+    try {
+      CommandLine cmdLine = parser.parse(args);
 
-    writer.close(false);
+      if (cmdLine.hasOption(helpOpt)) {
+        CommandLineUtil.printHelp(group);
+        return;
+      }
 
-    dir.crash();
+      Path input = new Path(cmdLine.getValue(inputOpt).toString());
+      Path output = new Path("output"); // TODO surely this should be configurable?
 
-    /*
-    String[] l = dir.list();
-    Arrays.sort(l);
-    for(int i=0;i<l.length;i++)
-      System.out.println("file " + i + " = " + l[i] + " " + dir.fileLength(l[i]) + " bytes");
-    */
-    IndexReader reader = IndexReader.open(dir, false);
-    assertEquals(157, reader.numDocs());
-    reader.close();
-    dir.close();
-  }
+      FileSystem fs = FileSystem.get(input.toUri(), new Configuration());
 
-  public void testCrashReaderDeletes() throws IOException {
-    
-    IndexWriter writer = initIndex(random, false);
-    MockDirectoryWrapper dir = (MockDirectoryWrapper) writer.getDirectory();
+      log.info("Loading Descriptors...");
+      Descriptors descriptors = loadDescriptors(fs, input);
 
-    writer.close(false);
-    IndexReader reader = IndexReader.open(dir, false);
-    reader.deleteDocument(3);
+      log.info("Gathering informations...");
+      List<String> descriptions = new ArrayList<String>();
+      gatherInfos(descriptors, input, output, descriptions);
 
-    dir.crash();
-
-    /*
-    String[] l = dir.list();
-    Arrays.sort(l);
-    for(int i=0;i<l.length;i++)
-      System.out.println("file " + i + " = " + l[i] + " " + dir.fileLength(l[i]) + " bytes");
-    */
-    reader = IndexReader.open(dir, false);
-    assertEquals(157, reader.numDocs());
-    reader.close();
-    dir.close();
-  }
-
-  public void testCrashReaderDeletesAfterClose() throws IOException {
-    
-    IndexWriter writer = initIndex(random, false);
-    MockDirectoryWrapper dir = (MockDirectoryWrapper) writer.getDirectory();
-
-    writer.close(false);
-    IndexReader reader = IndexReader.open(dir, false);
-    reader.deleteDocument(3);
-    reader.close();
-
-    dir.crash();
-
-    /*
-    String[] l = dir.list();
-    Arrays.sort(l);
-    for(int i=0;i<l.length;i++)
-      System.out.println("file " + i + " = " + l[i] + " " + dir.fileLength(l[i]) + " bytes");
-    */
-    reader = IndexReader.open(dir, false);
-    assertEquals(156, reader.numDocs());
-    reader.close();
-    dir.close();
+      log.info("Storing Descriptions...");
+      storeDescriptions(fs, input, descriptors, descriptions);
+    } catch (OptionException e) {
+      log.error("Error while parsing options", e);
+      CommandLineUtil.printHelp(group);
+    }
   }
 }

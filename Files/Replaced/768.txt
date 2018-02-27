@@ -1,5 +1,6 @@
-Set<InetAddress> endpoints = new LinkedHashSet<InetAddress>(totalReplicas);
+Range<RowPosition> range = Util.range("", "");
 
+package org.apache.cassandra.io.sstable;
 /*
  * 
  * Licensed to the Apache Software Foundation (ASF) under one
@@ -21,189 +22,258 @@ Set<InetAddress> endpoints = new LinkedHashSet<InetAddress>(totalReplicas);
  * 
  */
 
-package org.apache.cassandra.locator;
 
-import java.net.InetAddress;
-import java.util.*;
-import java.util.Map.Entry;
+import java.io.File;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.concurrent.ExecutionException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.junit.Test;
 
-import com.google.common.collect.Multimap;
-import org.apache.cassandra.config.ConfigurationException;
+import org.apache.cassandra.CleanupHelper;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.columniterator.IdentityQueryFilter;
+import org.apache.cassandra.db.compaction.CompactionManager;
+import org.apache.cassandra.db.filter.QueryPath;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
-import org.apache.cassandra.service.*;
-import org.apache.cassandra.thrift.ConsistencyLevel;
-import org.apache.cassandra.utils.ResourceWatcher;
-import org.apache.cassandra.utils.WrappedRunnable;
+import org.apache.cassandra.io.util.FileDataInput;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.io.util.MmappedSegmentedFile;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.thrift.IndexClause;
+import org.apache.cassandra.thrift.IndexExpression;
+import org.apache.cassandra.thrift.IndexOperator;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.CLibrary;
+import org.apache.cassandra.utils.Pair;
 
-/**
- * This Replication Strategy takes a property file that gives the intended
- * replication factor in each datacenter.  The sum total of the datacenter
- * replication factor values should be equal to the keyspace replication
- * factor.
- * <p/>
- * So for example, if the keyspace replication factor is 6, the
- * datacenter replication factors could be 3, 2, and 1 - so 3 replicas in
- * one datacenter, 2 in another, and 1 in another - totalling 6.
- * <p/>
- * This class also caches the Endpoints and invalidates the cache if there is a
- * change in the number of tokens.
- */
-public class DatacenterShardStrategy extends AbstractReplicationStrategy
+import org.apache.cassandra.Util;
+
+import static org.junit.Assert.assertEquals;
+
+public class SSTableReaderTest extends CleanupHelper
 {
-    private static final String DATACENTER_PROPERTY_FILENAME = "datacenters.properties";
-    private AbstractRackAwareSnitch snitch;
-    private volatile Map<String, Map<String, Integer>> datacenters;
-    private static final Logger logger = LoggerFactory.getLogger(DatacenterShardStrategy.class);
-
-    public DatacenterShardStrategy(TokenMetadata tokenMetadata, IEndpointSnitch snitch) throws ConfigurationException
+    static Token t(int i)
     {
-        super(tokenMetadata, snitch);
-        if ((!(snitch instanceof AbstractRackAwareSnitch)))
-            throw new IllegalArgumentException("DatacenterShardStrategy requires a rack-aware endpointsnitch");
-        this.snitch = (AbstractRackAwareSnitch)snitch;
-        
-        reloadConfiguration();
-        Runnable runnable = new WrappedRunnable()
-        {
-            protected void runMayThrow() throws ConfigurationException
-            {
-                reloadConfiguration();
-            }
-        };
-        ResourceWatcher.watch(DATACENTER_PROPERTY_FILENAME, runnable, 60 * 1000);
+        return StorageService.getPartitioner().getToken(ByteBufferUtil.bytes(String.valueOf(i)));
     }
 
-    public synchronized void reloadConfiguration() throws ConfigurationException
+    @Test
+    public void testGetPositionsForRanges() throws IOException, ExecutionException, InterruptedException
     {
-        Properties props = PropertyFileSnitch.resourceToProperties(DATACENTER_PROPERTY_FILENAME);
-        Map<String, Map<String, Integer>> newDatacenters = new HashMap<String, Map<String, Integer>>();
-        for (Entry entry : props.entrySet())
+        Table table = Table.open("Keyspace1");
+        ColumnFamilyStore store = table.getColumnFamilyStore("Standard2");
+
+        // insert data and compact to a single sstable
+        CompactionManager.instance.disableAutoCompaction();
+        for (int j = 0; j < 10; j++)
         {
-            String[] keys = ((String)entry.getKey()).split(":");
-            Map<String, Integer> map = newDatacenters.get(keys[0]);
-            if (map == null)
-                map = new HashMap<String, Integer>();
-            map.put(keys[1], Integer.parseInt((String) entry.getValue()));
-            newDatacenters.put(keys[0], map);
+            ByteBuffer key = ByteBufferUtil.bytes(String.valueOf(j));
+            RowMutation rm = new RowMutation("Keyspace1", key);
+            rm.add(new QueryPath("Standard2", null, ByteBufferUtil.bytes("0")), ByteBufferUtil.EMPTY_BYTE_BUFFER, j);
+            rm.apply();
         }
-        datacenters = Collections.unmodifiableMap(newDatacenters);
-        logger.info(DATACENTER_PROPERTY_FILENAME + " changed, clearing endpoint cache");
-        clearCachedEndpoints();
+        store.forceBlockingFlush();
+        CompactionManager.instance.performMaximal(store);
+
+        List<Range<Token>> ranges = new ArrayList<Range<Token>>();
+        // 1 key
+        ranges.add(new Range<Token>(t(0), t(1)));
+        // 2 keys
+        ranges.add(new Range<Token>(t(2), t(4)));
+        // wrapping range from key to end
+        ranges.add(new Range<Token>(t(6), StorageService.getPartitioner().getMinimumToken()));
+        // empty range (should be ignored)
+        ranges.add(new Range<Token>(t(9), t(91)));
+
+        // confirm that positions increase continuously
+        SSTableReader sstable = store.getSSTables().iterator().next();
+        long previous = -1;
+        for (Pair<Long,Long> section : sstable.getPositionsForRanges(ranges))
+        {
+            assert previous <= section.left : previous + " ! < " + section.left;
+            assert section.left < section.right : section.left + " ! < " + section.right;
+            previous = section.right;
+        }
     }
 
-    public Set<InetAddress> calculateNaturalEndpoints(Token searchToken, TokenMetadata tokenMetadata, String table)
+    @Test
+    public void testSpannedIndexPositions() throws IOException, ExecutionException, InterruptedException
     {
-        int totalReplicas = getReplicationFactor(table);
-        Map<String, Integer> remainingReplicas = new HashMap<String, Integer>(datacenters.get(table));
-        Map<String, Set<String>> dcUsedRacks = new HashMap<String, Set<String>>();
-        Set<InetAddress> endpoints = new HashSet<InetAddress>(totalReplicas);
+        MmappedSegmentedFile.MAX_SEGMENT_SIZE = 40; // each index entry is ~11 bytes, so this will generate lots of segments
 
-        // first pass: only collect replicas on unique racks
-        for (Iterator<Token> iter = TokenMetadata.ringIterator(tokenMetadata.sortedTokens(), searchToken);
-             endpoints.size() < totalReplicas && iter.hasNext();)
+        Table table = Table.open("Keyspace1");
+        ColumnFamilyStore store = table.getColumnFamilyStore("Standard1");
+
+        // insert a bunch of data and compact to a single sstable
+        CompactionManager.instance.disableAutoCompaction();
+        for (int j = 0; j < 100; j += 2)
         {
-            Token token = iter.next();
-            InetAddress endpoint = tokenMetadata.getEndpoint(token);
-            String datacenter = snitch.getDatacenter(endpoint);
-            int remaining = remainingReplicas.containsKey(datacenter) ? remainingReplicas.get(datacenter) : 0;
-            if (remaining > 0)
-            {
-                Set<String> usedRacks = dcUsedRacks.get(datacenter);
-                if (usedRacks == null)
-                {
-                    usedRacks = new HashSet<String>();
-                    dcUsedRacks.put(datacenter, usedRacks);
-                }
-                String rack = snitch.getRack(endpoint);
-                if (!usedRacks.contains(rack))
-                {
-                    endpoints.add(endpoint);
-                    usedRacks.add(rack);
-                    remainingReplicas.put(datacenter, remaining - 1);
-                }
-            }
+            ByteBuffer key = ByteBufferUtil.bytes(String.valueOf(j));
+            RowMutation rm = new RowMutation("Keyspace1", key);
+            rm.add(new QueryPath("Standard1", null, ByteBufferUtil.bytes("0")), ByteBufferUtil.EMPTY_BYTE_BUFFER, j);
+            rm.apply();
+        }
+        store.forceBlockingFlush();
+        CompactionManager.instance.performMaximal(store);
+
+        // check that all our keys are found correctly
+        SSTableReader sstable = store.getSSTables().iterator().next();
+        for (int j = 0; j < 100; j += 2)
+        {
+            DecoratedKey dk = Util.dk(String.valueOf(j));
+            FileDataInput file = sstable.getFileDataInput(dk, DatabaseDescriptor.getIndexedReadBufferSizeInKB() * 1024);
+            DecoratedKey keyInDisk = SSTableReader.decodeKey(sstable.partitioner,
+                                                             sstable.descriptor,
+                                                             ByteBufferUtil.readWithShortLength(file));
+            assert keyInDisk.equals(dk) : String.format("%s != %s in %s", keyInDisk, dk, file.getPath());
         }
 
-        // second pass: if replica count has not been achieved from unique racks, add nodes from the same racks
-        for (Iterator<Token> iter = TokenMetadata.ringIterator(tokenMetadata.sortedTokens(), searchToken);
-             endpoints.size() < totalReplicas && iter.hasNext();)
+        // check no false positives
+        for (int j = 1; j < 110; j += 2)
         {
-            Token token = iter.next();
-            InetAddress endpoint = tokenMetadata.getEndpoint(token);
-            if (endpoints.contains(endpoint))
+            DecoratedKey dk = Util.dk(String.valueOf(j));
+            assert sstable.getPosition(dk, SSTableReader.Operator.EQ) == -1;
+        }
+    }
+
+    @Test
+    public void testPersistentStatistics() throws IOException, ExecutionException, InterruptedException
+    {
+
+        Table table = Table.open("Keyspace1");
+        ColumnFamilyStore store = table.getColumnFamilyStore("Standard1");
+
+        for (int j = 0; j < 100; j += 2)
+        {
+            ByteBuffer key = ByteBufferUtil.bytes(String.valueOf(j));
+            RowMutation rm = new RowMutation("Keyspace1", key);
+            rm.add(new QueryPath("Standard1", null, ByteBufferUtil.bytes("0")), ByteBufferUtil.EMPTY_BYTE_BUFFER, j);
+            rm.apply();
+        }
+        store.forceBlockingFlush();
+
+        store.clearUnsafe();
+        store.loadNewSSTables();
+        assert store.getMaxRowSize() != 0;
+    }
+
+    @Test
+    public void testGetPositionsForRangesWithKeyCache() throws IOException, ExecutionException, InterruptedException
+    {
+        Table table = Table.open("Keyspace1");
+        ColumnFamilyStore store = table.getColumnFamilyStore("Standard2");
+        store.getKeyCache().setCapacity(100);
+
+        // insert data and compact to a single sstable
+        CompactionManager.instance.disableAutoCompaction();
+        for (int j = 0; j < 10; j++)
+        {
+            ByteBuffer key = ByteBufferUtil.bytes(String.valueOf(j));
+            RowMutation rm = new RowMutation("Keyspace1", key);
+            rm.add(new QueryPath("Standard2", null, ByteBufferUtil.bytes("0")), ByteBufferUtil.EMPTY_BYTE_BUFFER, j);
+            rm.apply();
+        }
+        store.forceBlockingFlush();
+        CompactionManager.instance.performMaximal(store);
+
+        SSTableReader sstable = store.getSSTables().iterator().next();
+        long p2 = sstable.getPosition(k(2), SSTableReader.Operator.EQ);
+        long p3 = sstable.getPosition(k(3), SSTableReader.Operator.EQ);
+        long p6 = sstable.getPosition(k(6), SSTableReader.Operator.EQ);
+        long p7 = sstable.getPosition(k(7), SSTableReader.Operator.EQ);
+
+        Pair<Long, Long> p = sstable.getPositionsForRanges(makeRanges(t(2), t(6))).iterator().next();
+
+        // range are start exclusive so we should start at 3
+        assert p.left == p3;
+
+        // to capture 6 we have to stop at the start of 7
+        assert p.right == p7;
+    }
+
+    @Test
+    public void testPersistentStatisticsWithSecondaryIndex() throws IOException, ExecutionException, InterruptedException
+    {
+        // Create secondary index and flush to disk
+        Table table = Table.open("Keyspace1");
+        ColumnFamilyStore store = table.getColumnFamilyStore("Indexed1");
+        ByteBuffer key = ByteBufferUtil.bytes(String.valueOf("k1"));
+        RowMutation rm = new RowMutation("Keyspace1", key);
+        rm.add(new QueryPath("Indexed1", null, ByteBufferUtil.bytes("birthdate")), ByteBufferUtil.bytes(1L), System.currentTimeMillis());
+        rm.apply();
+        store.forceBlockingFlush();
+
+        // check if opening and querying works
+        assertIndexQueryWorks(store);
+    }
+
+    @Test
+    public void testPersistentStatisticsFromOlderIndexedSSTable() throws IOException, ExecutionException, InterruptedException
+    {
+        // copy legacy indexed sstables
+        String root = System.getProperty("legacy-sstable-root");
+        assert root != null;
+        File rootDir = new File(root + File.separator + "hb" + File.separator + "Keyspace1");
+        assert rootDir.isDirectory();
+
+        String[] destDirs = DatabaseDescriptor.getAllDataFileLocationsForTable("Keyspace1");
+        assert destDirs != null;
+        assert destDirs.length > 0;
+
+        FileUtils.createDirectory(destDirs[0]);
+        for (File srcFile : rootDir.listFiles())
+        {
+            if (!srcFile.getName().startsWith("Indexed1"))
                 continue;
+            File destFile = new File(destDirs[0] + File.separator + srcFile.getName());
+            CLibrary.createHardLinkWithExec(srcFile, destFile);
 
-            String datacenter = snitch.getDatacenter(endpoint);
-            int remaining = remainingReplicas.containsKey(datacenter) ? remainingReplicas.get(datacenter) : 0;
-            if (remaining > 0)
-            {
-                endpoints.add(endpoint);
-                remainingReplicas.put(datacenter, remaining - 1);
-            }
+            destFile = new File(destDirs[0] + File.separator + srcFile.getName());
+
+            assert destFile.exists() : destFile.getAbsoluteFile();
         }
+        ColumnFamilyStore store = Table.open("Keyspace1").getColumnFamilyStore("Indexed1");
 
-        for (Map.Entry<String, Integer> entry : remainingReplicas.entrySet())
+        // check if opening and querying works
+        assertIndexQueryWorks(store);
+    }
+
+    private void assertIndexQueryWorks(ColumnFamilyStore indexedCFS)
+    {
+        assert "Indexed1".equals(indexedCFS.getColumnFamilyName());
+
+        // make sure all sstables including 2ary indexes load from disk
+        indexedCFS.clearUnsafe();
+        for (ColumnFamilyStore indexCfs : indexedCFS.indexManager.getIndexesBackedByCfs())
         {
-            if (entry.getValue() > 0)
-                throw new IllegalStateException(String.format("datacenter (%s) has no more endpoints, (%s) replicas still needed", entry.getKey(), entry.getValue()));
+            indexCfs.clearUnsafe();
+            indexCfs.loadNewSSTables(); // v1.0.4 would fail here (see CASSANDRA-3540)
         }
+        indexedCFS.loadNewSSTables();
 
-        return endpoints;
+        // query using index to see if sstable for secondary index opens
+        IndexExpression expr = new IndexExpression(ByteBufferUtil.bytes("birthdate"), IndexOperator.EQ, ByteBufferUtil.bytes(1L));
+        IndexClause clause = new IndexClause(Arrays.asList(expr), ByteBufferUtil.EMPTY_BYTE_BUFFER, 100);
+        IPartitioner p = StorageService.getPartitioner();
+        Range range = new Range(p.getMinimumToken(), p.getMinimumToken());
+        List<Row> rows = indexedCFS.search(clause, range, new IdentityQueryFilter());
+        assert rows.size() == 1;
     }
 
-    public int getReplicationFactor(String table)
+    private List<Range<Token>> makeRanges(Token left, Token right)
     {
-        int total = 0;
-        for (int repFactor : datacenters.get(table).values())
-            total += repFactor;
-        return total;
+        return Arrays.<Range<Token>>asList(new Range[]{ new Range<Token>(left, right) });
     }
 
-    public int getReplicationFactor(String dc, String table)
+    private DecoratedKey k(int i)
     {
-        return datacenters.get(table).get(dc);
-    }
-
-    public Set<String> getDatacenters(String table)
-    {
-        return datacenters.get(table).keySet();
-    }
-
-    /**
-     * This method will generate the QRH object and returns. If the Consistency
-     * level is DCQUORUM then it will return a DCQRH with a map of local rep
-     * factor alone. If the consistency level is DCQUORUMSYNC then it will
-     * return a DCQRH with a map of all the DC rep factor.
-     */
-    @Override
-    public AbstractWriteResponseHandler getWriteResponseHandler(Collection<InetAddress> writeEndpoints, Multimap<InetAddress, InetAddress> hintedEndpoints, ConsistencyLevel consistency_level, String table)
-    {
-        if (consistency_level == ConsistencyLevel.DCQUORUM)
-        {
-            // block for in this context will be localnodes block.
-            return new DatacenterWriteResponseHandler(writeEndpoints, hintedEndpoints, consistency_level, table);
-        }
-        else if (consistency_level == ConsistencyLevel.DCQUORUMSYNC)
-        {
-            return new DatacenterSyncWriteResponseHandler(writeEndpoints, hintedEndpoints, consistency_level, table);
-        }
-        return super.getWriteResponseHandler(writeEndpoints, hintedEndpoints, consistency_level, table);
-    }
-
-    /**
-     * This method will generate the WRH object and returns. If the Consistency
-     * level is DCQUORUM/DCQUORUMSYNC then it will return a DCQRH.
-     */
-    @Override
-    public QuorumResponseHandler getQuorumResponseHandler(IResponseResolver responseResolver, ConsistencyLevel consistencyLevel, String table)
-    {
-        if (consistencyLevel.equals(ConsistencyLevel.DCQUORUM) || consistencyLevel.equals(ConsistencyLevel.DCQUORUMSYNC))
-        {
-            return new DatacenterQuorumResponseHandler(responseResolver, consistencyLevel, table);
-        }
-        return super.getQuorumResponseHandler(responseResolver, consistencyLevel, table);
+        return new DecoratedKey(t(i), ByteBufferUtil.bytes(String.valueOf(i)));
     }
 }

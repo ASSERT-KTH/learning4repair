@@ -1,306 +1,316 @@
-List<String> mergeFiles;            // used by IndexWriter
+break;
 
-package org.apache.lucene.index;
+package org.apache.lucene.index.values;
+
+import java.io.IOException;
+import java.util.EnumSet;
+import java.util.Random;
+
+import org.apache.lucene.analysis.MockAnalyzer;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.Field;
+import org.apache.lucene.document.IndexDocValuesField;
+import org.apache.lucene.document.TextField;
+import org.apache.lucene.index.CorruptIndexException;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.IndexReader.ReaderContext;
+import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.index.IndexWriterConfig;
+import org.apache.lucene.index.NoMergePolicy;
+import org.apache.lucene.index.codecs.CodecProvider;
+import org.apache.lucene.index.values.IndexDocValues.Source;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.LuceneTestCase;
+import org.junit.Before;
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
+ * contributor license agreements. See the NOTICE file distributed with this
+ * work for additional information regarding copyright ownership. The ASF
+ * licenses this file to You under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * 
  * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
  */
-
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.util.SetOnce;
-import org.apache.lucene.util.SetOnce.AlreadySetException;
-
-import java.io.IOException;
-import java.util.List;
-import java.util.ArrayList;
-import java.util.Set;
-
-/**
- * <p>Expert: a MergePolicy determines the sequence of
- * primitive merge operations to be used for overall merge
- * and optimize operations.</p>
- * 
- * <p>Whenever the segments in an index have been altered by
- * {@link IndexWriter}, either the addition of a newly
- * flushed segment, addition of many segments from
- * addIndexes* calls, or a previous merge that may now need
- * to cascade, {@link IndexWriter} invokes {@link
- * #findMerges} to give the MergePolicy a chance to pick
- * merges that are now required.  This method returns a
- * {@link MergeSpecification} instance describing the set of
- * merges that should be done, or null if no merges are
- * necessary.  When IndexWriter.optimize is called, it calls
- * {@link #findMergesForOptimize} and the MergePolicy should
- * then return the necessary merges.</p>
- *
- * <p>Note that the policy can return more than one merge at
- * a time.  In this case, if the writer is using {@link
- * SerialMergeScheduler}, the merges will be run
- * sequentially but if it is using {@link
- * ConcurrentMergeScheduler} they will be run concurrently.</p>
- * 
- * <p>The default MergePolicy is {@link
- * LogByteSizeMergePolicy}.</p>
- *
- * @lucene.experimental
- */
-
-public abstract class MergePolicy implements java.io.Closeable {
-
-  /** OneMerge provides the information necessary to perform
-   *  an individual primitive merge operation, resulting in
-   *  a single new segment.  The merge spec includes the
-   *  subset of segments to be merged as well as whether the
-   *  new segment should use the compound file format. */
-
-  public static class OneMerge {
-
-    SegmentInfo info;               // used by IndexWriter
-    boolean mergeDocStores;         // used by IndexWriter
-    boolean optimize;               // used by IndexWriter
-    boolean increfDone;             // used by IndexWriter
-    boolean registerDone;           // used by IndexWriter
-    long mergeGen;                  // used by IndexWriter
-    boolean isExternal;             // used by IndexWriter
-    int maxNumSegmentsOptimize;     // used by IndexWriter
-    SegmentReader[] readers;        // used by IndexWriter
-    SegmentReader[] readersClone;   // used by IndexWriter
-    final SegmentInfos segments;
-    final boolean useCompoundFile;
-    boolean aborted;
-    Throwable error;
-    boolean paused;
-
-    public OneMerge(SegmentInfos segments, boolean useCompoundFile) {
-      if (0 == segments.size())
-        throw new RuntimeException("segments must include at least one segment");
-      this.segments = segments;
-      this.useCompoundFile = useCompoundFile;
-    }
-
-    /** Record that an exception occurred while executing
-     *  this merge */
-    synchronized void setException(Throwable error) {
-      this.error = error;
-    }
-
-    /** Retrieve previous exception set by {@link
-     *  #setException}. */
-    synchronized Throwable getException() {
-      return error;
-    }
-
-    /** Mark this merge as aborted.  If this is called
-     *  before the merge is committed then the merge will
-     *  not be committed. */
-    synchronized void abort() {
-      aborted = true;
-      notifyAll();
-    }
-
-    /** Returns true if this merge was aborted. */
-    synchronized boolean isAborted() {
-      return aborted;
-    }
-
-    synchronized void checkAborted(Directory dir) throws MergeAbortedException {
-      if (aborted) {
-        throw new MergeAbortedException("merge is aborted: " + segString(dir));
-      }
-
-      while (paused) {
-        try {
-          // In theory we could wait() indefinitely, but we
-          // do 1000 msec, defensively
-          wait(1000);
-        } catch (InterruptedException ie) {
-          throw new RuntimeException(ie);
-        }
-        if (aborted) {
-          throw new MergeAbortedException("merge is aborted: " + segString(dir));
-        }
-      }
-    }
-
-    synchronized public void setPause(boolean paused) {
-      this.paused = paused;
-      if (!paused) {
-        // Wakeup merge thread, if it's waiting
-        notifyAll();
-      }
-    }
-
-    synchronized public boolean getPause() {
-      return paused;
-    }
-
-    String segString(Directory dir) {
-      StringBuilder b = new StringBuilder();
-      final int numSegments = segments.size();
-      for(int i=0;i<numSegments;i++) {
-        if (i > 0) b.append(' ');
-        b.append(segments.info(i).toString(dir, 0));
-      }
-      if (info != null)
-        b.append(" into ").append(info.name);
-      if (optimize)
-        b.append(" [optimize]");
-      if (mergeDocStores) {
-        b.append(" [mergeDocStores]");
-      }
-      return b.toString();
-    }
+public class TestTypePromotion extends LuceneTestCase {
+  @Before
+  public void setUp() throws Exception {
+    super.setUp();
+    assumeFalse("cannot work with preflex codec", CodecProvider.getDefault()
+        .getDefaultFieldCodec().equals("PreFlex"));
   }
 
-  /**
-   * A MergeSpecification instance provides the information
-   * necessary to perform multiple merges.  It simply
-   * contains a list of {@link OneMerge} instances.
-   */
+  private static EnumSet<ValueType> INTEGERS = EnumSet.of(ValueType.VAR_INTS,
+      ValueType.FIXED_INTS_16, ValueType.FIXED_INTS_32,
+      ValueType.FIXED_INTS_64, ValueType.FIXED_INTS_8);
 
-  public static class MergeSpecification {
+  private static EnumSet<ValueType> FLOATS = EnumSet.of(ValueType.FLOAT_32,
+      ValueType.FLOAT_64);
 
-    /**
-     * The subset of segments to be included in the primitive merge.
-     */
+  private static EnumSet<ValueType> UNSORTED_BYTES = EnumSet.of(
+      ValueType.BYTES_FIXED_DEREF, ValueType.BYTES_FIXED_STRAIGHT,
+      ValueType.BYTES_VAR_STRAIGHT, ValueType.BYTES_VAR_DEREF);
 
-    public List<OneMerge> merges = new ArrayList<OneMerge>();
-
-    public void add(OneMerge merge) {
-      merges.add(merge);
-    }
-
-    public String segString(Directory dir) {
-      StringBuilder b = new StringBuilder();
-      b.append("MergeSpec:\n");
-      final int count = merges.size();
-      for(int i=0;i<count;i++)
-        b.append("  ").append(1 + i).append(": ").append(merges.get(i).segString(dir));
-      return b.toString();
-    }
-  }
-
-  /** Exception thrown if there are any problems while
-   *  executing a merge. */
-  public static class MergeException extends RuntimeException {
-    private Directory dir;
-
-    public MergeException(String message, Directory dir) {
-      super(message);
-      this.dir = dir;
-    }
-
-    public MergeException(Throwable exc, Directory dir) {
-      super(exc);
-      this.dir = dir;
-    }
-    /** Returns the {@link Directory} of the index that hit
-     *  the exception. */
-    public Directory getDirectory() {
-      return dir;
-    }
-  }
-
-  public static class MergeAbortedException extends IOException {
-    public MergeAbortedException() {
-      super("merge is aborted");
-    }
-    public MergeAbortedException(String message) {
-      super(message);
-    }
-  }
-
-  protected final SetOnce<IndexWriter> writer;
-
-  /**
-   * Creates a new merge policy instance. Note that if you intend to use it
-   * without passing it to {@link IndexWriter}, you should call
-   * {@link #setIndexWriter(IndexWriter)}.
-   */
-  public MergePolicy() {
-    writer = new SetOnce<IndexWriter>();
-  }
-
-  /**
-   * Sets the {@link IndexWriter} to use by this merge policy. This method is
-   * allowed to be called only once, and is usually set by IndexWriter. If it is
-   * called more than once, {@link AlreadySetException} is thrown.
-   * 
-   * @see SetOnce
-   */
-  public void setIndexWriter(IndexWriter writer) {
-    this.writer.set(writer);
+  private static EnumSet<ValueType> SORTED_BYTES = EnumSet.of(
+      ValueType.BYTES_FIXED_SORTED, ValueType.BYTES_VAR_SORTED);
+  
+  public ValueType randomValueType(EnumSet<ValueType> typeEnum, Random random) {
+    ValueType[] array = typeEnum.toArray(new ValueType[0]);
+    return array[random.nextInt(array.length)];
   }
   
-  /**
-   * Determine what set of merge operations are now necessary on the index.
-   * {@link IndexWriter} calls this whenever there is a change to the segments.
-   * This call is always synchronized on the {@link IndexWriter} instance so
-   * only one thread at a time will call this method.
-   * 
-   * @param segmentInfos
-   *          the total set of segments in the index
-   */
-  public abstract MergeSpecification findMerges(SegmentInfos segmentInfos)
-      throws CorruptIndexException, IOException;
+  private static enum TestType {
+    Int, Float, Byte
+  }
 
-  /**
-   * Determine what set of merge operations is necessary in order to optimize
-   * the index. {@link IndexWriter} calls this when its
-   * {@link IndexWriter#optimize()} method is called. This call is always
-   * synchronized on the {@link IndexWriter} instance so only one thread at a
-   * time will call this method.
-   * 
-   * @param segmentInfos
-   *          the total set of segments in the index
-   * @param maxSegmentCount
-   *          requested maximum number of segments in the index (currently this
-   *          is always 1)
-   * @param segmentsToOptimize
-   *          contains the specific SegmentInfo instances that must be merged
-   *          away. This may be a subset of all SegmentInfos.
-   */
-  public abstract MergeSpecification findMergesForOptimize(
-      SegmentInfos segmentInfos, int maxSegmentCount, Set<SegmentInfo> segmentsToOptimize)
-      throws CorruptIndexException, IOException;
+  private void runTest(EnumSet<ValueType> types, TestType type)
+      throws CorruptIndexException, IOException {
+    Directory dir = newDirectory();
+    IndexWriter writer = new IndexWriter(dir,
+        newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random)));
+    int num_1 = atLeast(200);
+    int num_2 = atLeast(200);
+    int num_3 = atLeast(200);
+    long[] values = new long[num_1 + num_2 + num_3];
+    index(writer, new IndexDocValuesField("promote"),
+        randomValueType(types, random), values, 0, num_1);
+    writer.commit();
+    
+    index(writer, new IndexDocValuesField("promote"),
+        randomValueType(types, random), values, num_1, num_2);
+    writer.commit();
+    
+    if (random.nextInt(4) == 0) {
+      // once in a while use addIndexes
+      writer.optimize();
+      
+      Directory dir_2 = newDirectory() ;
+      IndexWriter writer_2 = new IndexWriter(dir_2,
+          newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random)));
+      index(writer_2, new IndexDocValuesField("promote"),
+          randomValueType(types, random), values, num_1 + num_2, num_3);
+      writer_2.commit();
+      writer_2.close();
+      if (random.nextBoolean()) {
+        writer.addIndexes(dir_2);
+      } else {
+        // do a real merge here
+        IndexReader open = IndexReader.open(dir_2);
+        writer.addIndexes(open);
+        open.close();
+      }
+      dir_2.close();
+    } else {
+      index(writer, new IndexDocValuesField("promote"),
+          randomValueType(types, random), values, num_1 + num_2, num_3);
+    }
 
-  /**
-   * Determine what set of merge operations is necessary in order to expunge all
-   * deletes from the index.
-   * 
-   * @param segmentInfos
-   *          the total set of segments in the index
-   */
-  public abstract MergeSpecification findMergesToExpungeDeletes(
-      SegmentInfos segmentInfos) throws CorruptIndexException, IOException;
+    writer.optimize();
+    writer.close();
+    assertValues(type, dir, values);
+    dir.close();
+  }
 
-  /**
-   * Release all resources for the policy.
-   */
-  public abstract void close();
+  private void assertValues(TestType type, Directory dir, long[] values)
+      throws CorruptIndexException, IOException {
+    IndexReader reader = IndexReader.open(dir);
+    assertTrue(reader.isOptimized());
+    ReaderContext topReaderContext = reader.getTopReaderContext();
+    ReaderContext[] children = topReaderContext.children();
+    IndexDocValues docValues = children[0].reader.docValues("promote");
+    assertEquals(1, children.length);
+    Source directSource = docValues.getDirectSource();
+    for (int i = 0; i < values.length; i++) {
+      int id = Integer.parseInt(reader.document(i).get("id"));
+      String msg = "id: " + id + " doc: " + i;
+      switch (type) {
+      case Byte:
+        BytesRef bytes = directSource.getBytes(i, new BytesRef());
+        long value = 0;
+        switch(bytes.length) {
+        case 1:
+          value = bytes.bytes[bytes.offset];
+          break;
+        case 2:
+          value = bytes.asShort();
+          break;
+        case 4:
+          value = bytes.asInt();
+          break;
+        case 8:
+          value = bytes.asLong();
+          break;
+          
+        default:
+          fail(msg + " bytessize: " + bytes.length);
+        }
+        
+        assertEquals(msg  + " byteSize: " + bytes.length, values[id], value);
+        break;
+      case Float:
+          assertEquals(msg, values[id], Double.doubleToRawLongBits(directSource.getFloat(i)));
+        break;
+      case Int:
+        assertEquals(msg, values[id], directSource.getInt(i));
+      default:
+        break;
+      }
 
-  /**
-   * Returns true if a newly flushed (not from merge)
-   * segment should use the compound file format.
-   */
-  public abstract boolean useCompoundFile(SegmentInfos segments, SegmentInfo newSegment);
+    }
+    docValues.close();
+    reader.close();
+  }
 
-  /**
-   * Returns true if the doc store files should use the
-   * compound file format.
-   */
-  public abstract boolean useCompoundDocStore(SegmentInfos segments);
+  public void index(IndexWriter writer, IndexDocValuesField valField,
+      ValueType valueType, long[] values, int offset, int num)
+      throws CorruptIndexException, IOException {
+    BytesRef ref = new BytesRef(new byte[] { 1, 2, 3, 4 });
+    for (int i = offset; i < offset + num; i++) {
+      Document doc = new Document();
+      doc.add(new Field("id", i + "", TextField.TYPE_STORED));
+      switch (valueType) {
+      case VAR_INTS:
+        values[i] = random.nextInt();
+        valField.setInt(values[i]);
+        break;
+      case FIXED_INTS_16:
+        values[i] = random.nextInt(Short.MAX_VALUE);
+        valField.setInt((short) values[i], true);
+        break;
+      case FIXED_INTS_32:
+        values[i] = random.nextInt();
+        valField.setInt((int) values[i], true);
+        break;
+      case FIXED_INTS_64:
+        values[i] = random.nextLong();
+        valField.setInt(values[i], true);
+        break;
+      case FLOAT_64:
+        double nextDouble = random.nextDouble();
+        values[i] = Double.doubleToRawLongBits(nextDouble);
+        valField.setFloat(nextDouble);
+        break;
+      case FLOAT_32:
+        final float nextFloat = random.nextFloat();
+        values[i] = Double.doubleToRawLongBits(nextFloat);
+        valField.setFloat(nextFloat);
+        break;
+      case FIXED_INTS_8:
+         values[i] = (byte) i;
+        valField.setInt((byte)values[i], true);
+        break;
+      case BYTES_FIXED_DEREF:
+      case BYTES_FIXED_SORTED:
+      case BYTES_FIXED_STRAIGHT:
+        values[i] = random.nextLong();
+        ref.copy(values[i]);
+        valField.setBytes(ref, valueType);
+        break;
+      case BYTES_VAR_DEREF:
+      case BYTES_VAR_SORTED:
+      case BYTES_VAR_STRAIGHT:
+        if (random.nextBoolean()) {
+          ref.copy(random.nextInt());
+          values[i] = ref.asInt();
+        } else {
+          ref.copy(random.nextLong());
+          values[i] = ref.asLong();
+        }
+        valField.setBytes(ref, valueType);
+        break;
+
+      default:
+        fail("unexpected value " + valueType);
+
+      }
+      doc.add(valField);
+      writer.addDocument(doc);
+      if (random.nextInt(10) == 0) {
+        writer.commit();
+      }
+    }
+  }
+
+  public void testPromoteBytes() throws IOException {
+    runTest(UNSORTED_BYTES, TestType.Byte);
+  }
+  
+  public void testSortedPromoteBytes() throws IOException {
+    runTest(SORTED_BYTES, TestType.Byte);
+  }
+
+  public void testPromotInteger() throws IOException {
+    runTest(INTEGERS, TestType.Int);
+  }
+
+  public void testPromotFloatingPoint() throws CorruptIndexException,
+      IOException {
+    runTest(FLOATS, TestType.Float);
+  }
+  
+  public void testMergeIncompatibleTypes() throws IOException {
+    Directory dir = newDirectory();
+    IndexWriterConfig writerConfig = newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random));
+    writerConfig.setMergePolicy(NoMergePolicy.NO_COMPOUND_FILES); // no merges until we are done with adding values
+    IndexWriter writer = new IndexWriter(dir, writerConfig);
+    int num_1 = atLeast(200);
+    int num_2 = atLeast(200);
+    long[] values = new long[num_1 + num_2];
+    index(writer, new IndexDocValuesField("promote"),
+        randomValueType(INTEGERS, random), values, 0, num_1);
+    writer.commit();
+    
+    if (random.nextInt(4) == 0) {
+      // once in a while use addIndexes
+      Directory dir_2 = newDirectory() ;
+      IndexWriter writer_2 = new IndexWriter(dir_2,
+          newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random)));
+      index(writer_2, new IndexDocValuesField("promote"),
+          randomValueType(random.nextBoolean() ? UNSORTED_BYTES : SORTED_BYTES, random), values, num_1, num_2);
+      writer_2.commit();
+      writer_2.close();
+      if (random.nextBoolean()) {
+        writer.addIndexes(dir_2);
+      } else {
+        // do a real merge here
+        IndexReader open = IndexReader.open(dir_2);
+        writer.addIndexes(open);
+        open.close();
+      }
+      dir_2.close();
+    } else {
+      index(writer, new IndexDocValuesField("promote"),
+          randomValueType(random.nextBoolean() ? UNSORTED_BYTES : SORTED_BYTES, random), values, num_1, num_2);
+      writer.commit();
+    }
+    writer.close();
+    writerConfig = newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random));
+    if (writerConfig.getMergePolicy() instanceof NoMergePolicy) {
+      writerConfig.setMergePolicy(newLogMergePolicy()); // make sure we optimize to one segment (merge everything together)
+    }
+    writer = new IndexWriter(dir, writerConfig);
+    // now optimize
+    writer.optimize();
+    writer.close();
+    IndexReader reader = IndexReader.open(dir);
+    assertTrue(reader.isOptimized());
+    ReaderContext topReaderContext = reader.getTopReaderContext();
+    ReaderContext[] children = topReaderContext.children();
+    IndexDocValues docValues = children[0].reader.docValues("promote");
+    assertNotNull(docValues);
+    assertValues(TestType.Byte, dir, values);
+    assertEquals(ValueType.BYTES_VAR_STRAIGHT, docValues.type());
+    reader.close();
+    dir.close();
+  }
+
 }
+ No newline at end of file

@@ -1,6 +1,4 @@
-public MockRAMDirectory() {
-
-package org.apache.lucene.store;
+DocIdSet idSet = baseSet.getDocIdSet(context, null);  // this set only includes live docs
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,257 +17,414 @@ package org.apache.lucene.store;
  * limitations under the License.
  */
 
+package org.apache.solr.request;
+
+import org.apache.lucene.index.IndexReader.AtomicReaderContext;
+import org.apache.lucene.index.TermsEnum;
+import org.apache.lucene.search.DocIdSet;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.search.FieldCache;
+import org.apache.lucene.search.Filter;
+import org.apache.lucene.util.CharsRef;
+import org.apache.lucene.util.PriorityQueue;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.ReaderUtil;
+import org.apache.lucene.util.UnicodeUtil;
+import org.apache.lucene.util.packed.PackedInts;
+import org.apache.solr.common.SolrException;
+import org.apache.solr.common.params.FacetParams;
+import org.apache.solr.common.util.NamedList;
+import org.apache.solr.schema.FieldType;
+import org.apache.solr.search.DocSet;
+import org.apache.solr.search.SolrIndexSearcher;
+import org.apache.solr.util.BoundedTreeSet;
+
 import java.io.IOException;
-import java.io.File;
-import java.io.FileNotFoundException;
-import java.util.Iterator;
-import java.util.Random;
-import java.util.Map;
-import java.util.HashMap;
-import java.util.ArrayList;
+import java.util.*;
+import java.util.concurrent.*;
 
-/**
- * This is a subclass of RAMDirectory that adds methods
- * intented to be used only by unit tests.
- * @version $Id: RAMDirectory.java 437897 2006-08-29 01:13:10Z yonik $
- */
 
-public class MockRAMDirectory extends RAMDirectory {
-  long maxSize;
+class PerSegmentSingleValuedFaceting {
 
-  // Max actual bytes used. This is set by MockRAMOutputStream:
-  long maxUsedSize;
-  double randomIOExceptionRate;
-  Random randomState;
-  boolean noDeleteOpenFile = true;
+  // input params
+  SolrIndexSearcher searcher;
+  DocSet docs;
+  String fieldName;
+  int offset;
+  int limit;
+  int mincount;
+  boolean missing;
+  String sort;
+  String prefix;
 
-  // NOTE: we cannot initialize the Map here due to the
-  // order in which our constructor actually does this
-  // member initialization vs when it calls super.  It seems
-  // like super is called, then our members are initialized:
-  Map openFiles;
+  Filter baseSet;
 
-  public MockRAMDirectory() throws IOException {
-    super();
-    if (openFiles == null) {
-      openFiles = new HashMap();
-    }
-  }
-  public MockRAMDirectory(String dir) throws IOException {
-    super(dir);
-    if (openFiles == null) {
-      openFiles = new HashMap();
-    }
-  }
-  public MockRAMDirectory(Directory dir) throws IOException {
-    super(dir);
-    if (openFiles == null) {
-      openFiles = new HashMap();
-    }
-  }
-  public MockRAMDirectory(File dir) throws IOException {
-    super(dir);
-    if (openFiles == null) {
-      openFiles = new HashMap();
-    }
+  int nThreads;
+
+  public PerSegmentSingleValuedFaceting(SolrIndexSearcher searcher, DocSet docs, String fieldName, int offset, int limit, int mincount, boolean missing, String sort, String prefix) {
+    this.searcher = searcher;
+    this.docs = docs;
+    this.fieldName = fieldName;
+    this.offset = offset;
+    this.limit = limit;
+    this.mincount = mincount;
+    this.missing = missing;
+    this.sort = sort;
+    this.prefix = prefix;
   }
 
-  public void setMaxSizeInBytes(long maxSize) {
-    this.maxSize = maxSize;
-  }
-  public long getMaxSizeInBytes() {
-    return this.maxSize;
+  public void setNumThreads(int threads) {
+    nThreads = threads;
   }
 
-  /**
-   * Returns the peek actual storage used (bytes) in this
-   * directory.
-   */
-  public long getMaxUsedSizeInBytes() {
-    return this.maxUsedSize;
-  }
-  public void resetMaxUsedSizeInBytes() {
-    this.maxUsedSize = getRecomputedActualSizeInBytes();
-  }
 
-  /**
-   * Emulate windows whereby deleting an open file is not
-   * allowed (raise IOException).
-  */
-  public void setNoDeleteOpenFile(boolean value) {
-    this.noDeleteOpenFile = value;
-  }
-  public boolean getNoDeleteOpenFile() {
-    return noDeleteOpenFile;
-  }
+  NamedList<Integer> getFacetCounts(Executor executor) throws IOException {
 
-  /**
-   * If 0.0, no exceptions will be thrown.  Else this should
-   * be a double 0.0 - 1.0.  We will randomly throw an
-   * IOException on the first write to an OutputStream based
-   * on this probability.
-   */
-  public void setRandomIOExceptionRate(double rate, long seed) {
-    randomIOExceptionRate = rate;
-    // seed so we have deterministic behaviour:
-    randomState = new Random(seed);
-  }
-  public double getRandomIOExceptionRate() {
-    return randomIOExceptionRate;
-  }
+    CompletionService<SegFacet> completionService = new ExecutorCompletionService<SegFacet>(executor);
 
-  void maybeThrowIOException() throws IOException {
-    maybeThrowDeterministicException();
-    if (randomIOExceptionRate > 0.0) {
-      int number = Math.abs(randomState.nextInt() % 1000);
-      if (number < randomIOExceptionRate*1000) {
-        throw new IOException("a random IOException");
+    // reuse the translation logic to go from top level set to per-segment set
+    baseSet = docs.getTopFilter();
+
+    final AtomicReaderContext[] leaves = ReaderUtil.leaves(searcher.getTopReaderContext());
+    // The list of pending tasks that aren't immediately submitted
+    // TODO: Is there a completion service, or a delegating executor that can
+    // limit the number of concurrent tasks submitted to a bigger executor?
+    LinkedList<Callable<SegFacet>> pending = new LinkedList<Callable<SegFacet>>();
+
+    int threads = nThreads <= 0 ? Integer.MAX_VALUE : nThreads;
+
+    for (int i=0; i<leaves.length; i++) {
+      final SegFacet segFacet = new SegFacet(leaves[i]);
+
+      Callable<SegFacet> task = new Callable<SegFacet>() {
+        public SegFacet call() throws Exception {
+          segFacet.countTerms();
+          return segFacet;
+        }
+      };
+
+      // TODO: if limiting threads, submit by largest segment first?
+
+      if (--threads >= 0) {
+        completionService.submit(task);
+      } else {
+        pending.add(task);
       }
     }
-  }
 
-  public synchronized void deleteFile(String name) throws IOException {
-    synchronized(openFiles) {
-      if (noDeleteOpenFile && openFiles.containsKey(name)) {
-        throw new IOException("MockRAMDirectory: file \"" + name + "\" is still open: cannot delete");
+
+    // now merge the per-segment results
+    PriorityQueue<SegFacet> queue = new PriorityQueue<SegFacet>(leaves.length) {
+      @Override
+      protected boolean lessThan(SegFacet a, SegFacet b) {
+        return a.tempBR.compareTo(b.tempBR) < 0;
       }
-    }
-    super.deleteFile(name);
-  }
+    };
 
-  public IndexOutput createOutput(String name) {
-    if (openFiles == null) {
-      openFiles = new HashMap();
-    }
-    synchronized(openFiles) {
-      if (noDeleteOpenFile && openFiles.containsKey(name)) {
-        // RuntimeException instead of IOException because
-        // super() does not throw IOException currently:
-        throw new RuntimeException("MockRAMDirectory: file \"" + name + "\" is still open: cannot overwrite");
-      }
-    }
-    RAMFile file = new RAMFile(this);
-    synchronized (this) {
-      RAMFile existing = (RAMFile)fileMap.get(name);
-      if (existing!=null) {
-        sizeInBytes -= existing.sizeInBytes;
-        existing.directory = null;
-      }
-      fileMap.put(name, file);
-    }
 
-    return new MockRAMOutputStream(this, file);
-  }
+    boolean hasMissingCount=false;
+    int missingCount=0;
+    for (int i=0; i<leaves.length; i++) {
+      SegFacet seg = null;
 
-  public IndexInput openInput(String name) throws IOException {
-    RAMFile file;
-    synchronized (this) {
-      file = (RAMFile)fileMap.get(name);
-    }
-    if (file == null)
-      throw new FileNotFoundException(name);
-    else {
-      synchronized(openFiles) {
-        if (openFiles.containsKey(name)) {
-          Integer v = (Integer) openFiles.get(name);
-          v = new Integer(v.intValue()+1);
-          openFiles.put(name, v);
+      try {
+        Future<SegFacet> future = completionService.take();        
+        seg = future.get();
+        if (!pending.isEmpty()) {
+          completionService.submit(pending.removeFirst());
+        }
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, e);
+      } catch (ExecutionException e) {
+        Throwable cause = e.getCause();
+        if (cause instanceof RuntimeException) {
+          throw (RuntimeException)cause;
         } else {
-          openFiles.put(name, new Integer(1));
+          throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, "Error in per-segment faceting on field: " + fieldName, cause);
+        }
+      }
+
+
+      if (seg.startTermIndex < seg.endTermIndex) {
+        if (seg.startTermIndex==0) {
+          hasMissingCount=true;
+          missingCount += seg.counts[0];
+          seg.pos = 1;
+        } else {
+          seg.pos = seg.startTermIndex;
+        }
+        if (seg.pos < seg.endTermIndex) {
+          seg.tenum = seg.si.getTermsEnum();          
+          seg.tenum.seekExact(seg.pos);
+          seg.tempBR = seg.tenum.term();
+          queue.add(seg);
         }
       }
     }
-    return new MockRAMInputStream(this, name, file);
-  }
 
-  /** Provided for testing purposes.  Use sizeInBytes() instead. */
-  public synchronized final long getRecomputedSizeInBytes() {
-    long size = 0;
-    Iterator it = fileMap.values().iterator();
-    while (it.hasNext())
-      size += ((RAMFile) it.next()).getSizeInBytes();
-    return size;
-  }
-
-  /** Like getRecomputedSizeInBytes(), but, uses actual file
-   * lengths rather than buffer allocations (which are
-   * quantized up to nearest
-   * RAMOutputStream.BUFFER_SIZE (now 1024) bytes.
-   */
-
-  final synchronized long getRecomputedActualSizeInBytes() {
-    long size = 0;
-    Iterator it = fileMap.values().iterator();
-    while (it.hasNext())
-      size += ((RAMFile) it.next()).length;
-    return size;
-  }
-
-  public void close() {
-    if (openFiles == null) {
-      openFiles = new HashMap();
+    FacetCollector collector;
+    if (sort.equals(FacetParams.FACET_SORT_COUNT) || sort.equals(FacetParams.FACET_SORT_COUNT_LEGACY)) {
+      collector = new CountSortedFacetCollector(offset, limit, mincount);
+    } else {
+      collector = new IndexSortedFacetCollector(offset, limit, mincount);
     }
-    synchronized(openFiles) {
-      if (noDeleteOpenFile && openFiles.size() > 0) {
-        // RuntimeException instead of IOException because
-        // super() does not throw IOException currently:
-        throw new RuntimeException("MockRAMDirectory: cannot close: there are still open files: " + openFiles);
+
+    BytesRef val = new BytesRef();
+
+    while (queue.size() > 0) {
+      SegFacet seg = queue.top();
+
+      // make a shallow copy
+      val.bytes = seg.tempBR.bytes;
+      val.offset = seg.tempBR.offset;
+      val.length = seg.tempBR.length;
+
+      int count = 0;
+
+      do {
+        count += seg.counts[seg.pos - seg.startTermIndex];
+
+        // TODO: OPTIMIZATION...
+        // if mincount>0 then seg.pos++ can skip ahead to the next non-zero entry.
+        seg.pos++;
+        if (seg.pos >= seg.endTermIndex) {
+          queue.pop();
+          seg = queue.top();
+        }  else {
+          seg.tempBR = seg.tenum.next();
+          seg = queue.updateTop();
+        }
+      } while (seg != null && val.compareTo(seg.tempBR) == 0);
+
+      boolean stop = collector.collect(val, count);
+      if (stop) break;
+    }
+
+    NamedList<Integer> res = collector.getFacetCounts();
+
+    // convert labels to readable form    
+    FieldType ft = searcher.getSchema().getFieldType(fieldName);
+    int sz = res.size();
+    for (int i=0; i<sz; i++) {
+      res.setName(i, ft.indexedToReadable(res.getName(i)));
+    }
+
+    if (missing) {
+      if (!hasMissingCount) {
+        missingCount = SimpleFacets.getFieldMissingCount(searcher,docs,fieldName);
+      }
+      res.add(null, missingCount);
+    }
+
+    return res;
+  }
+
+  class SegFacet {
+    AtomicReaderContext context;
+    SegFacet(AtomicReaderContext context) {
+      this.context = context;
+    }
+    
+    FieldCache.DocTermsIndex si;
+    int startTermIndex;
+    int endTermIndex;
+    int[] counts;
+
+    int pos; // only used when merging
+    TermsEnum tenum; // only used when merging
+
+    BytesRef tempBR = new BytesRef();
+
+    void countTerms() throws IOException {
+      si = FieldCache.DEFAULT.getTermsIndex(context.reader, fieldName);
+      // SolrCore.log.info("reader= " + reader + "  FC=" + System.identityHashCode(si));
+
+      if (prefix!=null) {
+        BytesRef prefixRef = new BytesRef(prefix);
+        startTermIndex = si.binarySearchLookup(prefixRef, tempBR);
+        if (startTermIndex<0) startTermIndex=-startTermIndex-1;
+        prefixRef.append(UnicodeUtil.BIG_TERM);
+        // TODO: we could constrain the lower endpoint if we had a binarySearch method that allowed passing start/end
+        endTermIndex = si.binarySearchLookup(prefixRef, tempBR);
+        assert endTermIndex < 0;
+        endTermIndex = -endTermIndex-1;
+      } else {
+        startTermIndex=0;
+        endTermIndex=si.numOrd();
+      }
+
+      final int nTerms=endTermIndex-startTermIndex;
+      if (nTerms>0) {
+        // count collection array only needs to be as big as the number of terms we are
+        // going to collect counts for.
+        final int[] counts = this.counts = new int[nTerms];
+        DocIdSet idSet = baseSet.getDocIdSet(context);
+        DocIdSetIterator iter = idSet.iterator();
+
+
+        ////
+        PackedInts.Reader ordReader = si.getDocToOrd();
+        int doc;
+
+        final Object arr;
+        if (ordReader.hasArray()) {
+          arr = ordReader.getArray();
+        } else {
+          arr = null;
+        }
+
+        if (arr instanceof int[]) {
+          int[] ords = (int[]) arr;
+          if (prefix==null) {
+            while ((doc = iter.nextDoc()) < DocIdSetIterator.NO_MORE_DOCS) {
+              counts[ords[doc]]++;
+            }
+          } else {
+            while ((doc = iter.nextDoc()) < DocIdSetIterator.NO_MORE_DOCS) {
+              int term = ords[doc];
+              int arrIdx = term-startTermIndex;
+              if (arrIdx>=0 && arrIdx<nTerms) counts[arrIdx]++;
+            }
+          }
+        } else if (arr instanceof short[]) {
+          short[] ords = (short[]) arr;
+          if (prefix==null) {
+            while ((doc = iter.nextDoc()) < DocIdSetIterator.NO_MORE_DOCS) {
+              counts[ords[doc] & 0xffff]++;
+            }
+          } else {
+            while ((doc = iter.nextDoc()) < DocIdSetIterator.NO_MORE_DOCS) {
+              int term = ords[doc] & 0xffff;
+              int arrIdx = term-startTermIndex;
+              if (arrIdx>=0 && arrIdx<nTerms) counts[arrIdx]++;
+            }
+          }
+        } else if (arr instanceof byte[]) {
+          byte[] ords = (byte[]) arr;
+          if (prefix==null) {
+            while ((doc = iter.nextDoc()) < DocIdSetIterator.NO_MORE_DOCS) {
+              counts[ords[doc] & 0xff]++;
+            }
+          } else {
+            while ((doc = iter.nextDoc()) < DocIdSetIterator.NO_MORE_DOCS) {
+              int term = ords[doc] & 0xff;
+              int arrIdx = term-startTermIndex;
+              if (arrIdx>=0 && arrIdx<nTerms) counts[arrIdx]++;
+            }
+          }
+        } else {
+          if (prefix==null) {
+            // specialized version when collecting counts for all terms
+            while ((doc = iter.nextDoc()) < DocIdSetIterator.NO_MORE_DOCS) {
+              counts[si.getOrd(doc)]++;
+            }
+          } else {
+            // version that adjusts term numbers because we aren't collecting the full range
+            while ((doc = iter.nextDoc()) < DocIdSetIterator.NO_MORE_DOCS) {
+              int term = si.getOrd(doc);
+              int arrIdx = term-startTermIndex;
+              if (arrIdx>=0 && arrIdx<nTerms) counts[arrIdx]++;
+            }
+          }
+        }
       }
     }
   }
 
-  /**
-   * Objects that represent fail-able conditions. Objects of a derived
-   * class are created and registered with the mock directory. After
-   * register, each object will be invoked once for each first write
-   * of a file, giving the object a chance to throw an IOException.
-   */
-  public static class Failure {
-    /**
-     * eval is called on the first write of every new file.
-     */
-    public void eval(MockRAMDirectory dir) throws IOException { }
+}
 
-    /**
-     * reset should set the state of the failure to its default
-     * (freshly constructed) state. Reset is convenient for tests
-     * that want to create one failure object and then reuse it in
-     * multiple cases. This, combined with the fact that Failure
-     * subclasses are often anonymous classes makes reset difficult to
-     * do otherwise.
-     *
-     * A typical example of use is
-     * Failure failure = new Failure() { ... };
-     * ...
-     * mock.failOn(failure.reset())
-     */
-    public Failure reset() { return this; }
+
+
+abstract class FacetCollector {
+  /*** return true to stop collection */
+  public abstract boolean collect(BytesRef term, int count);
+  public abstract NamedList<Integer> getFacetCounts();
+}
+
+
+// This collector expects facets to be collected in index order
+class CountSortedFacetCollector extends FacetCollector {
+  private final CharsRef spare = new CharsRef();
+
+  final int offset;
+  final int limit;
+  final int maxsize;
+  final BoundedTreeSet<SimpleFacets.CountPair<String,Integer>> queue;
+
+  int min;  // the smallest value in the top 'N' values
+
+  public CountSortedFacetCollector(int offset, int limit, int mincount) {
+    this.offset = offset;
+    this.limit = limit;
+    maxsize = limit>0 ? offset+limit : Integer.MAX_VALUE-1;
+    queue = new BoundedTreeSet<SimpleFacets.CountPair<String,Integer>>(maxsize);
+    min=mincount-1;  // the smallest value in the top 'N' values
   }
 
-  ArrayList failures;
-
-  /**
-   * add a Failure object to the list of objects to be evaluated
-   * at every potential failure point
-   */
-  public void failOn(Failure fail) {
-    if (failures == null) {
-      failures = new ArrayList();
+  @Override
+  public boolean collect(BytesRef term, int count) {
+    if (count > min) {
+      // NOTE: we use c>min rather than c>=min as an optimization because we are going in
+      // index order, so we already know that the keys are ordered.  This can be very
+      // important if a lot of the counts are repeated (like zero counts would be).
+      queue.add(new SimpleFacets.CountPair<String,Integer>(term.utf8ToChars(spare).toString(), count));
+      if (queue.size()>=maxsize) min=queue.last().val;
     }
-    failures.add(fail);
+    return false;
   }
 
-  /**
-   * Itterate through the failures list, giving each object a
-   * chance to throw an IOE
-   */
-  void maybeThrowDeterministicException() throws IOException {
-    if (failures != null) {
-      for(int i = 0; i < failures.size(); i++) {
-        ((Failure)failures.get(i)).eval(this);
-      }
+  @Override
+  public NamedList<Integer> getFacetCounts() {
+    NamedList<Integer> res = new NamedList<Integer>();
+    int off=offset;
+    int lim=limit>=0 ? limit : Integer.MAX_VALUE;
+     // now select the right page from the results
+     for (SimpleFacets.CountPair<String,Integer> p : queue) {
+       if (--off>=0) continue;
+       if (--lim<0) break;
+       res.add(p.key, p.val);
+     }
+    return res;
+  }
+}
+
+// This collector expects facets to be collected in index order
+class IndexSortedFacetCollector extends FacetCollector {
+  private final CharsRef spare = new CharsRef();
+
+  int offset;
+  int limit;
+  final int mincount;
+  final NamedList<Integer> res = new NamedList<Integer>();
+
+  public IndexSortedFacetCollector(int offset, int limit, int mincount) {
+    this.offset = offset;
+    this.limit = limit>0 ? limit : Integer.MAX_VALUE;
+    this.mincount = mincount;
+  }
+
+  @Override
+  public boolean collect(BytesRef term, int count) {
+    if (count < mincount) {
+      return false;
     }
+
+    if (offset > 0) {
+      offset--;
+      return false;
+    }
+
+    if (limit > 0) {
+      res.add(term.utf8ToChars(spare).toString(), count);
+      limit--;
+    }
+
+    return limit <= 0;
   }
 
-
+  @Override
+  public NamedList<Integer> getFacetCounts() {
+    return res;
+  }
 }

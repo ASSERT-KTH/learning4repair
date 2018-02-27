@@ -1,13 +1,12 @@
-catch (Throwable e)
+LOG.warn("Could not get attribute " + attribute);
 
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -17,289 +16,335 @@ catch (Throwable e)
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+package org.apache.solr.core;
 
-package org.apache.cassandra.cli;
+import org.apache.solr.common.SolrException;
+import org.apache.solr.common.util.NamedList;
+import org.apache.solr.core.SolrConfig.JmxConfiguration;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import jline.ConsoleReader;
-import jline.History;
-import org.apache.cassandra.auth.SimpleAuthenticator;
-import org.apache.cassandra.thrift.*;
-import org.apache.thrift.TException;
-import org.apache.thrift.protocol.TBinaryProtocol;
-import org.apache.thrift.transport.TFramedTransport;
-import org.apache.thrift.transport.TSocket;
-import org.apache.thrift.transport.TTransport;
-
-import java.io.File;
-import java.io.IOException;
-import java.util.Arrays;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Map;
-import java.util.Set;
+import javax.management.*;
+import javax.management.openmbean.OpenMBeanAttributeInfoSupport;
+import javax.management.openmbean.OpenType;
+import javax.management.openmbean.SimpleType;
+import javax.management.remote.JMXConnectorServer;
+import javax.management.remote.JMXConnectorServerFactory;
+import javax.management.remote.JMXServiceURL;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Cassandra Command Line Interface (CLI) Main
+ * <p>
+ * Responsible for finding (or creating) a MBeanServer from given configuration
+ * and registering all SolrInfoMBean objects with JMX.
+ * </p>
+ * <p/>
+ * <p>
+ * Please see http://wiki.apache.org/solr/SolrJmx for instructions on usage and configuration
+ * </p>
+ *
+ *
+ * @see org.apache.solr.core.SolrConfig.JmxConfiguration
+ * @since solr 1.3
  */
-public class CliMain
-{
-    public final static String HISTORYFILE = ".cassandra.history";
+public class JmxMonitoredMap<K, V> extends
+        ConcurrentHashMap<String, SolrInfoMBean> {
+  private static final Logger LOG = LoggerFactory.getLogger(JmxMonitoredMap.class
+          .getName());
 
-    private static TTransport transport_ = null;
-    private static Cassandra.Client thriftClient_ = null;
-    private static CliSessionState css_ = new CliSessionState();
-    private static CliClient cliClient_;
-    private static CliCompleter completer_ = new CliCompleter();
+  private MBeanServer server = null;
 
-    /**
-     * Establish a thrift connection to cassandra instance
-     *
-     * @param server - hostname or IP of the server
-     * @param port   - Thrift port number
-     */
-    public static void connect(String server, int port)
-    {
+  private String jmxRootName;
 
-        TSocket socket = new TSocket(server, port);
+  private String coreHashCode;
 
-        if (transport_ != null)
-            transport_.close();
+  public JmxMonitoredMap(String coreName, String coreHashCode,
+                         final JmxConfiguration jmxConfig) {
+    this.coreHashCode = coreHashCode;
+    jmxRootName = (null != jmxConfig.rootName ?
+                   jmxConfig.rootName
+                   : ("solr" + (null != coreName ? "/" + coreName : "")));
+      
+    if (jmxConfig.serviceUrl == null) {
+      List<MBeanServer> servers = null;
 
-        if (css_.framed)
-        {
-            transport_ = new TFramedTransport(socket);
-        }
-        else 
-        {
-            transport_ = socket;
-        }
+      if (jmxConfig.agentId == null) {
+        // Try to find the first MBeanServer
+        servers = MBeanServerFactory.findMBeanServer(null);
+      } else if (jmxConfig.agentId != null) {
+        // Try to find the first MBean server with the given agentId
+        servers = MBeanServerFactory.findMBeanServer(jmxConfig.agentId);
+        // throw Exception if no servers were found with the given agentId
+        if (servers == null || servers.isEmpty())
+          throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
+                  "No JMX Servers found with agentId: " + jmxConfig.agentId);
+      }
 
-        TBinaryProtocol binaryProtocol = new TBinaryProtocol(transport_, true, true);
-        Cassandra.Client cassandraClient = new Cassandra.Client(binaryProtocol);
+      if (servers == null || servers.isEmpty()) {
+        LOG.info("No JMX servers found, not exposing Solr information with JMX.");
+        return;
+      }
+      server = servers.get(0);
+      LOG.info("JMX monitoring is enabled. Adding Solr mbeans to JMX Server: "
+               + server);
+    } else {
+      try {
+        // Create a new MBeanServer with the given serviceUrl
+        server = MBeanServerFactory.newMBeanServer();
+        JMXConnectorServer connector = JMXConnectorServerFactory
+                .newJMXConnectorServer(new JMXServiceURL(jmxConfig.serviceUrl),
+                        null, server);
+        connector.start();
+        LOG.info("JMX monitoring is enabled at " + jmxConfig.serviceUrl);
+      } catch (Exception e) {
+        // Release the reference
+        server = null;
+        throw new RuntimeException("Could not start JMX monitoring ", e);
+      }
+    }
+  }
 
-        try
-        {
-            transport_.open();
-        }
-        catch (Exception e)
-        {
-            // Should move this to Log4J as well probably...
-            css_.err.format("Exception connecting to %s/%d - %s\n", server, port, e.getMessage());
-
-            if (css_.debug)
-                e.printStackTrace();
-
-            return;
-        }
-
-        thriftClient_ = cassandraClient;
-        cliClient_ = new CliClient(css_, thriftClient_);
-        
-        if (css_.keyspace != null)
-        {
-            try {
-                thriftClient_.set_keyspace(css_.keyspace);
-                cliClient_.setKeyspace(css_.keyspace);
-
-                Set<String> cfnames = new HashSet<String>();
-                KsDef ksd = cliClient_.getKSMetaData(css_.keyspace);
-                for (CfDef cfd : ksd.cf_defs) {
-                    cfnames.add(cfd.name);
-                }
-                updateCompletor(cfnames);
-                
-            }
-            catch (InvalidRequestException e)
-            {
-                css_.err.println("Keyspace " + css_.keyspace + " not found");
-                return;
-            }
-            catch (TException e)
-            {
-                css_.err.println("Did you specify 'keyspace'?");
-                return;
-            }
-            catch (NotFoundException e)
-            {
-                css_.err.println("Keyspace " + css_.keyspace + " not found");
-                return;
-            }
-        }
-        
-        if ((css_.username != null) && (css_.password != null))
-        {
-            // Authenticate 
-            Map<String, String> credentials = new HashMap<String, String>();
-            credentials.put(SimpleAuthenticator.USERNAME_KEY, css_.username);
-            credentials.put(SimpleAuthenticator.PASSWORD_KEY, css_.password);
-            AuthenticationRequest authRequest = new AuthenticationRequest(credentials);
-            try 
-            {
-                thriftClient_.login(authRequest);
-                cliClient_.setUsername(css_.username);
-            } 
-            catch (AuthenticationException e) 
-            {
-                css_.err.println("Exception during authentication to the cassandra node, " +
-                		"Verify the keyspace exists, and that you are using the correct credentials.");
-                return;
-            } 
-            catch (AuthorizationException e) 
-            {
-                css_.err.println("You are not authorized to use keyspace: " + css_.keyspace);
-                return;
-            }
-            catch (TException e) 
-            {
-                css_.err.println("Login failure. Did you specify 'keyspace', 'username' and 'password'?");
-                return;
-            } 
-        }
-        
-        // Lookup the cluster name, this is to make it clear which cluster the user is connected to
-        String clusterName;
-
-        try
-        {
-            clusterName = thriftClient_.describe_cluster_name();
-        }
-        catch (Exception e)
-        {
-
-            css_.err.println("Exception retrieving information about the cassandra node, check you have connected to the thrift port.");
-
-            if (css_.debug)
-                e.printStackTrace();
-
-            return;
-        }
-
-        css_.out.printf("Connected to: \"%s\" on %s/%d%n", clusterName, server, port);
+  /**
+   * Clears the map and unregisters all SolrInfoMBeans in the map from
+   * MBeanServer
+   */
+  @Override
+  public void clear() {
+    if (server != null) {
+      for (Map.Entry<String, SolrInfoMBean> entry : entrySet()) {
+        unregister(entry.getKey(), entry.getValue());
+      }
     }
 
-    /**
-     * Disconnect thrift connection to cassandra instance
-     */
-    public static void disconnect()
-    {
-        if (transport_ != null)
-        {
-            transport_.close();
-            transport_ = null;
-        }
+    super.clear();
+  }
+
+  /**
+   * Adds the SolrInfoMBean to the map and registers the given SolrInfoMBean
+   * instance with the MBeanServer defined for this core. If a SolrInfoMBean is
+   * already registered with the MBeanServer then it is unregistered and then
+   * re-registered.
+   *
+   * @param key      the JMX type name for this SolrInfoMBean
+   * @param infoBean the SolrInfoMBean instance to be registered
+   */
+  @Override
+  public SolrInfoMBean put(String key, SolrInfoMBean infoBean) {
+    if (server != null && infoBean != null) {
+      try {
+        ObjectName name = getObjectName(key, infoBean);
+        if (server.isRegistered(name))
+          server.unregisterMBean(name);
+        SolrDynamicMBean mbean = new SolrDynamicMBean(coreHashCode, infoBean);
+        server.registerMBean(mbean, name);
+      } catch (Exception e) {
+        LOG.warn( "Failed to register info bean: " + key, e);
+      }
     }
 
-    private static void printBanner()
-    {
-        css_.out.println("Welcome to cassandra CLI.\n");
-        css_.out.println("Type 'help' or '?' for help. Type 'quit' or 'exit' to quit.");
+    return super.put(key, infoBean);
+  }
+
+  /**
+   * Removes the SolrInfoMBean object at the given key and unregisters it from
+   * MBeanServer
+   *
+   * @param key the JMX type name for this SolrInfoMBean
+   */
+  @Override
+  public SolrInfoMBean remove(Object key) {
+    SolrInfoMBean infoBean = get(key);
+    if (infoBean != null) {
+      try {
+        unregister((String) key, infoBean);
+      } catch (RuntimeException e) {
+        LOG.warn( "Failed to unregister info bean: " + key, e);
+      }
+    }
+    return super.remove(key);
+  }
+
+  private void unregister(String key, SolrInfoMBean infoBean) {
+    if (server == null)
+      return;
+
+    try {
+      ObjectName name = getObjectName(key, infoBean);
+      if (server.isRegistered(name) && coreHashCode.equals(server.getAttribute(name, "coreHashCode"))) {
+        server.unregisterMBean(name);
+      }
+    } catch (Exception e) {
+      throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
+              "Failed to unregister info bean: " + key, e);
+    }
+  }
+
+  private ObjectName getObjectName(String key, SolrInfoMBean infoBean)
+          throws MalformedObjectNameException {
+    Hashtable<String, String> map = new Hashtable<String, String>();
+    map.put("type", key);
+    if (infoBean.getName() != null && !"".equals(infoBean.getName())) {
+      map.put("id", infoBean.getName());
+    }
+    return ObjectName.getInstance(jmxRootName, map);
+  }
+
+  /** For test verification */
+  public MBeanServer getServer() {
+    return server;
+  }
+
+  /**
+   * DynamicMBean is used to dynamically expose all SolrInfoMBean
+   * getStatistics() NameList keys as String getters.
+   */
+  static class SolrDynamicMBean implements DynamicMBean {
+    private SolrInfoMBean infoBean;
+
+    private HashSet<String> staticStats;
+
+    private String coreHashCode;
+
+    public SolrDynamicMBean(String coreHashCode, SolrInfoMBean managedResource) {
+      this.infoBean = managedResource;
+      staticStats = new HashSet<String>();
+
+      // For which getters are already available in SolrInfoMBean
+      staticStats.add("name");
+      staticStats.add("version");
+      staticStats.add("description");
+      staticStats.add("category");
+      staticStats.add("source");
+      this.coreHashCode = coreHashCode;
     }
 
-    /**
-     * Checks whether the thrift client is connected.
-     */
-    public static boolean isConnected()
-    {
-        if (thriftClient_ == null)
-        {
-            css_.out.println("Not connected to a cassandra instance.");
-            return false;
-        }
-        return true;
-    }
-    
-    public static void updateCompletor(Set<String> candidates)
-    {
-        Set<String> actions = new HashSet<String>();
-        for (String cf : candidates)
-        {
-            for (String cmd : completer_.getKeyspaceCommands())
-                actions.add(String.format("%s %s", cmd, cf));
-        }
-        
-        String[] strs = Arrays.copyOf(actions.toArray(), actions.toArray().length, String[].class);
-        
-        completer_.setCandidateStrings(strs);
-    }
+    @Override
+    public MBeanInfo getMBeanInfo() {
+      ArrayList<MBeanAttributeInfo> attrInfoList = new ArrayList<MBeanAttributeInfo>();
 
-    private static void processCLIStmt(String query)
-    {
-        try
-        {
-            cliClient_.executeCLIStmt(query);
-        }
-        catch (InvalidRequestException ire)
-        {
-            css_.err.println(ire.why);
-            if (css_.debug)
-                ire.printStackTrace(css_.err);
-            
-            // Abort a batch run when errors are encountered
-            if (css_.batch)
-                System.exit(4);
-        }
-        catch (Exception e)
-        {
-            css_.err.println((e.getCause() == null) ? e.getMessage() : e.getCause().getMessage());
-            
-            if (css_.debug)
-                e.printStackTrace(css_.err);
-            
-            // Abort a batch run when errors are encountered
-            if (css_.batch)
-                System.exit(8);
-        }
-    }
+      for (String stat : staticStats) {
+        attrInfoList.add(new MBeanAttributeInfo(stat, String.class.getName(),
+                null, true, false, false));
+      }
 
-    public static void main(String args[]) throws IOException
-    {
-        // process command line args
-        CliOptions cliOptions = new CliOptions();
-        cliOptions.processArgs(css_, args);
+      // add core's hashcode
+      attrInfoList.add(new MBeanAttributeInfo("coreHashCode", String.class.getName(),
+                null, true, false, false));
 
-        // connect to cassandra server if host argument specified.
-        if (css_.hostName != null)
-        {
-            connect(css_.hostName, css_.thriftPort);
-        }
-        
-        if ( cliClient_ == null )
-        {
-            // Connection parameter was either invalid or not present.
-            // User must connect explicitly using the "connect" CLI statement.
-            cliClient_ = new CliClient(css_, null);
-        }
-
-        ConsoleReader reader = new ConsoleReader();
-        
-        if (!css_.batch)
-        {
-            reader.addCompletor(completer_);
-            reader.setBellEnabled(false);
-            
-            String historyFile = System.getProperty("user.home") + File.separator + HISTORYFILE;
-
-            try
-            {
-                History history = new History(new File(historyFile));
-                reader.setHistory(history);
+      try {
+        NamedList dynamicStats = infoBean.getStatistics();
+        if (dynamicStats != null) {
+          for (int i = 0; i < dynamicStats.size(); i++) {
+            String name = dynamicStats.getName(i);
+            if (staticStats.contains(name)) {
+              continue;
             }
-            catch (IOException exp)
-            {
-                css_.err.printf("Unable to open %s for writing %n", historyFile);
+            Class type = dynamicStats.get(name).getClass();
+            OpenType typeBox = determineType(type);
+            if (type.equals(String.class) || typeBox == null) {
+              attrInfoList.add(new MBeanAttributeInfo(dynamicStats.getName(i),
+                  String.class.getName(), null, true, false, false));
+            } else {
+              attrInfoList.add(new OpenMBeanAttributeInfoSupport(
+                  dynamicStats.getName(i), dynamicStats.getName(i), typeBox,
+                  true, false, false));
             }
+          }
         }
-        else
-        {
-            css_.out.close();
-        }
+      } catch (Exception e) {
+        LOG.warn("Could not getStatistics on info bean {}", infoBean.getName(), e);
+      }
 
-        printBanner();
-
-        String line;
-        while ((line = reader.readLine("[" + cliClient_.getUsername() + "@" + cliClient_.getKeySpace() + "] ")) != null)
-        {
-            processCLIStmt(line);
-        }
+      MBeanAttributeInfo[] attrInfoArr = attrInfoList
+              .toArray(new MBeanAttributeInfo[attrInfoList.size()]);
+      return new MBeanInfo(getClass().getName(), infoBean
+              .getDescription(), attrInfoArr, null, null, null);
     }
+
+    private OpenType determineType(Class type) {
+      try {
+        for (Field field : SimpleType.class.getFields()) {
+          if (field.getType().equals(SimpleType.class)) {
+            SimpleType candidate = (SimpleType) field.get(SimpleType.class);
+            if (candidate.getTypeName().equals(type.getName())) {
+              return candidate;
+            }
+          }
+        }
+      } catch (Exception e) {
+        throw new RuntimeException(e);
+      }
+      return null;
+    }
+
+    @Override
+    public Object getAttribute(String attribute)
+            throws AttributeNotFoundException, MBeanException, ReflectionException {
+      Object val;
+      if ("coreHashCode".equals(attribute)) {
+        val = coreHashCode;
+      } else if (staticStats.contains(attribute) && attribute != null
+              && attribute.length() > 0) {
+        try {
+          String getter = "get" + attribute.substring(0, 1).toUpperCase(Locale.ROOT)
+                  + attribute.substring(1);
+          Method meth = infoBean.getClass().getMethod(getter);
+          val = meth.invoke(infoBean);
+        } catch (Exception e) {
+          throw new AttributeNotFoundException(attribute);
+        }
+      } else {
+        NamedList list = infoBean.getStatistics();
+        val = list.get(attribute);
+      }
+
+      if (val != null) {
+        // Its String or one of the simple types, just return it as JMX suggests direct support for such types
+        for (String simpleTypeName : SimpleType.ALLOWED_CLASSNAMES_LIST) {
+          if (val.getClass().getName().equals(simpleTypeName)) {
+            return val;
+          }
+        }
+        // Its an arbitrary object which could be something complex and odd, return its toString, assuming that is
+        // a workable representation of the object
+        return val.toString();
+      }
+      return null;
+    }
+
+    @Override
+    public AttributeList getAttributes(String[] attributes) {
+      AttributeList list = new AttributeList();
+      for (String attribute : attributes) {
+        try {
+          list.add(new Attribute(attribute, getAttribute(attribute)));
+        } catch (Exception e) {
+          LOG.warn("Could not get attibute " + attribute);
+        }
+      }
+
+      return list;
+    }
+
+    @Override
+    public void setAttribute(Attribute attribute)
+            throws AttributeNotFoundException, InvalidAttributeValueException,
+            MBeanException, ReflectionException {
+      throw new UnsupportedOperationException("Operation not Supported");
+    }
+
+    @Override
+    public AttributeList setAttributes(AttributeList attributes) {
+      throw new UnsupportedOperationException("Operation not Supported");
+    }
+
+    @Override
+    public Object invoke(String actionName, Object[] params, String[] signature)
+            throws MBeanException, ReflectionException {
+      throw new UnsupportedOperationException("Operation not Supported");
+    }
+  }
 }

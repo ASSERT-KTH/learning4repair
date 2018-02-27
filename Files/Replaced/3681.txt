@@ -1,239 +1,169 @@
-iw.shutdown();
+bf = BloomFilter.getFilter(keyCount, 15);
 
-package org.apache.lucene.queries.function;
-
+package org.apache.cassandra.io;
 /*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * 
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ * 
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ * 
  */
 
-import org.apache.lucene.analysis.MockAnalyzer;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.Field;
-import org.apache.lucene.document.TextField;
-import org.apache.lucene.index.FieldInvertState;
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.IndexWriterConfig;
-import org.apache.lucene.index.RandomIndexWriter;
-import org.apache.lucene.queries.function.valuesource.NormValueSource;
-import org.apache.lucene.search.CheckHits;
-import org.apache.lucene.search.IndexSearcher;
-import org.apache.lucene.search.Query;
-import org.apache.lucene.search.ScoreDoc;
-import org.apache.lucene.search.Sort;
-import org.apache.lucene.search.SortField;
-import org.apache.lucene.search.TopDocs;
-import org.apache.lucene.search.similarities.Similarity;
-import org.apache.lucene.search.similarities.TFIDFSimilarity;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.LuceneTestCase;
-import org.junit.AfterClass;
-import org.junit.BeforeClass;
 
-public class TestLongNormValueSource extends LuceneTestCase {
+import java.io.*;
+import java.util.ArrayList;
 
-  static Directory dir;
-  static IndexReader reader;
-  static IndexSearcher searcher;
-  private static Similarity sim = new PreciseDefaultSimilarity();
+import org.apache.log4j.Logger;
 
-  @BeforeClass
-  public static void beforeClass() throws Exception {
-    dir = newDirectory();
-    IndexWriterConfig iwConfig = newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random()));
-    iwConfig.setMergePolicy(newLogMergePolicy());
-    iwConfig.setSimilarity(sim);
-    RandomIndexWriter iw = new RandomIndexWriter(random(), dir, iwConfig);
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.BloomFilter;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import com.reardencommerce.kernel.collections.shared.evictable.ConcurrentLinkedHashMap;
 
-    Document doc = new Document();
-    doc.add(new TextField("text", "this is a test test test", Field.Store.NO));
-    iw.addDocument(doc);
+public class SSTableWriter extends SSTable
+{
+    private static Logger logger = Logger.getLogger(SSTableWriter.class);
 
-    doc = new Document();
-    doc.add(new TextField("text", "second test", Field.Store.NO));
-    iw.addDocument(doc);
+    private long keysWritten;
+    private BufferedRandomAccessFile dataFile;
+    private BufferedRandomAccessFile indexFile;
+    private DecoratedKey lastWrittenKey;
+    private BloomFilter bf;
 
-    reader = iw.getReader();
-    searcher = newSearcher(reader);
-    iw.close();
-  }
-
-  @AfterClass
-  public static void afterClass() throws Exception {
-    searcher = null;
-    reader.close();
-    reader = null;
-    dir.close();
-    dir = null;
-  }
-
-  public void testNorm() throws Exception {
-    Similarity saved = searcher.getSimilarity();
-    try {
-      // no norm field (so agnostic to indexed similarity)
-      searcher.setSimilarity(sim);
-      assertHits(new FunctionQuery(
-          new NormValueSource("text")),
-          new float[] { 0f, 0f });
-    } finally {
-      searcher.setSimilarity(saved);
+    public SSTableWriter(String filename, long keyCount, IPartitioner partitioner) throws IOException
+    {
+        super(filename, partitioner);
+        dataFile = new BufferedRandomAccessFile(path, "rw", (int)(DatabaseDescriptor.getFlushDataBufferSizeInMB() * 1024 * 1024));
+        indexFile = new BufferedRandomAccessFile(indexFilename(), "rw", (int)(DatabaseDescriptor.getFlushIndexBufferSizeInMB() * 1024 * 1024));
+        bf = new BloomFilter((int)keyCount, 15); // TODO fix long -> int cast
     }
-  }
 
-  void assertHits(Query q, float scores[]) throws Exception {
-    ScoreDoc expected[] = new ScoreDoc[scores.length];
-    int expectedDocs[] = new int[scores.length];
-    for (int i = 0; i < expected.length; i++) {
-      expectedDocs[i] = i;
-      expected[i] = new ScoreDoc(i, scores[i]);
+    private long beforeAppend(DecoratedKey decoratedKey) throws IOException
+    {
+        if (decoratedKey == null)
+        {
+            throw new IOException("Keys must not be null.");
+        }
+        if (lastWrittenKey != null && lastWrittenKey.compareTo(decoratedKey) > 0)
+        {
+            logger.info("Last written key : " + lastWrittenKey);
+            logger.info("Current key : " + decoratedKey);
+            logger.info("Writing into file " + path);
+            throw new IOException("Keys must be written in ascending order.");
+        }
+        return (lastWrittenKey == null) ? 0 : dataFile.getFilePointer();
     }
-    TopDocs docs = searcher.search(q, 2, new Sort(new SortField("id", SortField.Type.STRING)));
 
-    /*
-    for (int i=0;i<docs.scoreDocs.length;i++) {
-      System.out.println(searcher.explain(q, docs.scoreDocs[i].doc));
+    private void afterAppend(DecoratedKey decoratedKey, long position) throws IOException
+    {
+        String diskKey = partitioner.convertToDiskFormat(decoratedKey);
+        bf.add(diskKey);
+        lastWrittenKey = decoratedKey;
+        long indexPosition = indexFile.getFilePointer();
+        indexFile.writeUTF(diskKey);
+        indexFile.writeLong(position);
+        if (logger.isTraceEnabled())
+            logger.trace("wrote " + decoratedKey + " at " + position);
+
+        if (keysWritten++ % INDEX_INTERVAL != 0)
+            return;
+        if (indexPositions == null)
+        {
+            indexPositions = new ArrayList<KeyPosition>();
+        }
+        indexPositions.add(new KeyPosition(decoratedKey, indexPosition));
+        if (logger.isTraceEnabled())
+            logger.trace("wrote index of " + decoratedKey + " at " + indexPosition);
     }
-    */
 
-    CheckHits.checkHits(random(), q, "", searcher, expectedDocs);
-    CheckHits.checkHitsQuery(q, expected, docs.scoreDocs, expectedDocs);
-    CheckHits.checkExplanations(q, "", searcher);
-  }
-}
-
-
-/** Encodes norm as 4-byte float. */
-class PreciseDefaultSimilarity extends TFIDFSimilarity {
-
-  /** Sole constructor: parameter-free */
-  public PreciseDefaultSimilarity() {}
-
-  /** Implemented as <code>overlap / maxOverlap</code>. */
-  @Override
-  public float coord(int overlap, int maxOverlap) {
-    return overlap / (float)maxOverlap;
-  }
-
-  /** Implemented as <code>1/sqrt(sumOfSquaredWeights)</code>. */
-  @Override
-  public float queryNorm(float sumOfSquaredWeights) {
-    return (float)(1.0 / Math.sqrt(sumOfSquaredWeights));
-  }
-
-  /**
-   * Encodes a normalization factor for storage in an index.
-   * <p>
-   * The encoding uses a three-bit mantissa, a five-bit exponent, and the
-   * zero-exponent point at 15, thus representing values from around 7x10^9 to
-   * 2x10^-9 with about one significant decimal digit of accuracy. Zero is also
-   * represented. Negative numbers are rounded up to zero. Values too large to
-   * represent are rounded down to the largest representable value. Positive
-   * values too small to represent are rounded up to the smallest positive
-   * representable value.
-   *
-   * @see org.apache.lucene.document.Field#setBoost(float)
-   * @see org.apache.lucene.util.SmallFloat
-   */
-  @Override
-  public final long encodeNormValue(float f) {
-    return Float.floatToIntBits(f);
-  }
-
-  /**
-   * Decodes the norm value, assuming it is a single byte.
-   *
-   * @see #encodeNormValue(float)
-   */
-  @Override
-  public final float decodeNormValue(long norm) {
-    return Float.intBitsToFloat((int)norm);
-  }
-
-  /** Implemented as
-   *  <code>state.getBoost()*lengthNorm(numTerms)</code>, where
-   *  <code>numTerms</code> is {@link org.apache.lucene.index.FieldInvertState#getLength()} if {@link
-   *  #setDiscountOverlaps} is false, else it's {@link
-   *  org.apache.lucene.index.FieldInvertState#getLength()} - {@link
-   *  org.apache.lucene.index.FieldInvertState#getNumOverlap()}.
-   *
-   *  @lucene.experimental */
-  @Override
-  public float lengthNorm(FieldInvertState state) {
-    final int numTerms;
-    if (discountOverlaps) {
-      numTerms = state.getLength() - state.getNumOverlap();
-    } else {
-      numTerms = state.getLength();
+    // TODO make this take a DataOutputStream and wrap the byte[] version to combine them
+    public void append(DecoratedKey decoratedKey, DataOutputBuffer buffer) throws IOException
+    {
+        long currentPosition = beforeAppend(decoratedKey);
+        dataFile.writeUTF(partitioner.convertToDiskFormat(decoratedKey));
+        int length = buffer.getLength();
+        assert length > 0;
+        dataFile.writeInt(length);
+        dataFile.write(buffer.getData(), 0, length);
+        afterAppend(decoratedKey, currentPosition);
     }
-    return state.getBoost() * ((float) (1.0 / Math.sqrt(numTerms)));
-  }
 
-  /** Implemented as <code>sqrt(freq)</code>. */
-  @Override
-  public float tf(float freq) {
-    return (float)Math.sqrt(freq);
-  }
+    public void append(DecoratedKey decoratedKey, byte[] value) throws IOException
+    {
+        long currentPosition = beforeAppend(decoratedKey);
+        dataFile.writeUTF(partitioner.convertToDiskFormat(decoratedKey));
+        assert value.length > 0;
+        dataFile.writeInt(value.length);
+        dataFile.write(value);
+        afterAppend(decoratedKey, currentPosition);
+    }
 
-  /** Implemented as <code>1 / (distance + 1)</code>. */
-  @Override
-  public float sloppyFreq(int distance) {
-    return 1.0f / (distance + 1);
-  }
+    /**
+     * Renames temporary SSTable files to valid data, index, and bloom filter files
+     */
+    public SSTableReader closeAndOpenReader(double cacheFraction) throws IOException
+    {
+        // bloom filter
+        FileOutputStream fos = new FileOutputStream(filterFilename());
+        DataOutputStream stream = new DataOutputStream(fos);
+        BloomFilter.serializer().serialize(bf, stream);
+        stream.flush();
+        fos.getFD().sync();
+        stream.close();
 
-  /** The default implementation returns <code>1</code> */
-  @Override
-  public float scorePayload(int doc, int start, int end, BytesRef payload) {
-    return 1;
-  }
+        // index
+        indexFile.getChannel().force(true);
+        indexFile.close();
 
-  /** Implemented as <code>log(numDocs/(docFreq+1)) + 1</code>. */
-  @Override
-  public float idf(long docFreq, long numDocs) {
-    return (float)(Math.log(numDocs/(double)(docFreq+1)) + 1.0);
-  }
+        // main data
+        dataFile.close(); // calls force
 
-  /**
-   * True if overlap tokens (tokens with a position of increment of zero) are
-   * discounted from the document's length.
-   */
-  protected boolean discountOverlaps = true;
+        rename(indexFilename());
+        rename(filterFilename());
+        path = rename(path); // important to do this last since index & filter file names are derived from it
 
-  /** Determines whether overlap tokens (Tokens with
-   *  0 position increment) are ignored when computing
-   *  norm.  By default this is true, meaning overlap
-   *  tokens do not count when computing norms.
-   *
-   *  @lucene.experimental
-   *
-   *  @see #computeNorm
-   */
-  public void setDiscountOverlaps(boolean v) {
-    discountOverlaps = v;
-  }
+        ConcurrentLinkedHashMap<DecoratedKey, Long> keyCache = cacheFraction > 0
+                                                        ? SSTableReader.createKeyCache((int) (cacheFraction * keysWritten))
+                                                        : null;
+        return new SSTableReader(path, partitioner, indexPositions, bf, keyCache);
+    }
 
-  /**
-   * Returns true if overlap tokens are discounted from the document's length.
-   * @see #setDiscountOverlaps
-   */
-  public boolean getDiscountOverlaps() {
-    return discountOverlaps;
-  }
+    static String rename(String tmpFilename)
+    {
+        String filename = tmpFilename.replace("-" + SSTable.TEMPFILE_MARKER, "");
+        try
+        {
+            FBUtilities.renameWithConfirm(tmpFilename, filename);
+        }
+        catch (IOException e)
+        {
+            throw new IOError(e);
+        }
+        return filename;
+    }
 
-  @Override
-  public String toString() {
-    return "DefaultSimilarity";
-  }
+    public static SSTableReader renameAndOpen(String dataFileName) throws IOException
+    {
+        SSTableWriter.rename(indexFilename(dataFileName));
+        SSTableWriter.rename(filterFilename(dataFileName));
+        dataFileName = SSTableWriter.rename(dataFileName);
+        return SSTableReader.open(dataFileName, StorageService.getPartitioner(), DatabaseDescriptor.getKeysCachedFraction(parseTableName(dataFileName)));
+    }
+
 }

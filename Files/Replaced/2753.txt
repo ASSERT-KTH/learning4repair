@@ -1,4 +1,4 @@
-if (!result.isDigestQuery())
+protected static EndPoint sentinelLocalEndPoint_;
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one
@@ -18,195 +18,159 @@ if (!result.isDigestQuery())
  * limitations under the License.
  */
 
-package org.apache.cassandra.service;
+package org.apache.cassandra.net;
 
-import java.io.ByteArrayInputStream;
-import java.io.DataInputStream;
-import java.io.IOError;
+
 import java.io.IOException;
-import java.util.*;
-
-import org.apache.cassandra.db.*;
-import java.net.InetAddress;
+import java.io.Serializable;
+import java.net.*;
 import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
+import java.util.HashMap;
+import java.util.Map;
 
-import org.apache.cassandra.net.Message;
-import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.utils.FBUtilities;
-import org.cliffc.high_scale_lib.NonBlockingHashMap;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.cassandra.utils.LogUtil;
+import org.apache.log4j.Logger;
 
 /**
- * Turns ReadResponse messages into Row objects, resolving to the most recent
- * version and setting up read repairs as necessary.
+ * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
  */
-public class ReadResponseResolver implements IResponseResolver<Row>
+
+public class EndPoint implements Serializable, Comparable<EndPoint>
 {
-	private static Logger logger_ = LoggerFactory.getLogger(ReadResponseResolver.class);
-    private final String table;
-    private final Map<Message, ReadResponse> results = new NonBlockingHashMap<Message, ReadResponse>();
+    // logging and profiling.
+    private static Logger logger_ = Logger.getLogger(EndPoint.class);
+    private static final long serialVersionUID = -4962625949179835907L;
+    private static Map<CharBuffer, String> hostNames_ = new HashMap<CharBuffer, String>();
 
-    public ReadResponseResolver(String table)
-    {
-        this.table = table;
-    }
+    // use as a kind of magic number to send ourselves a message indicating listening state
+    protected static final int sentinelPort_ = 5555;
+    public static EndPoint sentinelLocalEndPoint_;
     
-    /*
-      * This method for resolving read data should look at the timestamps of each
-      * of the columns that are read and should pick up columns with the latest
-      * timestamp. For those columns where the timestamp is not the latest a
-      * repair request should be scheduled.
-      *
-      */
-	public Row resolve(Collection<Message> responses) throws DigestMismatchException, IOException
+    static
     {
-        if (logger_.isDebugEnabled())
-            logger_.debug("resolving " + responses.size() + " responses");
-
-        long startTime = System.currentTimeMillis();
-		List<ColumnFamily> versions = new ArrayList<ColumnFamily>(responses.size());
-		List<InetAddress> endpoints = new ArrayList<InetAddress>(responses.size());
-		DecoratedKey key = null;
-		ByteBuffer digest = FBUtilities.EMPTY_BYTE_BUFFER;
-		boolean isDigestQuery = false;
-        
-        /*
-		 * Populate the list of rows from each of the messages
-		 * Check to see if there is a digest query. If a digest 
-         * query exists then we need to compare the digest with 
-         * the digest of the data that is received.
-        */
-		for (Message message : responses)
-		{
-            ReadResponse result = results.get(message);
-            if (result == null)
-                continue; // arrived after quorum already achieved
-            if (result.isDigestQuery())
-            {
-                digest = result.digest();
-                isDigestQuery = true;
-            }
-            else
-            {
-                versions.add(result.row().cf);
-                endpoints.add(message.getFrom());
-                key = result.row().key;
-            }
-        }
-
-		// If there was a digest query compare it with all the data digests
-		// If there is a mismatch then throw an exception so that read repair can happen.
-        if (isDigestQuery)
-        {
-            
-            for (ColumnFamily cf : versions)
-            {
-                if (!ColumnFamily.digest(cf).equals(digest))
-                {
-                    /* Wrap the key as the context in this exception */
-                    String s = String.format("Mismatch for key %s (%s vs %s)", key, FBUtilities.bytesToHex(ColumnFamily.digest(cf)), FBUtilities.bytesToHex(digest));
-                    throw new DigestMismatchException(s);
-                }
-            }
-            if (logger_.isDebugEnabled())
-                logger_.debug("digests verified");
-        }
-
-        ColumnFamily resolved;
-        if (versions.size() > 1)
-        {
-            resolved = resolveSuperset(versions);
-            if (logger_.isDebugEnabled())
-                logger_.debug("versions merged");
-            maybeScheduleRepairs(resolved, table, key, versions, endpoints);
-        }
-        else
-        {
-            resolved = versions.get(0);
-        }
-
-        if (logger_.isDebugEnabled())
-            logger_.debug("resolve: " + (System.currentTimeMillis() - startTime) + " ms.");
-		return new Row(key, resolved);
-	}
-
-    /**
-     * For each row version, compare with resolved (the superset of all row versions);
-     * if it is missing anything, send a mutation to the endpoint it come from.
-     */
-    public static void maybeScheduleRepairs(ColumnFamily resolved, String table, DecoratedKey key, List<ColumnFamily> versions, List<InetAddress> endpoints)
-    {
-        for (int i = 0; i < versions.size(); i++)
-        {
-            ColumnFamily diffCf = ColumnFamily.diff(versions.get(i), resolved);
-            if (diffCf == null) // no repair needs to happen
-                continue;
-
-            // create and send the row mutation message based on the diff
-            RowMutation rowMutation = new RowMutation(table, key.key);
-            rowMutation.add(diffCf);
-            RowMutationMessage rowMutationMessage = new RowMutationMessage(rowMutation);
-            Message repairMessage;
-            try
-            {
-                repairMessage = rowMutationMessage.makeRowMutationMessage(StorageService.Verb.READ_REPAIR);
-            }
-            catch (IOException e)
-            {
-                throw new IOError(e);
-            }
-            MessagingService.instance.sendOneWay(repairMessage, endpoints.get(i));
-        }
-    }
-
-    static ColumnFamily resolveSuperset(List<ColumnFamily> versions)
-    {
-        assert versions.size() > 0;
-        ColumnFamily resolved = null;
-        for (ColumnFamily cf : versions)
-        {
-            if (cf != null)
-            {
-                resolved = cf.cloneMe();
-                break;
-            }
-        }
-        if (resolved == null)
-            return null;
-        for (ColumnFamily cf : versions)
-        {
-            resolved.resolve(cf);
-        }
-        return resolved;
-    }
-
-    public void preprocess(Message message)
-    {
-        byte[] body = message.getMessageBody();
-        ByteArrayInputStream bufIn = new ByteArrayInputStream(body);
         try
         {
-            ReadResponse result = ReadResponse.serializer().deserialize(new DataInputStream(bufIn));
-            results.put(message, result);
-        }
-        catch (IOException e)
+            sentinelLocalEndPoint_ = new EndPoint(FBUtilities.getHostAddress(), EndPoint.sentinelPort_);
+        }        
+        catch ( IOException ex )
         {
-            throw new IOError(e);
+            logger_.warn(LogUtil.throwableToString(ex));
         }
     }
 
-    public boolean isDataPresent(Collection<Message> responses)
-	{
-        for (Message message : responses)
+    private String host_;
+    private int port_;
+
+    private transient InetSocketAddress ia_;
+
+    public EndPoint(String host, int port)
+    {
+        assert host.matches("\\d+\\.\\d+\\.\\d+\\.\\d+") : host;
+        host_ = host;
+        port_ = port;
+    }
+
+    // create a local endpoint id
+    public EndPoint(int port)
+    {
+        try
         {
-            ReadResponse result = results.get(message);
-            if (result == null)
-                continue; // arrived concurrently
-            if (result.isDigestQuery())
-                return true;
+            host_ = FBUtilities.getHostAddress();
         }
-        return false;
+        catch (UnknownHostException e)
+        {
+            throw new RuntimeException(e);
+        }
+        port_ = port;
+    }
+
+    public String getHost()
+    {
+        return host_;
+    }
+
+    public int getPort()
+    {
+        return port_;
+    }
+
+    public void setPort(int port)
+    {
+        port_ = port;
+    }
+
+    public InetSocketAddress getInetAddress()
+    {
+        if (ia_ == null || ia_.isUnresolved())
+        {
+            ia_ = new InetSocketAddress(host_, port_);
+        }
+        return ia_;
+    }
+
+    public boolean equals(Object o)
+    {
+        if (!(o instanceof EndPoint))
+            return false;
+
+        EndPoint rhs = (EndPoint) o;
+        return (host_.equals(rhs.host_) && port_ == rhs.port_);
+    }
+
+    public int hashCode()
+    {
+        return (host_ + port_).hashCode();
+    }
+
+    public int compareTo(EndPoint rhs)
+    {
+        return host_.compareTo(rhs.host_);
+    }
+
+    public String toString()
+    {
+        return (host_ + ":" + port_);
+    }
+
+    public static EndPoint fromString(String str)
+    {
+        String[] values = str.split(":");
+        return new EndPoint(values[0], Integer.parseInt(values[1]));
+    }
+
+    public static byte[] toBytes(EndPoint ep)
+    {
+        ByteBuffer buffer = ByteBuffer.allocate(6);
+        byte[] iaBytes = ep.getInetAddress().getAddress().getAddress();
+        buffer.put(iaBytes);
+        buffer.put(MessagingService.toByteArray((short) ep.getPort()));
+        buffer.flip();
+        return buffer.array();
+    }
+
+    public static EndPoint fromBytes(byte[] bytes)
+    {
+        ByteBuffer buffer = ByteBuffer.allocate(4);
+        System.arraycopy(bytes, 0, buffer.array(), 0, 4);
+        byte[] portBytes = new byte[2];
+        System.arraycopy(bytes, 4, portBytes, 0, portBytes.length);
+        try
+        {
+            CharBuffer charBuffer = buffer.asCharBuffer();
+            String host = hostNames_.get(charBuffer);
+            if (host == null)
+            {               
+                host = InetAddress.getByAddress(buffer.array()).getHostAddress();              
+                hostNames_.put(charBuffer, host);
+            }
+            int port = (int) MessagingService.byteArrayToShort(portBytes);
+            return new EndPoint(host, port);
+        }
+        catch (UnknownHostException e)
+        {
+            throw new IllegalArgumentException(e);
+        }
     }
 }

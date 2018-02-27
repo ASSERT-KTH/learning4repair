@@ -1,10 +1,11 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -15,247 +16,424 @@
  * limitations under the License.
  */
 
-package org.apache.solr.handler.component;
+package org.apache.cassandra.db;
 
-import java.io.File;
+import java.io.IOError;
 import java.util.*;
+import java.io.IOException;
+import java.io.File;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.concurrent.Future;
 
-import org.apache.lucene.util.Constants;
-import org.apache.lucene.util.LuceneTestCase.Slow;
-import org.apache.solr.SolrTestCaseJ4;
-import org.apache.solr.common.params.CommonParams;
-import org.apache.solr.common.params.ModifiableSolrParams;
-import org.apache.solr.common.params.SpellingParams;
-import org.apache.solr.common.util.NamedList;
-import org.apache.solr.common.util.SimpleOrderedMap;
-import org.apache.solr.core.SolrCore;
-import org.apache.solr.request.LocalSolrQueryRequest;
-import org.apache.solr.request.SolrQueryRequest;
-import org.apache.solr.request.SolrRequestHandler;
-import org.apache.solr.response.SolrQueryResponse;
-import org.apache.solr.spelling.AbstractLuceneSpellChecker;
-import org.apache.solr.spelling.SolrSpellChecker;
-import org.junit.BeforeClass;
-import org.junit.Test;
+import com.google.common.base.Function;
+import com.google.common.collect.Iterables;
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.Config;
+import org.apache.cassandra.db.commitlog.CommitLog;
+import org.apache.cassandra.db.commitlog.CommitLogSegment;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.io.sstable.SSTableDeletingReference;
+import org.apache.cassandra.io.sstable.SSTableReader;
+import org.apache.cassandra.io.util.FileUtils;
 
-/**
- * @since solr 1.3
- */
-@Slow
-public class SpellCheckComponentTest extends SolrTestCaseJ4 {
-  static String rh = "spellCheckCompRH";
+import java.net.InetAddress;
 
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.db.filter.*;
+import org.cliffc.high_scale_lib.NonBlockingHashMap;
 
-  @BeforeClass
-  public static void beforeClass() throws Exception {
-    initCore("solrconfig-spellcheckcomponent.xml","schema.xml");
-  }
-  
-  @Override
-  public void setUp() throws Exception {
-    super.setUp();
-    assertU(adoc("id", "0", "lowerfilt", "This is a title"));
-    assertU((adoc("id", "1", "lowerfilt",
-            "The quick reb fox jumped over the lazy brown dogs.")));
-    assertU((adoc("id", "2", "lowerfilt", "This is a document")));
-    assertU((adoc("id", "3", "lowerfilt", "another document")));
-    //bunch of docs that are variants on blue
-    assertU((adoc("id", "4", "lowerfilt", "blue")));
-    assertU((adoc("id", "5", "lowerfilt", "blud")));
-    assertU((adoc("id", "6", "lowerfilt", "boue")));
-    assertU((adoc("id", "7", "lowerfilt", "glue")));
-    assertU((adoc("id", "8", "lowerfilt", "blee")));
-    assertU((adoc("id", "9", "lowerfilt", "pixmaa")));
-    assertU((commit()));
-  }
-  
-  @Override
-  public void tearDown() throws Exception {
-    super.tearDown();
-    assertU(delQ("*:*"));
-    optimize();
-    assertU((commit()));
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-  }
-  
-  @Test
-  public void testExtendedResultsCount() throws Exception {
-    assertJQ(req("qt",rh, SpellCheckComponent.COMPONENT_NAME, "true", SpellingParams.SPELLCHECK_BUILD, "true", "q","bluo", SpellingParams.SPELLCHECK_COUNT,"5", SpellingParams.SPELLCHECK_EXTENDED_RESULTS,"false")
-       ,"/spellcheck/suggestions/[0]=='bluo'"
-       ,"/spellcheck/suggestions/[1]/numFound==5"
-    );
+public class Table 
+{
+    public static final String SYSTEM_TABLE = "system";
+    public static final String DEFINITIONS = "definitions";
 
-    assertJQ(req("qt",rh, SpellCheckComponent.COMPONENT_NAME, "true", "q","bluo", SpellingParams.SPELLCHECK_COUNT,"3", SpellingParams.SPELLCHECK_EXTENDED_RESULTS,"true")
-       ,"/spellcheck/suggestions/[1]/suggestion==[{'word':'blud','freq':1}, {'word':'blue','freq':1}, {'word':'blee','freq':1}]"
-    );
-  }
+    private static final Logger logger = LoggerFactory.getLogger(Table.class);
+    private static final String SNAPSHOT_SUBDIR_NAME = "snapshots";
+    /* accesses to CFS.memtable should acquire this for thread safety.  only switchMemtable should aquire the writeLock. */
+    static final ReentrantReadWriteLock flusherLock = new ReentrantReadWriteLock(true);
 
-  @Test
-  public void test() throws Exception {
-    assertJQ(req("qt",rh, SpellCheckComponent.COMPONENT_NAME, "true", "q","documemt")
-       ,"/spellcheck=={'suggestions':['documemt',{'numFound':1,'startOffset':0,'endOffset':8,'suggestion':['document']}]}"
-    );
-  }
+    private static Timer flushTimer = new Timer("FLUSH-TIMER");
+    private final boolean waitForCommitLog;
 
-
-  @Test
-  public void testPerDictionary() throws Exception {
-    assumeFalse("This test fails in most cases with Java 8+, looks like it depends on order of some HashSet/HashMap whatever", Constants.JRE_IS_MINIMUM_JAVA8);
-    assertJQ(req("json.nl","map", "qt",rh, SpellCheckComponent.COMPONENT_NAME, "true", SpellingParams.SPELLCHECK_BUILD, "true", "q","documemt"
-        , SpellingParams.SPELLCHECK_DICT, "perDict", SpellingParams.SPELLCHECK_PREFIX + ".perDict.foo", "bar", SpellingParams.SPELLCHECK_PREFIX + ".perDict.bar", "foo")
-       ,"/spellcheck/suggestions/bar=={'numFound':1, 'startOffset':0, 'endOffset':1, 'suggestion':['foo']}"
-       ,"/spellcheck/suggestions/foo=={'numFound':1, 'startOffset':2, 'endOffset':3, 'suggestion':['bar']}"        
-    );
-  }
-
-  @Test
-  public void testCollate() throws Exception {
-    assertJQ(req("json.nl","map", "qt",rh, SpellCheckComponent.COMPONENT_NAME, "true", SpellingParams.SPELLCHECK_BUILD, "true", "q","documemt", SpellingParams.SPELLCHECK_COLLATE, "true")
-       ,"/spellcheck/suggestions/collation=='document'"
-    );
-    assertJQ(req("json.nl","map", "qt",rh, SpellCheckComponent.COMPONENT_NAME, "true", "q","documemt lowerfilt:broen^4", SpellingParams.SPELLCHECK_COLLATE, "true")
-       ,"/spellcheck/suggestions/collation=='document lowerfilt:brown^4'"
-    );
-    assertJQ(req("json.nl","map", "qt",rh, SpellCheckComponent.COMPONENT_NAME, "true", "q","documemtsss broens", SpellingParams.SPELLCHECK_COLLATE, "true")
-       ,"/spellcheck/suggestions/collation=='document brown'"
-    );
-    assertJQ(req("json.nl","map", "qt",rh, SpellCheckComponent.COMPONENT_NAME, "true", "q","pixma", SpellingParams.SPELLCHECK_COLLATE, "true")
-       ,"/spellcheck/suggestions/collation=='pixmaa'"
-    );
-  }
-  
-
-  @Test
-  public void testCorrectSpelling() throws Exception {
-    // Make sure correct spellings are signaled in the response
-    assertJQ(req("json.nl","map", "qt",rh, SpellCheckComponent.COMPONENT_NAME, "true",
-        "q","lowerfilt:lazy lowerfilt:brown", SpellingParams.SPELLCHECK_EXTENDED_RESULTS, "true")
-       ,"/spellcheck/suggestions=={'correctlySpelled':true}"
-    );
-    assertJQ(req("json.nl","map", "qt",rh, SpellCheckComponent.COMPONENT_NAME, "true", "spellcheck.dictionary", "direct_lowerfilt",
-        "q","lowerfilt:lazy lowerfilt:brown", SpellingParams.SPELLCHECK_EXTENDED_RESULTS, "true")
-       ,"/spellcheck/suggestions=={'correctlySpelled':true}"
-    );
-    assertJQ(req("json.nl","map", "qt",rh, SpellCheckComponent.COMPONENT_NAME, "true", "spellcheck.dictionary", "direct_lowerfilt",
-        "q","lakkle", SpellingParams.SPELLCHECK_EXTENDED_RESULTS, "true")
-       ,"/spellcheck/suggestions/correctlySpelled==false"
-    );
-  }
-  
-  @SuppressWarnings("unchecked")
-  @Test
-  public void testRelativeIndexDirLocation() throws Exception {
-    SolrCore core = h.getCore();
-    File indexDir = new File(core.getDataDir() + File.separator + "spellchecker1");
-    assertTrue(indexDir.exists());
-    
-    indexDir = new File(core.getDataDir() + File.separator + "spellchecker2");
-    assertTrue(indexDir.exists());
-    
-    indexDir = new File(core.getDataDir() + File.separator + "spellchecker3");
-    assertTrue(indexDir.exists());
-  }
-
-  @Test
-  public void testReloadOnStart() throws Exception {
-    assertU(adoc("id", "0", "lowerfilt", "This is a title"));
-    assertU(commit());
-    SolrQueryRequest request = req("qt", "spellCheckCompRH", "q", "*:*",
-        "spellcheck.q", "ttle", "spellcheck", "true", "spellcheck.dictionary",
-        "default", "spellcheck.build", "true");
-    assertQ(request, "//arr[@name='suggestion'][.='title']");
-
-    NamedList args = new NamedList();
-    NamedList spellchecker = new NamedList();
-    spellchecker.add(SolrSpellChecker.DICTIONARY_NAME, "default");
-    spellchecker.add(AbstractLuceneSpellChecker.FIELD, "lowerfilt");
-    spellchecker.add(AbstractLuceneSpellChecker.INDEX_DIR, "spellchecker1");
-    args.add("spellchecker", spellchecker);
-
-    // TODO: this is really fragile and error prone - find a higher level way to test this.
-    SpellCheckComponent checker = new SpellCheckComponent();
-    checker.init(args);
-    checker.inform(h.getCore());
-
-    request = req("qt", "spellCheckCompRH", "q", "*:*", "spellcheck.q", "ttle",
-        "spellcheck", "true", "spellcheck.dictionary", "default",
-        "spellcheck.reload", "true");
-    ResponseBuilder rb = new ResponseBuilder(request, new SolrQueryResponse(), new ArrayList(h.getCore().getSearchComponents().values()));
-    checker.prepare(rb);
-
-    try {
-      checker.process(rb);
-    } catch (NullPointerException e) {
-      fail("NullPointerException due to reload not initializing analyzers");
+    // This is a result of pushing down the point in time when storage directories get created.  It used to happen in
+    // CassandraDaemon, but it is possible to call Table.open without a running daemon, so it made sense to ensure
+    // proper directories here.
+    static
+    {
+        try
+        {
+            DatabaseDescriptor.createAllDirectories();
+        }
+        catch (IOException ex)
+        {
+            throw new RuntimeException(ex);
+        }
     }
 
-    rb.req.close();
-  }
-  
-    @SuppressWarnings("unchecked")
-    @Test
-  public void testRebuildOnCommit() throws Exception {
-    SolrQueryRequest req = req("q", "lowerfilt:lucenejavt", "qt", "spellCheckCompRH", "spellcheck", "true");
-    String response = h.query(req);
-    assertFalse("No suggestions should be returned", response.contains("lucenejava"));
+    /** Table objects, one per keyspace.  only one instance should ever exist for any given keyspace. */
+    private static final Map<String, Table> instances = new NonBlockingHashMap<String, Table>();
+
+    /* Table name. */
+    public final String name;
+    /* ColumnFamilyStore per column family */
+    private final Map<Integer, ColumnFamilyStore> columnFamilyStores = new HashMap<Integer, ColumnFamilyStore>();
+    /* map to make it easier to look up cfs by name */
+    private final Map<String, Integer> cfNameMap = new HashMap<String, Integer>();
+    // cache application CFs since Range queries ask for them a _lot_
+    private SortedSet<String> applicationColumnFamilies;
+    private final TimerTask flushTask;
     
-    assertU(adoc("id", "11231", "lowerfilt", "lucenejava"));
-    assertU("commit", commit());
+    public static Table open(String table)
+    {
+        Table tableInstance = instances.get(table);
+        if (tableInstance == null)
+        {
+            // instantiate the Table.  we could use putIfAbsent but it's important to making sure it is only done once
+            // per keyspace, so we synchronize and re-check before doing it.
+            synchronized (Table.class)
+            {
+                tableInstance = instances.get(table);
+                if (tableInstance == null)
+                {
+                    tableInstance = new Table(table);
+                    instances.put(table, tableInstance);
+                }
+            }
+        }
+        return tableInstance;
+    }
     
-    assertQ(req, "//arr[@name='suggestion'][.='lucenejava']");
-  }
+    public static Table clear(String table) throws IOException
+    {
+        synchronized (Table.class)
+        {
+            Table t = instances.remove(table);
+            if (t != null)
+                t.flushTask.cancel();
+            return t;
+        }
+    }
     
-    @Test
-    public void testThresholdTokenFrequency() throws Exception {
-    	
-  	  	//"document" is in 2 documents but "another" is only in 1.  
-  	  	//So with a threshold of 29%, "another" is absent from the dictionary 
-  	  	//while "document" is present.
-    	
-  	  	assertJQ(req("qt",rh, SpellCheckComponent.COMPONENT_NAME, "true", "q","documenq", SpellingParams.SPELLCHECK_DICT, "threshold", SpellingParams.SPELLCHECK_COUNT,"5", SpellingParams.SPELLCHECK_EXTENDED_RESULTS,"true")
-  	        ,"/spellcheck/suggestions/[1]/suggestion==[{'word':'document','freq':2}]"
-  	    );
-  	  	
-  	  	assertJQ(req("qt",rh, SpellCheckComponent.COMPONENT_NAME, "true", "q","documenq", SpellingParams.SPELLCHECK_DICT, "threshold_direct", SpellingParams.SPELLCHECK_COUNT,"5", SpellingParams.SPELLCHECK_EXTENDED_RESULTS,"true")
-  	        ,"/spellcheck/suggestions/[1]/suggestion==[{'word':'document','freq':2}]"
-  	    );
-  	  	
-  	  	//TODO:  how do we make this into a 1-liner using "assertQ()" ???
-  	  	SolrCore core = h.getCore();
-  	  	SearchComponent speller = core.getSearchComponent("spellcheck");
-  	  	assertTrue("speller is null and it shouldn't be", speller != null);
-  	  	
-  	  	ModifiableSolrParams params = new ModifiableSolrParams();		
-  			params.add(SpellCheckComponent.COMPONENT_NAME, "true");
-  			params.add(SpellingParams.SPELLCHECK_COUNT, "10");	
-  			params.add(SpellingParams.SPELLCHECK_DICT, "threshold");
-  			params.add(SpellingParams.SPELLCHECK_EXTENDED_RESULTS,"true");
-  			params.add(CommonParams.Q, "anotheq");
-  			
-  			SolrRequestHandler handler = core.getRequestHandler("spellCheckCompRH");
-  			SolrQueryResponse rsp = new SolrQueryResponse();
-  			rsp.add("responseHeader", new SimpleOrderedMap());
-  			SolrQueryRequest req = new LocalSolrQueryRequest(core, params);
-  			handler.handleRequest(req, rsp);
-  			req.close();
-  			NamedList values = rsp.getValues();
-  			NamedList spellCheck = (NamedList) values.get("spellcheck");
-  			NamedList suggestions = (NamedList) spellCheck.get("suggestions");
-  			assertTrue(suggestions.get("suggestion")==null);
-  			assertTrue((Boolean) suggestions.get("correctlySpelled")==false);
-  			
-  			params.remove(SpellingParams.SPELLCHECK_DICT);
-  			params.add(SpellingParams.SPELLCHECK_DICT, "threshold_direct");
-  			rsp = new SolrQueryResponse();
-  			rsp.add("responseHeader", new SimpleOrderedMap());
-  			req = new LocalSolrQueryRequest(core, params);
-  			handler.handleRequest(req, rsp);
-  			req.close();
-  			values = rsp.getValues();
-  			spellCheck = (NamedList) values.get("spellcheck");
-  			suggestions = (NamedList) spellCheck.get("suggestions");
-  			assertTrue(suggestions.get("suggestion")==null);
-  			
-  			assertTrue((Boolean) suggestions.get("correctlySpelled")==false);
+    public Set<String> getColumnFamilies()
+    {
+        return cfNameMap.keySet();
+    }
+
+    public Collection<ColumnFamilyStore> getColumnFamilyStores()
+    {
+        return Collections.unmodifiableCollection(columnFamilyStores.values());
+    }
+
+    public ColumnFamilyStore getColumnFamilyStore(String cfName)
+    {
+        return columnFamilyStores.get(cfNameMap.get(cfName));
+    }
+
+    /**
+     * Do a cleanup of keys that do not belong locally.
+     */
+    public void forceCleanup()
+    {
+        if (name.equals(SYSTEM_TABLE))
+            throw new RuntimeException("Cleanup of the system table is neither necessary nor wise");
+
+        for (ColumnFamilyStore cfStore : columnFamilyStores.values())
+            cfStore.forceCleanup();
+    }
+    
+    
+    /**
+     * Take a snapshot of the entire set of column families with a given timestamp.
+     * 
+     * @param clientSuppliedName the tag associated with the name of the snapshot.  This
+     *                           value can be null.
+     */
+    public void snapshot(String clientSuppliedName)
+    {
+        String snapshotName = getTimestampedSnapshotName(clientSuppliedName);
+
+        for (ColumnFamilyStore cfStore : columnFamilyStores.values())
+        {
+            cfStore.snapshot(snapshotName);
+        }
+    }
+
+    /**
+     * @param clientSuppliedName; may be null.
+     * @return
+     */
+    public static String getTimestampedSnapshotName(String clientSuppliedName)
+    {
+        String snapshotName = Long.toString(System.currentTimeMillis());
+        if (clientSuppliedName != null && !clientSuppliedName.equals(""))
+        {
+            snapshotName = snapshotName + "-" + clientSuppliedName;
+        }
+        return snapshotName;
+    }
+
+
+    /**
+     * Clear all the snapshots for a given table.
+     */
+    public void clearSnapshot() throws IOException
+    {
+        for (String dataDirPath : DatabaseDescriptor.getAllDataFileLocations())
+        {
+            String snapshotPath = dataDirPath + File.separator + name + File.separator + SNAPSHOT_SUBDIR_NAME;
+            File snapshotDir = new File(snapshotPath);
+            if (snapshotDir.exists())
+            {
+                if (logger.isDebugEnabled())
+                    logger.debug("Removing snapshot directory " + snapshotPath);
+                FileUtils.deleteRecursive(snapshotDir);
+            }
+        }
+    }
+
+    /*
+     * This method is invoked only during a bootstrap process. We basically
+     * do a complete compaction since we can figure out based on the ranges
+     * whether the files need to be split.
+    */
+    public List<SSTableReader> forceAntiCompaction(Collection<Range> ranges, InetAddress target)
+    {
+        List<SSTableReader> allResults = new ArrayList<SSTableReader>();
+        for (ColumnFamilyStore cfStore : columnFamilyStores.values())
+        {
+            try
+            {
+                allResults.addAll(CompactionManager.instance.submitAnticompaction(cfStore, ranges, target).get());
+            }
+            catch (Exception e)
+            {
+                throw new RuntimeException(e);
+            }
+        }
+        return allResults;
+    }
+    
+    /*
+     * This method is an ADMIN operation to force compaction
+     * of all SSTables on disk. 
+    */
+    public void forceCompaction()
+    {
+        for (ColumnFamilyStore cfStore : columnFamilyStores.values())
+            CompactionManager.instance.submitMajor(cfStore);
+    }
+
+    List<SSTableReader> getAllSSTablesOnDisk()
+    {
+        List<SSTableReader> list = new ArrayList<SSTableReader>();
+        for (ColumnFamilyStore cfStore : columnFamilyStores.values())
+            list.addAll(cfStore.getSSTables());
+        return list;
+    }
+
+    private Table(String table)
+    {
+        name = table;
+        waitForCommitLog = DatabaseDescriptor.getCommitLogSync() == Config.CommitLogSync.batch;
+        // create data directories.
+        for (String dataDir : DatabaseDescriptor.getAllDataFileLocations())
+        {
+            try
+            {
+                String keyspaceDir = dataDir + File.separator + table;
+                FileUtils.createDirectory(keyspaceDir);
+    
+                // remove the deprecated streaming directory.
+                File streamingDir = new File(keyspaceDir, "stream");
+                if (streamingDir.exists())
+                    FileUtils.deleteRecursive(streamingDir);
+            }
+            catch (IOException ex)
+            {
+                throw new IOError(ex);
+            }
+        }
+      
+        for (CFMetaData cfm : DatabaseDescriptor.getTableDefinition(table).cfMetaData().values())
+        {
+            columnFamilyStores.put(cfm.cfId, ColumnFamilyStore.createColumnFamilyStore(table, cfm.cfName));
+            cfNameMap.put(cfm.cfName, cfm.cfId);
+        }
+
+        // check 10x as often as the lifetime, so we can exceed lifetime by 10% at most
+        int checkMs = DatabaseDescriptor.getMemtableLifetimeMS() / 10;
+        flushTask = new TimerTask()
+        {
+            public void run()
+            {
+                for (ColumnFamilyStore cfs : columnFamilyStores.values())
+                {
+                    cfs.forceFlushIfExpired();
+                }
+            }
+        };
+        flushTimer.schedule(flushTask, checkMs, checkMs);
+    }
+    
+    /** removes a cf from internal structures (doesn't change disk files). */
+    public void dropCf(int cfId) throws IOException
+    {
+        assert columnFamilyStores.containsKey(cfId);
+        ColumnFamilyStore cfs = columnFamilyStores.remove(cfId);
+        if (cfs != null)
+        {
+            cfNameMap.remove(cfs.getColumnFamilyName());
+            try
+            {
+                cfs.forceBlockingFlush();
+            }
+            catch (ExecutionException e)
+            {
+                throw new IOException(e);
+            }
+            catch (InterruptedException e)
+            {
+                throw new IOException(e);
+            }
+        }
+    }
+    
+    /** adds a cf to internal structures, ends up creating disk files). */
+    public void initCf(int cfId, String cfName)
+    {
+        assert !columnFamilyStores.containsKey(cfId) : cfId;
+        columnFamilyStores.put(cfId, ColumnFamilyStore.createColumnFamilyStore(name, cfName));
+        cfNameMap.put(cfName, cfId);
+    }
+    
+    /** basically a combined drop and add */
+    public void renameCf(int cfId, String newName) throws IOException
+    {
+        dropCf(cfId);
+        initCf(cfId, newName);
+    }
+
+    public Row getRow(QueryFilter filter) throws IOException
+    {
+        ColumnFamilyStore cfStore = columnFamilyStores.get(cfNameMap.get(filter.getColumnFamilyName()));
+        ColumnFamily columnFamily = cfStore.getColumnFamily(filter);
+        return new Row(filter.key, columnFamily);
+    }
+
+    /**
+     * This method adds the row to the Commit Log associated with this table.
+     * Once this happens the data associated with the individual column families
+     * is also written to the column family store's memtable.
+    */
+    public void apply(RowMutation mutation, Object serializedMutation, boolean writeCommitLog) throws IOException
+    {
+        HashMap<ColumnFamilyStore,Memtable> memtablesToFlush = new HashMap<ColumnFamilyStore, Memtable>(2);
+
+        // write the mutation to the commitlog and memtables
+        flusherLock.readLock().lock();
+        try
+        {
+            if (writeCommitLog)
+            {
+                CommitLog.instance().add(mutation, serializedMutation);
+            }
+        
+            DecoratedKey key = StorageService.getPartitioner().decorateKey(mutation.key());
+            for (ColumnFamily columnFamily : mutation.getColumnFamilies())
+            {
+                Memtable memtableToFlush;
+                ColumnFamilyStore cfs = columnFamilyStores.get(columnFamily.id());
+                if (cfs == null)
+                {
+                    logger.error("Attempting to mutate non-existant column family " + columnFamily.name());
+                }
+                else
+                {
+                    if ((memtableToFlush=cfs.apply(key, columnFamily)) != null)
+                        memtablesToFlush.put(cfs, memtableToFlush);
+    
+                    ColumnFamily cachedRow = cfs.getRawCachedRow(key);
+                    if (cachedRow != null)
+                        cachedRow.addAll(columnFamily);
+                }
+            }
+        }
+        finally
+        {
+            flusherLock.readLock().unlock();
+        }
+
+        // flush memtables that got filled up.  usually mTF will be empty and this will be a no-op
+        for (Map.Entry<ColumnFamilyStore, Memtable> entry : memtablesToFlush.entrySet())
+            entry.getKey().maybeSwitchMemtable(entry.getValue(), writeCommitLog);
+    }
+
+    public List<Future<?>> flush() throws IOException
+    {
+        List<Future<?>> futures = new ArrayList<Future<?>>();
+        for (Integer cfId : columnFamilyStores.keySet())
+        {
+            Future<?> future = columnFamilyStores.get(cfId).forceFlush();
+            if (future != null)
+                futures.add(future);
+        }
+        return futures;
+    }
+
+    // for binary load path.  skips commitlog.
+    void load(RowMutation rowMutation) throws IOException
+    {
+        DecoratedKey key = StorageService.getPartitioner().decorateKey(rowMutation.key());
+        for (ColumnFamily columnFamily : rowMutation.getColumnFamilies())
+        {
+            Collection<IColumn> columns = columnFamily.getSortedColumns();
+            for (IColumn column : columns)
+            {
+                ColumnFamilyStore cfStore = columnFamilyStores.get(cfNameMap.get(new String(column.name(), "UTF-8")));
+                cfStore.applyBinary(key, column.value());
+            }
+        }
+    }
+
+    public String getDataFileLocation(long expectedCompactedFileSize)
+    {
+        String path = DatabaseDescriptor.getDataFileLocationForTable(name, expectedCompactedFileSize);
+        if (path == null)
+        {
+            // retry after GCing to force unmap of compacted SSTables so they can be deleted
+            StorageService.instance.requestGC();
+            try
+            {
+                Thread.sleep(SSTableDeletingReference.RETRY_DELAY * 2);
+            }
+            catch (InterruptedException e)
+            {
+                throw new AssertionError(e);
+            }
+            path = DatabaseDescriptor.getDataFileLocationForTable(name, expectedCompactedFileSize);
+        }
+        return path;
+    }
+
+    public static String getSnapshotPath(String dataDirPath, String tableName, String snapshotName)
+    {
+        return dataDirPath + File.separator + tableName + File.separator + SNAPSHOT_SUBDIR_NAME + File.separator + snapshotName;
+    }
+
+    public static Iterable<Table> all()
+    {
+        Function<String, Table> transformer = new Function<String, Table>()
+        {
+            public Table apply(String tableName)
+            {
+                return Table.open(tableName);
+            }
+        };
+        return Iterables.transform(DatabaseDescriptor.getTables(), transformer);
     }
 }

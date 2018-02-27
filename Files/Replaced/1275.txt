@@ -1,6 +1,8 @@
-for (int i = 0; i < length; i++) { // Loop to length-1, not length-2, not for diffs but average item pref
+while (currentUpto == currentLength) {
 
-/**
+package org.apache.lucene.index;
+
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -17,386 +19,289 @@ for (int i = 0; i < length; i++) { // Loop to length-1, not length-2, not for di
  * limitations under the License.
  */
 
-package org.apache.mahout.cf.taste.impl.recommender.slopeone;
+import static org.apache.lucene.util.ByteBlockPool.BYTE_BLOCK_SIZE;
 
-import java.util.Collection;
+import java.io.IOException;
+import java.util.Arrays;
 import java.util.Iterator;
-import java.util.Map;
-import java.util.concurrent.Callable;
-import java.util.concurrent.locks.ReadWriteLock;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.NoSuchElementException;
 
-import org.apache.mahout.cf.taste.common.Refreshable;
-import org.apache.mahout.cf.taste.common.TasteException;
-import org.apache.mahout.cf.taste.common.Weighting;
-import org.apache.mahout.cf.taste.impl.common.FastByIDMap;
-import org.apache.mahout.cf.taste.impl.common.FastIDSet;
-import org.apache.mahout.cf.taste.impl.common.FullRunningAverage;
-import org.apache.mahout.cf.taste.impl.common.FullRunningAverageAndStdDev;
-import org.apache.mahout.cf.taste.impl.common.LongPrimitiveIterator;
-import org.apache.mahout.cf.taste.impl.common.RefreshHelper;
-import org.apache.mahout.cf.taste.impl.common.RunningAverage;
-import org.apache.mahout.cf.taste.model.DataModel;
-import org.apache.mahout.cf.taste.model.PreferenceArray;
-import org.apache.mahout.cf.taste.recommender.slopeone.DiffStorage;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.lucene.codecs.DocValuesConsumer;
+import org.apache.lucene.util.ArrayUtil;
+import org.apache.lucene.util.ByteBlockPool;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.BytesRefHash.DirectBytesStartArray;
+import org.apache.lucene.util.BytesRefHash;
+import org.apache.lucene.util.Counter;
+import org.apache.lucene.util.RamUsageEstimator;
+import org.apache.lucene.util.packed.AppendingLongBuffer;
 
-import com.google.common.base.Preconditions;
+/** Buffers up pending byte[]s per doc, deref and sorting via
+ *  int ord, then flushes when segment flushes. */
+class SortedSetDocValuesWriter extends DocValuesWriter {
+  final BytesRefHash hash;
+  private AppendingLongBuffer pending; // stream of all ords
+  private AppendingLongBuffer pendingCounts; // ords per doc
+  private final Counter iwBytesUsed;
+  private long bytesUsed; // this only tracks differences in 'pending' and 'pendingCounts'
+  private final FieldInfo fieldInfo;
+  private int currentDoc;
+  private int currentValues[] = new int[8];
+  private int currentUpto = 0;
+  private int maxCount = 0;
 
-/**
- * <p>
- * An implementation of {@link DiffStorage} that merely stores item-item diffs in memory. It is fast, but can
- * consume a great deal of memory.
- * </p>
- */
-public final class MemoryDiffStorage implements DiffStorage {
-  
-  private static final Logger log = LoggerFactory.getLogger(MemoryDiffStorage.class);
-  
-  private final DataModel dataModel;
-  private final boolean stdDevWeighted;
-  private final long maxEntries;
-  private final FastByIDMap<FastByIDMap<RunningAverage>> averageDiffs;
-  private final FastByIDMap<RunningAverage> averageItemPref;
-  private final FastIDSet allRecommendableItemIDs;
-  private final ReadWriteLock buildAverageDiffsLock;
-  private final RefreshHelper refreshHelper;
-  
-  /**
-   * <p>
-   * See {@link SlopeOneRecommender} for the meaning of
-   * {@code stdDevWeighted}. {@code maxEntries} controls the maximum number of
-   * item-item average preference differences that will be tracked internally. After the limit is reached, if
-   * a new item-item pair is observed in the data it will be ignored. This is recommended for large datasets.
-   * The first {@code maxEntries} item-item pairs observed in the data are tracked. Assuming that item
-   * ratings are reasonably distributed among users, this should only ignore item-item pairs that are very
-   * infrequently co-rated by a user. The intuition is that data on these infrequently co-rated item-item
-   * pairs is less reliable and should be the first that is ignored. This parameter can be used to limit the
-   * memory requirements of {@link SlopeOneRecommender}, which otherwise grow as the square of the number of
-   * items that exist in the {@link DataModel}. Memory requirements can reach gigabytes with only about 10000
-   * items, so this may be necessary on larger datasets.
-   *
-   * @param stdDevWeighted
-   *          see {@link SlopeOneRecommender}
-   * @param maxEntries
-   *          maximum number of item-item average preference differences to track internally
-   * @throws IllegalArgumentException
-   *           if {@code maxEntries} is not positive or {@code dataModel} is null
-   */
-  public MemoryDiffStorage(DataModel dataModel,
-                           Weighting stdDevWeighted,
-                           long maxEntries) throws TasteException {
-    Preconditions.checkArgument(dataModel != null, "dataModel is null");
-    Preconditions.checkArgument(dataModel.getNumItems() >= 1, "dataModel has no items");
-    Preconditions.checkArgument(maxEntries > 0L, "maxEntries must be positive");
-    this.dataModel = dataModel;
-    this.stdDevWeighted = stdDevWeighted == Weighting.WEIGHTED;
-    this.maxEntries = maxEntries;
-    this.averageDiffs = new FastByIDMap<FastByIDMap<RunningAverage>>();
-    this.averageItemPref = new FastByIDMap<RunningAverage>();
-    this.buildAverageDiffsLock = new ReentrantReadWriteLock();
-    this.allRecommendableItemIDs = new FastIDSet(dataModel.getNumItems());
-    this.refreshHelper = new RefreshHelper(new Callable<Object>() {
-      @Override
-      public Object call() throws TasteException {
-        buildAverageDiffs();
-        return null;
-      }
-    });
-    refreshHelper.addDependency(dataModel);
-    buildAverageDiffs();
+  public SortedSetDocValuesWriter(FieldInfo fieldInfo, Counter iwBytesUsed) {
+    this.fieldInfo = fieldInfo;
+    this.iwBytesUsed = iwBytesUsed;
+    hash = new BytesRefHash(
+        new ByteBlockPool(
+            new ByteBlockPool.DirectTrackingAllocator(iwBytesUsed)),
+            BytesRefHash.DEFAULT_CAPACITY,
+            new DirectBytesStartArray(BytesRefHash.DEFAULT_CAPACITY, iwBytesUsed));
+    pending = new AppendingLongBuffer();
+    pendingCounts = new AppendingLongBuffer();
+    bytesUsed = pending.ramBytesUsed() + pendingCounts.ramBytesUsed();
+    iwBytesUsed.addAndGet(bytesUsed);
+  }
+
+  public void addValue(int docID, BytesRef value) {
+    if (value == null) {
+      throw new IllegalArgumentException("field \"" + fieldInfo.name + "\": null value not allowed");
+    }
+    if (value.length > (BYTE_BLOCK_SIZE - 2)) {
+      throw new IllegalArgumentException("DocValuesField \"" + fieldInfo.name + "\" is too large, must be <= " + (BYTE_BLOCK_SIZE - 2));
+    }
+    
+    if (docID != currentDoc) {
+      finishCurrentDoc();
+    }
+
+    // Fill in any holes:
+    while(currentDoc < docID) {
+      pendingCounts.add(0); // no values
+      currentDoc++;
+    }
+
+    addOneValue(value);
+    updateBytesUsed();
   }
   
+  // finalize currentDoc: this deduplicates the current term ids
+  private void finishCurrentDoc() {
+    Arrays.sort(currentValues, 0, currentUpto);
+    int lastValue = -1;
+    int count = 0;
+    for (int i = 0; i < currentUpto; i++) {
+      int v = currentValues[i];
+      // if its not a duplicate
+      if (v != lastValue) {
+        pending.add(v); // record the ord
+        count++;
+      }
+      lastValue = v;
+    }
+    // record the number of unique ords for this doc
+    pendingCounts.add(count);
+    maxCount = Math.max(maxCount, count);
+    currentUpto = 0;
+    currentDoc++;
+  }
+
   @Override
-  public RunningAverage getDiff(long itemID1, long itemID2) {
+  public void finish(int maxDoc) {
+    finishCurrentDoc();
     
-    boolean inverted = false;
-    if (itemID1 > itemID2) {
-      inverted = true;
-      long temp = itemID1;
-      itemID1 = itemID2;
-      itemID2 = temp;
+    // fill in any holes
+    for (int i = currentDoc; i < maxDoc; i++) {
+      pendingCounts.add(0); // no values
     }
-    
-    FastByIDMap<RunningAverage> level2Map;
-    try {
-      buildAverageDiffsLock.readLock().lock();
-      level2Map = averageDiffs.get(itemID1);
-    } finally {
-      buildAverageDiffsLock.readLock().unlock();
-    }
-    RunningAverage average = null;
-    if (level2Map != null) {
-      average = level2Map.get(itemID2);
-    }
-    if (inverted) {
-      return average == null ? null : average.inverse();
+  }
+
+  private void addOneValue(BytesRef value) {
+    int ord = hash.add(value);
+    if (ord < 0) {
+      ord = -ord-1;
     } else {
-      return average;
+      // reserve additional space for each unique value:
+      // 1. when indexing, when hash is 50% full, rehash() suddenly needs 2*size ints.
+      //    TODO: can this same OOM happen in THPF?
+      // 2. when flushing, we need 1 int per value (slot in the ordMap).
+      iwBytesUsed.addAndGet(2 * RamUsageEstimator.NUM_BYTES_INT);
+    }
+    
+    if (currentUpto == currentValues.length) {
+      currentValues = ArrayUtil.grow(currentValues, currentValues.length+1);
+      // reserve additional space for max # values per-doc
+      // when flushing, we need an int[] to sort the mapped-ords within the doc
+      iwBytesUsed.addAndGet((currentValues.length - currentUpto) * 2 * RamUsageEstimator.NUM_BYTES_INT);
+    }
+    
+    currentValues[currentUpto] = ord;
+    currentUpto++;
+  }
+  
+  private void updateBytesUsed() {
+    final long newBytesUsed = pending.ramBytesUsed() + pendingCounts.ramBytesUsed();
+    iwBytesUsed.addAndGet(newBytesUsed - bytesUsed);
+    bytesUsed = newBytesUsed;
+  }
+
+  @Override
+  public void flush(SegmentWriteState state, DocValuesConsumer dvConsumer) throws IOException {
+    final int maxDoc = state.segmentInfo.getDocCount();
+    final int maxCountPerDoc = maxCount;
+    assert pendingCounts.size() == maxDoc;
+    final int valueCount = hash.size();
+
+    final int[] sortedValues = hash.sort(BytesRef.getUTF8SortedAsUnicodeComparator());
+    final int[] ordMap = new int[valueCount];
+
+    for(int ord=0;ord<valueCount;ord++) {
+      ordMap[sortedValues[ord]] = ord;
+    }
+
+    dvConsumer.addSortedSetField(fieldInfo,
+
+                              // ord -> value
+                              new Iterable<BytesRef>() {
+                                @Override
+                                public Iterator<BytesRef> iterator() {
+                                  return new ValuesIterator(sortedValues, valueCount);
+                                }
+                              },
+                              
+                              // doc -> ordCount
+                              new Iterable<Number>() {
+                                @Override
+                                public Iterator<Number> iterator() {
+                                  return new OrdCountIterator(maxDoc);
+                                }
+                              },
+
+                              // ords
+                              new Iterable<Number>() {
+                                @Override
+                                public Iterator<Number> iterator() {
+                                  return new OrdsIterator(ordMap, maxCountPerDoc);
+                                }
+                              });
+  }
+
+  @Override
+  public void abort() {
+  }
+  
+  // iterates over the unique values we have in ram
+  private class ValuesIterator implements Iterator<BytesRef> {
+    final int sortedValues[];
+    final BytesRef scratch = new BytesRef();
+    final int valueCount;
+    int ordUpto;
+    
+    ValuesIterator(int sortedValues[], int valueCount) {
+      this.sortedValues = sortedValues;
+      this.valueCount = valueCount;
+    }
+
+    @Override
+    public boolean hasNext() {
+      return ordUpto < valueCount;
+    }
+
+    @Override
+    public BytesRef next() {
+      if (!hasNext()) {
+        throw new NoSuchElementException();
+      }
+      hash.get(sortedValues[ordUpto], scratch);
+      ordUpto++;
+      return scratch;
+    }
+
+    @Override
+    public void remove() {
+      throw new UnsupportedOperationException();
     }
   }
   
-  @Override
-  public RunningAverage[] getDiffs(long userID, long itemID, PreferenceArray prefs) {
-    try {
-      buildAverageDiffsLock.readLock().lock();
-      int size = prefs.length();
-      RunningAverage[] result = new RunningAverage[size];
-      for (int i = 0; i < size; i++) {
-        result[i] = getDiff(prefs.getItemID(i), itemID);
-      }
-      return result;
-    } finally {
-      buildAverageDiffsLock.readLock().unlock();
+  // iterates over the ords for each doc we have in ram
+  private class OrdsIterator implements Iterator<Number> {
+    final AppendingLongBuffer.Iterator iter = pending.iterator();
+    final AppendingLongBuffer.Iterator counts = pendingCounts.iterator();
+    final int ordMap[];
+    final long numOrds;
+    long ordUpto;
+    
+    final int currentDoc[];
+    int currentUpto;
+    int currentLength;
+    
+    OrdsIterator(int ordMap[], int maxCount) {
+      this.currentDoc = new int[maxCount];
+      this.ordMap = ordMap;
+      this.numOrds = pending.size();
     }
-  }
-  
-  @Override
-  public RunningAverage getAverageItemPref(long itemID) {
-    return averageItemPref.get(itemID);
-  }
+    
+    @Override
+    public boolean hasNext() {
+      return ordUpto < numOrds;
+    }
 
-  @Override
-  public void addItemPref(long userID, long itemIDA, float prefValue) throws TasteException {
-    PreferenceArray userPreferences = dataModel.getPreferencesFromUser(userID);
-    try {
-      buildAverageDiffsLock.writeLock().lock();
-
-      FastByIDMap<RunningAverage> aMap = averageDiffs.get(itemIDA);
-      if (aMap == null) {
-        aMap = new FastByIDMap<RunningAverage>();
-        averageDiffs.put(itemIDA, aMap);
+    @Override
+    public Number next() {
+      if (!hasNext()) {
+        throw new NoSuchElementException();
       }
-
-      int length = userPreferences.length();
-      for (int i = 0; i < length; i++) {
-        long itemIDB = userPreferences.getItemID(i);
-        float bValue = userPreferences.getValue(i);
-        if (itemIDA < itemIDB) {
-          RunningAverage average = aMap.get(itemIDB);
-          if (average == null) {
-            average = buildRunningAverage();
-            aMap.put(itemIDB, average);
-          }
-          average.addDatum(bValue - prefValue);
-        } else {
-          FastByIDMap<RunningAverage> bMap = averageDiffs.get(itemIDB);
-          if (bMap == null) {
-            bMap = new FastByIDMap<RunningAverage>();
-            averageDiffs.put(itemIDB, bMap);
-          }
-          RunningAverage average = bMap.get(itemIDA);
-          if (average == null) {
-            average = buildRunningAverage();
-            bMap.put(itemIDA, average);
-          }
-          average.addDatum(prefValue - bValue);
+      if (currentUpto == currentLength) {
+        // refill next doc, and sort remapped ords within the doc.
+        currentUpto = 0;
+        currentLength = (int) counts.next();
+        for (int i = 0; i < currentLength; i++) {
+          currentDoc[i] = ordMap[(int) iter.next()];
         }
+        Arrays.sort(currentDoc, 0, currentLength);
       }
+      int ord = currentDoc[currentUpto];
+      currentUpto++;
+      ordUpto++;
+      // TODO: make reusable Number
+      return ord;
+    }
 
-    } finally {
-      buildAverageDiffsLock.writeLock().unlock();
+    @Override
+    public void remove() {
+      throw new UnsupportedOperationException();
     }
   }
   
-  @Override
-  public void updateItemPref(long itemID, float prefDelta) {
-    if (stdDevWeighted) {
-      throw new UnsupportedOperationException("Can't update only when stdDevWeighted is set");
+  private class OrdCountIterator implements Iterator<Number> {
+    final AppendingLongBuffer.Iterator iter = pendingCounts.iterator();
+    final int maxDoc;
+    int docUpto;
+    
+    OrdCountIterator(int maxDoc) {
+      this.maxDoc = maxDoc;
+      assert pendingCounts.size() == maxDoc;
     }
-    try {
-      buildAverageDiffsLock.readLock().lock();
-      for (Map.Entry<Long,FastByIDMap<RunningAverage>> entry : averageDiffs.entrySet()) {
-        boolean matchesItemID1 = itemID == entry.getKey();
-        for (Map.Entry<Long,RunningAverage> entry2 : entry.getValue().entrySet()) {
-          RunningAverage average = entry2.getValue();
-          if (matchesItemID1) {
-            average.changeDatum(-prefDelta);
-          } else if (itemID == entry2.getKey()) {
-            average.changeDatum(prefDelta);
-          }
-        }
-      }
-      RunningAverage itemAverage = averageItemPref.get(itemID);
-      if (itemAverage != null) {
-        itemAverage.changeDatum(prefDelta);
-      }
-    } finally {
-      buildAverageDiffsLock.readLock().unlock();
+    
+    @Override
+    public boolean hasNext() {
+      return docUpto < maxDoc;
     }
-  }
 
-  @Override
-  public void removeItemPref(long userID, long itemIDA, float prefValue) throws TasteException {
-    PreferenceArray userPreferences = dataModel.getPreferencesFromUser(userID);
-    try {
-      buildAverageDiffsLock.writeLock().lock();
-
-      FastByIDMap<RunningAverage> aMap = averageDiffs.get(itemIDA);
-
-      int length = userPreferences.length();
-      for (int i = 0; i < length; i++) {
-
-        long itemIDB = userPreferences.getItemID(i);
-        float bValue = userPreferences.getValue(i);
-
-        if (itemIDA < itemIDB) {
-
-          if (aMap != null) {
-            RunningAverage average = aMap.get(itemIDB);
-            if (average != null) {
-              if (average.getCount() <= 1) {
-                aMap.remove(itemIDB);
-              } else {
-                average.removeDatum(bValue - prefValue);
-              }
-            }
-          }
-
-        } else  if (itemIDA > itemIDB) {
-
-          FastByIDMap<RunningAverage> bMap = averageDiffs.get(itemIDB);
-          if (bMap != null) {
-            RunningAverage average = bMap.get(itemIDA);
-            if (average != null) {
-              if (average.getCount() <= 1) {
-                aMap.remove(itemIDA);
-              } else {
-                average.removeDatum(prefValue - bValue);
-              }
-            }
-          }
-
-        }
+    @Override
+    public Number next() {
+      if (!hasNext()) {
+        throw new NoSuchElementException();
       }
+      docUpto++;
+      // TODO: make reusable Number
+      return iter.next();
+    }
 
-    } finally {
-      buildAverageDiffsLock.writeLock().unlock();
+    @Override
+    public void remove() {
+      throw new UnsupportedOperationException();
     }
   }
-  
-  @Override
-  public FastIDSet getRecommendableItemIDs(long userID) throws TasteException {
-    FastIDSet result;
-    try {
-      buildAverageDiffsLock.readLock().lock();
-      result = allRecommendableItemIDs.clone();
-    } finally {
-      buildAverageDiffsLock.readLock().unlock();
-    }
-    Iterator<Long> it = result.iterator();
-    while (it.hasNext()) {
-      if (dataModel.getPreferenceValue(userID, it.next()) != null) {
-        it.remove();
-      }
-    }
-    return result;
-  }
-  
-  private void buildAverageDiffs() throws TasteException {
-    log.info("Building average diffs...");
-    try {
-      buildAverageDiffsLock.writeLock().lock();
-      averageDiffs.clear();
-      long averageCount = 0L;
-      LongPrimitiveIterator it = dataModel.getUserIDs();
-      while (it.hasNext()) {
-        averageCount = processOneUser(averageCount, it.nextLong());
-      }
-      
-      pruneInconsequentialDiffs();
-      updateAllRecommendableItems();
-      
-    } finally {
-      buildAverageDiffsLock.writeLock().unlock();
-    }
-  }
-  
-  private void pruneInconsequentialDiffs() {
-    // Go back and prune inconsequential diffs. "Inconsequential" means, here, only represented by one
-    // data point, so possibly unreliable
-    Iterator<Map.Entry<Long,FastByIDMap<RunningAverage>>> it1 = averageDiffs.entrySet().iterator();
-    while (it1.hasNext()) {
-      FastByIDMap<RunningAverage> map = it1.next().getValue();
-      Iterator<Map.Entry<Long,RunningAverage>> it2 = map.entrySet().iterator();
-      while (it2.hasNext()) {
-        RunningAverage average = it2.next().getValue();
-        if (average.getCount() <= 1) {
-          it2.remove();
-        }
-      }
-      if (map.isEmpty()) {
-        it1.remove();
-      } else {
-        map.rehash();
-      }
-    }
-    averageDiffs.rehash();
-  }
-  
-  private void updateAllRecommendableItems() throws TasteException {
-    FastIDSet ids = new FastIDSet(dataModel.getNumItems());
-    for (Map.Entry<Long,FastByIDMap<RunningAverage>> entry : averageDiffs.entrySet()) {
-      ids.add(entry.getKey());
-      LongPrimitiveIterator it = entry.getValue().keySetIterator();
-      while (it.hasNext()) {
-        ids.add(it.next());
-      }
-    }
-    allRecommendableItemIDs.clear();
-    allRecommendableItemIDs.addAll(ids);
-    allRecommendableItemIDs.rehash();
-  }
-  
-  private long processOneUser(long averageCount, long userID) throws TasteException {
-    log.debug("Processing prefs for user {}", userID);
-    // Save off prefs for the life of this loop iteration
-    PreferenceArray userPreferences = dataModel.getPreferencesFromUser(userID);
-    int length = userPreferences.length();
-    for (int i = 0; i < length - 1; i++) {
-      float prefAValue = userPreferences.getValue(i);
-      long itemIDA = userPreferences.getItemID(i);
-      FastByIDMap<RunningAverage> aMap = averageDiffs.get(itemIDA);
-      if (aMap == null) {
-        aMap = new FastByIDMap<RunningAverage>();
-        averageDiffs.put(itemIDA, aMap);
-      }
-      for (int j = i + 1; j < length; j++) {
-        // This is a performance-critical block
-        long itemIDB = userPreferences.getItemID(j);
-        RunningAverage average = aMap.get(itemIDB);
-        if (average == null && averageCount < maxEntries) {
-          average = buildRunningAverage();
-          aMap.put(itemIDB, average);
-          averageCount++;
-        }
-        if (average != null) {
-          average.addDatum(userPreferences.getValue(j) - prefAValue);
-        }
-      }
-      RunningAverage itemAverage = averageItemPref.get(itemIDA);
-      if (itemAverage == null) {
-        itemAverage = buildRunningAverage();
-        averageItemPref.put(itemIDA, itemAverage);
-      }
-      itemAverage.addDatum(prefAValue);
-    }
-    return averageCount;
-  }
-  
-  private RunningAverage buildRunningAverage() {
-    return stdDevWeighted ? new FullRunningAverageAndStdDev() : new FullRunningAverage();
-  }
-  
-  @Override
-  public void refresh(Collection<Refreshable> alreadyRefreshed) {
-    refreshHelper.refresh(alreadyRefreshed);
-  }
-  
-  @Override
-  public String toString() {
-    return "MemoryDiffStorage";
-  }
-  
 }

@@ -1,4 +1,6 @@
-FileSystem dfs = FileSystem.get(outPath.toUri(), conf);
+PhrasePositions pp = new PhrasePositions(postings[i].postings, postings[i].position, i);
+
+package org.apache.lucene.search;
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -17,89 +19,168 @@ FileSystem dfs = FileSystem.get(outPath.toUri(), conf);
  * limitations under the License.
  */
 
-package org.apache.mahout.classifier.bayes.common;
-
-import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.io.DefaultStringifier;
-import org.apache.hadoop.io.DoubleWritable;
-import org.apache.hadoop.io.Text;
-import org.apache.hadoop.mapred.JobClient;
-import org.apache.hadoop.mapred.JobConf;
-import org.apache.hadoop.mapred.KeyValueTextInputFormat;
-import org.apache.hadoop.mapred.FileInputFormat;
-import org.apache.hadoop.mapred.FileOutputFormat;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import java.io.IOException;
 
-/**
- * Create and run the Bayes Feature Reader Step.
+/** Expert: Scoring functionality for phrase queries.
+ * <br>A document is considered matching if it contains the phrase-query terms  
+ * at "valid" positions. What "valid positions" are
+ * depends on the type of the phrase query: for an exact phrase query terms are required 
+ * to appear in adjacent locations, while for a sloppy phrase query some distance between 
+ * the terms is allowed. The abstract method {@link #phraseFreq()} of extending classes
+ * is invoked for each document containing all the phrase query terms, in order to 
+ * compute the frequency of the phrase query in that document. A non zero frequency
+ * means a match. 
  */
-public class BayesFeatureDriver {
+abstract class PhraseScorer extends Scorer {
+  protected byte[] norms;
+  protected float value;
 
-  private static final Logger log = LoggerFactory.getLogger(BayesFeatureDriver.class);
+  private boolean firstTime = true;
+  private boolean more = true;
+  protected PhraseQueue pq;
+  protected PhrasePositions first, last;
 
-  private BayesFeatureDriver() {
+  private float freq; //phrase frequency in current doc as computed by phraseFreq().
+
+  PhraseScorer(Weight weight, PhraseQuery.PostingsAndFreq[] postings,
+      Similarity similarity, byte[] norms) {
+    super(similarity, weight);
+    this.norms = norms;
+    this.value = weight.getValue();
+
+    // convert tps to a list of phrase positions.
+    // note: phrase-position differs from term-position in that its position
+    // reflects the phrase offset: pp.pos = tp.pos - offset.
+    // this allows to easily identify a matching (exact) phrase 
+    // when all PhrasePositions have exactly the same position.
+    for (int i = 0; i < postings.length; i++) {
+      PhrasePositions pp = new PhrasePositions(postings[i].postings, postings[i].position);
+      if (last != null) {			  // add next to end of list
+        last.next = pp;
+      } else {
+        first = pp;
+      }
+      last = pp;
+    }
+
+    pq = new PhraseQueue(postings.length);             // construct empty pq
+    first.doc = -1;
+  }
+
+  @Override
+  public int docID() { return first.doc; }
+
+  @Override
+  public int nextDoc() throws IOException {
+    if (firstTime) {
+      init();
+      firstTime = false;
+    } else if (more) {
+      more = last.next();                         // trigger further scanning
+    }
+    if (!doNext()) {
+      first.doc = NO_MORE_DOCS;
+    }
+    return first.doc;
+  }
+  
+  // next without initial increment
+  private boolean doNext() throws IOException {
+    while (more) {
+      while (more && first.doc < last.doc) {      // find doc w/ all the terms
+        more = first.skipTo(last.doc);            // skip first upto last
+        firstToLast();                            // and move it to the end
+      }
+
+      if (more) {
+        // found a doc with all of the terms
+        freq = phraseFreq();                      // check for phrase
+        if (freq == 0.0f)                         // no match
+          more = last.next();                     // trigger further scanning
+        else
+          return true;                            // found a match
+      }
+    }
+    return false;                                 // no more matches
+  }
+
+  @Override
+  public float score() throws IOException {
+    //System.out.println("scoring " + first.doc);
+    float raw = getSimilarity().tf(freq) * value; // raw score
+    return norms == null ? raw : raw * getSimilarity().decodeNormValue(norms[first.doc]); // normalize
+  }
+
+  @Override
+  public int advance(int target) throws IOException {
+    firstTime = false;
+    for (PhrasePositions pp = first; more && pp != null; pp = pp.next) {
+      more = pp.skipTo(target);
+    }
+    if (more) {
+      sort();                                     // re-sort
+    }
+    if (!doNext()) {
+      first.doc = NO_MORE_DOCS;
+    }
+    return first.doc;
+  }
+  
+  /**
+   * phrase frequency in current doc as computed by phraseFreq().
+   */
+  @Override
+  public final float freq() {
+    return freq;
   }
 
   /**
-   * Takes in two arguments:
-   * <ol>
-   * <li>The input {@link org.apache.hadoop.fs.Path} where the input documents live</li>
-   * <li>The output {@link org.apache.hadoop.fs.Path} where to write the interim files as a {@link org.apache.hadoop.io.SequenceFile}</li>
-   * </ol>
-   * @param args The args
+   * For a document containing all the phrase query terms, compute the
+   * frequency of the phrase in that document. 
+   * A non zero frequency means a match.
+   * <br>Note, that containing all phrase terms does not guarantee a match - they have to be found in matching locations.  
+   * @return frequency of the phrase in current doc, 0 if not found. 
    */
-  public static void main(String[] args) throws IOException {
-    String input = args[0];
-    String output = args[1];
+  protected abstract float phraseFreq() throws IOException;
 
-    runJob(input, output, 1);
+  private void init() throws IOException {
+    for (PhrasePositions pp = first; more && pp != null; pp = pp.next) {
+      more = pp.next();
+    }
+    if (more) {
+      sort();
+    }
+  }
+  
+  private void sort() {
+    pq.clear();
+    for (PhrasePositions pp = first; pp != null; pp = pp.next) {
+      pq.add(pp);
+    }
+    pqToList();
   }
 
-  /**
-   * Run the job
-   *
-   * @param input            the input pathname String
-   * @param output           the output pathname String
-   */
-  public static void runJob(String input, String output, int gramSize) throws IOException {
-    JobClient client = new JobClient();
-    JobConf conf = new JobConf(BayesFeatureDriver.class);
-
-    conf.setOutputKeyClass(Text.class);
-    conf.setOutputValueClass(DoubleWritable.class);
-
-    FileInputFormat.setInputPaths(conf, new Path(input));
-    Path outPath = new Path(output);
-    FileOutputFormat.setOutputPath(conf, outPath);
-    conf.setNumMapTasks(100);
-    //conf.setNumReduceTasks(1);
-    conf.setMapperClass(BayesFeatureMapper.class);
-
-    conf.setInputFormat(KeyValueTextInputFormat.class);
-    conf.setCombinerClass(BayesFeatureReducer.class);
-    conf.setReducerClass(BayesFeatureReducer.class);    
-    conf.setOutputFormat(BayesFeatureOutputFormat.class);
-
-    conf.set("io.serializations",
-             "org.apache.hadoop.io.serializer.JavaSerialization,org.apache.hadoop.io.serializer.WritableSerialization"); 
-    // Dont ever forget this. People should keep track of how hadoop conf parameters and make or break a piece of code
-
-    FileSystem dfs = FileSystem.get(conf);
-    if (dfs.exists(outPath))
-      dfs.delete(outPath, true);
-
-    DefaultStringifier<Integer> intStringifier = new DefaultStringifier<Integer>(conf, Integer.class);
-    String gramSizeString = intStringifier.toString(gramSize);
-
-    log.info("{}", intStringifier.fromString(gramSizeString));
-    conf.set("bayes.gramSize", gramSizeString);
-
-    client.setConf(conf);
-    JobClient.runJob(conf);
-    
+  protected final void pqToList() {
+    last = first = null;
+    while (pq.top() != null) {
+      PhrasePositions pp = pq.pop();
+      if (last != null) {			  // add next to end of list
+        last.next = pp;
+      } else
+        first = pp;
+      last = pp;
+      pp.next = null;
+    }
   }
+
+  protected final void firstToLast() {
+    last.next = first;			  // move first to end of list
+    last = first;
+    first = first.next;
+    last.next = null;
+  }
+
+  @Override
+  public String toString() { return "scorer(" + weight + ")"; }
+ 
 }

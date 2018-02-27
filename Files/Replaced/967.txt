@@ -1,16 +1,15 @@
-return new CFMetaData(ksName, cfName, ColumnFamilyType.Standard, comp, null).defaultValidator(comp);
+throw new IOException(e.toString());
 
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- * <p/>
- * http://www.apache.org/licenses/LICENSE-2.0
- * <p/>
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -18,207 +17,168 @@ return new CFMetaData(ksName, cfName, ColumnFamilyType.Standard, comp, null).def
  * limitations under the License.
  */
 
-package org.apache.cassandra;
+package org.apache.solr.spelling.suggest;
 
-import java.nio.ByteBuffer;
-import java.util.*;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.UnsupportedEncodingException;
+import java.util.Collection;
+import java.util.List;
 
-import org.apache.commons.lang.NotImplementedException;
+import org.apache.lucene.analysis.Token;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.search.spell.Dictionary;
+import org.apache.solr.common.util.NamedList;
+import org.apache.solr.core.SolrCore;
+import org.apache.solr.search.SolrIndexSearcher;
+import org.apache.solr.spelling.SolrSpellChecker;
+import org.apache.solr.spelling.SpellingOptions;
+import org.apache.solr.spelling.SpellingResult;
+import org.apache.solr.spelling.suggest.Lookup.LookupResult;
+import org.apache.solr.spelling.suggest.jaspell.JaspellLookup;
+import org.apache.solr.util.HighFrequencyDictionary;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import com.google.common.base.Charsets;
-import org.apache.cassandra.config.*;
-import org.apache.cassandra.db.ColumnFamilyType;
-import org.apache.cassandra.db.KeyspaceNotDefinedException;
-import org.apache.cassandra.db.marshal.*;
-import org.apache.cassandra.locator.AbstractReplicationStrategy;
-import org.apache.cassandra.locator.SimpleStrategy;
-import org.apache.cassandra.thrift.IndexType;
+public class Suggester extends SolrSpellChecker {
+  private static final Logger LOG = LoggerFactory.getLogger(Suggester.class);
+  
+  /** Location of the source data - either a path to a file, or null for the
+   * current IndexReader.
+   */
+  public static final String LOCATION = "sourceLocation";
+  /** Field to use as the source of terms if using IndexReader. */
+  public static final String FIELD = "field";
+  /** Fully-qualified class of the {@link Lookup} implementation. */
+  public static final String LOOKUP_IMPL = "lookupImpl";
+  /**
+   * Minimum frequency of terms to consider when building the dictionary.
+   */
+  public static final String THRESHOLD_TOKEN_FREQUENCY = "threshold";
+  /**
+   * Name of the location where to persist the dictionary. If this location
+   * is relative then the data will be stored under the core's dataDir. If this
+   * is null the storing will be disabled.
+   */
+  public static final String STORE_DIR = "storeDir";
+  
+  protected String sourceLocation;
+  protected File storeDir;
+  protected String field;
+  protected float threshold;
+  protected Dictionary dictionary;
+  protected IndexReader reader;
+  protected Lookup lookup;
+  protected String lookupImpl;
+  protected SolrCore core;
+  
+  @Override
+  public String init(NamedList config, SolrCore core) {
+    LOG.info("init: " + config);
+    String name = super.init(config, core);
+    threshold = config.get(THRESHOLD_TOKEN_FREQUENCY) == null ? 0.0f
+            : (Float) config.get(THRESHOLD_TOKEN_FREQUENCY);
+    sourceLocation = (String) config.get(LOCATION);
+    field = (String)config.get(FIELD);
+    lookupImpl = (String)config.get(LOOKUP_IMPL);
+    if (lookupImpl == null) {
+      lookupImpl = JaspellLookup.class.getName();
+    }
+    String store = (String)config.get(STORE_DIR);
+    if (store != null) {
+      storeDir = new File(store);
+      if (!storeDir.isAbsolute()) {
+        storeDir = new File(core.getDataDir() + File.separator + storeDir);
+      }
+      if (!storeDir.exists()) {
+        storeDir.mkdirs();
+      }
+    }
+    return name;
+  }
+  
+  @Override
+  public void build(SolrCore core, SolrIndexSearcher searcher) {
+    LOG.info("build()");
+    if (sourceLocation == null) {
+      reader = searcher.getReader();
+      dictionary = new HighFrequencyDictionary(reader, field, threshold);
+    } else {
+      try {
+        dictionary = new FileDictionary(new InputStreamReader(
+                core.getResourceLoader().openResource(sourceLocation), "UTF-8"));
+      } catch (UnsupportedEncodingException e) {
+        e.printStackTrace();
+      }
+    }
+    lookup = (Lookup) core.getResourceLoader().newInstance(lookupImpl);
+    try {
+      lookup.build(dictionary);
+      if (storeDir != null) {
+        lookup.store(storeDir);
+      }
+    } catch (Exception e) {
+      e.printStackTrace();
+    }
+  }
 
-import org.junit.BeforeClass;
-
-public class SchemaLoader
-{
-    @BeforeClass
-    public static void loadSchema()
-    {
-        try
-        {
-            for (KSMetaData ksm : schemaDefinition())
-            {
-                for (CFMetaData cfm : ksm.cfMetaData().values())
-                    CFMetaData.map(cfm);
-                DatabaseDescriptor.setTableDefinition(ksm, DatabaseDescriptor.getDefsVersion());
-            }
+  @Override
+  public void reload(SolrCore core, SolrIndexSearcher searcher) throws IOException {
+    LOG.info("reload()");
+    if (dictionary == null && storeDir != null) {
+      // this may be a firstSearcher event, try loading it
+      if (lookup.load(storeDir)) {
+        return;  // loaded ok
+      }
+    }
+    // dictionary based on the current index may need refreshing
+    if (dictionary instanceof HighFrequencyDictionary) {
+      reader = reader.reopen();
+      dictionary = new HighFrequencyDictionary(reader, field, threshold);
+      try {
+        lookup.build(dictionary);
+        if (storeDir != null) {
+          lookup.store(storeDir);
         }
-        catch (ConfigurationException e)
-        {
-            throw new RuntimeException(e);
-        }
+      } catch (Exception e) {
+        throw new IOException(e);
+      }
     }
+  }
 
-    public static Collection<KSMetaData> schemaDefinition()
-    {
-        List<KSMetaData> schema = new ArrayList<KSMetaData>();
+  public void add(String query, int numHits) {
+    LOG.info("add " + query + ", " + numHits);
+    lookup.add(query, new Integer(numHits));
+  }
+  
+  static SpellingResult EMPTY_RESULT = new SpellingResult();
 
-        // A whole bucket of shorthand
-        String ks1 = "Keyspace1";
-        String ks2 = "Keyspace2";
-        String ks3 = "Keyspace3";
-        String ks4 = "Keyspace4";
-        String ks5 = "Keyspace5";
-        String ks_kcs = "KeyCacheSpace";
-        String ks_rcs = "RowCacheSpace";
 
-        Class<? extends AbstractReplicationStrategy> simple = SimpleStrategy.class;
-        Map<String, String> no_opts = Collections.<String, String>emptyMap();
-        int rep_factor1 = 1;
-        int rep_factor2 = 2;
-        int rep_factor3 = 3;
-        int rep_factor5 = 5;
+  @Override
+  public SpellingResult getSuggestions(Collection<Token> tokens, IndexReader reader, int count, boolean onlyMorePopular, boolean extendedResults) throws IOException {
+    return getSuggestions(new SpellingOptions(tokens, reader, count, onlyMorePopular, extendedResults, Float.MIN_VALUE, null));
+  }
 
-        ColumnFamilyType st = ColumnFamilyType.Standard;
-        ColumnFamilyType su = ColumnFamilyType.Super;
-        AbstractType bytes = BytesType.instance;
-
-        // Keyspace 1
-        schema.add(new KSMetaData(ks1,
-                                  simple,
-                                  no_opts,
-                                  rep_factor1,
-
-                                  // Column Families
-                                  standardCFMD(ks1, "Standard1"),
-                                  standardCFMD(ks1, "Standard2"),
-                                  standardCFMD(ks1, "Standard3"),
-                                  standardCFMD(ks1, "Standard4"),
-                                  standardCFMD(ks1, "StandardLong1"),
-                                  standardCFMD(ks1, "StandardLong2"),
-                                  superCFMD(ks1, "Super1", LongType.instance),
-                                  superCFMD(ks1, "Super2", LongType.instance),
-                                  superCFMD(ks1, "Super3", LongType.instance),
-                                  superCFMD(ks1, "Super4", UTF8Type.instance),
-                                  superCFMD(ks1, "Super5", bytes),
-                                  indexCFMD(ks1, "Indexed1", true),
-                                  indexCFMD(ks1, "Indexed2", false),
-                                  new CFMetaData(ks1,
-                                                 "StandardInteger1",
-                                                 st,
-                                                 IntegerType.instance,
-                                                 null)
-                                                 .keyCacheSize(0),
-                                  new CFMetaData(ks1,
-                                                 "Counter1",
-                                                 st,
-                                                 bytes,
-                                                 null)
-                                                 .defaultValidator(CounterColumnType.instance),
-                                  new CFMetaData(ks1,
-                                                 "SuperCounter1",
-                                                 su,
-                                                 bytes,
-                                                 bytes)
-                                                 .defaultValidator(CounterColumnType.instance),
-                                  jdbcCFMD(ks1, "JdbcInteger", IntegerType.instance),
-                                  jdbcCFMD(ks1, "JdbcUtf8", UTF8Type.instance),
-                                  jdbcCFMD(ks1, "JdbcLong", LongType.instance),
-                                  jdbcCFMD(ks1, "JdbcBytes", bytes),
-                                  jdbcCFMD(ks1, "JdbcAscii", AsciiType.instance)));
-
-        // Keyspace 2
-        schema.add(new KSMetaData(ks2,
-                                  simple,
-                                  no_opts,
-                                  rep_factor1,
-
-                                  // Column Families
-                                  standardCFMD(ks2, "Standard1"),
-                                  standardCFMD(ks2, "Standard3"),
-                                  superCFMD(ks2, "Super3", bytes),
-                                  superCFMD(ks2, "Super4", TimeUUIDType.instance),
-                                  indexCFMD(ks2, "Indexed1", true)));
-
-        // Keyspace 3
-        schema.add(new KSMetaData(ks3,
-                                  simple,
-                                  no_opts,
-                                  rep_factor5,
-
-                                  // Column Families
-                                  standardCFMD(ks3, "Standard1"),
-                                  indexCFMD(ks3, "Indexed1", true)));
-
-        // Keyspace 4
-        schema.add(new KSMetaData(ks4,
-                                  simple,
-                                  no_opts,
-                                  rep_factor3,
-
-                                  // Column Families
-                                  standardCFMD(ks4, "Standard1"),
-                                  standardCFMD(ks4, "Standard3"),
-                                  superCFMD(ks4, "Super3", bytes),
-                                  superCFMD(ks4, "Super4", TimeUUIDType.instance),
-                                  new CFMetaData(ks4,
-                                                 "Super5",
-                                                 su,
-                                                 TimeUUIDType.instance,
-                                                 bytes)
-                                                 .keyCacheSize(0)));
-
-        // Keyspace 5
-        schema.add(new KSMetaData(ks5,
-                                  simple,
-                                  no_opts,
-                                  rep_factor2,
-
-                                  // Column Families
-                                  standardCFMD(ks5, "Standard1"),
-                                  standardCFMD(ks5, "Counter1")
-                                               .defaultValidator(CounterColumnType.instance)));
-
-        // KeyCacheSpace
-        schema.add(new KSMetaData(ks_kcs,
-                                  simple,
-                                  no_opts,
-                                  rep_factor1,
-                                  standardCFMD(ks_kcs, "Standard1")
-                                              .keyCacheSize(0.5),
-                                  standardCFMD(ks_kcs, "Standard2")
-                                              .keyCacheSize(1.0)));
-
-        // RowCacheSpace
-        schema.add(new KSMetaData(ks_rcs,
-                                  simple,
-                                  no_opts,
-                                  rep_factor1,
-                                  standardCFMD(ks_rcs, "CFWithoutCache"),
-                                  standardCFMD(ks_rcs, "CachedCF")
-                                              .rowCacheSize(100)));
-
-        return schema;
+  @Override
+  public SpellingResult getSuggestions(SpellingOptions options) throws IOException {
+    LOG.debug("getSuggestions: " + options.tokens);
+    if (lookup == null) {
+      LOG.info("Lookup is null - invoke spellchecker.build first");
+      return EMPTY_RESULT;
     }
-
-    private static CFMetaData standardCFMD(String ksName, String cfName)
-    {
-        return new CFMetaData(ksName, cfName, ColumnFamilyType.Standard, BytesType.instance, null).keyCacheSize(0);
+    SpellingResult res = new SpellingResult();
+    for (Token t : options.tokens) {
+      String term = new String(t.buffer(), 0, t.length());
+      List<LookupResult> suggestions = lookup.lookup(term,
+          options.onlyMorePopular, options.count);
+      if (suggestions == null) {
+        continue;
+      }
+      for (LookupResult lr : suggestions) {
+        res.add(t, lr.key, ((Number)lr.value).intValue());
+      }
     }
-    private static CFMetaData superCFMD(String ksName, String cfName, AbstractType subcc)
-    {
-        return new CFMetaData(ksName, cfName, ColumnFamilyType.Super, BytesType.instance, subcc).keyCacheSize(0);
-    }
-    private static CFMetaData indexCFMD(String ksName, String cfName, final Boolean withIdxType)
-    {
-        return standardCFMD(ksName, cfName)
-                .columnMetadata(Collections.unmodifiableMap(new HashMap<ByteBuffer, ColumnDefinition>()
-                    {{
-                        ByteBuffer cName = ByteBuffer.wrap("birthdate".getBytes(Charsets.UTF_8));
-                        IndexType keys = withIdxType ? IndexType.KEYS : null;
-                        put(cName,
-                            new ColumnDefinition(cName, LongType.instance, keys, null));
-                    }}));
-    }
-    private static CFMetaData jdbcCFMD(String ksName, String cfName, AbstractType comp)
-    {
-        return new CFMetaData(ksName, cfName, ColumnFamilyType.Standard, comp, comp);
-    }
+    return res;
+  }
 }

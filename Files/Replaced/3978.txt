@@ -1,13 +1,14 @@
-Message response = message.getInternalReply(tokenString.getBytes(Charsets.UTF_8), message.getVersion());
+abort();
 
- /**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+package org.apache.lucene.index.codecs;
+
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,272 +19,360 @@ Message response = message.getInternalReply(tokenString.getBytes(Charsets.UTF_8)
  * limitations under the License.
  */
 
-package org.apache.cassandra.dht;
+import java.io.IOException;
 
- import java.io.IOException;
- import java.net.InetAddress;
- import java.util.*;
- import java.util.concurrent.CountDownLatch;
- import java.util.concurrent.locks.Condition;
+import org.apache.lucene.index.FieldInfo;
+import org.apache.lucene.index.Fields;
+import org.apache.lucene.index.IndexFileNames;
+import org.apache.lucene.index.MergePolicy.MergeAbortedException;
+import org.apache.lucene.index.MergeState;
+import org.apache.lucene.index.SegmentReader;
+import org.apache.lucene.store.DataInput;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.IOContext;
+import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.util.ArrayUtil;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.IOUtils;
+import org.apache.lucene.util.StringHelper;
 
- import com.google.common.base.Charsets;
- import com.google.common.collect.ArrayListMultimap;
- import com.google.common.collect.HashMultimap;
- import com.google.common.collect.Multimap;
- import org.apache.commons.lang.ArrayUtils;
- import org.apache.commons.lang.StringUtils;
- import org.slf4j.Logger;
- import org.slf4j.LoggerFactory;
+// TODO: make a new 4.0 TV format that encodes better
+//   - use startOffset (not endOffset) as base for delta on
+//     next startOffset because today for syns or ngrams or
+//     WDF or shingles etc. we are encoding negative vints
+//     (= slow, 5 bytes per)
+//   - if doc has no term vectors, write 0 into the tvx
+//     file; saves a seek to tvd only to read a 0 vint (and
+//     saves a byte in tvd)
 
- import org.apache.cassandra.config.ConfigurationException;
- import org.apache.cassandra.config.DatabaseDescriptor;
- import org.apache.cassandra.db.Table;
- import org.apache.cassandra.gms.FailureDetector;
- import org.apache.cassandra.gms.IFailureDetector;
- import org.apache.cassandra.locator.AbstractReplicationStrategy;
- import org.apache.cassandra.locator.TokenMetadata;
- import org.apache.cassandra.net.IAsyncCallback;
- import org.apache.cassandra.net.IVerbHandler;
- import org.apache.cassandra.net.Message;
- import org.apache.cassandra.net.MessagingService;
- import org.apache.cassandra.service.StorageService;
- import org.apache.cassandra.streaming.OperationType;
- import org.apache.cassandra.streaming.StreamIn;
- import org.apache.cassandra.utils.FBUtilities;
- import org.apache.cassandra.utils.SimpleCondition;
+public final class DefaultTermVectorsWriter extends TermVectorsWriter {
+  private final Directory directory;
+  private final String segment;
+  private IndexOutput tvx = null, tvd = null, tvf = null;
 
-
-public class BootStrapper
-{
-    private static final Logger logger = LoggerFactory.getLogger(BootStrapper.class);
-
-    /* endpoints that need to be bootstrapped */
-    protected final InetAddress address;
-    /* tokens of the nodes being bootstrapped. */
-    protected final Token token;
-    protected final TokenMetadata tokenMetadata;
-
-    public BootStrapper(InetAddress address, Token token, TokenMetadata tmd)
-    {
-        assert address != null;
-        assert token != null;
-
-        this.address = address;
-        this.token = token;
-        tokenMetadata = tmd;
+  public DefaultTermVectorsWriter(Directory directory, String segment, IOContext context) throws IOException {
+    this.directory = directory;
+    this.segment = segment;
+    boolean success = false;
+    try {
+      // Open files for TermVector storage
+      tvx = directory.createOutput(IndexFileNames.segmentFileName(segment, "", DefaultTermVectorsReader.VECTORS_INDEX_EXTENSION), context);
+      tvx.writeInt(DefaultTermVectorsReader.FORMAT_CURRENT);
+      tvd = directory.createOutput(IndexFileNames.segmentFileName(segment, "", DefaultTermVectorsReader.VECTORS_DOCUMENTS_EXTENSION), context);
+      tvd.writeInt(DefaultTermVectorsReader.FORMAT_CURRENT);
+      tvf = directory.createOutput(IndexFileNames.segmentFileName(segment, "", DefaultTermVectorsReader.VECTORS_FIELDS_EXTENSION), context);
+      tvf.writeInt(DefaultTermVectorsReader.FORMAT_CURRENT);
+      success = true;
+    } finally {
+      if (!success) {
+        IOUtils.closeWhileHandlingException(tvx, tvd, tvf);
+      }
     }
+  }
+ 
+  @Override
+  public void startDocument(int numVectorFields) throws IOException {
+    lastFieldName = null;
+    this.numVectorFields = numVectorFields;
+    tvx.writeLong(tvd.getFilePointer());
+    tvx.writeLong(tvf.getFilePointer());
+    tvd.writeVInt(numVectorFields);
+    fieldCount = 0;
+    fps = ArrayUtil.grow(fps, numVectorFields);
+  }
+  
+  private long fps[] = new long[10]; // pointers to the tvf before writing each field 
+  private int fieldCount = 0;        // number of fields we have written so far for this document
+  private int numVectorFields = 0;   // total number of fields we will write for this document
+  private String lastFieldName;
 
-    public void bootstrap() throws IOException
-    {
-        if (logger.isDebugEnabled())
-            logger.debug("Beginning bootstrap process");
-
-        final Multimap<String, Map.Entry<InetAddress, Collection<Range>>> rangesToFetch = HashMultimap.create();
-
-        int requests = 0;
-        for (String table : DatabaseDescriptor.getNonSystemTables())
-        {
-            Map<InetAddress, Collection<Range>> workMap = getWorkMap(getRangesWithSources(table)).asMap();
-            for (Map.Entry<InetAddress, Collection<Range>> entry : workMap.entrySet())
-            {
-                requests++;
-                rangesToFetch.put(table, entry);
-            }
-        }
-
-        final CountDownLatch latch = new CountDownLatch(requests);
-        for (final String table : rangesToFetch.keySet())
-        {
-            /* Send messages to respective folks to stream data over to me */
-            for (Map.Entry<InetAddress, Collection<Range>> entry : rangesToFetch.get(table))
-            {
-                final InetAddress source = entry.getKey();
-                Collection<Range> ranges = entry.getValue();
-                final Runnable callback = new Runnable()
-                {
-                    public void run()
-                    {
-                        latch.countDown();
-                        if (logger.isDebugEnabled())
-                            logger.debug(String.format("Removed %s/%s as a bootstrap source; remaining is %s",
-                                                       source, table, latch.getCount()));
-                    }
-                };
-                if (logger.isDebugEnabled())
-                    logger.debug("Bootstrapping from " + source + " ranges " + StringUtils.join(entry.getValue(), ", "));
-                StreamIn.requestRanges(source, table, entry.getValue(), callback, OperationType.BOOTSTRAP);
-            }
-        }
-
-        try
-        {
-            latch.await();
-            StorageService.instance.finishBootstrapping();
-        }
-        catch (InterruptedException e)
-        {
-            throw new AssertionError(e);
-        }
+  @Override
+  public void startField(FieldInfo info, int numTerms, boolean positions, boolean offsets) throws IOException {
+    assert lastFieldName == null || info.name.compareTo(lastFieldName) > 0: "fieldName=" + info.name + " lastFieldName=" + lastFieldName;
+    lastFieldName = info.name;
+    this.positions = positions;
+    this.offsets = offsets;
+    lastTerm.length = 0;
+    fps[fieldCount++] = tvf.getFilePointer();
+    tvd.writeVInt(info.number);
+    tvf.writeVInt(numTerms);
+    byte bits = 0x0;
+    if (positions)
+      bits |= DefaultTermVectorsReader.STORE_POSITIONS_WITH_TERMVECTOR;
+    if (offsets)
+      bits |= DefaultTermVectorsReader.STORE_OFFSET_WITH_TERMVECTOR;
+    tvf.writeByte(bits);
+    
+    assert fieldCount <= numVectorFields;
+    if (fieldCount == numVectorFields) {
+      // last field of the document
+      // this is crazy because the file format is crazy!
+      for (int i = 1; i < fieldCount; i++) {
+        tvd.writeVLong(fps[i] - fps[i-1]);
+      }
     }
+  }
+  
+  private final BytesRef lastTerm = new BytesRef(10);
 
-    /**
-     * if initialtoken was specified, use that.
-     * otherwise, pick a token to assume half the load of the most-loaded node.
-     */
-    public static Token getBootstrapToken(final TokenMetadata metadata, final Map<InetAddress, Double> load) throws IOException, ConfigurationException
-    {
-        if (DatabaseDescriptor.getInitialToken() != null)
-        {
-            logger.debug("token manually specified as " + DatabaseDescriptor.getInitialToken());
-            Token token = StorageService.getPartitioner().getTokenFactory().fromString(DatabaseDescriptor.getInitialToken());
-            if (metadata.getEndpoint(token) != null)
-                throw new ConfigurationException("Bootstraping to existing token " + token + " is not allowed (decommission/removetoken the old node first).");
-            return token;
-        }
+  // NOTE: we override addProx, so we don't need to buffer when indexing.
+  // we also don't buffer during bulk merges.
+  private int offsetStartBuffer[] = new int[10];
+  private int offsetEndBuffer[] = new int[10];
+  private int offsetIndex = 0;
+  private int offsetFreq = 0;
+  private boolean positions = false;
+  private boolean offsets = false;
 
-        return getBalancedToken(metadata, load);
+  @Override
+  public void startTerm(BytesRef term, int freq) throws IOException {
+    final int prefix = StringHelper.bytesDifference(lastTerm.bytes, lastTerm.offset, lastTerm.length, 
+                                                    term.bytes, term.offset, term.length);
+    final int suffix = term.length - prefix;
+    tvf.writeVInt(prefix);
+    tvf.writeVInt(suffix);
+    tvf.writeBytes(term.bytes, term.offset + prefix, suffix);
+    tvf.writeVInt(freq);
+    lastTerm.copyBytes(term);
+    lastPosition = lastOffset = 0;
+    
+    if (offsets && positions) {
+      // we might need to buffer if its a non-bulk merge
+      offsetStartBuffer = ArrayUtil.grow(offsetStartBuffer, freq);
+      offsetEndBuffer = ArrayUtil.grow(offsetEndBuffer, freq);
+      offsetIndex = 0;
+      offsetFreq = freq;
     }
+  }
 
-    public static Token getBalancedToken(TokenMetadata metadata, Map<InetAddress, Double> load)
-    {
-        InetAddress maxEndpoint = getBootstrapSource(metadata, load);
-        Token<?> t = getBootstrapTokenFrom(maxEndpoint);
-        logger.info("New token will be " + t + " to assume load from " + maxEndpoint);
-        return t;
+  int lastPosition = 0;
+  int lastOffset = 0;
+
+  @Override
+  public void addProx(int numProx, DataInput positions, DataInput offsets) throws IOException {
+    // TODO: technically we could just copy bytes and not re-encode if we knew the length...
+    if (positions != null) {
+      for (int i = 0; i < numProx; i++) {
+        tvf.writeVInt(positions.readVInt());
+      }
     }
+    
+    if (offsets != null) {
+      for (int i = 0; i < numProx; i++) {
+        tvf.writeVInt(offsets.readVInt());
+        tvf.writeVInt(offsets.readVInt());
+      }
+    }
+  }
 
-    static InetAddress getBootstrapSource(final TokenMetadata metadata, final Map<InetAddress, Double> load)
-    {
-        // sort first by number of nodes already bootstrapping into a source node's range, then by load.
-        List<InetAddress> endpoints = new ArrayList<InetAddress>(load.size());
-        for (InetAddress endpoint : load.keySet())
-        {
-            if (!metadata.isMember(endpoint))
-                continue;
-            endpoints.add(endpoint);
+  @Override
+  public void addPosition(int position, int startOffset, int endOffset) throws IOException {
+    if (positions && offsets) {
+      // write position delta
+      tvf.writeVInt(position - lastPosition);
+      lastPosition = position;
+      
+      // buffer offsets
+      offsetStartBuffer[offsetIndex] = startOffset;
+      offsetEndBuffer[offsetIndex] = endOffset;
+      offsetIndex++;
+      
+      // dump buffer if we are done
+      if (offsetIndex == offsetFreq) {
+        for (int i = 0; i < offsetIndex; i++) {
+          tvf.writeVInt(offsetStartBuffer[i] - lastOffset);
+          tvf.writeVInt(offsetEndBuffer[i] - offsetStartBuffer[i]);
+          lastOffset = offsetEndBuffer[i];
         }
+      }
+    } else if (positions) {
+      // write position delta
+      tvf.writeVInt(position - lastPosition);
+      lastPosition = position;
+    } else if (offsets) {
+      // write offset deltas
+      tvf.writeVInt(startOffset - lastOffset);
+      tvf.writeVInt(endOffset - startOffset);
+      lastOffset = endOffset;
+    }
+  }
 
-        if (endpoints.isEmpty())
-            throw new RuntimeException("No other nodes seen!  Unable to bootstrap");
-        Collections.sort(endpoints, new Comparator<InetAddress>()
-        {
-            public int compare(InetAddress ia1, InetAddress ia2)
-            {
-                int n1 = metadata.pendingRangeChanges(ia1);
-                int n2 = metadata.pendingRangeChanges(ia2);
-                if (n1 != n2)
-                    return -(n1 - n2); // more targets = _less_ priority!
+  @Override
+  public void abort() {
+    try {
+      close();
+    } catch (IOException ignored) {}
+    
+    try {
+      directory.deleteFile(IndexFileNames.segmentFileName(segment, "", DefaultTermVectorsReader.VECTORS_INDEX_EXTENSION));
+    } catch (IOException ignored) {}
+    
+    try {
+      directory.deleteFile(IndexFileNames.segmentFileName(segment, "", DefaultTermVectorsReader.VECTORS_DOCUMENTS_EXTENSION));
+    } catch (IOException ignored) {}
+    
+    try {
+      directory.deleteFile(IndexFileNames.segmentFileName(segment, "", DefaultTermVectorsReader.VECTORS_FIELDS_EXTENSION));
+    } catch (IOException ignored) {}
+  }
 
-                double load1 = load.get(ia1);
-                double load2 = load.get(ia2);
-                if (load1 == load2)
-                    return 0;
-                return load1 < load2 ? -1 : 1;
-            }
-        });
+  /**
+   * Do a bulk copy of numDocs documents from reader to our
+   * streams.  This is used to expedite merging, if the
+   * field numbers are congruent.
+   */
+  private void addRawDocuments(DefaultTermVectorsReader reader, int[] tvdLengths, int[] tvfLengths, int numDocs) throws IOException {
+    long tvdPosition = tvd.getFilePointer();
+    long tvfPosition = tvf.getFilePointer();
+    long tvdStart = tvdPosition;
+    long tvfStart = tvfPosition;
+    for(int i=0;i<numDocs;i++) {
+      tvx.writeLong(tvdPosition);
+      tvdPosition += tvdLengths[i];
+      tvx.writeLong(tvfPosition);
+      tvfPosition += tvfLengths[i];
+    }
+    tvd.copyBytes(reader.getTvdStream(), tvdPosition-tvdStart);
+    tvf.copyBytes(reader.getTvfStream(), tvfPosition-tvfStart);
+    assert tvd.getFilePointer() == tvdPosition;
+    assert tvf.getFilePointer() == tvfPosition;
+  }
 
-        InetAddress maxEndpoint = endpoints.get(endpoints.size() - 1);
-        assert !maxEndpoint.equals(FBUtilities.getLocalAddress());
-        if (metadata.pendingRangeChanges(maxEndpoint) > 0)
-            throw new RuntimeException("Every node is a bootstrap source! Please specify an initial token manually or wait for an existing bootstrap operation to finish.");
+  @Override
+  public final int merge(MergeState mergeState) throws IOException {
+    // Used for bulk-reading raw bytes for term vectors
+    int rawDocLengths[] = new int[MAX_RAW_MERGE_DOCS];
+    int rawDocLengths2[] = new int[MAX_RAW_MERGE_DOCS];
+
+    int idx = 0;
+    int numDocs = 0;
+    for (final MergeState.IndexReaderAndLiveDocs reader : mergeState.readers) {
+      final SegmentReader matchingSegmentReader = mergeState.matchingSegmentReaders[idx++];
+      DefaultTermVectorsReader matchingVectorsReader = null;
+      if (matchingSegmentReader != null) {
+        TermVectorsReader vectorsReader = matchingSegmentReader.getTermVectorsReader();
+
+        if (vectorsReader != null && vectorsReader instanceof DefaultTermVectorsReader) {
+          // If the TV* files are an older format then they cannot read raw docs:
+          if (((DefaultTermVectorsReader)vectorsReader).canReadRawDocs()) {
+            matchingVectorsReader = (DefaultTermVectorsReader) vectorsReader;
+          }
+        }
+      }
+      if (reader.liveDocs != null) {
+        numDocs += copyVectorsWithDeletions(mergeState, matchingVectorsReader, reader, rawDocLengths, rawDocLengths2);
+      } else {
+        numDocs += copyVectorsNoDeletions(mergeState, matchingVectorsReader, reader, rawDocLengths, rawDocLengths2);
+      }
+    }
+    finish(numDocs);
+    return numDocs;
+  }
+
+  /** Maximum number of contiguous documents to bulk-copy
+      when merging term vectors */
+  private final static int MAX_RAW_MERGE_DOCS = 4192;
+
+  private int copyVectorsWithDeletions(MergeState mergeState,
+                                        final DefaultTermVectorsReader matchingVectorsReader,
+                                        final MergeState.IndexReaderAndLiveDocs reader,
+                                        int rawDocLengths[],
+                                        int rawDocLengths2[])
+          throws IOException, MergeAbortedException {
+    final int maxDoc = reader.reader.maxDoc();
+    final Bits liveDocs = reader.liveDocs;
+    int totalNumDocs = 0;
+    if (matchingVectorsReader != null) {
+      // We can bulk-copy because the fieldInfos are "congruent"
+      for (int docNum = 0; docNum < maxDoc;) {
+        if (!liveDocs.get(docNum)) {
+          // skip deleted docs
+          ++docNum;
+          continue;
+        }
+        // We can optimize this case (doing a bulk byte copy) since the field
+        // numbers are identical
+        int start = docNum, numDocs = 0;
+        do {
+          docNum++;
+          numDocs++;
+          if (docNum >= maxDoc) break;
+          if (!liveDocs.get(docNum)) {
+            docNum++;
+            break;
+          }
+        } while(numDocs < MAX_RAW_MERGE_DOCS);
         
-        return maxEndpoint;
-    }
-
-    /** get potential sources for each range, ordered by proximity (as determined by EndpointSnitch) */
-    Multimap<Range, InetAddress> getRangesWithSources(String table)
-    {
-        assert tokenMetadata.sortedTokens().size() > 0;
-        final AbstractReplicationStrategy strat = Table.open(table).getReplicationStrategy();
-        Collection<Range> myRanges = strat.getPendingAddressRanges(tokenMetadata, token, address);
-
-        Multimap<Range, InetAddress> myRangeAddresses = ArrayListMultimap.create();
-        Multimap<Range, InetAddress> rangeAddresses = strat.getRangeAddresses(tokenMetadata);
-        for (Range myRange : myRanges)
-        {
-            for (Range range : rangeAddresses.keySet())
-            {
-                if (range.contains(myRange))
-                {
-                    List<InetAddress> preferred = DatabaseDescriptor.getEndpointSnitch().getSortedListByProximity(address, rangeAddresses.get(range));
-                    myRangeAddresses.putAll(myRange, preferred);
-                    break;
-                }
-            }
-            assert myRangeAddresses.keySet().contains(myRange);
+        matchingVectorsReader.rawDocs(rawDocLengths, rawDocLengths2, start, numDocs);
+        addRawDocuments(matchingVectorsReader, rawDocLengths, rawDocLengths2, numDocs);
+        totalNumDocs += numDocs;
+        mergeState.checkAbort.work(300 * numDocs);
+      }
+    } else {
+      for (int docNum = 0; docNum < maxDoc; docNum++) {
+        if (!liveDocs.get(docNum)) {
+          // skip deleted docs
+          continue;
         }
-        return myRangeAddresses;
+        
+        // NOTE: it's very important to first assign to vectors then pass it to
+        // termVectorsWriter.addAllDocVectors; see LUCENE-1282
+        Fields vectors = reader.reader.getTermVectors(docNum);
+        addAllDocVectors(vectors, mergeState.fieldInfos);
+        totalNumDocs++;
+        mergeState.checkAbort.work(300);
+      }
     }
-
-    static Token<?> getBootstrapTokenFrom(InetAddress maxEndpoint)
-    {
-        Message message = new Message(FBUtilities.getLocalAddress(), StorageService.Verb.BOOTSTRAP_TOKEN, ArrayUtils.EMPTY_BYTE_ARRAY);
-        BootstrapTokenCallback btc = new BootstrapTokenCallback();
-        MessagingService.instance().sendRR(message, maxEndpoint, btc);
-        return btc.getToken();
+    return totalNumDocs;
+  }
+  
+  private int copyVectorsNoDeletions(MergeState mergeState,
+                                      final DefaultTermVectorsReader matchingVectorsReader,
+                                      final MergeState.IndexReaderAndLiveDocs reader,
+                                      int rawDocLengths[],
+                                      int rawDocLengths2[])
+          throws IOException, MergeAbortedException {
+    final int maxDoc = reader.reader.maxDoc();
+    if (matchingVectorsReader != null) {
+      // We can bulk-copy because the fieldInfos are "congruent"
+      int docCount = 0;
+      while (docCount < maxDoc) {
+        int len = Math.min(MAX_RAW_MERGE_DOCS, maxDoc - docCount);
+        matchingVectorsReader.rawDocs(rawDocLengths, rawDocLengths2, docCount, len);
+        addRawDocuments(matchingVectorsReader, rawDocLengths, rawDocLengths2, len);
+        docCount += len;
+        mergeState.checkAbort.work(300 * len);
+      }
+    } else {
+      for (int docNum = 0; docNum < maxDoc; docNum++) {
+        // NOTE: it's very important to first assign to vectors then pass it to
+        // termVectorsWriter.addAllDocVectors; see LUCENE-1282
+        Fields vectors = reader.reader.getTermVectors(docNum);
+        addAllDocVectors(vectors, mergeState.fieldInfos);
+        mergeState.checkAbort.work(300);
+      }
     }
+    return maxDoc;
+  }
+  
+  @Override
+  public void finish(int numDocs) throws IOException {
+    if (4+((long) numDocs)*16 != tvx.getFilePointer())
+      // This is most likely a bug in Sun JRE 1.6.0_04/_05;
+      // we detect that the bug has struck, here, and
+      // throw an exception to prevent the corruption from
+      // entering the index.  See LUCENE-1282 for
+      // details.
+      throw new RuntimeException("mergeVectors produced an invalid result: mergedDocs is " + numDocs + " but tvx size is " + tvx.getFilePointer() + " file=" + tvx.toString() + "; now aborting this merge to prevent index corruption");
+  }
 
-    static Multimap<InetAddress, Range> getWorkMap(Multimap<Range, InetAddress> rangesWithSourceTarget)
-    {
-        return getWorkMap(rangesWithSourceTarget, FailureDetector.instance);
-    }
-
-    static Multimap<InetAddress, Range> getWorkMap(Multimap<Range, InetAddress> rangesWithSourceTarget, IFailureDetector failureDetector)
-    {
-        /*
-         * Map whose key is the source node and the value is a map whose key is the
-         * target and value is the list of ranges to be sent to it.
-        */
-        Multimap<InetAddress, Range> sources = ArrayListMultimap.create();
-
-        // TODO look for contiguous ranges and map them to the same source
-        for (Range range : rangesWithSourceTarget.keySet())
-        {
-            for (InetAddress source : rangesWithSourceTarget.get(range))
-            {
-                if (failureDetector.isAlive(source))
-                {
-                    sources.put(source, range);
-                    break;
-                }
-            }
-        }
-        return sources;
-    }
-
-    public static class BootstrapTokenVerbHandler implements IVerbHandler
-    {
-        public void doVerb(Message message)
-        {
-            StorageService ss = StorageService.instance;
-            String tokenString = StorageService.getPartitioner().getTokenFactory().toString(ss.getBootstrapToken());
-            Message response = message.getInternalReply(tokenString.getBytes(Charsets.UTF_8));
-            MessagingService.instance().sendOneWay(response, message.getFrom());
-        }
-    }
-
-    private static class BootstrapTokenCallback implements IAsyncCallback
-    {
-        private volatile Token<?> token;
-        private final Condition condition = new SimpleCondition();
-
-        public Token<?> getToken()
-        {
-            try
-            {
-                condition.await();
-            }
-            catch (InterruptedException e)
-            {
-                throw new RuntimeException(e);
-            }
-            return token;
-        }
-
-        public void response(Message msg)
-        {
-            token = StorageService.getPartitioner().getTokenFactory().fromString(new String(msg.getMessageBody(), Charsets.UTF_8));
-            condition.signalAll();
-        }
-    }
+  /** Close all streams. */
+  @Override
+  public void close() throws IOException {
+    // make an effort to close all streams we can but remember and re-throw
+    // the first exception encountered in this process
+    IOUtils.close(tvx, tvd, tvf);
+    tvx = tvd = tvf = null;
+  }
 }

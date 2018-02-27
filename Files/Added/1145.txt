@@ -1,13 +1,14 @@
 @Override
 
-package org.apache.lucene.search;
+package org.apache.lucene.search.spans;
 
-/**
- * Copyright 2004 The Apache Software Foundation
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,283 +19,328 @@ package org.apache.lucene.search;
  * limitations under the License.
  */
 
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Iterator;
-import java.util.Set;
-
 import org.apache.lucene.index.AtomicReaderContext;
-import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.Term;
+import org.apache.lucene.index.TermContext;
+import org.apache.lucene.util.ArrayUtil;
 import org.apache.lucene.util.Bits;
 
-/**
- * A query that generates the union of documents produced by its subqueries, and that scores each document with the maximum
- * score for that document as produced by any subquery, plus a tie breaking increment for any additional matching subqueries.
- * This is useful when searching for a word in multiple fields with different boost factors (so that the fields cannot be
- * combined equivalently into a single search field).  We want the primary score to be the one associated with the highest boost,
- * not the sum of the field scores (as BooleanQuery would give).
- * If the query is "albino elephant" this ensures that "albino" matching one field and "elephant" matching
- * another gets a higher score than "albino" matching both fields.
- * To get this result, use both BooleanQuery and DisjunctionMaxQuery:  for each term a DisjunctionMaxQuery searches for it in
- * each field, while the set of these DisjunctionMaxQuery's is combined into a BooleanQuery.
- * The tie breaker capability allows results that include the same term in multiple fields to be judged better than results that
- * include this term in only the best of those multiple fields, without confusing this with the better case of two different terms
- * in the multiple fields.
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Collection;
+import java.util.Map;
+import java.util.Set;
+
+/** A Spans that is formed from the ordered subspans of a SpanNearQuery
+ * where the subspans do not overlap and have a maximum slop between them.
+ * <p>
+ * The formed spans only contains minimum slop matches.<br>
+ * The matching slop is computed from the distance(s) between
+ * the non overlapping matching Spans.<br>
+ * Successive matches are always formed from the successive Spans
+ * of the SpanNearQuery.
+ * <p>
+ * The formed spans may contain overlaps when the slop is at least 1.
+ * For example, when querying using
+ * <pre>t1 t2 t3</pre>
+ * with slop at least 1, the fragment:
+ * <pre>t1 t2 t1 t3 t2 t3</pre>
+ * matches twice:
+ * <pre>t1 t2 .. t3      </pre>
+ * <pre>      t1 .. t2 t3</pre>
+ *
+ *
+ * Expert:
+ * Only public for subclassing.  Most implementations should not need this class
  */
-public class DisjunctionMaxQuery extends Query implements Iterable<Query> {
+public class NearSpansOrdered extends Spans {
+  private final int allowedSlop;
+  private boolean firstTime = true;
+  private boolean more = false;
 
-  /* The subqueries */
-  private ArrayList<Query> disjuncts = new ArrayList<Query>();
+  /** The spans in the same order as the SpanNearQuery */
+  private final Spans[] subSpans;
 
-  /* Multiple of the non-max disjunct scores added into our final score.  Non-zero values support tie-breaking. */
-  private float tieBreakerMultiplier = 0.0f;
+  /** Indicates that all subSpans have same doc() */
+  private boolean inSameDoc = false;
 
-  /** Creates a new empty DisjunctionMaxQuery.  Use add() to add the subqueries.
-   * @param tieBreakerMultiplier the score of each non-maximum disjunct for a document is multiplied by this weight
-   *        and added into the final score.  If non-zero, the value should be small, on the order of 0.1, which says that
-   *        10 occurrences of word in a lower-scored field that is also in a higher scored field is just as good as a unique
-   *        word in the lower scored field (i.e., one that is not in any higher scored field.
-   */
-  public DisjunctionMaxQuery(float tieBreakerMultiplier) {
-    this.tieBreakerMultiplier = tieBreakerMultiplier;
+  private int matchDoc = -1;
+  private int matchStart = -1;
+  private int matchEnd = -1;
+  private List<byte[]> matchPayload;
+
+  private final Spans[] subSpansByDoc;
+  private final Comparator<Spans> spanDocComparator = new Comparator<Spans>() {
+    public int compare(Spans o1, Spans o2) {
+      return o1.doc() - o2.doc();
+    }
+  };
+  
+  private SpanNearQuery query;
+  private boolean collectPayloads = true;
+  
+  public NearSpansOrdered(SpanNearQuery spanNearQuery, AtomicReaderContext context, Bits acceptDocs, Map<Term,TermContext> termContexts) throws IOException {
+    this(spanNearQuery, context, acceptDocs, termContexts, true);
   }
 
-  /**
-   * Creates a new DisjunctionMaxQuery
-   * @param disjuncts a {@code Collection<Query>} of all the disjuncts to add
-   * @param tieBreakerMultiplier   the weight to give to each matching non-maximum disjunct
-   */
-  public DisjunctionMaxQuery(Collection<Query> disjuncts, float tieBreakerMultiplier) {
-    this.tieBreakerMultiplier = tieBreakerMultiplier;
-    add(disjuncts);
+  public NearSpansOrdered(SpanNearQuery spanNearQuery, AtomicReaderContext context, Bits acceptDocs, Map<Term,TermContext> termContexts, boolean collectPayloads)
+  throws IOException {
+    if (spanNearQuery.getClauses().length < 2) {
+      throw new IllegalArgumentException("Less than 2 clauses: "
+                                         + spanNearQuery);
+    }
+    this.collectPayloads = collectPayloads;
+    allowedSlop = spanNearQuery.getSlop();
+    SpanQuery[] clauses = spanNearQuery.getClauses();
+    subSpans = new Spans[clauses.length];
+    matchPayload = new LinkedList<byte[]>();
+    subSpansByDoc = new Spans[clauses.length];
+    for (int i = 0; i < clauses.length; i++) {
+      subSpans[i] = clauses[i].getSpans(context, acceptDocs, termContexts);
+      subSpansByDoc[i] = subSpans[i]; // used in toSameDoc()
+    }
+    query = spanNearQuery; // kept for toString() only.
   }
 
-  /** Add a subquery to this disjunction
-   * @param query the disjunct added
-   */
-  public void add(Query query) {
-    disjuncts.add(query);
+  // inherit javadocs
+  @Override
+  public int doc() { return matchDoc; }
+
+  // inherit javadocs
+  @Override
+  public int start() { return matchStart; }
+
+  // inherit javadocs
+  @Override
+  public int end() { return matchEnd; }
+  
+  public Spans[] getSubSpans() {
+    return subSpans;
+  }  
+
+  // TODO: Remove warning after API has been finalized
+  // TODO: Would be nice to be able to lazy load payloads
+  @Override
+  public Collection<byte[]> getPayload() throws IOException {
+    return matchPayload;
   }
 
-  /** Add a collection of disjuncts to this disjunction
-   * via {@code Iterable<Query>}
-   * @param disjuncts a collection of queries to add as disjuncts.
-   */
-  public void add(Collection<Query> disjuncts) {
-    this.disjuncts.addAll(disjuncts);
+  // TODO: Remove warning after API has been finalized
+  @Override
+  public boolean isPayloadAvailable() {
+    return matchPayload.isEmpty() == false;
   }
 
-  /** @return An {@code Iterator<Query>} over the disjuncts */
-  public Iterator<Query> iterator() {
-    return disjuncts.iterator();
+  // inherit javadocs
+  @Override
+  public boolean next() throws IOException {
+    if (firstTime) {
+      firstTime = false;
+      for (int i = 0; i < subSpans.length; i++) {
+        if (! subSpans[i].next()) {
+          more = false;
+          return false;
+        }
+      }
+      more = true;
+    }
+    if(collectPayloads) {
+      matchPayload.clear();
+    }
+    return advanceAfterOrdered();
+  }
+
+  // inherit javadocs
+  @Override
+  public boolean skipTo(int target) throws IOException {
+    if (firstTime) {
+      firstTime = false;
+      for (int i = 0; i < subSpans.length; i++) {
+        if (! subSpans[i].skipTo(target)) {
+          more = false;
+          return false;
+        }
+      }
+      more = true;
+    } else if (more && (subSpans[0].doc() < target)) {
+      if (subSpans[0].skipTo(target)) {
+        inSameDoc = false;
+      } else {
+        more = false;
+        return false;
+      }
+    }
+    if(collectPayloads) {
+      matchPayload.clear();
+    }
+    return advanceAfterOrdered();
   }
   
-  /**
-   * @return the disjuncts.
+  /** Advances the subSpans to just after an ordered match with a minimum slop
+   * that is smaller than the slop allowed by the SpanNearQuery.
+   * @return true iff there is such a match.
    */
-  public ArrayList<Query> getDisjuncts() {
-    return disjuncts;
+  private boolean advanceAfterOrdered() throws IOException {
+    while (more && (inSameDoc || toSameDoc())) {
+      if (stretchToOrder() && shrinkToAfterShortestMatch()) {
+        return true;
+      }
+    }
+    return false; // no more matches
   }
 
-  /**
-   * @return tie breaker value for multiple matches.
+
+  /** Advance the subSpans to the same document */
+  private boolean toSameDoc() throws IOException {
+    ArrayUtil.mergeSort(subSpansByDoc, spanDocComparator);
+    int firstIndex = 0;
+    int maxDoc = subSpansByDoc[subSpansByDoc.length - 1].doc();
+    while (subSpansByDoc[firstIndex].doc() != maxDoc) {
+      if (! subSpansByDoc[firstIndex].skipTo(maxDoc)) {
+        more = false;
+        inSameDoc = false;
+        return false;
+      }
+      maxDoc = subSpansByDoc[firstIndex].doc();
+      if (++firstIndex == subSpansByDoc.length) {
+        firstIndex = 0;
+      }
+    }
+    for (int i = 0; i < subSpansByDoc.length; i++) {
+      assert (subSpansByDoc[i].doc() == maxDoc)
+             : " NearSpansOrdered.toSameDoc() spans " + subSpansByDoc[0]
+                                 + "\n at doc " + subSpansByDoc[i].doc()
+                                 + ", but should be at " + maxDoc;
+    }
+    inSameDoc = true;
+    return true;
+  }
+  
+  /** Check whether two Spans in the same document are ordered.
+   * @return true iff spans1 starts before spans2
+   *              or the spans start at the same position,
+   *              and spans1 ends before spans2.
    */
-  public float getTieBreakerMultiplier() {
-    return tieBreakerMultiplier;
+  static final boolean docSpansOrdered(Spans spans1, Spans spans2) {
+    assert spans1.doc() == spans2.doc() : "doc1 " + spans1.doc() + " != doc2 " + spans2.doc();
+    int start1 = spans1.start();
+    int start2 = spans2.start();
+    /* Do not call docSpansOrdered(int,int,int,int) to avoid invoking .end() : */
+    return (start1 == start2) ? (spans1.end() < spans2.end()) : (start1 < start2);
   }
 
-  /**
-   * Expert: the Weight for DisjunctionMaxQuery, used to
-   * normalize, score and explain these queries.
-   *
-   * <p>NOTE: this API and implementation is subject to
-   * change suddenly in the next release.</p>
+  /** Like {@link #docSpansOrdered(Spans,Spans)}, but use the spans
+   * starts and ends as parameters.
    */
-  protected class DisjunctionMaxWeight extends Weight {
+  private static final boolean docSpansOrdered(int start1, int end1, int start2, int end2) {
+    return (start1 == start2) ? (end1 < end2) : (start1 < start2);
+  }
 
-    /** The Weights for our subqueries, in 1-1 correspondence with disjuncts */
-    protected ArrayList<Weight> weights = new ArrayList<Weight>();  // The Weight's for our subqueries, in 1-1 correspondence with disjuncts
-
-    /** Construct the Weight for this Query searched by searcher.  Recursively construct subquery weights. */
-    public DisjunctionMaxWeight(IndexSearcher searcher) throws IOException {
-      for (Query disjunctQuery : disjuncts) {
-        weights.add(disjunctQuery.createWeight(searcher));
-      }
-    }
-
-    /** Return our associated DisjunctionMaxQuery */
-    @Override
-    public Query getQuery() { return DisjunctionMaxQuery.this; }
-
-    /** Compute the sub of squared weights of us applied to our subqueries.  Used for normalization. */
-    @Override
-    public float getValueForNormalization() throws IOException {
-      float max = 0.0f, sum = 0.0f;
-      for (Weight currentWeight : weights) {
-        float sub = currentWeight.getValueForNormalization();
-        sum += sub;
-        max = Math.max(max, sub);
-        
-      }
-      float boost = getBoost();
-      return (((sum - max) * tieBreakerMultiplier * tieBreakerMultiplier) + max) * boost * boost;
-    }
-
-    /** Apply the computed normalization factor to our subqueries */
-    @Override
-    public void normalize(float norm, float topLevelBoost) {
-      topLevelBoost *= getBoost();  // Incorporate our boost
-      for (Weight wt : weights) {
-        wt.normalize(norm, topLevelBoost);
-      }
-    }
-
-    /** Create the scorer used to score our associated DisjunctionMaxQuery */
-    @Override
-    public Scorer scorer(AtomicReaderContext context, boolean scoreDocsInOrder,
-        boolean topScorer, Bits acceptDocs) throws IOException {
-      Scorer[] scorers = new Scorer[weights.size()];
-      int idx = 0;
-      for (Weight w : weights) {
-        // we will advance() subscorers
-        Scorer subScorer = w.scorer(context, true, false, acceptDocs);
-        if (subScorer != null) {
-          scorers[idx++] = subScorer;
+  /** Order the subSpans within the same document by advancing all later spans
+   * after the previous one.
+   */
+  private boolean stretchToOrder() throws IOException {
+    matchDoc = subSpans[0].doc();
+    for (int i = 1; inSameDoc && (i < subSpans.length); i++) {
+      while (! docSpansOrdered(subSpans[i-1], subSpans[i])) {
+        if (! subSpans[i].next()) {
+          inSameDoc = false;
+          more = false;
+          break;
+        } else if (matchDoc != subSpans[i].doc()) {
+          inSameDoc = false;
+          break;
         }
       }
-      if (idx == 0) return null; // all scorers did not have documents
-      DisjunctionMaxScorer result = new DisjunctionMaxScorer(this, tieBreakerMultiplier, scorers, idx);
-      return result;
+    }
+    return inSameDoc;
+  }
+
+  /** The subSpans are ordered in the same doc, so there is a possible match.
+   * Compute the slop while making the match as short as possible by advancing
+   * all subSpans except the last one in reverse order.
+   */
+  private boolean shrinkToAfterShortestMatch() throws IOException {
+    matchStart = subSpans[subSpans.length - 1].start();
+    matchEnd = subSpans[subSpans.length - 1].end();
+    Set<byte[]> possibleMatchPayloads = new HashSet<byte[]>();
+    if (subSpans[subSpans.length - 1].isPayloadAvailable()) {
+      possibleMatchPayloads.addAll(subSpans[subSpans.length - 1].getPayload());
     }
 
-    /** Explain the score we computed for doc */
-    @Override
-    public Explanation explain(AtomicReaderContext context, int doc) throws IOException {
-      if (disjuncts.size() == 1) return weights.get(0).explain(context,doc);
-      ComplexExplanation result = new ComplexExplanation();
-      float max = 0.0f, sum = 0.0f;
-      result.setDescription(tieBreakerMultiplier == 0.0f ? "max of:" : "max plus " + tieBreakerMultiplier + " times others of:");
-      for (Weight wt : weights) {
-        Explanation e = wt.explain(context, doc);
-        if (e.isMatch()) {
-          result.setMatch(Boolean.TRUE);
-          result.addDetail(e);
-          sum += e.getValue();
-          max = Math.max(max, e.getValue());
+    Collection<byte[]> possiblePayload = null;
+    
+    int matchSlop = 0;
+    int lastStart = matchStart;
+    int lastEnd = matchEnd;
+    for (int i = subSpans.length - 2; i >= 0; i--) {
+      Spans prevSpans = subSpans[i];
+      if (collectPayloads && prevSpans.isPayloadAvailable()) {
+        Collection<byte[]> payload = prevSpans.getPayload();
+        possiblePayload = new ArrayList<byte[]>(payload.size());
+        possiblePayload.addAll(payload);
+      }
+      
+      int prevStart = prevSpans.start();
+      int prevEnd = prevSpans.end();
+      while (true) { // Advance prevSpans until after (lastStart, lastEnd)
+        if (! prevSpans.next()) {
+          inSameDoc = false;
+          more = false;
+          break; // Check remaining subSpans for final match.
+        } else if (matchDoc != prevSpans.doc()) {
+          inSameDoc = false; // The last subSpans is not advanced here.
+          break; // Check remaining subSpans for last match in this document.
+        } else {
+          int ppStart = prevSpans.start();
+          int ppEnd = prevSpans.end(); // Cannot avoid invoking .end()
+          if (! docSpansOrdered(ppStart, ppEnd, lastStart, lastEnd)) {
+            break; // Check remaining subSpans.
+          } else { // prevSpans still before (lastStart, lastEnd)
+            prevStart = ppStart;
+            prevEnd = ppEnd;
+            if (collectPayloads && prevSpans.isPayloadAvailable()) {
+              Collection<byte[]> payload = prevSpans.getPayload();
+              possiblePayload = new ArrayList<byte[]>(payload.size());
+              possiblePayload.addAll(payload);
+            }
+          }
         }
       }
-      result.setValue(max + (sum - max) * tieBreakerMultiplier);
-      return result;
+
+      if (collectPayloads && possiblePayload != null) {
+        possibleMatchPayloads.addAll(possiblePayload);
+      }
+      
+      assert prevStart <= matchStart;
+      if (matchStart > prevEnd) { // Only non overlapping spans add to slop.
+        matchSlop += (matchStart - prevEnd);
+      }
+
+      /* Do not break on (matchSlop > allowedSlop) here to make sure
+       * that subSpans[0] is advanced after the match, if any.
+       */
+      matchStart = prevStart;
+      lastStart = prevStart;
+      lastEnd = prevEnd;
     }
     
-  }  // end of DisjunctionMaxWeight inner class
-
-  /** Create the Weight used to score us */
-  @Override
-  public Weight createWeight(IndexSearcher searcher) throws IOException {
-    return new DisjunctionMaxWeight(searcher);
-  }
-
-  /** Optimize our representation and our subqueries representations
-   * @param reader the IndexReader we query
-   * @return an optimized copy of us (which may not be a copy if there is nothing to optimize) */
-  @Override
-  public Query rewrite(IndexReader reader) throws IOException {
-    int numDisjunctions = disjuncts.size();
-    if (numDisjunctions == 1) {
-      Query singleton = disjuncts.get(0);
-      Query result = singleton.rewrite(reader);
-      if (getBoost() != 1.0f) {
-        if (result == singleton) result = result.clone();
-        result.setBoost(getBoost() * result.getBoost());
-      }
-      return result;
+    boolean match = matchSlop <= allowedSlop;
+    
+    if(collectPayloads && match && possibleMatchPayloads.size() > 0) {
+      matchPayload.addAll(possibleMatchPayloads);
     }
-    DisjunctionMaxQuery clone = null;
-    for (int i = 0 ; i < numDisjunctions; i++) {
-      Query clause = disjuncts.get(i);
-      Query rewrite = clause.rewrite(reader);
-      if (rewrite != clause) {
-        if (clone == null) clone = this.clone();
-        clone.disjuncts.set(i, rewrite);
-      }
-    }
-    if (clone != null) return clone;
-    else return this;
+
+    return match; // ordered and allowed slop
   }
 
-  /** Create a shallow copy of us -- used in rewriting if necessary
-   * @return a copy of us (but reuse, don't copy, our subqueries) */
-  @Override @SuppressWarnings("unchecked")
-  public DisjunctionMaxQuery clone() {
-    DisjunctionMaxQuery clone = (DisjunctionMaxQuery)super.clone();
-    clone.disjuncts = (ArrayList<Query>) this.disjuncts.clone();
-    return clone;
-  }
-
-  // inherit javadoc
   @Override
-  public void extractTerms(Set<Term> terms) {
-    for (Query query : disjuncts) {
-      query.extractTerms(terms);
-    }
+  public String toString() {
+    return getClass().getName() + "("+query.toString()+")@"+
+      (firstTime?"START":(more?(doc()+":"+start()+"-"+end()):"END"));
   }
-
-  /** Prettyprint us.
-   * @param field the field to which we are applied
-   * @return a string that shows what we do, of the form "(disjunct1 | disjunct2 | ... | disjunctn)^boost"
-   */
-  @Override
-  public String toString(String field) {
-    StringBuilder buffer = new StringBuilder();
-    buffer.append("(");
-    int numDisjunctions = disjuncts.size();
-    for (int i = 0 ; i < numDisjunctions; i++) {
-      Query subquery = disjuncts.get(i);
-      if (subquery instanceof BooleanQuery) {   // wrap sub-bools in parens
-        buffer.append("(");
-        buffer.append(subquery.toString(field));
-        buffer.append(")");
-      }
-      else buffer.append(subquery.toString(field));
-      if (i != numDisjunctions-1) buffer.append(" | ");
-    }
-    buffer.append(")");
-    if (tieBreakerMultiplier != 0.0f) {
-      buffer.append("~");
-      buffer.append(tieBreakerMultiplier);
-    }
-    if (getBoost() != 1.0) {
-      buffer.append("^");
-      buffer.append(getBoost());
-    }
-    return buffer.toString();
-  }
-
-  /** Return true iff we represent the same query as o
-   * @param o another object
-   * @return true iff o is a DisjunctionMaxQuery with the same boost and the same subqueries, in the same order, as us
-   */
-  @Override
-  public boolean equals(Object o) {
-    if (! (o instanceof DisjunctionMaxQuery) ) return false;
-    DisjunctionMaxQuery other = (DisjunctionMaxQuery)o;
-    return this.getBoost() == other.getBoost()
-            && this.tieBreakerMultiplier == other.tieBreakerMultiplier
-            && this.disjuncts.equals(other.disjuncts);
-  }
-
-  /** Compute a hash code for hashing us
-   * @return the hash code
-   */
-  @Override
-  public int hashCode() {
-    return Float.floatToIntBits(getBoost())
-            + Float.floatToIntBits(tieBreakerMultiplier)
-            + disjuncts.hashCode();
-  }
-
-
 }

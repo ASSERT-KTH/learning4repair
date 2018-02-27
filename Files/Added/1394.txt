@@ -1,350 +1,587 @@
 @Override
 
-package org.apache.lucene.store;
+// This file has been automatically generated, DO NOT EDIT
+
+package org.apache.lucene.util.packed;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * contributor license agreements. See the NOTICE file distributed with this
+ * work for additional information regarding copyright ownership. The ASF
+ * licenses this file to You under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
  */
 
-import java.io.Closeable;
-import java.io.FileNotFoundException;
 import java.io.IOException;
-import java.util.Collection;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedList;
-import java.util.Map;
-import java.util.Queue;
-import java.util.Set;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.Arrays;
 
-import org.apache.lucene.codecs.CodecUtil;
-import org.apache.lucene.index.IndexFileNames;
-import org.apache.lucene.util.IOUtils;
+import org.apache.lucene.store.DataInput;
+import org.apache.lucene.util.RamUsageEstimator;
 
 /**
- * Combines multiple files into a single compound file.
- * 
- * @see CompoundFileDirectory
- * @lucene.internal
+ * This class is similar to {@link Packed64} except that it trades space for
+ * speed by ensuring that a single block needs to be read/written in order to
+ * read/write a value.
  */
-final class CompoundFileWriter implements Closeable{
+abstract class Packed64SingleBlock extends PackedInts.MutableImpl {
 
-  private static final class FileEntry {
-    /** source file */
-    String file;
-    long length;
-    /** temporary holder for the start of this file's data section */
-    long offset;
-    /** the directory which contains the file. */
-    Directory dir;
+  public static final int MAX_SUPPORTED_BITS_PER_VALUE = 32;
+  private static final int[] SUPPORTED_BITS_PER_VALUE = new int[] {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 16, 21, 32};
+
+  public static boolean isSupported(int bitsPerValue) {
+    return Arrays.binarySearch(SUPPORTED_BITS_PER_VALUE, bitsPerValue) >= 0;
   }
 
-  // versioning for the .cfs file
-  static final String DATA_CODEC = "CompoundFileWriterData";
-  static final int VERSION_START = 0;
-  static final int VERSION_CURRENT = VERSION_START;
-
-  // versioning for the .cfe file
-  static final String ENTRY_CODEC = "CompoundFileWriterEntries";
-
-  private final Directory directory;
-  private final Map<String, FileEntry> entries = new HashMap<String, FileEntry>();
-  private final Set<String> seenIDs = new HashSet<String>();
-  // all entries that are written to a sep. file but not yet moved into CFS
-  private final Queue<FileEntry> pendingEntries = new LinkedList<FileEntry>();
-  private boolean closed = false;
-  private IndexOutput dataOut;
-  private final AtomicBoolean outputTaken = new AtomicBoolean(false);
-  final String entryTableName;
-  final String dataFileName;
-
-  /**
-   * Create the compound stream in the specified file. The file name is the
-   * entire name (no extensions are added).
-   * 
-   * @throws NullPointerException
-   *           if <code>dir</code> or <code>name</code> is null
-   */
-  CompoundFileWriter(Directory dir, String name) {
-    if (dir == null)
-      throw new NullPointerException("directory cannot be null");
-    if (name == null)
-      throw new NullPointerException("name cannot be null");
-    directory = dir;
-    entryTableName = IndexFileNames.segmentFileName(
-        IndexFileNames.stripExtension(name), "",
-        IndexFileNames.COMPOUND_FILE_ENTRIES_EXTENSION);
-    dataFileName = name;
-    
+  private static int requiredCapacity(int valueCount, int valuesPerBlock) {
+    return valueCount / valuesPerBlock
+        + (valueCount % valuesPerBlock == 0 ? 0 : 1);
   }
-  
-  private synchronized IndexOutput getOutput() throws IOException {
-    if (dataOut == null) {
-      boolean success = false;
-      try {
-        dataOut = directory.createOutput(dataFileName, IOContext.DEFAULT);
-        CodecUtil.writeHeader(dataOut, DATA_CODEC, VERSION_CURRENT);
-        success = true;
-      } finally {
-        if (!success) {
-          IOUtils.closeWhileHandlingException(dataOut);
-        }
+
+  final long[] blocks;
+
+  Packed64SingleBlock(int valueCount, int bitsPerValue) {
+    super(valueCount, bitsPerValue);
+    assert isSupported(bitsPerValue);
+    final int valuesPerBlock = 64 / bitsPerValue;
+    blocks = new long[requiredCapacity(valueCount, valuesPerBlock)];
+  }
+
+  @Override
+  public void clear() {
+    Arrays.fill(blocks, 0L);
+  }
+
+  public long ramBytesUsed() {
+    return RamUsageEstimator.sizeOf(blocks);
+  }
+
+  @Override
+  public int get(int index, long[] arr, int off, int len) {
+    assert len > 0 : "len must be > 0 (got " + len + ")";
+    assert index >= 0 && index < valueCount;
+    len = Math.min(len, valueCount - index);
+    assert off + len <= arr.length;
+
+    final int originalIndex = index;
+
+    // go to the next block boundary
+    final int valuesPerBlock = 64 / bitsPerValue;
+    final int offsetInBlock = index % valuesPerBlock;
+    if (offsetInBlock != 0) {
+      for (int i = offsetInBlock; i < valuesPerBlock && len > 0; ++i) {
+        arr[off++] = get(index++);
+        --len;
       }
-    } 
-    return dataOut;
+      if (len == 0) {
+        return index - originalIndex;
+      }
+    }
+
+    // bulk get
+    assert index % valuesPerBlock == 0;
+    final PackedInts.Decoder decoder = BulkOperation.of(PackedInts.Format.PACKED_SINGLE_BLOCK, bitsPerValue);
+    assert decoder.blockCount() == 1;
+    assert decoder.valueCount() == valuesPerBlock;
+    final int blockIndex = index / valuesPerBlock;
+    final int nblocks = (index + len) / valuesPerBlock - blockIndex;
+    decoder.decode(blocks, blockIndex, arr, off, nblocks);
+    final int diff = nblocks * valuesPerBlock;
+    index += diff; len -= diff;
+
+    if (index > originalIndex) {
+      // stay at the block boundary
+      return index - originalIndex;
+    } else {
+      // no progress so far => already at a block boundary but no full block to
+      // get
+      assert index == originalIndex;
+      return super.get(index, arr, off, len);
+    }
   }
 
-  /** Returns the directory of the compound file. */
-  Directory getDirectory() {
-    return directory;
+  @Override
+  public int set(int index, long[] arr, int off, int len) {
+    assert len > 0 : "len must be > 0 (got " + len + ")";
+    assert index >= 0 && index < valueCount;
+    len = Math.min(len, valueCount - index);
+    assert off + len <= arr.length;
+
+    final int originalIndex = index;
+
+    // go to the next block boundary
+    final int valuesPerBlock = 64 / bitsPerValue;
+    final int offsetInBlock = index % valuesPerBlock;
+    if (offsetInBlock != 0) {
+      for (int i = offsetInBlock; i < valuesPerBlock && len > 0; ++i) {
+        set(index++, arr[off++]);
+        --len;
+      }
+      if (len == 0) {
+        return index - originalIndex;
+      }
+    }
+
+    // bulk set
+    assert index % valuesPerBlock == 0;
+    final BulkOperation op = BulkOperation.of(PackedInts.Format.PACKED_SINGLE_BLOCK, bitsPerValue);
+    assert op.blockCount() == 1;
+    assert op.valueCount() == valuesPerBlock;
+    final int blockIndex = index / valuesPerBlock;
+    final int nblocks = (index + len) / valuesPerBlock - blockIndex;
+    op.encode(arr, off, blocks, blockIndex, nblocks);
+    final int diff = nblocks * valuesPerBlock;
+    index += diff; len -= diff;
+
+    if (index > originalIndex) {
+      // stay at the block boundary
+      return index - originalIndex;
+    } else {
+      // no progress so far => already at a block boundary but no full block to
+      // set
+      assert index == originalIndex;
+      return super.set(index, arr, off, len);
+    }
   }
 
-  /** Returns the name of the compound file. */
-  String getName() {
-    return dataFileName;
-  }
+  @Override
+  public void fill(int fromIndex, int toIndex, long val) {
+    assert fromIndex >= 0;
+    assert fromIndex <= toIndex;
+    assert PackedInts.bitsRequired(val) <= bitsPerValue;
 
-  /**
-   * Closes all resources and writes the entry table
-   * 
-   * @throws IllegalStateException
-   *           if close() had been called before or if no file has been added to
-   *           this object
-   */
-  public void close() throws IOException {
-    if (closed) {
+    final int valuesPerBlock = 64 / bitsPerValue;
+    if (toIndex - fromIndex <= valuesPerBlock << 1) {
+      // there needs to be at least one full block to set for the block
+      // approach to be worth trying
+      super.fill(fromIndex, toIndex, val);
       return;
     }
-    IOException priorException = null;
-    IndexOutput entryTableOut = null;
-    // TODO this code should clean up after itself
-    // (remove partial .cfs/.cfe)
-    try {
-      if (!pendingEntries.isEmpty() || outputTaken.get()) {
-        throw new IllegalStateException("CFS has pending open files");
+
+    // set values naively until the next block start
+    int fromOffsetInBlock = fromIndex % valuesPerBlock;
+    if (fromOffsetInBlock != 0) {
+      for (int i = fromOffsetInBlock; i < valuesPerBlock; ++i) {
+        set(fromIndex++, val);
       }
-      closed = true;
-      // open the compound stream
-      getOutput();
-      assert dataOut != null;
-    } catch (IOException e) {
-      priorException = e;
-    } finally {
-      IOUtils.closeWhileHandlingException(priorException, dataOut);
+      assert fromIndex % valuesPerBlock == 0;
     }
-    try {
-      entryTableOut = directory.createOutput(entryTableName, IOContext.DEFAULT);
-      writeEntryTable(entries.values(), entryTableOut);
-    } catch (IOException e) {
-      priorException = e;
-    } finally {
-      IOUtils.closeWhileHandlingException(priorException, entryTableOut);
-    }
-  }
 
-  private final void ensureOpen() {
-    if (closed) {
-      throw new AlreadyClosedException("CFS Directory is already closed");
+    // bulk set of the inner blocks
+    final int fromBlock = fromIndex / valuesPerBlock;
+    final int toBlock = toIndex / valuesPerBlock;
+    assert fromBlock * valuesPerBlock == fromIndex;
+
+    long blockValue = 0L;
+    for (int i = 0; i < valuesPerBlock; ++i) {
+      blockValue = blockValue | (val << (i * bitsPerValue));
+    }
+    Arrays.fill(blocks, fromBlock, toBlock, blockValue);
+
+    // fill the gap
+    for (int i = valuesPerBlock * toBlock; i < toIndex; ++i) {
+      set(i, val);
     }
   }
 
-  /**
-   * Copy the contents of the file with specified extension into the provided
-   * output stream.
-   */
-  private final long copyFileEntry(IndexOutput dataOut, FileEntry fileEntry)
-      throws IOException {
-    final IndexInput is = fileEntry.dir.openInput(fileEntry.file, IOContext.READONCE);
-    boolean success = false;
-    try {
-      final long startPtr = dataOut.getFilePointer();
-      final long length = fileEntry.length;
-      dataOut.copyBytes(is, length);
-      // Verify that the output length diff is equal to original file
-      long endPtr = dataOut.getFilePointer();
-      long diff = endPtr - startPtr;
-      if (diff != length)
-        throw new IOException("Difference in the output file offsets " + diff
-            + " does not match the original file length " + length);
-      fileEntry.offset = startPtr;
-      success = true;
-      return length;
-    } finally {
-      if (success) {
-        IOUtils.close(is);
-        // copy successful - delete file
-        fileEntry.dir.deleteFile(fileEntry.file);
-      } else {
-        IOUtils.closeWhileHandlingException(is);
-      }
+  @Override
+  protected PackedInts.Format getFormat() {
+    return PackedInts.Format.PACKED_SINGLE_BLOCK;
+  }
+
+  @Override
+  public String toString() {
+    return getClass().getSimpleName() + "(bitsPerValue=" + bitsPerValue
+        + ", size=" + size() + ", elements.length=" + blocks.length + ")";
+  }
+
+  public static Packed64SingleBlock create(DataInput in,
+      int valueCount, int bitsPerValue) throws IOException {
+    Packed64SingleBlock reader = create(valueCount, bitsPerValue);
+    for (int i = 0; i < reader.blocks.length; ++i) {
+      reader.blocks[i] = in.readLong();
+    }
+    return reader;
+  }
+
+  public static Packed64SingleBlock create(int valueCount, int bitsPerValue) {
+    switch (bitsPerValue) {
+      case 1:
+        return new Packed64SingleBlock1(valueCount);
+      case 2:
+        return new Packed64SingleBlock2(valueCount);
+      case 3:
+        return new Packed64SingleBlock3(valueCount);
+      case 4:
+        return new Packed64SingleBlock4(valueCount);
+      case 5:
+        return new Packed64SingleBlock5(valueCount);
+      case 6:
+        return new Packed64SingleBlock6(valueCount);
+      case 7:
+        return new Packed64SingleBlock7(valueCount);
+      case 8:
+        return new Packed64SingleBlock8(valueCount);
+      case 9:
+        return new Packed64SingleBlock9(valueCount);
+      case 10:
+        return new Packed64SingleBlock10(valueCount);
+      case 12:
+        return new Packed64SingleBlock12(valueCount);
+      case 16:
+        return new Packed64SingleBlock16(valueCount);
+      case 21:
+        return new Packed64SingleBlock21(valueCount);
+      case 32:
+        return new Packed64SingleBlock32(valueCount);
+      default:
+        throw new IllegalArgumentException("Unsupported number of bits per value: " + 32);
     }
   }
 
-  protected void writeEntryTable(Collection<FileEntry> entries,
-      IndexOutput entryOut) throws IOException {
-    CodecUtil.writeHeader(entryOut, ENTRY_CODEC, VERSION_CURRENT);
-    entryOut.writeVInt(entries.size());
-    for (FileEntry fe : entries) {
-      entryOut.writeString(IndexFileNames.stripSegmentName(fe.file));
-      entryOut.writeLong(fe.offset);
-      entryOut.writeLong(fe.length);
-    }
-  }
+  static class Packed64SingleBlock1 extends Packed64SingleBlock {
 
-  IndexOutput createOutput(String name, IOContext context) throws IOException {
-    ensureOpen();
-    boolean success = false;
-    boolean outputLocked = false;
-    try {
-      assert name != null : "name must not be null";
-      if (entries.containsKey(name)) {
-        throw new IllegalArgumentException("File " + name + " already exists");
-      }
-      final FileEntry entry = new FileEntry();
-      entry.file = name;
-      entries.put(name, entry);
-      final String id = IndexFileNames.stripSegmentName(name);
-      assert !seenIDs.contains(id): "file=\"" + name + "\" maps to id=\"" + id + "\", which was already written";
-      seenIDs.add(id);
-      final DirectCFSIndexOutput out;
-      if ((outputLocked = outputTaken.compareAndSet(false, true))) {
-        out = new DirectCFSIndexOutput(getOutput(), entry, false);
-      } else {
-        entry.dir = this.directory;
-        if (directory.fileExists(name)) {
-          throw new IllegalArgumentException("File " + name + " already exists");
-        }
-        out = new DirectCFSIndexOutput(directory.createOutput(name, context), entry,
-            true);
-      }
-      success = true;
-      return out;
-    } finally {
-      if (!success) {
-        entries.remove(name);
-        if (outputLocked) { // release the output lock if not successful
-          assert outputTaken.get();
-          releaseOutputLock();
-        }
-      }
-    }
-  }
-
-  final void releaseOutputLock() {
-    outputTaken.compareAndSet(true, false);
-  }
-
-  private final void prunePendingEntries() throws IOException {
-    // claim the output and copy all pending files in
-    if (outputTaken.compareAndSet(false, true)) {
-      try {
-        while (!pendingEntries.isEmpty()) {
-          FileEntry entry = pendingEntries.poll();
-          copyFileEntry(getOutput(), entry);
-          entries.put(entry.file, entry);
-        }
-      } finally {
-        final boolean compareAndSet = outputTaken.compareAndSet(true, false);
-        assert compareAndSet;
-      }
-    }
-  }
-
-  long fileLength(String name) throws IOException {
-    FileEntry fileEntry = entries.get(name);
-    if (fileEntry == null) {
-      throw new FileNotFoundException(name + " does not exist");
-    }
-    return fileEntry.length;
-  }
-
-  boolean fileExists(String name) {
-    return entries.containsKey(name);
-  }
-
-  String[] listAll() {
-    return entries.keySet().toArray(new String[0]);
-  }
-
-  private final class DirectCFSIndexOutput extends IndexOutput {
-    private final IndexOutput delegate;
-    private final long offset;
-    private boolean closed;
-    private FileEntry entry;
-    private long writtenBytes;
-    private final boolean isSeparate;
-
-    DirectCFSIndexOutput(IndexOutput delegate, FileEntry entry,
-        boolean isSeparate) {
-      super();
-      this.delegate = delegate;
-      this.entry = entry;
-      entry.offset = offset = delegate.getFilePointer();
-      this.isSeparate = isSeparate;
-
+    Packed64SingleBlock1(int valueCount) {
+      super(valueCount, 1);
     }
 
     @Override
-    public void flush() throws IOException {
-      delegate.flush();
+    public long get(int index) {
+      final int o = index >>> 6;
+      final int b = index & 63;
+      final int shift = b << 0;
+      return (blocks[o] >>> shift) & 1L;
     }
 
     @Override
-    public void close() throws IOException {
-      if (!closed) {
-        closed = true;
-        entry.length = writtenBytes;
-        if (isSeparate) {
-          delegate.close();
-          // we are a separate file - push into the pending entries
-          pendingEntries.add(entry);
-        } else {
-          // we have been written into the CFS directly - release the lock
-          releaseOutputLock();
-        }
-        // now prune all pending entries and push them into the CFS
-        prunePendingEntries();
-      }
+    public void set(int index, long value) {
+      final int o = index >>> 6;
+      final int b = index & 63;
+      final int shift = b << 0;
+      blocks[o] = (blocks[o] & ~(1L << shift)) | (value << shift);
+    }
+
+  }
+
+  static class Packed64SingleBlock2 extends Packed64SingleBlock {
+
+    Packed64SingleBlock2(int valueCount) {
+      super(valueCount, 2);
     }
 
     @Override
-    public long getFilePointer() {
-      return delegate.getFilePointer() - offset;
+    public long get(int index) {
+      final int o = index >>> 5;
+      final int b = index & 31;
+      final int shift = b << 1;
+      return (blocks[o] >>> shift) & 3L;
     }
 
     @Override
-    public long length() throws IOException {
-      assert !closed;
-      return delegate.length() - offset;
+    public void set(int index, long value) {
+      final int o = index >>> 5;
+      final int b = index & 31;
+      final int shift = b << 1;
+      blocks[o] = (blocks[o] & ~(3L << shift)) | (value << shift);
+    }
+
+  }
+
+  static class Packed64SingleBlock3 extends Packed64SingleBlock {
+
+    Packed64SingleBlock3(int valueCount) {
+      super(valueCount, 3);
     }
 
     @Override
-    public void writeByte(byte b) throws IOException {
-      assert !closed;
-      writtenBytes++;
-      delegate.writeByte(b);
+    public long get(int index) {
+      final int o = index / 21;
+      final int b = index % 21;
+      final int shift = b * 3;
+      return (blocks[o] >>> shift) & 7L;
     }
 
     @Override
-    public void writeBytes(byte[] b, int offset, int length) throws IOException {
-      assert !closed;
-      writtenBytes += length;
-      delegate.writeBytes(b, offset, length);
+    public void set(int index, long value) {
+      final int o = index / 21;
+      final int b = index % 21;
+      final int shift = b * 3;
+      blocks[o] = (blocks[o] & ~(7L << shift)) | (value << shift);
     }
+
+  }
+
+  static class Packed64SingleBlock4 extends Packed64SingleBlock {
+
+    Packed64SingleBlock4(int valueCount) {
+      super(valueCount, 4);
+    }
+
+    @Override
+    public long get(int index) {
+      final int o = index >>> 4;
+      final int b = index & 15;
+      final int shift = b << 2;
+      return (blocks[o] >>> shift) & 15L;
+    }
+
+    @Override
+    public void set(int index, long value) {
+      final int o = index >>> 4;
+      final int b = index & 15;
+      final int shift = b << 2;
+      blocks[o] = (blocks[o] & ~(15L << shift)) | (value << shift);
+    }
+
+  }
+
+  static class Packed64SingleBlock5 extends Packed64SingleBlock {
+
+    Packed64SingleBlock5(int valueCount) {
+      super(valueCount, 5);
+    }
+
+    @Override
+    public long get(int index) {
+      final int o = index / 12;
+      final int b = index % 12;
+      final int shift = b * 5;
+      return (blocks[o] >>> shift) & 31L;
+    }
+
+    @Override
+    public void set(int index, long value) {
+      final int o = index / 12;
+      final int b = index % 12;
+      final int shift = b * 5;
+      blocks[o] = (blocks[o] & ~(31L << shift)) | (value << shift);
+    }
+
+  }
+
+  static class Packed64SingleBlock6 extends Packed64SingleBlock {
+
+    Packed64SingleBlock6(int valueCount) {
+      super(valueCount, 6);
+    }
+
+    @Override
+    public long get(int index) {
+      final int o = index / 10;
+      final int b = index % 10;
+      final int shift = b * 6;
+      return (blocks[o] >>> shift) & 63L;
+    }
+
+    @Override
+    public void set(int index, long value) {
+      final int o = index / 10;
+      final int b = index % 10;
+      final int shift = b * 6;
+      blocks[o] = (blocks[o] & ~(63L << shift)) | (value << shift);
+    }
+
+  }
+
+  static class Packed64SingleBlock7 extends Packed64SingleBlock {
+
+    Packed64SingleBlock7(int valueCount) {
+      super(valueCount, 7);
+    }
+
+    @Override
+    public long get(int index) {
+      final int o = index / 9;
+      final int b = index % 9;
+      final int shift = b * 7;
+      return (blocks[o] >>> shift) & 127L;
+    }
+
+    @Override
+    public void set(int index, long value) {
+      final int o = index / 9;
+      final int b = index % 9;
+      final int shift = b * 7;
+      blocks[o] = (blocks[o] & ~(127L << shift)) | (value << shift);
+    }
+
+  }
+
+  static class Packed64SingleBlock8 extends Packed64SingleBlock {
+
+    Packed64SingleBlock8(int valueCount) {
+      super(valueCount, 8);
+    }
+
+    @Override
+    public long get(int index) {
+      final int o = index >>> 3;
+      final int b = index & 7;
+      final int shift = b << 3;
+      return (blocks[o] >>> shift) & 255L;
+    }
+
+    @Override
+    public void set(int index, long value) {
+      final int o = index >>> 3;
+      final int b = index & 7;
+      final int shift = b << 3;
+      blocks[o] = (blocks[o] & ~(255L << shift)) | (value << shift);
+    }
+
+  }
+
+  static class Packed64SingleBlock9 extends Packed64SingleBlock {
+
+    Packed64SingleBlock9(int valueCount) {
+      super(valueCount, 9);
+    }
+
+    @Override
+    public long get(int index) {
+      final int o = index / 7;
+      final int b = index % 7;
+      final int shift = b * 9;
+      return (blocks[o] >>> shift) & 511L;
+    }
+
+    @Override
+    public void set(int index, long value) {
+      final int o = index / 7;
+      final int b = index % 7;
+      final int shift = b * 9;
+      blocks[o] = (blocks[o] & ~(511L << shift)) | (value << shift);
+    }
+
+  }
+
+  static class Packed64SingleBlock10 extends Packed64SingleBlock {
+
+    Packed64SingleBlock10(int valueCount) {
+      super(valueCount, 10);
+    }
+
+    @Override
+    public long get(int index) {
+      final int o = index / 6;
+      final int b = index % 6;
+      final int shift = b * 10;
+      return (blocks[o] >>> shift) & 1023L;
+    }
+
+    @Override
+    public void set(int index, long value) {
+      final int o = index / 6;
+      final int b = index % 6;
+      final int shift = b * 10;
+      blocks[o] = (blocks[o] & ~(1023L << shift)) | (value << shift);
+    }
+
+  }
+
+  static class Packed64SingleBlock12 extends Packed64SingleBlock {
+
+    Packed64SingleBlock12(int valueCount) {
+      super(valueCount, 12);
+    }
+
+    @Override
+    public long get(int index) {
+      final int o = index / 5;
+      final int b = index % 5;
+      final int shift = b * 12;
+      return (blocks[o] >>> shift) & 4095L;
+    }
+
+    @Override
+    public void set(int index, long value) {
+      final int o = index / 5;
+      final int b = index % 5;
+      final int shift = b * 12;
+      blocks[o] = (blocks[o] & ~(4095L << shift)) | (value << shift);
+    }
+
+  }
+
+  static class Packed64SingleBlock16 extends Packed64SingleBlock {
+
+    Packed64SingleBlock16(int valueCount) {
+      super(valueCount, 16);
+    }
+
+    @Override
+    public long get(int index) {
+      final int o = index >>> 2;
+      final int b = index & 3;
+      final int shift = b << 4;
+      return (blocks[o] >>> shift) & 65535L;
+    }
+
+    @Override
+    public void set(int index, long value) {
+      final int o = index >>> 2;
+      final int b = index & 3;
+      final int shift = b << 4;
+      blocks[o] = (blocks[o] & ~(65535L << shift)) | (value << shift);
+    }
+
+  }
+
+  static class Packed64SingleBlock21 extends Packed64SingleBlock {
+
+    Packed64SingleBlock21(int valueCount) {
+      super(valueCount, 21);
+    }
+
+    @Override
+    public long get(int index) {
+      final int o = index / 3;
+      final int b = index % 3;
+      final int shift = b * 21;
+      return (blocks[o] >>> shift) & 2097151L;
+    }
+
+    @Override
+    public void set(int index, long value) {
+      final int o = index / 3;
+      final int b = index % 3;
+      final int shift = b * 21;
+      blocks[o] = (blocks[o] & ~(2097151L << shift)) | (value << shift);
+    }
+
+  }
+
+  static class Packed64SingleBlock32 extends Packed64SingleBlock {
+
+    Packed64SingleBlock32(int valueCount) {
+      super(valueCount, 32);
+    }
+
+    @Override
+    public long get(int index) {
+      final int o = index >>> 1;
+      final int b = index & 1;
+      final int shift = b << 5;
+      return (blocks[o] >>> shift) & 4294967295L;
+    }
+
+    @Override
+    public void set(int index, long value) {
+      final int o = index >>> 1;
+      final int b = index & 1;
+      final int shift = b << 5;
+      blocks[o] = (blocks[o] & ~(4294967295L << shift)) | (value << shift);
+    }
+
   }
 
 }
+ No newline at end of file

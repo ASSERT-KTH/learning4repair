@@ -1,6 +1,6 @@
 @Override
 
-package org.apache.solr.search.grouping.endresulttransformer;
+package org.apache.solr.search.grouping.distributed.requestfactory;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,95 +19,69 @@ package org.apache.solr.search.grouping.endresulttransformer;
  * limitations under the License.
  */
 
-import org.apache.lucene.search.ScoreDoc;
-import org.apache.lucene.search.grouping.GroupDocs;
-import org.apache.lucene.search.grouping.TopGroups;
-import org.apache.lucene.util.BytesRef;
-import org.apache.solr.common.SolrDocumentList;
-import org.apache.solr.common.util.NamedList;
-import org.apache.solr.common.util.SimpleOrderedMap;
+import org.apache.solr.common.params.CommonParams;
+import org.apache.solr.common.params.GroupParams;
+import org.apache.solr.common.params.ModifiableSolrParams;
+import org.apache.solr.common.params.ShardParams;
 import org.apache.solr.handler.component.ResponseBuilder;
-import org.apache.solr.schema.FieldType;
-import org.apache.solr.schema.SchemaField;
+import org.apache.solr.handler.component.ShardRequest;
 import org.apache.solr.search.SolrIndexSearcher;
-import org.apache.solr.search.grouping.distributed.command.QueryCommandResult;
-
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
+import org.apache.solr.search.grouping.GroupingSpecification;
+import org.apache.solr.search.grouping.distributed.ShardRequestFactory;
 
 /**
- * Implementation of {@link EndResultTransformer} that keeps each grouped result separate in the final response.
+ * Concrete implementation of {@link ShardRequestFactory} that creates {@link ShardRequest} instances for getting the
+ * search groups from all shards.
  */
-public class GroupedEndResultTransformer implements EndResultTransformer {
-
-  private final SolrIndexSearcher searcher;
-
-  public GroupedEndResultTransformer(SolrIndexSearcher searcher) {
-    this.searcher = searcher;
-  }
+public class SearchGroupsRequestFactory implements ShardRequestFactory {
 
   /**
    * {@inheritDoc}
    */
-  public void transform(Map<String, ?> result, ResponseBuilder rb, SolrDocumentSource solrDocumentSource) {
-    NamedList<Object> commands = new NamedList<Object>();
-    for (Map.Entry<String, ?> entry : result.entrySet()) {
-      Object value = entry.getValue();
-      if (TopGroups.class.isInstance(value)) {
-        @SuppressWarnings("unchecked")
-        TopGroups<BytesRef> topGroups = (TopGroups<BytesRef>) value;
-        NamedList<Object> command = new SimpleOrderedMap<Object>();
-        command.add("matches", rb.totalHitCount);
-        Integer totalGroupCount = rb.mergedGroupCounts.get(entry.getKey());
-        if (totalGroupCount != null) {
-          command.add("ngroups", totalGroupCount);
-        }
-
-        List<NamedList> groups = new ArrayList<NamedList>();
-        SchemaField groupField = searcher.getSchema().getField(entry.getKey());
-        FieldType groupFieldType = groupField.getType();
-        for (GroupDocs<BytesRef> group : topGroups.groups) {
-          SimpleOrderedMap<Object> groupResult = new SimpleOrderedMap<Object>();
-          if (group.groupValue != null) {
-            groupResult.add(
-                "groupValue", groupFieldType.toObject(groupField.createField(group.groupValue.utf8ToString(), 1.0f))
-            );
-          } else {
-            groupResult.add("groupValue", null);
-          }
-          SolrDocumentList docList = new SolrDocumentList();
-          docList.setNumFound(group.totalHits);
-          if (!Float.isNaN(group.maxScore)) {
-            docList.setMaxScore(group.maxScore);
-          }
-          docList.setStart(rb.getGroupingSpec().getGroupOffset());
-          for (ScoreDoc scoreDoc : group.scoreDocs) {
-            docList.add(solrDocumentSource.retrieve(scoreDoc));
-          }
-          groupResult.add("doclist", docList);
-          groups.add(groupResult);
-        }
-        command.add("groups", groups);
-        commands.add(entry.getKey(), command);
-      } else if (QueryCommandResult.class.isInstance(value)) {
-        QueryCommandResult queryCommandResult = (QueryCommandResult) value;
-        NamedList<Object> command = new SimpleOrderedMap<Object>();
-        command.add("matches", queryCommandResult.getMatches());
-        SolrDocumentList docList = new SolrDocumentList();
-        docList.setNumFound(queryCommandResult.getTopDocs().totalHits);
-        if (!Float.isNaN(queryCommandResult.getTopDocs().getMaxScore())) {
-          docList.setMaxScore(queryCommandResult.getTopDocs().getMaxScore());
-        }
-        docList.setStart(rb.getGroupingSpec().getGroupOffset());
-        for (ScoreDoc scoreDoc :queryCommandResult.getTopDocs().scoreDocs){
-          docList.add(solrDocumentSource.retrieve(scoreDoc));
-        }
-        command.add("doclist", docList);
-        commands.add(entry.getKey(), command);
-      }
+  public ShardRequest[] constructRequest(ResponseBuilder rb) {
+    ShardRequest sreq = new ShardRequest();
+    GroupingSpecification groupingSpecification = rb.getGroupingSpec();
+    if (groupingSpecification.getFields().length == 0) {
+      return new ShardRequest[0];
     }
-    rb.rsp.add("grouped", commands);
+
+    sreq.purpose = ShardRequest.PURPOSE_GET_TOP_GROUPS;
+
+    sreq.params = new ModifiableSolrParams(rb.req.getParams());
+    // TODO: base on current params or original params?
+
+    // don't pass through any shards param
+    sreq.params.remove(ShardParams.SHARDS);
+
+    // set the start (offset) to 0 for each shard request so we can properly merge
+    // results from the start.
+    if(rb.shards_start > -1) {
+      // if the client set shards.start set this explicitly
+      sreq.params.set(CommonParams.START,rb.shards_start);
+    } else {
+      sreq.params.set(CommonParams.START, "0");
+    }
+    // TODO: should we even use the SortSpec?  That's obtained from the QParser, and
+    // perhaps we shouldn't attempt to parse the query at this level?
+    // Alternate Idea: instead of specifying all these things at the upper level,
+    // we could just specify that this is a shard request.
+    if(rb.shards_rows > -1) {
+      // if the client set shards.rows set this explicity
+      sreq.params.set(CommonParams.ROWS,rb.shards_rows);
+    } else {
+      sreq.params.set(CommonParams.ROWS, rb.getSortSpec().getOffset() + rb.getSortSpec().getCount());
+    }
+
+    // in this first phase, request only the unique key field
+    // and any fields needed for merging.
+    sreq.params.set(GroupParams.GROUP_DISTRIBUTED_FIRST, "true");
+
+    if ( (rb.getFieldFlags() & SolrIndexSearcher.GET_SCORES)!=0 || rb.getSortSpec().includesScore()) {
+      sreq.params.set(CommonParams.FL, rb.req.getSchema().getUniqueKeyField().getName() + ",score");
+    } else {
+      sreq.params.set(CommonParams.FL, rb.req.getSchema().getUniqueKeyField().getName());
+    }
+    return new ShardRequest[] {sreq};
   }
 
 }

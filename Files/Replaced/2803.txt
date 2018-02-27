@@ -1,13 +1,14 @@
+position += code >>> 1;
 
+package org.apache.lucene.index;
 
 /**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,207 +19,308 @@
  * limitations under the License.
  */
 
-package org.apache.cassandra.tools;
+import org.apache.lucene.index.FieldInfo.IndexOptions;
+import org.apache.lucene.util.UnicodeUtil;
 
-import java.io.FileReader;
 import java.io.IOException;
-import java.util.*;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.db.ColumnFamily;
-import org.apache.cassandra.db.DecoratedKey;
-import org.apache.cassandra.db.SuperColumn;
-import org.apache.cassandra.db.ColumnFamilyType;
-import org.apache.cassandra.db.filter.QueryPath;
-import org.apache.cassandra.dht.IPartitioner;
-import org.apache.cassandra.io.util.DataOutputBuffer;
-import org.apache.cassandra.io.sstable.SSTableWriter;
-import org.apache.cassandra.utils.FBUtilities;
-import static org.apache.cassandra.utils.FBUtilities.hexToBytes;
-import org.apache.commons.cli.*;
-import org.json.simple.JSONArray;
-import org.json.simple.JSONObject;
-import org.json.simple.JSONValue;
-import org.json.simple.parser.ParseException;
+import java.util.Collection;
+import java.util.Map;
+import java.util.ArrayList;
+import java.util.List;
+import org.apache.lucene.util.BitVector;
+import org.apache.lucene.util.CollectionUtil;
 
-/**
- * Create SSTables from JSON input
- */
-public class SSTableImport
-{
-    private static final String KEYSPACE_OPTION = "K";
-    private static final String COLFAM_OPTION = "c";
-    private static Options options;
-    private static CommandLine cmd;
+final class FreqProxTermsWriter extends TermsHashConsumer {
 
-    static
-    {
-        options = new Options();
-        Option optKeyspace = new Option(KEYSPACE_OPTION, true, "Keyspace name");
-        optKeyspace.setRequired(true);
-        options.addOption(optKeyspace);
-        Option optColfamily = new Option(COLFAM_OPTION, true, "Column family");
-        optColfamily.setRequired(true);
-        options.addOption(optColfamily);
+  @Override
+  public TermsHashConsumerPerThread addThread(TermsHashPerThread perThread) {
+    return new FreqProxTermsWriterPerThread(perThread);
+  }
+
+  private static int compareText(final char[] text1, int pos1, final char[] text2, int pos2) {
+    while(true) {
+      final char c1 = text1[pos1++];
+      final char c2 = text2[pos2++];
+      if (c1 != c2) {
+        if (0xffff == c2)
+          return 1;
+        else if (0xffff == c1)
+          return -1;
+        else
+          return c1-c2;
+      } else if (0xffff == c1)
+        return 0;
     }
-    
-    private static class JsonColumn
-    {
-        private String name;
-        private String value;
-        private long timestamp;
-        private boolean isDeleted;
+  }
+
+  @Override
+  void abort() {}
+
+  // TODO: would be nice to factor out more of this, eg the
+  // FreqProxFieldMergeState, and code to visit all Fields
+  // under the same FieldInfo together, up into TermsHash*.
+  // Other writers would presumably share alot of this...
+
+  @Override
+  public void flush(Map<TermsHashConsumerPerThread,Collection<TermsHashConsumerPerField>> threadsAndFields, final SegmentWriteState state) throws IOException {
+
+    // Gather all FieldData's that have postings, across all
+    // ThreadStates
+    List<FreqProxTermsWriterPerField> allFields = new ArrayList<FreqProxTermsWriterPerField>();
+
+    for (Map.Entry<TermsHashConsumerPerThread,Collection<TermsHashConsumerPerField>> entry : threadsAndFields.entrySet()) {
+
+      Collection<TermsHashConsumerPerField> fields = entry.getValue();
+
+      for (final TermsHashConsumerPerField i : fields) {
+        final FreqProxTermsWriterPerField perField = (FreqProxTermsWriterPerField) i;
+        if (perField.termsHashPerField.numPostings > 0)
+          allFields.add(perField);
+      }
+    }
+
+    // Sort by field name
+    CollectionUtil.quickSort(allFields);
+    final int numAllFields = allFields.size();
+
+    // TODO: allow Lucene user to customize this consumer:
+    final FormatPostingsFieldsConsumer consumer = new FormatPostingsFieldsWriter(state, fieldInfos);
+    /*
+    Current writer chain:
+      FormatPostingsFieldsConsumer
+        -> IMPL: FormatPostingsFieldsWriter
+          -> FormatPostingsTermsConsumer
+            -> IMPL: FormatPostingsTermsWriter
+              -> FormatPostingsDocConsumer
+                -> IMPL: FormatPostingsDocWriter
+                  -> FormatPostingsPositionsConsumer
+                    -> IMPL: FormatPostingsPositionsWriter
+    */
+    try {
+      int start = 0;
+      while(start < numAllFields) {
+        final FieldInfo fieldInfo = allFields.get(start).fieldInfo;
+        final String fieldName = fieldInfo.name;
         
-        private JsonColumn(Object obj) throws ClassCastException
-        {
-            JSONArray colSpec = (JSONArray)obj;
-            assert colSpec.size() == 4;
-            name = (String)colSpec.get(0);
-            value = (String)colSpec.get(1);
-            timestamp = (Long)colSpec.get(2);
-            isDeleted = (Boolean)colSpec.get(3);
-        }
-    }
-
-    /**
-     * Add columns to a column family.
-     * 
-     * @param row the columns associated with a row
-     * @param cfamily the column family to add columns to
-     */
-    private static void addToStandardCF(JSONArray row, ColumnFamily cfamily)
-    {
-        for (Object c : row)
-        {
-            JsonColumn col = new JsonColumn(c);
-            QueryPath path = new QueryPath(cfamily.name(), null, hexToBytes(col.name));
-            if (col.isDeleted) {
-                cfamily.addColumn(path, hexToBytes(col.value), col.timestamp);
-            } else {
-                cfamily.addTombstone(path, hexToBytes(col.value), col.timestamp);
-            }
-        }
-    }
-    
-    /**
-     * Add super columns to a column family.
-     * 
-     * @param row the super columns associated with a row
-     * @param cfamily the column family to add columns to
-     */
-    private static void addToSuperCF(JSONObject row, ColumnFamily cfamily)
-    {
-        // Super columns
-        for (Map.Entry<String, JSONObject> entry : (Set<Map.Entry<String, JSONObject>>)row.entrySet())
-        {
-            byte[] superName = hexToBytes(entry.getKey());
-            long deletedAt = (Long)entry.getValue().get("deletedAt");
-            JSONArray subColumns = (JSONArray)entry.getValue().get("subColumns");
-            
-            // Add sub-columns
-            for (Object c : subColumns)
-            {
-                JsonColumn col = new JsonColumn(c);
-                QueryPath path = new QueryPath(cfamily.name(), superName, hexToBytes(col.name));
-                if (col.isDeleted) {
-                    cfamily.addColumn(path, hexToBytes(col.value), col.timestamp);
-                } else {
-                    cfamily.addTombstone(path, hexToBytes(col.value), col.timestamp);
-                }
-            }
-            
-            SuperColumn superColumn = (SuperColumn)cfamily.getColumn(superName);
-            superColumn.markForDeleteAt((int)(System.currentTimeMillis()/1000), deletedAt);
-        }
-    }
-
-    /**
-     * Convert a JSON formatted file to an SSTable.
-     * 
-     * @param jsonFile the file containing JSON formatted data
-     * @param keyspace keyspace the data belongs to
-     * @param cf column family the data belongs to
-     * @param ssTablePath file to write the SSTable to
-     * @throws IOException for errors reading/writing input/output
-     * @throws ParseException for errors encountered parsing JSON input
-     */
-    public static void importJson(String jsonFile, String keyspace, String cf, String ssTablePath)
-    throws IOException, ParseException
-    {
-        ColumnFamily cfamily = ColumnFamily.create(keyspace, cf);
-        ColumnFamilyType cfType = cfamily.getColumnFamilyType();    // Super or Standard
-        IPartitioner<?> partitioner = DatabaseDescriptor.getPartitioner();
-        DataOutputBuffer dob = new DataOutputBuffer();
+        int end = start+1;
+        while(end < numAllFields && allFields.get(end).fieldInfo.name.equals(fieldName))
+          end++;
         
-        try
-        {
-            JSONObject json = (JSONObject)JSONValue.parseWithException(new FileReader(jsonFile));
-            
-            SSTableWriter writer = new SSTableWriter(ssTablePath, json.size(), partitioner);
-            SortedMap<DecoratedKey,String> decoratedKeys = new TreeMap<DecoratedKey,String>();
-            
-            // sort by dk representation, but hold onto the hex version
-            for (String key : (Set<String>)json.keySet())
-                decoratedKeys.put(partitioner.decorateKey(hexToBytes(key)), key);
-
-            for (Map.Entry<DecoratedKey, String> rowKey : decoratedKeys.entrySet())
-            {
-                if (cfType == ColumnFamilyType.Super)
-                    addToSuperCF((JSONObject)json.get(rowKey.getValue()), cfamily);
-                else
-                    addToStandardCF((JSONArray)json.get(rowKey.getValue()), cfamily);
-                           
-                ColumnFamily.serializer().serializeWithIndexes(cfamily, dob);
-                writer.append(rowKey.getKey(), dob);
-                dob.reset();
-                cfamily.clear();
-            }
-            
-            writer.closeAndOpenReader();
+        FreqProxTermsWriterPerField[] fields = new FreqProxTermsWriterPerField[end-start];
+        for(int i=start;i<end;i++) {
+          fields[i-start] = allFields.get(i);
+          
+          // Aggregate the storePayload as seen by the same
+          // field across multiple threads
+          if (fieldInfo.indexOptions == IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) {
+            fieldInfo.storePayloads |= fields[i-start].hasPayloads;
+          }
         }
-        catch (ClassCastException cce)
-        {
-            throw new RuntimeException("Invalid JSON input, or incorrect column family.", cce);
-        }
-    }
-
-    /**
-     * Converts JSON to an SSTable file. JSON input can either be a file specified
-     * using an optional command line argument, or supplied on standard in.
-     * 
-     * @param args command line arguments
-     * @throws IOException on failure to open/read/write files or output streams
-     * @throws ParseException on failure to parse JSON input
-     */
-    public static void main(String[] args) throws IOException, ParseException
-    {
-        String usage = String.format("Usage: %s -K keyspace -c column_family <json> <sstable>%n",
-                SSTableImport.class.getName());
-
-        CommandLineParser parser = new PosixParser();
-        try
-        {
-            cmd = parser.parse(options, args);
-        } catch (org.apache.commons.cli.ParseException e1)
-        {
-            System.err.println(e1.getMessage());
-            System.err.println(usage);
-            System.exit(1);
-        }
-
-        if (cmd.getArgs().length != 2)
-        {
-            System.err.println(usage);
-            System.exit(1);
-        }
-
-        String json = cmd.getArgs()[0];
-        String ssTable = cmd.getArgs()[1];
-        String keyspace = cmd.getOptionValue(KEYSPACE_OPTION);
-        String cfamily = cmd.getOptionValue(COLFAM_OPTION);
-
-        importJson(json, keyspace, cfamily, ssTable);
         
-        System.exit(0);
+        // If this field has postings then add them to the
+        // segment
+        appendPostings(fieldName, state, fields, consumer);
+        
+        for(int i=0;i<fields.length;i++) {
+          TermsHashPerField perField = fields[i].termsHashPerField;
+          int numPostings = perField.numPostings;
+          perField.reset();
+          perField.shrinkHash(numPostings);
+          fields[i].reset();
+        }
+        
+        start = end;
+      }
+      
+      for (Map.Entry<TermsHashConsumerPerThread,Collection<TermsHashConsumerPerField>> entry : threadsAndFields.entrySet()) {
+        FreqProxTermsWriterPerThread perThread = (FreqProxTermsWriterPerThread) entry.getKey();
+        perThread.termsHashPerThread.reset(true);
+      }
+    } finally {
+      consumer.finish();
+    }
+  }
+
+  private byte[] payloadBuffer;
+
+  /* Walk through all unique text tokens (Posting
+   * instances) found in this field and serialize them
+   * into a single RAM segment. */
+  void appendPostings(String fieldName, SegmentWriteState state,
+                      FreqProxTermsWriterPerField[] fields,
+                      FormatPostingsFieldsConsumer consumer)
+    throws CorruptIndexException, IOException {
+
+    int numFields = fields.length;
+
+    final FreqProxFieldMergeState[] mergeStates = new FreqProxFieldMergeState[numFields];
+
+    for(int i=0;i<numFields;i++) {
+      FreqProxFieldMergeState fms = mergeStates[i] = new FreqProxFieldMergeState(fields[i]);
+
+      assert fms.field.fieldInfo == fields[0].fieldInfo;
+
+      // Should always be true
+      boolean result = fms.nextTerm();
+      assert result;
     }
 
+    final FormatPostingsTermsConsumer termsConsumer = consumer.addField(fields[0].fieldInfo);
+    final Term protoTerm = new Term(fieldName);
+
+    FreqProxFieldMergeState[] termStates = new FreqProxFieldMergeState[numFields];
+
+    final IndexOptions currentFieldIndexOptions = fields[0].fieldInfo.indexOptions;
+
+    final Map<Term,Integer> segDeletes;
+    if (state.segDeletes != null && state.segDeletes.terms.size() > 0) {
+      segDeletes = state.segDeletes.terms;
+    } else {
+      segDeletes = null;
+    }
+
+    try {
+      // TODO: really TermsHashPerField should take over most
+      // of this loop, including merge sort of terms from
+      // multiple threads and interacting with the
+      // TermsConsumer, only calling out to us (passing us the
+      // DocsConsumer) to handle delivery of docs/positions
+      while(numFields > 0) {
+
+        // Get the next term to merge
+        termStates[0] = mergeStates[0];
+        int numToMerge = 1;
+
+        // TODO: pqueue
+        for(int i=1;i<numFields;i++) {
+          final char[] text = mergeStates[i].text;
+          final int textOffset = mergeStates[i].textOffset;
+          final int cmp = compareText(text, textOffset, termStates[0].text, termStates[0].textOffset);
+
+          if (cmp < 0) {
+            termStates[0] = mergeStates[i];
+            numToMerge = 1;
+          } else if (cmp == 0)
+            termStates[numToMerge++] = mergeStates[i];
+        }
+
+        final FormatPostingsDocsConsumer docConsumer = termsConsumer.addTerm(termStates[0].text, termStates[0].textOffset);
+
+        final int delDocLimit;
+        if (segDeletes != null) {
+          final Integer docIDUpto = segDeletes.get(protoTerm.createTerm(termStates[0].termText()));
+          if (docIDUpto != null) {
+            delDocLimit = docIDUpto;
+          } else {
+            delDocLimit = 0;
+          }
+        } else {
+          delDocLimit = 0;
+        }
+
+        try {
+          // Now termStates has numToMerge FieldMergeStates
+          // which all share the same term.  Now we must
+          // interleave the docID streams.
+          while(numToMerge > 0) {
+            
+            FreqProxFieldMergeState minState = termStates[0];
+            for(int i=1;i<numToMerge;i++)
+              if (termStates[i].docID < minState.docID)
+                minState = termStates[i];
+
+            final int termDocFreq = minState.termFreq;
+
+            final FormatPostingsPositionsConsumer posConsumer = docConsumer.addDoc(minState.docID, termDocFreq);
+
+            // NOTE: we could check here if the docID was
+            // deleted, and skip it.  However, this is somewhat
+            // dangerous because it can yield non-deterministic
+            // behavior since we may see the docID before we see
+            // the term that caused it to be deleted.  This
+            // would mean some (but not all) of its postings may
+            // make it into the index, which'd alter the docFreq
+            // for those terms.  We could fix this by doing two
+            // passes, ie first sweep marks all del docs, and
+            // 2nd sweep does the real flush, but I suspect
+            // that'd add too much time to flush.
+
+            if (minState.docID < delDocLimit) {
+              // Mark it deleted.  TODO: we could also skip
+              // writing its postings; this would be
+              // deterministic (just for this Term's docs).
+              if (state.deletedDocs == null) {
+                state.deletedDocs = new BitVector(state.numDocs);
+              }
+              state.deletedDocs.set(minState.docID);
+            }
+
+            final ByteSliceReader prox = minState.prox;
+
+            // Carefully copy over the prox + payload info,
+            // changing the format to match Lucene's segment
+            // format.
+            if (currentFieldIndexOptions == IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) {
+              // omitTermFreqAndPositions == false so we do write positions &
+              // payload  
+              try {
+                int position = 0;
+                for(int j=0;j<termDocFreq;j++) {
+                  final int code = prox.readVInt();
+                  position += code >> 1;
+                
+                final int payloadLength;
+                if ((code & 1) != 0) {
+                  // This position has a payload
+                  payloadLength = prox.readVInt();
+                  
+                  if (payloadBuffer == null || payloadBuffer.length < payloadLength)
+                    payloadBuffer = new byte[payloadLength];
+                  
+                  prox.readBytes(payloadBuffer, 0, payloadLength);
+                  
+                } else
+                  payloadLength = 0;
+                
+                posConsumer.addPosition(position, payloadBuffer, 0, payloadLength);
+                } //End for
+              } finally {
+                posConsumer.finish();
+              }
+            }
+
+            if (!minState.nextDoc()) {
+
+              // Remove from termStates
+              int upto = 0;
+              for(int i=0;i<numToMerge;i++)
+                if (termStates[i] != minState)
+                  termStates[upto++] = termStates[i];
+              numToMerge--;
+              assert upto == numToMerge;
+
+              // Advance this state to the next term
+
+              if (!minState.nextTerm()) {
+                // OK, no more terms, so remove from mergeStates
+                // as well
+                upto = 0;
+                for(int i=0;i<numFields;i++)
+                  if (mergeStates[i] != minState)
+                    mergeStates[upto++] = mergeStates[i];
+                numFields--;
+                assert upto == numFields;
+              }
+            }
+          }
+        } finally {
+          docConsumer.finish();
+        }
+      }
+    } finally {
+      termsConsumer.finish();
+    }
+  }
+
+  final UnicodeUtil.UTF8Result termsUTF8 = new UnicodeUtil.UTF8Result();
 }

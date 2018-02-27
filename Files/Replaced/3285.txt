@@ -1,4 +1,6 @@
-public SnapShooter(SolrCore core, String location) {
+final List<AtomicReaderContext> leaves = reader.leaves();
+
+package org.apache.lucene.index;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -16,239 +18,587 @@ public SnapShooter(SolrCore core, String location) {
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.solr.handler;
-
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileNotFoundException;
-import java.io.FileOutputStream;
 import java.io.IOException;
-import java.text.SimpleDateFormat;
+import java.lang.reflect.Array;
 import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.Date;
+import java.util.Arrays;
+import java.util.Comparator;
 import java.util.List;
-import java.util.Locale;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
-import org.apache.commons.io.IOUtils;
-import org.apache.lucene.index.IndexCommit;
-import org.apache.lucene.store.Lock;
-import org.apache.lucene.store.SimpleFSLockFactory;
-import org.apache.solr.common.util.NamedList;
-import org.apache.solr.core.IndexDeletionPolicyWrapper;
-import org.apache.solr.core.SolrCore;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.lucene.index.SortedBytesMergeUtils.MergeContext;
+import org.apache.lucene.index.SortedBytesMergeUtils.SortedSourceSlice;
+import org.apache.lucene.util.ArrayUtil;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.PagedBytes;
+import org.apache.lucene.util.packed.PackedInts.Reader;
 
 /**
- * <p/> Provides functionality equivalent to the snapshooter script </p>
+ * A wrapper for CompositeIndexReader providing access to per segment
+ * {@link DocValues}
+ * 
+ * <p><b>NOTE</b>: for multi readers, you'll get better
+ * performance by gathering the sub readers using
+ * {@link IndexReader#getTopReaderContext()} to get the
+ * atomic leaves and then operate per-AtomicReader,
+ * instead of using this class.
  *
- *
- * @since solr 1.4
+ * @lucene.experimental
+ * @lucene.internal
  */
-public class SnapShooter {
-  private static final Logger LOG = LoggerFactory.getLogger(SnapShooter.class.getName());
-  private String snapDir = null;
-  private SolrCore solrCore;
-  private SimpleFSLockFactory lockFactory;
+public class MultiDocValues extends DocValues {
   
-  public SnapShooter(SolrCore core, String location) throws IOException {
-    solrCore = core;
-    if (location == null) snapDir = core.getDataDir();
-    else  {
-      File base = new File(core.getCoreDescriptor().getInstanceDir());
-      snapDir = org.apache.solr.util.FileUtils.resolvePath(base, location).getAbsolutePath();
-      File dir = new File(snapDir);
-      if (!dir.exists())  dir.mkdirs();
-    }
-    lockFactory = new SimpleFSLockFactory(snapDir);
-  }
-  
-  void createSnapAsync(final IndexCommit indexCommit, final ReplicationHandler replicationHandler) {
-    createSnapAsync(indexCommit, Integer.MAX_VALUE, replicationHandler);
-  }
-
-  void createSnapAsync(final IndexCommit indexCommit, final int numberToKeep, final ReplicationHandler replicationHandler) {
-    replicationHandler.core.getDeletionPolicy().saveCommitPoint(indexCommit.getGeneration());
-
-    new Thread() {
-      @Override
-      public void run() {
-        createSnapshot(indexCommit, numberToKeep, replicationHandler);
-      }
-    }.start();
-  }
-
-  void createSnapshot(final IndexCommit indexCommit, int numberToKeep, ReplicationHandler replicationHandler) {
-
-    NamedList<Object> details = new NamedList<Object>();
-    details.add("startTime", new Date().toString());
-    File snapShotDir = null;
-    String directoryName = null;
-    Lock lock = null;
-    try {
-      if(numberToKeep<Integer.MAX_VALUE) {
-        deleteOldBackups(numberToKeep);
-      }
-      SimpleDateFormat fmt = new SimpleDateFormat(DATE_FMT, Locale.US);
-      directoryName = "snapshot." + fmt.format(new Date());
-      lock = lockFactory.makeLock(directoryName + ".lock");
-      if (lock.isLocked()) return;
-      snapShotDir = new File(snapDir, directoryName);
-      if (!snapShotDir.mkdir()) {
-        LOG.warn("Unable to create snapshot directory: " + snapShotDir.getAbsolutePath());
-        return;
-      }
-      Collection<String> files = indexCommit.getFileNames();
-      FileCopier fileCopier = new FileCopier(solrCore.getDeletionPolicy(), indexCommit);
-      fileCopier.copyFiles(files, snapShotDir);
-
-      details.add("fileCount", files.size());
-      details.add("status", "success");
-      details.add("snapshotCompletedAt", new Date().toString());
-    } catch (Exception e) {
-      SnapPuller.delTree(snapShotDir);
-      LOG.error("Exception while creating snapshot", e);
-      details.add("snapShootException", e.getMessage());
-    } finally {
-      replicationHandler.core.getDeletionPolicy().releaseCommitPoint(indexCommit.getGeneration());
-      replicationHandler.snapShootDetails = details;
-      if (lock != null) {
-        try {
-          lock.release();
-        } catch (IOException e) {
-          LOG.error("Unable to release snapshoot lock: " + directoryName + ".lock");
-        }
-      }
-    }
-  }
-  private void deleteOldBackups(int numberToKeep) {
-    File[] files = new File(snapDir).listFiles();
-    List<OldBackupDirectory> dirs = new ArrayList<OldBackupDirectory>();
-    for(File f : files) {
-      OldBackupDirectory obd = new OldBackupDirectory(f);
-      if(obd.dir != null) {
-        dirs.add(obd);
-      }
-    }
-    Collections.sort(dirs);
-    int i=1;
-    for(OldBackupDirectory dir : dirs) {
-      if( i++ > numberToKeep-1 ) {
-        SnapPuller.delTree(dir.dir);
-      }
-    }   
-  }
-  private class OldBackupDirectory implements Comparable<OldBackupDirectory>{
-    File dir;
-    Date timestamp;
-    final Pattern dirNamePattern = Pattern.compile("^snapshot[.](.*)$");
-    
-    OldBackupDirectory(File dir) {
-      if(dir.isDirectory()) {
-        Matcher m = dirNamePattern.matcher(dir.getName());
-        if(m.find()) {
-          try {
-            this.dir = dir;
-            this.timestamp = new SimpleDateFormat(DATE_FMT).parse(m.group(1));
-          } catch(Exception e) {
-            this.dir = null;
-            this.timestamp = null;
-          }
-        }
-      }
-    }
-    public int compareTo(OldBackupDirectory that) {
-      return that.timestamp.compareTo(this.timestamp);
-    }
-  }
-
-  public static final String SNAP_DIR = "snapDir";
-  public static final String DATE_FMT = "yyyyMMddHHmmssSSS";
-  
-
-  private class FileCopier {
-    private static final int DEFAULT_BUFFER_SIZE = 32768;
-    private byte[] buffer = new byte[DEFAULT_BUFFER_SIZE];
-    private IndexCommit indexCommit;
-    private IndexDeletionPolicyWrapper delPolicy;
-
-    public FileCopier(IndexDeletionPolicyWrapper delPolicy, IndexCommit commit) {
-      this.delPolicy = delPolicy;
-      this.indexCommit = commit;
+  private static DocValuesPuller DEFAULT_PULLER = new DocValuesPuller();
+  private static final DocValuesPuller NORMS_PULLER = new DocValuesPuller() {
+    public DocValues pull(AtomicReader reader, String field) throws IOException {
+      return reader.normValues(field);
     }
     
-    public void copyFiles(Collection<String> files, File destDir) throws IOException {
-      for (String indexFile : files) {
-        File source = new File(solrCore.getIndexDir(), indexFile);
-        copyFile(source, new File(destDir, source.getName()), true);
-      }
+    public boolean stopLoadingOnNull(AtomicReader reader, String field) {
+      // for norms we drop all norms if one leaf reader has no norms and the field is present
+      FieldInfos fieldInfos = reader.getFieldInfos();
+      FieldInfo fieldInfo = fieldInfos.fieldInfo(field);
+      return fieldInfo != null && fieldInfo.omitsNorms();
+    }
+  };
+
+  public static class DocValuesSlice {
+    public final static DocValuesSlice[] EMPTY_ARRAY = new DocValuesSlice[0];
+    final int start;
+    final int length;
+    DocValues docValues;
+
+    public DocValuesSlice(DocValues docValues, int start, int length) {
+      this.docValues = docValues;
+      this.start = start;
+      this.length = length;
+    }
+  }
+  
+  private static class DocValuesPuller {
+    public DocValuesPuller() {}
+
+    public DocValues pull(AtomicReader reader, String field) throws IOException {
+      return reader.docValues(field);
     }
     
-    public void copyFile(File source, File destination, boolean preserveFileDate)
-      throws IOException {
-      // check source exists
-      if (!source.exists()) {
-        String message = "File " + source + " does not exist";
-        throw new FileNotFoundException(message);
-      }
+    public boolean stopLoadingOnNull(AtomicReader reader, String field) {
+      return false;
+    }
+  }
 
-      // does destinations directory exist ?
-      if (destination.getParentFile() != null
-          && !destination.getParentFile().exists()) {
-        destination.getParentFile().mkdirs();
-      }
+  private DocValuesSlice[] slices;
+  private int[] starts;
+  private Type type;
+  private int valueSize;
 
-      // make sure we can write to destination
-      if (destination.exists() && !destination.canWrite()) {
-        String message = "Unable to open file " + destination + " for writing.";
-        throw new IOException(message);
-      }
-
-      FileInputStream input = null;
-      FileOutputStream output = null;
-      try {
-        input = new FileInputStream(source);
-        output = new FileOutputStream(destination);
+  private MultiDocValues(DocValuesSlice[] slices, int[] starts, TypePromoter promotedType) {
+    this.starts = starts;
+    this.slices = slices;
+    this.type = promotedType.type();
+    this.valueSize = promotedType.getValueSize();
+  }
+  /**
+   * Returns a single {@link DocValues} instance for this field, merging
+   * their values on the fly.
+   * 
+   * <p>
+   * <b>NOTE</b>: this is a slow way to access DocValues.
+   * It's better to get the sub-readers and iterate through them
+   * yourself.
+   */
+  public static DocValues getDocValues(IndexReader r, final String field) throws IOException {
+    return getDocValues(r, field, DEFAULT_PULLER);
+  }
+  
+  /**
+   * Returns a single {@link DocValues} instance for this norms field, merging
+   * their values on the fly.
+   * 
+   * <p>
+   * <b>NOTE</b>: this is a slow way to access DocValues.
+   * It's better to get the sub-readers and iterate through them
+   * yourself.
+   */
+  public static DocValues getNormDocValues(IndexReader r, final String field) throws IOException {
+    return getDocValues(r, field, NORMS_PULLER);
+  }
+  
  
-        int count = 0;
-        int n = 0;
-        int rcnt = 0;
-        while (-1 != (n = input.read(buffer))) {
-          output.write(buffer, 0, n);
-          count += n;
-          rcnt++;
-          /***
-          // reserve every 4.6875 MB
-          if (rcnt == 150) {
-            rcnt = 0;
-            delPolicy.setReserveDuration(indexCommit.getVersion(), reserveTime);
+  private static DocValues getDocValues(IndexReader reader, final String field, final DocValuesPuller puller) throws IOException {
+    if (reader instanceof AtomicReader) {
+      // already an atomic reader
+      return puller.pull((AtomicReader) reader, field);
+    }
+    assert reader instanceof CompositeReader;
+    final List<AtomicReaderContext> leaves = reader.getTopReaderContext().leaves();
+    switch (leaves.size()) {
+      case 0:
+        // no fields
+        return null;
+      case 1:
+        // already an atomic reader / reader with one leave
+        return getDocValues(leaves.get(0).reader(), field, puller);
+      default:
+        final List<DocValuesSlice> slices = new ArrayList<DocValuesSlice>();
+        
+        TypePromoter promotedType =  TypePromoter.getIdentityPromoter();
+        
+        // gather all docvalues fields, accumulating a promoted type across 
+        // potentially incompatible types
+        for (final AtomicReaderContext ctx : leaves) {
+          final AtomicReader r = ctx.reader();
+          final DocValues d = puller.pull(r, field);
+          if (d != null) {
+            TypePromoter incoming = TypePromoter.create(d.getType(), d.getValueSize());
+            promotedType = promotedType.promote(incoming);
+          } else if (puller.stopLoadingOnNull(r, field)){
+            return null;
           }
-           ***/
+          slices.add(new DocValuesSlice(d, ctx.docBase, r.maxDoc()));
         }
-      } finally {
+        
+        // return null if no docvalues encountered anywhere
+        if (promotedType == TypePromoter.getIdentityPromoter()) {
+          return null;
+        }
+             
+        // populate starts and fill gaps with empty docvalues 
+        int starts[] = new int[slices.size()];
+        for (int i = 0; i < slices.size(); i++) {
+          DocValuesSlice slice = slices.get(i);
+          starts[i] = slice.start;
+          if (slice.docValues == null) {
+            Type promoted = promotedType.type();
+            switch(promoted) {
+              case BYTES_FIXED_DEREF:
+              case BYTES_FIXED_STRAIGHT:
+              case BYTES_FIXED_SORTED:
+                assert promotedType.getValueSize() >= 0;
+                slice.docValues = new EmptyFixedDocValues(slice.length, promoted, promotedType.getValueSize());
+                break;
+              default:
+                slice.docValues = new EmptyDocValues(slice.length, promoted);
+            }
+          }
+        }
+        
+        return new MultiDocValues(slices.toArray(new DocValuesSlice[slices.size()]), starts, promotedType);
+    }
+  }
+
+  @Override
+  public Source load() throws IOException {
+    return new MultiSource(slices, starts, false, type);
+  }
+
+  public static class EmptyDocValues extends DocValues {
+    final int maxDoc;
+    final Source emptySource;
+
+    public EmptyDocValues(int maxDoc, Type type) {
+      this.maxDoc = maxDoc;
+      this.emptySource = new EmptySource(type);
+    }
+
+    @Override
+    public Source load() throws IOException {
+      return emptySource;
+    }
+
+    @Override
+    public Type getType() {
+      return emptySource.getType();
+    }
+
+    @Override
+    public Source getDirectSource() throws IOException {
+      return emptySource;
+    }
+  }
+  
+  public static class EmptyFixedDocValues extends DocValues {
+    final int maxDoc;
+    final Source emptyFixedSource;
+    final int valueSize;
+
+    public EmptyFixedDocValues(int maxDoc, Type type, int valueSize) {
+      this.maxDoc = maxDoc;
+      this.emptyFixedSource = new EmptyFixedSource(type, valueSize);
+      this.valueSize = valueSize;
+    }
+
+    @Override
+    public Source load() throws IOException {
+      return emptyFixedSource;
+    }
+
+    @Override
+    public Type getType() {
+      return emptyFixedSource.getType();
+    }
+
+    @Override
+    public int getValueSize() {
+      return valueSize;
+    }
+
+    @Override
+    public Source getDirectSource() throws IOException {
+      return emptyFixedSource;
+    }
+  }
+
+  private static class MultiSource extends Source {
+    private int numDocs = 0;
+    private int start = 0;
+    private Source current;
+    private final int[] starts;
+    private final DocValuesSlice[] slices;
+    private boolean direct;
+    private Object cachedArray; // cached array if supported
+
+    public MultiSource(DocValuesSlice[] slices, int[] starts, boolean direct, Type type) {
+      super(type);
+      this.slices = slices;
+      this.starts = starts;
+      assert slices.length != 0;
+      this.direct = direct;
+    }
+
+    public long getInt(int docID) {
+      final int doc = ensureSource(docID);
+      return current.getInt(doc);
+    }
+
+    private final int ensureSource(int docID) {
+      if (docID >= start && docID < start+numDocs) {
+        return docID - start;
+      } else {
+        final int idx = ReaderUtil.subIndex(docID, starts);
+        assert idx >= 0 && idx < slices.length : "idx was " + idx
+            + " for doc id: " + docID + " slices : " + Arrays.toString(starts);
+        assert slices[idx] != null;
         try {
-          IOUtils.closeQuietly(input);
-        } finally {
-          IOUtils.closeQuietly(output);
+          if (direct) {
+            current = slices[idx].docValues.getDirectSource();
+          } else {
+            current = slices[idx].docValues.getSource();
+          }
+        } catch (IOException e) {
+          throw new RuntimeException("load failed", e); // TODO how should we
+          // handle this
+        }
+
+        start = slices[idx].start;
+        numDocs = slices[idx].length;
+        return docID - start;
+      }
+    }
+
+    public double getFloat(int docID) {
+      final int doc = ensureSource(docID);
+      return current.getFloat(doc);
+    }
+
+    public BytesRef getBytes(int docID, BytesRef bytesRef) {
+      final int doc = ensureSource(docID);
+      return current.getBytes(doc, bytesRef);
+    }
+
+    @Override
+    public SortedSource asSortedSource() {
+      try {
+        if (type == Type.BYTES_FIXED_SORTED || type == Type.BYTES_VAR_SORTED) {
+          DocValues[] values = new DocValues[slices.length];
+          Comparator<BytesRef> comp = null;
+          for (int i = 0; i < values.length; i++) {
+            values[i] = slices[i].docValues;
+            if (!(values[i] instanceof EmptyDocValues)) {
+              Comparator<BytesRef> comparator = values[i].getDirectSource()
+                  .asSortedSource().getComparator();
+              assert comp == null || comp == comparator;
+              comp = comparator;
+            }
+          }
+          assert comp != null;
+          final int globalNumDocs = globalNumDocs();
+          final MergeContext ctx = SortedBytesMergeUtils.init(type, values,
+              comp, globalNumDocs);
+          List<SortedSourceSlice> slices = SortedBytesMergeUtils.buildSlices(
+              docBases(), new MergeState.DocMap[values.length], values, ctx);
+          RecordingBytesRefConsumer consumer = new RecordingBytesRefConsumer(
+              type);
+          final int maxOrd = SortedBytesMergeUtils.mergeRecords(ctx, consumer,
+              slices);
+          final int[] docToOrd = new int[globalNumDocs];
+          for (SortedSourceSlice slice : slices) {
+            slice.toAbsolutOrds(docToOrd);
+          }
+          return new MultiSortedSource(type, comp, consumer.pagedBytes,
+              ctx.sizePerValues, maxOrd, docToOrd, consumer.ordToOffset);
+        }
+      } catch (IOException e) {
+        throw new RuntimeException("load failed", e);
+      }
+      return super.asSortedSource();
+    }
+    
+    private int globalNumDocs() {
+      int docs = 0;
+      for (int i = 0; i < slices.length; i++) {
+        docs += slices[i].length;
+      }
+      return docs;
+    }
+    
+    private int[] docBases() {
+      int[] docBases = new int[slices.length];
+      for (int i = 0; i < slices.length; i++) {
+        docBases[i] = slices[i].start;
+      }
+      return docBases;
+    }
+    
+    public boolean hasArray() {
+      boolean oneRealSource = false;
+      for (DocValuesSlice slice : slices) {
+        try {
+          Source source = slice.docValues.getSource();
+          if (source instanceof EmptySource) {
+            /*
+             * empty source marks a gap in the array skip if we encounter one
+             */
+            continue;
+          }
+          oneRealSource = true;
+          if (!source.hasArray()) {
+            return false;
+          }
+        } catch (IOException e) {
+          throw new RuntimeException("load failed", e);
         }
       }
+      return oneRealSource;
+    }
 
-      if (source.length() != destination.length()) {
-        String message = "Failed to copy full contents from " + source + " to "
-          + destination;
-        throw new IOException(message);
+    @Override
+    public Object getArray() {
+      if (!hasArray()) {
+        return null;
       }
+      try {
+        Class<?> componentType = null;
+        Object[] arrays = new Object[slices.length];
+        int numDocs = 0;
+        for (int i = 0; i < slices.length; i++) {
+          DocValuesSlice slice = slices[i];
+          Source source = slice.docValues.getSource();
+          Object array = null;
+          if (!(source instanceof EmptySource)) {
+            // EmptySource is skipped - marks a gap in the array
+            array = source.getArray();
+          }
+          numDocs += slice.length;
+          if (array != null) {
+            if (componentType == null) {
+              componentType = array.getClass().getComponentType();
+            }
+            assert componentType == array.getClass().getComponentType();
+          }
+          arrays[i] = array;
+        }
+        assert componentType != null;
+        synchronized (this) {
+          if (cachedArray != null) {
+            return cachedArray;
+          }
+          final Object globalArray = Array.newInstance(componentType, numDocs);
 
-      if (preserveFileDate) {
-        // file copy should preserve file date
-        destination.setLastModified(source.lastModified());
+          for (int i = 0; i < slices.length; i++) {
+            DocValuesSlice slice = slices[i];
+            if (arrays[i] != null) {
+              assert slice.length == Array.getLength(arrays[i]);
+              System.arraycopy(arrays[i], 0, globalArray, slice.start,
+                  slice.length);
+            }
+          }
+          return cachedArray = globalArray;
+        }
+      } catch (IOException e) {
+        throw new RuntimeException("load failed", e);
       }
     }
   }
   
+  private static final class RecordingBytesRefConsumer implements SortedBytesMergeUtils.BytesRefConsumer {
+    private final static int PAGED_BYTES_BITS = 15;
+    final PagedBytes pagedBytes = new PagedBytes(PAGED_BYTES_BITS);
+    long[] ordToOffset;
+    
+    public RecordingBytesRefConsumer(Type type) {
+      ordToOffset = type == Type.BYTES_VAR_SORTED ? new long[2] : null;
+    }
+    @Override
+    public void consume(BytesRef ref, int ord, long offset) {
+      pagedBytes.copy(ref);
+      if (ordToOffset != null) {
+        if (ord+1 >= ordToOffset.length) {
+          ordToOffset = ArrayUtil.grow(ordToOffset, ord + 2);
+        }
+        ordToOffset[ord+1] = offset;
+      }
+    }
+    
+  }
+  
+  private static final class MultiSortedSource extends SortedSource {
+    private final PagedBytes.Reader data;
+    private final int[] docToOrd;
+    private final long[] ordToOffset;
+    private int size;
+    private int valueCount;
+    public MultiSortedSource(Type type, Comparator<BytesRef> comparator, PagedBytes pagedBytes, int size, int numValues, int[] docToOrd, long[] ordToOffset) {
+      super(type, comparator);
+      data = pagedBytes.freeze(true);
+      this.size = size;
+      this.valueCount = numValues;
+      this.docToOrd = docToOrd;
+      this.ordToOffset = ordToOffset;
+    }
 
+    @Override
+    public int ord(int docID) {
+      return docToOrd[docID];
+    }
+
+    @Override
+    public BytesRef getByOrd(int ord, BytesRef bytesRef) {
+      int size = this.size;
+      long offset = (ord*size);
+      if (ordToOffset != null) {
+        offset =  ordToOffset[ord];
+        size = (int) (ordToOffset[1 + ord] - offset);
+      }
+      assert size >=0;
+      return data.fillSlice(bytesRef, offset, size);
+     }
+
+    @Override
+    public Reader getDocToOrd() {
+      return null;
+    }
+
+    @Override
+    public int getValueCount() {
+      return valueCount;
+    }
+  }
+
+  // TODO: this is dup of DocValues.getDefaultSource()?
+  private static class EmptySource extends SortedSource {
+
+    public EmptySource(Type type) {
+      super(type, BytesRef.getUTF8SortedAsUnicodeComparator());
+    }
+
+    @Override
+    public BytesRef getBytes(int docID, BytesRef ref) {
+      ref.length = 0;
+      return ref;
+    }
+
+    @Override
+    public double getFloat(int docID) {
+      return 0d;
+    }
+
+    @Override
+    public long getInt(int docID) {
+      return 0;
+    }
+
+    @Override
+    public SortedSource asSortedSource() {
+      if (getType() == Type.BYTES_FIXED_SORTED || getType() == Type.BYTES_VAR_SORTED) {
+        
+      }
+      return super.asSortedSource();
+    }
+
+    @Override
+    public int ord(int docID) {
+      return 0;
+    }
+
+    @Override
+    public BytesRef getByOrd(int ord, BytesRef bytesRef) {
+      bytesRef.length = 0;
+      bytesRef.offset = 0;
+      return bytesRef;
+    }
+
+    @Override
+    public Reader getDocToOrd() {
+      return null;
+    }
+
+    @Override
+    public int getValueCount() {
+      return 1;
+    }
+    
+  }
+  
+  private static class EmptyFixedSource extends EmptySource {
+    private final int valueSize;
+    private final byte[] valueArray;
+    public EmptyFixedSource(Type type, int valueSize) {
+      super(type);
+      this.valueSize = valueSize;
+      valueArray = new byte[valueSize];
+    }
+
+    @Override
+    public BytesRef getBytes(int docID, BytesRef ref) {
+      ref.grow(valueSize);
+      ref.length = valueSize;
+      Arrays.fill(ref.bytes, ref.offset, ref.offset+valueSize, (byte)0);
+      return ref;
+    }
+
+    @Override
+    public double getFloat(int docID) {
+      return 0d;
+    }
+
+    @Override
+    public long getInt(int docID) {
+      return 0;
+    }
+    
+    @Override
+    public BytesRef getByOrd(int ord, BytesRef bytesRef) {
+      bytesRef.bytes = valueArray;
+      bytesRef.length = valueSize;
+      bytesRef.offset = 0;
+      return bytesRef;
+    }
+  }
+
+  @Override
+  public Type getType() {
+    return type;
+  }
+
+  @Override
+  public int getValueSize() {
+    return valueSize;
+  }
+
+  @Override
+  public Source getDirectSource() throws IOException {
+    return new MultiSource(slices, starts, true, type);
+  }
+  
+  
 }

@@ -1,4 +1,4 @@
-args.put(new Pair<Integer, String>(0, Class.class.getName()), clsArg.getName());
+Message message = rowMutationMessage.makeRowMutationMessage(StorageService.readRepairVerbHandler_);
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one
@@ -9,102 +9,119 @@ args.put(new Pair<Integer, String>(0, Class.class.getName()), clsArg.getName());
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- *   http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
-package org.apache.aries.spifly;
 
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-import java.util.ServiceLoader;
+package org.apache.cassandra.service;
 
-import org.osgi.framework.Bundle;
-import org.osgi.framework.BundleReference;
-import org.osgi.framework.wiring.BundleWiring;
-import org.osgi.service.log.LogService;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.util.concurrent.locks.*;
 
-/** 
- * Methods used from ASM-generated code. They store, change and reset the thread context classloader.
- * The methods are static to make it easy to access them from generated code.
+import org.apache.cassandra.db.Column;
+import org.apache.cassandra.db.ColumnFamily;
+import org.apache.cassandra.db.RowMutation;
+import org.apache.cassandra.db.RowMutationMessage;
+import org.apache.cassandra.db.SuperColumn;
+import org.apache.cassandra.net.EndPoint;
+import org.apache.cassandra.net.Header;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.utils.Cachetable;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.ICacheExpungeHook;
+import org.apache.cassandra.utils.ICachetable;
+import org.apache.cassandra.utils.LogUtil;
+import org.apache.log4j.Logger;
+
+
+
+/*
+ * This class manages the read repairs . This is a singleton class
+ * it basically uses the cache table construct to schedule writes that have to be 
+ * made for read repairs. 
+ * A cachetable is created which wakes up every n  milliseconds specified by 
+ * expirationTimeInMillis and calls a global hook fn on pending entries 
+ * This fn basically sends the message to the appropriate servers to update them
+ * with the latest changes.
+ * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
  */
-public class Util {
-    static ThreadLocal<ClassLoader> storedClassLoaders = new ThreadLocal<ClassLoader>();
-    
-    public static void storeContextClassloader() {
-        storedClassLoaders.set(Thread.currentThread().getContextClassLoader());
-    }
-    
-    public static void restoreContextClassloader() {
-        Thread.currentThread().setContextClassLoader(storedClassLoaders.get());
-        storedClassLoaders.set(null);
-    }
-        
-    public static void fixContextClassloader(String cls, String method, Class<?> clsArg, ClassLoader bundleLoader) {
-        if (!(bundleLoader instanceof BundleReference)) {
-            Activator.activator.log(LogService.LOG_WARNING, "Classloader of consuming bundle doesn't implement BundleReference: " + bundleLoader);
-            return;
-        }
+class ReadRepairManager
+{
+    private static Logger logger_ = Logger.getLogger(ReadRepairManager.class);
+	private static final long expirationTimeInMillis = 2000;
+	private static Lock lock_ = new ReentrantLock();
+	private static ReadRepairManager self_ = null;
 
-        BundleReference br = ((BundleReference) bundleLoader);
-        System.out.println("~~~ cls: " + cls + " method: " + method + " clarg:" + clsArg + " cl:" + bundleLoader + " clientBundle: " + br.getBundle().getSymbolicName());        
-        
-        ClassLoader cl = findContextClassloader(br.getBundle(), cls, method, clsArg);
-        if (cl != null) {
-            Activator.activator.log(LogService.LOG_INFO, "Temporarily setting Thread Context Classloader to: " + cl);
-            Thread.currentThread().setContextClassLoader(cl);
-        } else {
-            Activator.activator.log(LogService.LOG_WARNING, "No classloader found for " + cls + ":" + method + "(" + clsArg + ")");
-        }
-    }
-    
-    private static ClassLoader findContextClassloader(Bundle consumerBundle, String className, String methodName, Class<?> clsArg) {
-        Activator activator = Activator.activator;
-        
-        String requestedClass;
-        if (ServiceLoader.class.getName().equals(className) && "load".equals(methodName)) {
-            requestedClass = clsArg.getName();
-        } else {
-            requestedClass = className;
-        }
-        Collection<Bundle> bundles = new ArrayList<Bundle>(activator.findProviderBundles(requestedClass));
-        activator.log(LogService.LOG_DEBUG, "Found bundles providing " + requestedClass + ": " + bundles);
-                
-        Map<Pair<Integer, String>, String> args = new HashMap<Pair<Integer,String>, String>();
-        args.put(new Pair<Integer, String>(1, Class.class.getName()), clsArg.getName());
-        Collection<Bundle> allowedBundles = activator.findConsumerRestrictions(consumerBundle, className, methodName, args);
+	/*
+	 * This is the internal class which actually
+	 * implements the global hook fn called by the readrepair manager
+	 */
+	static class ReadRepairPerformer implements
+			ICacheExpungeHook<String, Message>
+	{
+		/*
+		 * The hook fn which takes the end point and the row mutation that 
+		 * needs to be sent to the end point in order 
+		 * to perform read repair.
+		 */
+		public void callMe(String target,
+				Message message)
+		{
+			String[] pieces = FBUtilities.strip(target, ":");
+			EndPoint to = new EndPoint(pieces[0], Integer.parseInt(pieces[1]));
+			MessagingService.getMessagingInstance().sendOneWay(message, to);			
+		}
 
-        if (allowedBundles != null) {
-            for (Iterator<Bundle> it = bundles.iterator(); it.hasNext(); ) {
-                if (!allowedBundles.contains(it.next())) {
-                    it.remove();
-                }
+	}
+
+	private ICachetable<String, Message> readRepairTable_ = new Cachetable<String, Message>(expirationTimeInMillis, new ReadRepairManager.ReadRepairPerformer());
+
+	protected ReadRepairManager()
+	{
+
+	}
+
+	public  static ReadRepairManager instance()
+	{
+		if (self_ == null)
+		{
+            lock_.lock();
+            try
+            {
+                if ( self_ == null )
+                    self_ = new ReadRepairManager();
             }
-        }
-        
-        switch (bundles.size()) {
-        case 0:
-            return null;
-        case 1:
-            Bundle bundle = bundles.iterator().next();
-            BundleWiring wiring = bundle.adapt(BundleWiring.class);
-            return wiring.getClassLoader();            
-        default:
-            List<ClassLoader> loaders = new ArrayList<ClassLoader>();
-            for (Bundle b : bundles) {
-                BundleWiring bw = b.adapt(BundleWiring.class);
-                loaders.add(bw.getClassLoader());
+            finally
+            {
+                lock_.unlock();
             }
-            return new MultiDelegationClassloader(loaders.toArray(new ClassLoader[loaders.size()]));
+		}
+		return self_;
+	}
+
+	/*
+	 * Schedules a read repair.
+	 * @param target endpoint on whcih the read repair should happen
+	 * @param rowMutationMessage the row mutation message that has the repaired row.
+	 */
+	public void schedule(EndPoint target, RowMutationMessage rowMutationMessage)
+	{
+        try
+        {
+            Message message = RowMutationMessage.makeRowMutationMessage(rowMutationMessage, StorageService.readRepairVerbHandler_);
+    		String key = target + ":" + message.getMessageId();
+    		readRepairTable_.put(key, message);
         }
-    }
+        catch ( IOException ex )
+        {
+            logger_.error(LogUtil.throwableToString(ex));
+        }
+	}
 }

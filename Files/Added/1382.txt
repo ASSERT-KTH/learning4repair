@@ -1,6 +1,6 @@
 @Override
 
-package org.apache.lucene.index;
+package org.apache.lucene.store;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -18,539 +18,269 @@ package org.apache.lucene.index;
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.util.ThreadInterruptedException;
-import org.apache.lucene.util.CollectionUtil;
-
+ 
 import java.io.IOException;
-import java.util.List;
-import java.util.ArrayList;
-import java.util.Comparator;
+import java.io.File;
+import java.io.RandomAccessFile;
+import java.nio.ByteBuffer;
+import java.nio.channels.ClosedChannelException; // javadoc @link
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileChannel.MapMode;
 
-/** A {@link MergeScheduler} that runs each merge using a
- *  separate thread.
+import java.security.AccessController;
+import java.security.PrivilegedExceptionAction;
+import java.security.PrivilegedActionException;
+import java.lang.reflect.Method;
+
+import org.apache.lucene.util.Constants;
+
+/** File-based {@link Directory} implementation that uses
+ *  mmap for reading, and {@link
+ *  FSDirectory.FSIndexOutput} for writing.
  *
- *  <p>Specify the max number of threads that may run at
- *  once with {@link #setMaxThreadCount}.</p>
+ * <p><b>NOTE</b>: memory mapping uses up a portion of the
+ * virtual memory address space in your process equal to the
+ * size of the file being mapped.  Before using this class,
+ * be sure your have plenty of virtual address space, e.g. by
+ * using a 64 bit JRE, or a 32 bit JRE with indexes that are
+ * guaranteed to fit within the address space.
+ * On 32 bit platforms also consult {@link #MMapDirectory(File, LockFactory, int)}
+ * if you have problems with mmap failing because of fragmented
+ * address space. If you get an OutOfMemoryException, it is recommended
+ * to reduce the chunk size, until it works.
  *
- *  <p>Separately specify the maximum number of simultaneous
- *  merges with {@link #setMaxMergeCount}.  If the number of
- *  merges exceeds the max number of threads then the
- *  largest merges are paused until one of the smaller
- *  merges completes.</p>
+ * <p>Due to <a href="http://bugs.sun.com/bugdatabase/view_bug.do?bug_id=4724038">
+ * this bug</a> in Sun's JRE, MMapDirectory's {@link IndexInput#close}
+ * is unable to close the underlying OS file handle.  Only when GC
+ * finally collects the underlying objects, which could be quite
+ * some time later, will the file handle be closed.
  *
- *  <p>If more than {@link #getMaxMergeCount} merges are
- *  requested then this class will forcefully throttle the
- *  incoming threads by pausing until one more more merges
- *  complete.</p>
- */ 
-public class ConcurrentMergeScheduler extends MergeScheduler {
+ * <p>This will consume additional transient disk usage: on Windows,
+ * attempts to delete or overwrite the files will result in an
+ * exception; on other platforms, which typically have a &quot;delete on
+ * last close&quot; semantics, while such operations will succeed, the bytes
+ * are still consuming space on disk.  For many applications this
+ * limitation is not a problem (e.g. if you have plenty of disk space,
+ * and you don't rely on overwriting files on Windows) but it's still
+ * an important limitation to be aware of.
+ *
+ * <p>This class supplies the workaround mentioned in the bug report
+ * (see {@link #setUseUnmap}), which may fail on
+ * non-Sun JVMs. It forcefully unmaps the buffer on close by using
+ * an undocumented internal cleanup functionality.
+ * {@link #UNMAP_SUPPORTED} is <code>true</code>, if the workaround
+ * can be enabled (with no guarantees).
+ * <p>
+ * <b>NOTE:</b> Accessing this class either directly or
+ * indirectly from a thread while it's interrupted can close the
+ * underlying channel immediately if at the same time the thread is
+ * blocked on IO. The channel will remain closed and subsequent access
+ * to {@link MMapDirectory} will throw a {@link ClosedChannelException}. 
+ * </p>
+ */
+public class MMapDirectory extends FSDirectory {
+  private boolean useUnmapHack = UNMAP_SUPPORTED;
+  /** 
+   * Default max chunk size.
+   * @see #MMapDirectory(File, LockFactory, int)
+   */
+  public static final int DEFAULT_MAX_BUFF = Constants.JRE_IS_64BIT ? (1 << 30) : (1 << 28);
+  final int chunkSizePower;
 
-  private int mergeThreadPriority = -1;
-
-  /** List of currently active {@link MergeThread}s. */
-  protected List<MergeThread> mergeThreads = new ArrayList<MergeThread>();
-
-  // Max number of merge threads allowed to be running at
-  // once.  When there are more merges then this, we
-  // forcefully pause the larger ones, letting the smaller
-  // ones run, up until maxMergeCount merges at which point
-  // we forcefully pause incoming threads (that presumably
-  // are the ones causing so much merging).  We dynamically
-  // default this from 1 to 3, depending on how many cores
-  // you have:
-  private int maxThreadCount = Math.max(1, Math.min(3, Runtime.getRuntime().availableProcessors()/2));
-
-  // Max number of merges we accept before forcefully
-  // throttling the incoming threads
-  private int maxMergeCount = maxThreadCount+2;
-
-  /** {@link Directory} that holds the index. */
-  protected Directory dir;
-
-  /** {@link IndexWriter} that owns this instance. */
-  protected IndexWriter writer;
-
-  /** How many {@link MergeThread}s have kicked off (this is use
-   *  to name them). */
-  protected int mergeThreadCount;
-
-  /** Sole constructor, with all settings set to default
-   *  values. */
-  public ConcurrentMergeScheduler() {
-  }
-
-  /** Sets the max # simultaneous merge threads that should
-   *  be running at once.  This must be <= {@link
-   *  #setMaxMergeCount}. */
-  public void setMaxThreadCount(int count) {
-    if (count < 1) {
-      throw new IllegalArgumentException("count should be at least 1");
-    }
-    if (count > maxMergeCount) {
-      throw new IllegalArgumentException("count should be <= maxMergeCount (= " + maxMergeCount + ")");
-    }
-    maxThreadCount = count;
-  }
-
-  /** Returns {@code maxThreadCount}.
+  /** Create a new MMapDirectory for the named location.
    *
-   * @see #setMaxThreadCount(int) */
-  public int getMaxThreadCount() {
-    return maxThreadCount;
-  }
-
-  /** Sets the max # simultaneous merges that are allowed.
-   *  If a merge is necessary yet we already have this many
-   *  threads running, the incoming thread (that is calling
-   *  add/updateDocument) will block until a merge thread
-   *  has completed.  Note that we will only run the
-   *  smallest {@link #setMaxThreadCount} merges at a time. */
-  public void setMaxMergeCount(int count) {
-    if (count < 1) {
-      throw new IllegalArgumentException("count should be at least 1");
-    }
-    if (count < maxThreadCount) {
-      throw new IllegalArgumentException("count should be >= maxThreadCount (= " + maxThreadCount + ")");
-    }
-    maxMergeCount = count;
-  }
-
-  /** See {@link #setMaxMergeCount}. */
-  public int getMaxMergeCount() {
-    return maxMergeCount;
-  }
-
-  /** Return the priority that merge threads run at.  By
-   *  default the priority is 1 plus the priority of (ie,
-   *  slightly higher priority than) the first thread that
-   *  calls merge. */
-  public synchronized int getMergeThreadPriority() {
-    initMergeThreadPriority();
-    return mergeThreadPriority;
-  }
-
-  /** Set the base priority that merge threads run at.
-   *  Note that CMS may increase priority of some merge
-   *  threads beyond this base priority.  It's best not to
-   *  set this any higher than
-   *  Thread.MAX_PRIORITY-maxThreadCount, so that CMS has
-   *  room to set relative priority among threads.  */
-  public synchronized void setMergeThreadPriority(int pri) {
-    if (pri > Thread.MAX_PRIORITY || pri < Thread.MIN_PRIORITY)
-      throw new IllegalArgumentException("priority must be in range " + Thread.MIN_PRIORITY + " .. " + Thread.MAX_PRIORITY + " inclusive");
-    mergeThreadPriority = pri;
-    updateMergeThreads();
-  }
-
-  /** Sorts {@link MergeThread}s; larger merges come first. */
-  protected static final Comparator<MergeThread> compareByMergeDocCount = new Comparator<MergeThread>() {
-    public int compare(MergeThread t1, MergeThread t2) {
-      final MergePolicy.OneMerge m1 = t1.getCurrentMerge();
-      final MergePolicy.OneMerge m2 = t2.getCurrentMerge();
-      
-      final int c1 = m1 == null ? Integer.MAX_VALUE : m1.totalDocCount;
-      final int c2 = m2 == null ? Integer.MAX_VALUE : m2.totalDocCount;
-
-      return c2 - c1;
-    }
-  };
-
-  /**
-   * Called whenever the running merges have changed, to pause & unpause
-   * threads. This method sorts the merge threads by their merge size in
-   * descending order and then pauses/unpauses threads from first to last --
-   * that way, smaller merges are guaranteed to run before larger ones.
+   * @param path the path of the directory
+   * @param lockFactory the lock factory to use, or null for the default
+   * ({@link NativeFSLockFactory});
+   * @throws IOException if there is a low-level I/O error
    */
-  protected synchronized void updateMergeThreads() {
-
-    // Only look at threads that are alive & not in the
-    // process of stopping (ie have an active merge):
-    final List<MergeThread> activeMerges = new ArrayList<MergeThread>();
-
-    int threadIdx = 0;
-    while (threadIdx < mergeThreads.size()) {
-      final MergeThread mergeThread = mergeThreads.get(threadIdx);
-      if (!mergeThread.isAlive()) {
-        // Prune any dead threads
-        mergeThreads.remove(threadIdx);
-        continue;
-      }
-      if (mergeThread.getCurrentMerge() != null) {
-        activeMerges.add(mergeThread);
-      }
-      threadIdx++;
-    }
-
-    // Sort the merge threads in descending order.
-    CollectionUtil.mergeSort(activeMerges, compareByMergeDocCount);
-    
-    int pri = mergeThreadPriority;
-    final int activeMergeCount = activeMerges.size();
-    for (threadIdx=0;threadIdx<activeMergeCount;threadIdx++) {
-      final MergeThread mergeThread = activeMerges.get(threadIdx);
-      final MergePolicy.OneMerge merge = mergeThread.getCurrentMerge();
-      if (merge == null) { 
-        continue;
-      }
-
-      // pause the thread if maxThreadCount is smaller than the number of merge threads.
-      final boolean doPause = threadIdx < activeMergeCount - maxThreadCount;
-
-      if (verbose()) {
-        if (doPause != merge.getPause()) {
-          if (doPause) {
-            message("pause thread " + mergeThread.getName());
-          } else {
-            message("unpause thread " + mergeThread.getName());
-          }
-        }
-      }
-      if (doPause != merge.getPause()) {
-        merge.setPause(doPause);
-      }
-
-      if (!doPause) {
-        if (verbose()) {
-          message("set priority of merge thread " + mergeThread.getName() + " to " + pri);
-        }
-        mergeThread.setThreadPriority(pri);
-        pri = Math.min(Thread.MAX_PRIORITY, 1+pri);
-      }
-    }
+  public MMapDirectory(File path, LockFactory lockFactory) throws IOException {
+    this(path, lockFactory, DEFAULT_MAX_BUFF);
   }
 
+  /** Create a new MMapDirectory for the named location and {@link NativeFSLockFactory}.
+   *
+   * @param path the path of the directory
+   * @throws IOException if there is a low-level I/O error
+   */
+  public MMapDirectory(File path) throws IOException {
+    this(path, null);
+  }
+  
   /**
-   * Returns true if verbosing is enabled. This method is usually used in
-   * conjunction with {@link #message(String)}, like that:
+   * Create a new MMapDirectory for the named location, specifying the 
+   * maximum chunk size used for memory mapping.
    * 
-   * <pre class="prettyprint">
-   * if (verbose()) {
-   *   message(&quot;your message&quot;);
-   * }
-   * </pre>
+   * @param path the path of the directory
+   * @param lockFactory the lock factory to use, or null for the default
+   * ({@link NativeFSLockFactory});
+   * @param maxChunkSize maximum chunk size (default is 1 GiBytes for
+   * 64 bit JVMs and 256 MiBytes for 32 bit JVMs) used for memory mapping.
+   * <p>
+   * Especially on 32 bit platform, the address space can be very fragmented,
+   * so large index files cannot be mapped. Using a lower chunk size makes 
+   * the directory implementation a little bit slower (as the correct chunk 
+   * may be resolved on lots of seeks) but the chance is higher that mmap 
+   * does not fail. On 64 bit Java platforms, this parameter should always 
+   * be {@code 1 << 30}, as the address space is big enough.
+   * <p>
+   * <b>Please note:</b> The chunk size is always rounded down to a power of 2.
+   * @throws IOException if there is a low-level I/O error
    */
-  protected boolean verbose() {
-    return writer != null && writer.infoStream.isEnabled("CMS");
+  public MMapDirectory(File path, LockFactory lockFactory, int maxChunkSize) throws IOException {
+    super(path, lockFactory);
+    if (maxChunkSize <= 0) {
+      throw new IllegalArgumentException("Maximum chunk size for mmap must be >0");
+    }
+    this.chunkSizePower = 31 - Integer.numberOfLeadingZeros(maxChunkSize);
+    assert this.chunkSizePower >= 0 && this.chunkSizePower <= 30;
+  }
+
+  /**
+   * <code>true</code>, if this platform supports unmapping mmapped files.
+   */
+  public static final boolean UNMAP_SUPPORTED;
+  static {
+    boolean v;
+    try {
+      Class.forName("sun.misc.Cleaner");
+      Class.forName("java.nio.DirectByteBuffer")
+        .getMethod("cleaner");
+      v = true;
+    } catch (Exception e) {
+      v = false;
+    }
+    UNMAP_SUPPORTED = v;
   }
   
   /**
-   * Outputs the given message - this method assumes {@link #verbose()} was
-   * called and returned true.
+   * This method enables the workaround for unmapping the buffers
+   * from address space after closing {@link IndexInput}, that is
+   * mentioned in the bug report. This hack may fail on non-Sun JVMs.
+   * It forcefully unmaps the buffer on close by using
+   * an undocumented internal cleanup functionality.
+   * <p><b>NOTE:</b> Enabling this is completely unsupported
+   * by Java and may lead to JVM crashes if <code>IndexInput</code>
+   * is closed while another thread is still accessing it (SIGSEGV).
+   * @throws IllegalArgumentException if {@link #UNMAP_SUPPORTED}
+   * is <code>false</code> and the workaround cannot be enabled.
    */
-  protected void message(String message) {
-    writer.infoStream.message("CMS", message);
+  public void setUseUnmap(final boolean useUnmapHack) {
+    if (useUnmapHack && !UNMAP_SUPPORTED)
+      throw new IllegalArgumentException("Unmap hack not supported on this platform!");
+    this.useUnmapHack=useUnmapHack;
   }
-
-  private synchronized void initMergeThreadPriority() {
-    if (mergeThreadPriority == -1) {
-      // Default to slightly higher priority than our
-      // calling thread
-      mergeThreadPriority = 1+Thread.currentThread().getPriority();
-      if (mergeThreadPriority > Thread.MAX_PRIORITY)
-        mergeThreadPriority = Thread.MAX_PRIORITY;
-    }
-  }
-
-  @Override
-  public void close() {
-    sync();
-  }
-
-  /** Wait for any running merge threads to finish. This call is not interruptible as used by {@link #close()}. */
-  public void sync() {
-    boolean interrupted = false;
-    try {
-      while (true) {
-        MergeThread toSync = null;
-        synchronized (this) {
-          for (MergeThread t : mergeThreads) {
-            if (t.isAlive()) {
-              toSync = t;
-              break;
-            }
-          }
-        }
-        if (toSync != null) {
-          try {
-            toSync.join();
-          } catch (InterruptedException ie) {
-            // ignore this Exception, we will retry until all threads are dead
-            interrupted = true;
-          }
-        } else {
-          break;
-        }
-      }
-    } finally {
-      // finally, restore interrupt status:
-      if (interrupted) Thread.currentThread().interrupt();
-    }
-  }
-
+  
   /**
-   * Returns the number of merge threads that are alive. Note that this number
-   * is &le; {@link #mergeThreads} size.
+   * Returns <code>true</code>, if the unmap workaround is enabled.
+   * @see #setUseUnmap
    */
-  protected synchronized int mergeThreadCount() {
-    int count = 0;
-    for (MergeThread mt : mergeThreads) {
-      if (mt.isAlive() && mt.getCurrentMerge() != null) {
-        count++;
+  public boolean getUseUnmap() {
+    return useUnmapHack;
+  }
+  
+  /**
+   * Try to unmap the buffer, this method silently fails if no support
+   * for that in the JVM. On Windows, this leads to the fact,
+   * that mmapped files cannot be modified or deleted.
+   */
+  final void cleanMapping(final ByteBuffer buffer) throws IOException {
+    if (useUnmapHack) {
+      try {
+        AccessController.doPrivileged(new PrivilegedExceptionAction<Object>() {
+          public Object run() throws Exception {
+            final Method getCleanerMethod = buffer.getClass()
+              .getMethod("cleaner");
+            getCleanerMethod.setAccessible(true);
+            final Object cleaner = getCleanerMethod.invoke(buffer);
+            if (cleaner != null) {
+              cleaner.getClass().getMethod("clean")
+                .invoke(cleaner);
+            }
+            return null;
+          }
+        });
+      } catch (PrivilegedActionException e) {
+        final IOException ioe = new IOException("unable to unmap the mapped buffer");
+        ioe.initCause(e.getCause());
+        throw ioe;
       }
     }
-    return count;
+  }
+  
+  /**
+   * Returns the current mmap chunk size.
+   * @see #MMapDirectory(File, LockFactory, int)
+   */
+  public final int getMaxChunkSize() {
+    return 1 << chunkSizePower;
   }
 
+  /** Creates an IndexInput for the file with the given name. */
   @Override
-  public synchronized void merge(IndexWriter writer) throws IOException {
+  public IndexInput openInput(String name, IOContext context) throws IOException {
+    ensureOpen();
+    File f = new File(getDirectory(), name);
+    RandomAccessFile raf = new RandomAccessFile(f, "r");
+    try {
+      return new MMapIndexInput("MMapIndexInput(path=\"" + f + "\")", raf);
+    } finally {
+      raf.close();
+    }
+  }
+  
+  @Override
+  public IndexInputSlicer createSlicer(String name, IOContext context) throws IOException {
+    final MMapIndexInput full = (MMapIndexInput) openInput(name, context);
+    return new IndexInputSlicer() {
+      @Override
+      public IndexInput openSlice(String sliceDescription, long offset, long length) throws IOException {
+        ensureOpen();
+        return full.slice(sliceDescription, offset, length);
+      }
+      
+      @Override
+      public void close() throws IOException {
+        full.close();
+      }
+    };
+  }
 
-    assert !Thread.holdsLock(writer);
-
-    this.writer = writer;
-
-    initMergeThreadPriority();
-
-    dir = writer.getDirectory();
-
-    // First, quickly run through the newly proposed merges
-    // and add any orthogonal merges (ie a merge not
-    // involving segments already pending to be merged) to
-    // the queue.  If we are way behind on merging, many of
-    // these newly proposed merges will likely already be
-    // registered.
-
-    if (verbose()) {
-      message("now merge");
-      message("  index: " + writer.segString());
+  private final class MMapIndexInput extends ByteBufferIndexInput {
+    
+    MMapIndexInput(String resourceDescription, RandomAccessFile raf) throws IOException {
+      super(resourceDescription, map(raf, 0, raf.length()), raf.length(), chunkSizePower);
     }
     
-    // Iterate, pulling from the IndexWriter's queue of
-    // pending merges, until it's empty:
-    while (true) {
-
-      long startStallTime = 0;
-      while (writer.hasPendingMerges() && mergeThreadCount() >= maxMergeCount) {
-        // This means merging has fallen too far behind: we
-        // have already created maxMergeCount threads, and
-        // now there's at least one more merge pending.
-        // Note that only maxThreadCount of
-        // those created merge threads will actually be
-        // running; the rest will be paused (see
-        // updateMergeThreads).  We stall this producer
-        // thread to prevent creation of new segments,
-        // until merging has caught up:
-        startStallTime = System.currentTimeMillis();
-        if (verbose()) {
-          message("    too many merges; stalling...");
-        }
-        try {
-          wait();
-        } catch (InterruptedException ie) {
-          throw new ThreadInterruptedException(ie);
-        }
-      }
-
-      if (verbose()) {
-        if (startStallTime != 0) {
-          message("  stalled for " + (System.currentTimeMillis()-startStallTime) + " msec");
-        }
-      }
-
-      MergePolicy.OneMerge merge = writer.getNextMerge();
-      if (merge == null) {
-        if (verbose()) {
-          message("  no more merges pending; now return");
-        }
-        return;
-      }
-
-      boolean success = false;
-      try {
-        if (verbose()) {
-          message("  consider merge " + writer.segString(merge.segments));
-        }
-
-        // OK to spawn a new merge thread to handle this
-        // merge:
-        final MergeThread merger = getMergeThread(writer, merge);
-        mergeThreads.add(merger);
-        if (verbose()) {
-          message("    launch new thread [" + merger.getName() + "]");
-        }
-
-        merger.start();
-
-        // Must call this after starting the thread else
-        // the new thread is removed from mergeThreads
-        // (since it's not alive yet):
-        updateMergeThreads();
-
-        success = true;
-      } finally {
-        if (!success) {
-          writer.mergeFinish(merge);
-        }
-      }
-    }
-  }
-
-  /** Does the actual merge, by calling {@link IndexWriter#merge} */
-  protected void doMerge(MergePolicy.OneMerge merge) throws IOException {
-    writer.merge(merge);
-  }
-
-  /** Create and return a new MergeThread */
-  protected synchronized MergeThread getMergeThread(IndexWriter writer, MergePolicy.OneMerge merge) throws IOException {
-    final MergeThread thread = new MergeThread(writer, merge);
-    thread.setThreadPriority(mergeThreadPriority);
-    thread.setDaemon(true);
-    thread.setName("Lucene Merge Thread #" + mergeThreadCount++);
-    return thread;
-  }
-
-  /** Runs a merge thread, which may run one or more merges
-   *  in sequence. */
-  protected class MergeThread extends Thread {
-
-    IndexWriter tWriter;
-    MergePolicy.OneMerge startMerge;
-    MergePolicy.OneMerge runningMerge;
-    private volatile boolean done;
-
-    /** Sole constructor. */
-    public MergeThread(IndexWriter writer, MergePolicy.OneMerge startMerge) {
-      this.tWriter = writer;
-      this.startMerge = startMerge;
-    }
-
-    /** Record the currently running merge. */
-    public synchronized void setRunningMerge(MergePolicy.OneMerge merge) {
-      runningMerge = merge;
-    }
-
-    /** Return the currently running merge. */
-    public synchronized MergePolicy.OneMerge getRunningMerge() {
-      return runningMerge;
-    }
-
-    /** Return the current merge, or null if this {@code
-     *  MergeThread} is done. */
-    public synchronized MergePolicy.OneMerge getCurrentMerge() {
-      if (done) {
-        return null;
-      } else if (runningMerge != null) {
-        return runningMerge;
-      } else {
-        return startMerge;
-      }
-    }
-
-    /** Set the priority of this thread. */
-    public void setThreadPriority(int pri) {
-      try {
-        setPriority(pri);
-      } catch (NullPointerException npe) {
-        // Strangely, Sun's JDK 1.5 on Linux sometimes
-        // throws NPE out of here...
-      } catch (SecurityException se) {
-        // Ignore this because we will still run fine with
-        // normal thread priority
-      }
-    }
-
     @Override
-    public void run() {
-      
-      // First time through the while loop we do the merge
-      // that we were started with:
-      MergePolicy.OneMerge merge = this.startMerge;
-      
-      try {
-
-        if (verbose()) {
-          message("  merge thread: start");
-        }
-
-        while(true) {
-          setRunningMerge(merge);
-          doMerge(merge);
-
-          // Subsequent times through the loop we do any new
-          // merge that writer says is necessary:
-          merge = tWriter.getNextMerge();
-          if (merge != null) {
-            updateMergeThreads();
-            if (verbose()) {
-              message("  merge thread: do another merge " + tWriter.segString(merge.segments));
-            }
-          } else {
-            break;
-          }
-        }
-
-        if (verbose()) {
-          message("  merge thread: done");
-        }
-
-      } catch (Throwable exc) {
-
-        // Ignore the exception if it was due to abort:
-        if (!(exc instanceof MergePolicy.MergeAbortedException)) {
-          //System.out.println(Thread.currentThread().getName() + ": CMS: exc");
-          //exc.printStackTrace(System.out);
-          if (!suppressExceptions) {
-            // suppressExceptions is normally only set during
-            // testing.
-            handleMergeException(exc);
-          }
-        }
-      } finally {
-        done = true;
-        synchronized(ConcurrentMergeScheduler.this) {
-          updateMergeThreads();
-          ConcurrentMergeScheduler.this.notifyAll();
-        }
-      }
+    protected void freeBuffer(ByteBuffer buffer) throws IOException {
+      cleanMapping(buffer);
     }
-  }
-
-  /** Called when an exception is hit in a background merge
-   *  thread */
-  protected void handleMergeException(Throwable exc) {
-    try {
-      // When an exception is hit during merge, IndexWriter
-      // removes any partial files and then allows another
-      // merge to run.  If whatever caused the error is not
-      // transient then the exception will keep happening,
-      // so, we sleep here to avoid saturating CPU in such
-      // cases:
-      Thread.sleep(250);
-    } catch (InterruptedException ie) {
-      throw new ThreadInterruptedException(ie);
-    }
-    throw new MergePolicy.MergeException(exc, dir);
-  }
-
-  private boolean suppressExceptions;
-
-  /** Used for testing */
-  void setSuppressExceptions() {
-    suppressExceptions = true;
-  }
-
-  /** Used for testing */
-  void clearSuppressExceptions() {
-    suppressExceptions = false;
   }
   
-  @Override
-  public String toString() {
-    StringBuilder sb = new StringBuilder(getClass().getSimpleName() + ": ");
-    sb.append("maxThreadCount=").append(maxThreadCount).append(", ");    
-    sb.append("maxMergeCount=").append(maxMergeCount).append(", ");    
-    sb.append("mergeThreadPriority=").append(mergeThreadPriority);
-    return sb.toString();
+  /** Maps a file into a set of buffers */
+  ByteBuffer[] map(RandomAccessFile raf, long offset, long length) throws IOException {
+    if ((length >>> chunkSizePower) >= Integer.MAX_VALUE)
+      throw new IllegalArgumentException("RandomAccessFile too big for chunk size: " + raf.toString());
+    
+    final long chunkSize = 1L << chunkSizePower;
+    
+    // we always allocate one more buffer, the last one may be a 0 byte one
+    final int nrBuffers = (int) (length >>> chunkSizePower) + 1;
+    
+    ByteBuffer buffers[] = new ByteBuffer[nrBuffers];
+    
+    long bufferStart = 0L;
+    FileChannel rafc = raf.getChannel();
+    for (int bufNr = 0; bufNr < nrBuffers; bufNr++) { 
+      int bufSize = (int) ( (length > (bufferStart + chunkSize))
+          ? chunkSize
+              : (length - bufferStart)
+          );
+      buffers[bufNr] = rafc.map(MapMode.READ_ONLY, offset + bufferStart, bufSize);
+      bufferStart += bufSize;
+    }
+    
+    return buffers;
   }
 }

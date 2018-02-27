@@ -1,8 +1,8 @@
-st.term = BytesRef.deepCopyOf(candidateTerm);
+groups.put(groupValue == null ? null : BytesRef.deepCopyOf(groupValue), groupHead);
 
-package org.apache.lucene.search.spell;
+package org.apache.lucene.search.grouping.term;
 
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -19,474 +19,526 @@ package org.apache.lucene.search.spell;
  * limitations under the License.
  */
 
-import java.io.IOException;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.HashSet;
-import java.util.Locale;
-import java.util.PriorityQueue;
-
 import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.MultiFields;
-import org.apache.lucene.index.Term;
-import org.apache.lucene.index.Terms;
-import org.apache.lucene.search.FuzzyTermsEnum;
-import org.apache.lucene.search.BoostAttribute;
-import org.apache.lucene.search.MaxNonCompetitiveBoostAttribute;
-import org.apache.lucene.util.ArrayUtil;
-import org.apache.lucene.util.AttributeSource;
+import org.apache.lucene.search.*;
+import org.apache.lucene.search.grouping.AbstractAllGroupHeadsCollector;
+import org.apache.lucene.search.grouping.SentinelIntSet;
 import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.CharsRef;
-import org.apache.lucene.util.automaton.LevenshteinAutomata;
+
+import java.io.IOException;
+import java.util.*;
 
 /**
- * Simple automaton-based spellchecker.
- * <p>
- * Candidates are presented directly from the term dictionary, based on
- * Levenshtein distance. This is an alternative to {@link SpellChecker}
- * if you are using an edit-distance-like metric such as Levenshtein
- * or {@link JaroWinklerDistance}.
- * <p>
- * A practical benefit of this spellchecker is that it requires no additional
- * datastructures (neither in RAM nor on disk) to do its work.
- * 
- * @see LevenshteinAutomata
- * @see FuzzyTermsEnum
- * 
+ * A base implementation of {@link org.apache.lucene.search.grouping.AbstractAllGroupHeadsCollector} for retrieving the most relevant groups when grouping
+ * on a string based group field. More specifically this all concrete implementations of this base implementation
+ * use {@link org.apache.lucene.search.FieldCache.DocTermsIndex}.
+ *
  * @lucene.experimental
  */
-public class DirectSpellChecker {
-  /** The default StringDistance, Levenshtein distance implemented internally
-   *  via {@link LevenshteinAutomata}.
-   *  <p>
-   *  Note: this is the fastest distance metric, because Levenshtein is used
-   *  to draw candidates from the term dictionary: this just re-uses the scoring.
-   *  <p>
-   *  Note also that this metric differs in subtle ways from {@link LevensteinDistance}:
-   *  <ul>
-   *    <li> This metric treats full unicode codepoints as characters, but
-   *         LevenshteinDistance calculates based on UTF-16 code units.
-   *    <li> This metric scales raw edit distances into a floating point score
-   *         differently than LevenshteinDistance: the scaling is based upon the
-   *         shortest of the two terms instead of the longest.
-   *  </ul>
-   */
-  public static final StringDistance INTERNAL_LEVENSHTEIN = new LuceneLevenshteinDistance();
+public abstract class TermAllGroupHeadsCollector<GH extends AbstractAllGroupHeadsCollector.GroupHead> extends AbstractAllGroupHeadsCollector<GH> {
 
-  /** maximum edit distance for candidate terms */
-  private int maxEdits = LevenshteinAutomata.MAXIMUM_SUPPORTED_DISTANCE;
-  /** minimum prefix for candidate terms */
-  private int minPrefix = 1;
-  /** maximum number of top-N inspections per suggestion */
-  private int maxInspections = 5;
-  /** minimum accuracy for a term to match */
-  private float accuracy = SpellChecker.DEFAULT_ACCURACY;
-  /** value in [0..1] (or absolute number >=1) representing the minimum
-    * number of documents (of the total) where a term should appear. */
-  private float thresholdFrequency = 0f;
-  /** minimum length of a query word to return suggestions */
-  private int minQueryLength = 4;
-  /** value in [0..1] (or absolute number >=1) representing the maximum
-   *  number of documents (of the total) a query term can appear in to
-   *  be corrected. */
-  private float maxQueryFrequency = 0.01f;
-  /** true if the spellchecker should lowercase terms */
-  private boolean lowerCaseTerms = true;
-  /** the comparator to use */
-  private Comparator<SuggestWord> comparator = SuggestWordQueue.DEFAULT_COMPARATOR;
-  /** the string distance to use */
-  private StringDistance distance = INTERNAL_LEVENSHTEIN;
+  private static final int DEFAULT_INITIAL_SIZE = 128;
 
-  /** Get the maximum number of Levenshtein edit-distances to draw
-   *  candidate terms from. */  
-  public int getMaxEdits() {
-    return maxEdits;
-  }
+  final String groupField;
+  final BytesRef scratchBytesRef = new BytesRef();
 
-  /** Sets the maximum number of Levenshtein edit-distances to draw
-   *  candidate terms from. This value can be 1 or 2. The default is 2.
-   *  <p>
-   *  Note: a large number of spelling errors occur with an edit distance
-   *  of 1, by setting this value to 1 you can increase both performance
-   *  and precision at the cost of recall.
-   */
-  public void setMaxEdits(int maxEdits) {
-    if (maxEdits < 1 || maxEdits > LevenshteinAutomata.MAXIMUM_SUPPORTED_DISTANCE)
-      throw new UnsupportedOperationException("Invalid maxEdits");
-    this.maxEdits = maxEdits;
-  }
-  
-  /**
-   * Get the minimal number of characters that must match exactly
-   */
-  public int getMinPrefix() {
-    return minPrefix;
-  }
-  
-  /**
-   * Sets the minimal number of initial characters (default: 1) 
-   * that must match exactly.
-   * <p>
-   * This can improve both performance and accuracy of results,
-   * as misspellings are commonly not the first character.
-   */
-  public void setMinPrefix(int minPrefix) {
-    this.minPrefix = minPrefix;
-  }
-  
-  /**
-   * Get the maximum number of top-N inspections per suggestion
-   */
-  public int getMaxInspections() {
-    return maxInspections;
+  FieldCache.DocTermsIndex groupIndex;
+  IndexReader.AtomicReaderContext readerContext;
+
+  protected TermAllGroupHeadsCollector(String groupField, int numberOfSorts) {
+    super(numberOfSorts);
+    this.groupField = groupField;
   }
 
   /**
-   * Set the maximum number of top-N inspections (default: 5) per suggestion.
-   * <p>
-   * Increasing this number can improve the accuracy of results, at the cost 
-   * of performance.
+   * Creates an <code>AbstractAllGroupHeadsCollector</code> instance based on the supplied arguments.
+   * This factory method decides with implementation is best suited.
+   *
+   * Delegates to {@link #create(String, org.apache.lucene.search.Sort, int)} with an initialSize of 128.
+   *
+   * @param groupField      The field to group by
+   * @param sortWithinGroup The sort within each group
+   * @return an <code>AbstractAllGroupHeadsCollector</code> instance based on the supplied arguments
+   * @throws IOException If I/O related errors occur
    */
-  public void setMaxInspections(int maxInspections) {
-    this.maxInspections = maxInspections;
+  public static AbstractAllGroupHeadsCollector create(String groupField, Sort sortWithinGroup) throws IOException {
+    return create(groupField, sortWithinGroup, DEFAULT_INITIAL_SIZE);
   }
 
   /**
-   * Get the minimal accuracy from the StringDistance for a match
+   * Creates an <code>AbstractAllGroupHeadsCollector</code> instance based on the supplied arguments.
+   * This factory method decides with implementation is best suited.
+   *
+   * @param groupField      The field to group by
+   * @param sortWithinGroup The sort within each group
+   * @param initialSize The initial allocation size of the internal int set and group list which should roughly match
+   *                    the total number of expected unique groups. Be aware that the heap usage is
+   *                    4 bytes * initialSize.
+   * @return an <code>AbstractAllGroupHeadsCollector</code> instance based on the supplied arguments
+   * @throws IOException If I/O related errors occur
    */
-  public float getAccuracy() {
-    return accuracy;
-  }
+  public static AbstractAllGroupHeadsCollector create(String groupField, Sort sortWithinGroup, int initialSize) throws IOException {
+    boolean sortAllScore = true;
+    boolean sortAllFieldValue = true;
 
-  /**
-   * Set the minimal accuracy required (default: 0.5f) from a StringDistance 
-   * for a suggestion match.
-   */
-  public void setAccuracy(float accuracy) {
-    this.accuracy = accuracy;
-  }
-
-  /**
-   * Get the minimal threshold of documents a term must appear for a match
-   */
-  public float getThresholdFrequency() {
-    return thresholdFrequency;
-  }
-
-  /**
-   * Set the minimal threshold of documents a term must appear for a match.
-   * <p>
-   * This can improve quality by only suggesting high-frequency terms. Note that
-   * very high values might decrease performance slightly, by forcing the spellchecker
-   * to draw more candidates from the term dictionary, but a practical value such
-   * as <code>1</code> can be very useful towards improving quality.
-   * <p>
-   * This can be specified as a relative percentage of documents such as 0.5f,
-   * or it can be specified as an absolute whole document frequency, such as 4f.
-   * Absolute document frequencies may not be fractional.
-   */
-  public void setThresholdFrequency(float thresholdFrequency) {
-    if (thresholdFrequency >= 1f && thresholdFrequency != (int) thresholdFrequency)
-      throw new IllegalArgumentException("Fractional absolute document frequencies are not allowed");
-    this.thresholdFrequency = thresholdFrequency;
-  }
-
-  /** Get the minimum length of a query term needed to return suggestions */
-  public int getMinQueryLength() {
-    return minQueryLength;
-  }
-
-  /** 
-   * Set the minimum length of a query term (default: 4) needed to return suggestions. 
-   * <p>
-   * Very short query terms will often cause only bad suggestions with any distance
-   * metric.
-   */
-  public void setMinQueryLength(int minQueryLength) {
-    this.minQueryLength = minQueryLength;
-  }
-
-  /**
-   * Get the maximum threshold of documents a query term can appear in order
-   * to provide suggestions.
-   */
-  public float getMaxQueryFrequency() {
-    return maxQueryFrequency;
-  }
-
-  /**
-   * Set the maximum threshold (default: 0.01f) of documents a query term can 
-   * appear in order to provide suggestions.
-   * <p>
-   * Very high-frequency terms are typically spelled correctly. Additionally,
-   * this can increase performance as it will do no work for the common case
-   * of correctly-spelled input terms.
-   * <p>
-   * This can be specified as a relative percentage of documents such as 0.5f,
-   * or it can be specified as an absolute whole document frequency, such as 4f.
-   * Absolute document frequencies may not be fractional.
-   */
-  public void setMaxQueryFrequency(float maxQueryFrequency) {
-    if (maxQueryFrequency >= 1f && maxQueryFrequency != (int) maxQueryFrequency)
-      throw new IllegalArgumentException("Fractional absolute document frequencies are not allowed");
-    this.maxQueryFrequency = maxQueryFrequency;
-  }
-
-  /** true if the spellchecker should lowercase terms */
-  public boolean getLowerCaseTerms() {
-    return lowerCaseTerms;
-  }
-  
-  /** 
-   * True if the spellchecker should lowercase terms (default: true)
-   * <p>
-   * This is a convenience method, if your index field has more complicated
-   * analysis (such as StandardTokenizer removing punctuation), its probably
-   * better to turn this off, and instead run your query terms through your
-   * Analyzer first.
-   * <p>
-   * If this option is not on, case differences count as an edit! 
-   */
-  public void setLowerCaseTerms(boolean lowerCaseTerms) {
-    this.lowerCaseTerms = lowerCaseTerms;
-  }
-  
-  /**
-   * Get the current comparator in use.
-   */
-  public Comparator<SuggestWord> getComparator() {
-    return comparator;
-  }
-
-  /**
-   * Set the comparator for sorting suggestions.
-   * The default is {@link SuggestWordQueue#DEFAULT_COMPARATOR}
-   */
-  public void setComparator(Comparator<SuggestWord> comparator) {
-    this.comparator = comparator;
-  }
-
-  /**
-   * Get the string distance metric in use.
-   */
-  public StringDistance getDistance() {
-    return distance;
-  }
-
-  /**
-   * Set the string distance metric.
-   * The default is {@link #INTERNAL_LEVENSHTEIN}
-   * <p>
-   * Note: because this spellchecker draws its candidates from the
-   * term dictionary using Levenshtein, it works best with an edit-distance-like
-   * string metric. If you use a different metric than the default,
-   * you might want to consider increasing {@link #setMaxInspections(int)}
-   * to draw more candidates for your metric to rank.
-   */
-  public void setDistance(StringDistance distance) {
-    this.distance = distance;
-  }
-
-  /**
-   * Calls {@link #suggestSimilar(Term, int, IndexReader, SuggestMode) 
-   *       suggestSimilar(term, numSug, ir, SuggestMode.SUGGEST_WHEN_NOT_IN_INDEX)}
-   */
-  public SuggestWord[] suggestSimilar(Term term, int numSug, IndexReader ir) 
-     throws IOException {
-    return suggestSimilar(term, numSug, ir, SuggestMode.SUGGEST_WHEN_NOT_IN_INDEX);
-  }
-  
-  /**
-   * Calls {@link #suggestSimilar(Term, int, IndexReader, SuggestMode, float) 
-   *       suggestSimilar(term, numSug, ir, suggestMode, this.accuracy)}
-   * 
-   */
-  public SuggestWord[] suggestSimilar(Term term, int numSug, IndexReader ir, 
-      SuggestMode suggestMode) throws IOException {
-  	return suggestSimilar(term, numSug, ir, suggestMode, this.accuracy);
-  }
-  
-  /**
-   * Suggest similar words.
-   * 
-   * <p>Unlike {@link SpellChecker}, the similarity used to fetch the most
-   * relevant terms is an edit distance, therefore typically a low value
-   * for numSug will work very well.
-   * 
-   * @param term Term you want to spell check on
-   * @param numSug the maximum number of suggested words
-   * @param ir IndexReader to find terms from
-   * @param suggestMode specifies when to return suggested words
-   * @param accuracy return only suggested words that match with this similarity
-   * @return sorted list of the suggested words according to the comparator
-   * @throws IOException
-   */
-  public SuggestWord[] suggestSimilar(Term term, int numSug, IndexReader ir, 
-      SuggestMode suggestMode, float accuracy) throws IOException {
-    final CharsRef spare = new CharsRef();
-    String text = term.text();
-    if (minQueryLength > 0 && text.codePointCount(0, text.length()) < minQueryLength)
-      return new SuggestWord[0];
-    
-    if (lowerCaseTerms) {
-      term = new Term(term.field(), text.toLowerCase(Locale.ENGLISH));
-    }
-    
-    int docfreq = ir.docFreq(term);
-    
-    if (suggestMode==SuggestMode.SUGGEST_WHEN_NOT_IN_INDEX && docfreq > 0) {
-      return new SuggestWord[0];
-    }
-    
-    int maxDoc = ir.maxDoc();
-    
-    if (maxQueryFrequency >= 1f && docfreq > maxQueryFrequency) {
-      return new SuggestWord[0];
-    } else if (docfreq > (int) Math.ceil(maxQueryFrequency * (float)maxDoc)) {
-      return new SuggestWord[0];
-    }
-    
-    if (suggestMode!=SuggestMode.SUGGEST_MORE_POPULAR) docfreq = 0;
-    
-    if (thresholdFrequency >= 1f) {
-      docfreq = Math.max(docfreq, (int) thresholdFrequency);
-    } else if (thresholdFrequency > 0f) {
-      docfreq = Math.max(docfreq, (int)(thresholdFrequency * (float)maxDoc)-1);
-    }
-    
-    Collection<ScoreTerm> terms = null;
-    int inspections = numSug * maxInspections;
-    
-    // try ed=1 first, in case we get lucky
-    terms = suggestSimilar(term, inspections, ir, docfreq, 1, accuracy, spare);
-    if (maxEdits > 1 && terms.size() < inspections) {
-      HashSet<ScoreTerm> moreTerms = new HashSet<ScoreTerm>();
-      moreTerms.addAll(terms);
-      moreTerms.addAll(suggestSimilar(term, inspections, ir, docfreq, maxEdits, accuracy, spare));
-      terms = moreTerms;
-    }
-    
-    // create the suggestword response, sort it, and trim it to size.
-    
-    SuggestWord suggestions[] = new SuggestWord[terms.size()];
-    int index = suggestions.length - 1;
-    for (ScoreTerm s : terms) {
-      SuggestWord suggestion = new SuggestWord();
-      suggestion.string = s.termAsString != null ? s.termAsString : s.term.utf8ToChars(spare).toString();
-      suggestion.score = s.score;
-      suggestion.freq = s.docfreq;
-      suggestions[index--] = suggestion;
-    }
-    
-    ArrayUtil.mergeSort(suggestions, Collections.reverseOrder(comparator));
-    if (numSug < suggestions.length) {
-      SuggestWord trimmed[] = new SuggestWord[numSug];
-      System.arraycopy(suggestions, 0, trimmed, 0, numSug);
-      suggestions = trimmed;
-    }
-    return suggestions;
-  }
-  
-  private Collection<ScoreTerm> suggestSimilar(Term term, int numSug, 
-      IndexReader ir, int docfreq, int editDistance, float accuracy, final CharsRef spare) throws IOException {
-    
-    AttributeSource atts = new AttributeSource();
-    MaxNonCompetitiveBoostAttribute maxBoostAtt =
-      atts.addAttribute(MaxNonCompetitiveBoostAttribute.class);
-    Terms terms = MultiFields.getTerms(ir, term.field());
-    if (terms == null) {
-      return Collections.emptyList();
-    }
-    FuzzyTermsEnum e = new FuzzyTermsEnum(terms, atts, term, editDistance, Math.max(minPrefix, editDistance-1));
-    final PriorityQueue<ScoreTerm> stQueue = new PriorityQueue<ScoreTerm>();
-    
-    BytesRef queryTerm = new BytesRef(term.text());
-    BytesRef candidateTerm;
-    ScoreTerm st = new ScoreTerm();
-    BoostAttribute boostAtt =
-      e.attributes().addAttribute(BoostAttribute.class);
-    while ((candidateTerm = e.next()) != null) {
-      final float boost = boostAtt.getBoost();
-      // ignore uncompetitive hits
-      if (stQueue.size() >= numSug && boost <= stQueue.peek().boost)
-        continue;
-      
-      // ignore exact match of the same term
-      if (queryTerm.bytesEquals(candidateTerm))
-        continue;
-      
-      int df = e.docFreq();
-      
-      // check docFreq if required
-      if (df <= docfreq)
-        continue;
-      
-      final float score;
-      final String termAsString;
-      if (distance == INTERNAL_LEVENSHTEIN) {
-        // delay creating strings until the end
-        termAsString = null;
-        // undo FuzzyTermsEnum's scale factor for a real scaled lev score
-        score = boost / e.getScaleFactor() + e.getMinSimilarity();
+    for (SortField sortField : sortWithinGroup.getSort()) {
+      if (sortField.getType() == SortField.Type.SCORE) {
+        sortAllFieldValue = false;
+      } else if (needGeneralImpl(sortField)) {
+        return new GeneralAllGroupHeadsCollector(groupField, sortWithinGroup);
       } else {
-        termAsString = candidateTerm.utf8ToChars(spare).toString();
-        score = distance.getDistance(term.text(), termAsString);
+        sortAllScore = false;
       }
-      
-      if (score < accuracy)
-        continue;
-      
-      // add new entry in PQ
-      st.term = new BytesRef(candidateTerm);
-      st.boost = boost;
-      st.docfreq = df;
-      st.termAsString = termAsString;
-      st.score = score;
-      stQueue.offer(st);
-      // possibly drop entries from queue
-      st = (stQueue.size() > numSug) ? stQueue.poll() : new ScoreTerm();
-      maxBoostAtt.setMaxNonCompetitiveBoost((stQueue.size() >= numSug) ? stQueue.peek().boost : Float.NEGATIVE_INFINITY);
-    }
-      
-    return stQueue;
-  }
-  
-  private static class ScoreTerm implements Comparable<ScoreTerm> {
-    public BytesRef term;
-    public float boost;
-    public int docfreq;
-    
-    public String termAsString;
-    public float score;
-    
-    public int compareTo(ScoreTerm other) {
-      if (term.bytesEquals(other.term))
-        return 0; // consistent with equals
-      if (this.boost == other.boost)
-        return other.term.compareTo(this.term);
-      else
-        return Float.compare(this.boost, other.boost);
     }
 
-    @Override
-    public int hashCode() {
-      final int prime = 31;
-      int result = 1;
-      result = prime * result + ((term == null) ? 0 : term.hashCode());
-      return result;
-    }
-
-    @Override
-    public boolean equals(Object obj) {
-      if (this == obj) return true;
-      if (obj == null) return false;
-      if (getClass() != obj.getClass()) return false;
-      ScoreTerm other = (ScoreTerm) obj;
-      if (term == null) {
-        if (other.term != null) return false;
-      } else if (!term.bytesEquals(other.term)) return false;
-      return true;
+    if (sortAllScore) {
+      return new ScoreAllGroupHeadsCollector(groupField, sortWithinGroup, initialSize);
+    } else if (sortAllFieldValue) {
+      return new OrdAllGroupHeadsCollector(groupField, sortWithinGroup, initialSize);
+    } else {
+      return new OrdScoreAllGroupHeadsCollector(groupField, sortWithinGroup, initialSize);
     }
   }
+
+  // Returns when a sort field needs the general impl.
+  private static boolean needGeneralImpl(SortField sortField) {
+    SortField.Type sortType = sortField.getType();
+    // Note (MvG): We can also make an optimized impl when sorting is SortField.DOC
+    return sortType != SortField.Type.STRING_VAL && sortType != SortField.Type.STRING && sortType != SortField.Type.SCORE;
+  }
+
+  // A general impl that works for any group sort.
+  static class GeneralAllGroupHeadsCollector extends TermAllGroupHeadsCollector<GeneralAllGroupHeadsCollector.GroupHead> {
+
+    private final Sort sortWithinGroup;
+    private final Map<BytesRef, GroupHead> groups;
+
+    private Scorer scorer;
+
+    GeneralAllGroupHeadsCollector(String groupField, Sort sortWithinGroup) throws IOException {
+      super(groupField, sortWithinGroup.getSort().length);
+      this.sortWithinGroup = sortWithinGroup;
+      groups = new HashMap<BytesRef, GroupHead>();
+
+      final SortField[] sortFields = sortWithinGroup.getSort();
+      for (int i = 0; i < sortFields.length; i++) {
+        reversed[i] = sortFields[i].getReverse() ? -1 : 1;
+      }
+    }
+
+    protected void retrieveGroupHeadAndAddIfNotExist(int doc) throws IOException {
+      final int ord = groupIndex.getOrd(doc);
+      final BytesRef groupValue = ord == 0 ? null : groupIndex.lookup(ord, scratchBytesRef);
+      GroupHead groupHead = groups.get(groupValue);
+      if (groupHead == null) {
+        groupHead = new GroupHead(groupValue, sortWithinGroup, doc);
+        groups.put(groupValue == null ? null : new BytesRef(groupValue), groupHead);
+        temporalResult.stop = true;
+      } else {
+        temporalResult.stop = false;
+      }
+      temporalResult.groupHead = groupHead;
+    }
+
+    protected Collection<GroupHead> getCollectedGroupHeads() {
+      return groups.values();
+    }
+
+    public void setNextReader(IndexReader.AtomicReaderContext context) throws IOException {
+      this.readerContext = context;
+      groupIndex = FieldCache.DEFAULT.getTermsIndex(context.reader, groupField);
+
+      for (GroupHead groupHead : groups.values()) {
+        for (int i = 0; i < groupHead.comparators.length; i++) {
+          groupHead.comparators[i] = groupHead.comparators[i].setNextReader(context);
+        }
+      }
+    }
+
+    public void setScorer(Scorer scorer) throws IOException {
+      this.scorer = scorer;
+      for (GroupHead groupHead : groups.values()) {
+        for (FieldComparator comparator : groupHead.comparators) {
+          comparator.setScorer(scorer);
+        }
+      }
+    }
+
+    class GroupHead extends AbstractAllGroupHeadsCollector.GroupHead<BytesRef> {
+
+      final FieldComparator[] comparators;
+
+      private GroupHead(BytesRef groupValue, Sort sort, int doc) throws IOException {
+        super(groupValue, doc + readerContext.docBase);
+        final SortField[] sortFields = sort.getSort();
+        comparators = new FieldComparator[sortFields.length];
+        for (int i = 0; i < sortFields.length; i++) {
+          comparators[i] = sortFields[i].getComparator(1, i).setNextReader(readerContext);
+          comparators[i].setScorer(scorer);
+          comparators[i].copy(0, doc);
+          comparators[i].setBottom(0);
+        }
+      }
+
+      public int compare(int compIDX, int doc) throws IOException {
+        return comparators[compIDX].compareBottom(doc);
+      }
+
+      public void updateDocHead(int doc) throws IOException {
+        for (FieldComparator comparator : comparators) {
+          comparator.copy(0, doc);
+          comparator.setBottom(0);
+        }
+        this.doc = doc + readerContext.docBase;
+      }
+    }
+  }
+
+
+  // AbstractAllGroupHeadsCollector optimized for ord fields and scores.
+  static class OrdScoreAllGroupHeadsCollector extends TermAllGroupHeadsCollector<OrdScoreAllGroupHeadsCollector.GroupHead> {
+
+    private final SentinelIntSet ordSet;
+    private final List<GroupHead> collectedGroups;
+    private final SortField[] fields;
+
+    private FieldCache.DocTermsIndex[] sortsIndex;
+    private Scorer scorer;
+    private GroupHead[] segmentGroupHeads;
+
+    OrdScoreAllGroupHeadsCollector(String groupField, Sort sortWithinGroup, int initialSize) {
+      super(groupField, sortWithinGroup.getSort().length);
+      ordSet = new SentinelIntSet(initialSize, -1);
+      collectedGroups = new ArrayList<GroupHead>(initialSize);
+
+      final SortField[] sortFields = sortWithinGroup.getSort();
+      fields = new SortField[sortFields.length];
+      sortsIndex = new FieldCache.DocTermsIndex[sortFields.length];
+      for (int i = 0; i < sortFields.length; i++) {
+        reversed[i] = sortFields[i].getReverse() ? -1 : 1;
+        fields[i] = sortFields[i];
+      }
+    }
+
+    protected Collection<GroupHead> getCollectedGroupHeads() {
+      return collectedGroups;
+    }
+
+    public void setScorer(Scorer scorer) throws IOException {
+      this.scorer = scorer;
+    }
+
+    protected void retrieveGroupHeadAndAddIfNotExist(int doc) throws IOException {
+      int key = groupIndex.getOrd(doc);
+      GroupHead groupHead;
+      if (!ordSet.exists(key)) {
+        ordSet.put(key);
+        BytesRef term = key == 0 ? null : groupIndex.getTerm(doc, new BytesRef());
+        groupHead = new GroupHead(doc, term);
+        collectedGroups.add(groupHead);
+        segmentGroupHeads[key] = groupHead;
+        temporalResult.stop = true;
+      } else {
+        temporalResult.stop = false;
+        groupHead = segmentGroupHeads[key];
+      }
+      temporalResult.groupHead = groupHead;
+    }
+
+    public void setNextReader(IndexReader.AtomicReaderContext context) throws IOException {
+      this.readerContext = context;
+      groupIndex = FieldCache.DEFAULT.getTermsIndex(context.reader, groupField);
+      for (int i = 0; i < fields.length; i++) {
+        if (fields[i].getType() == SortField.Type.SCORE) {
+          continue;
+        }
+
+        sortsIndex[i] = FieldCache.DEFAULT.getTermsIndex(context.reader, fields[i].getField());
+      }
+
+      // Clear ordSet and fill it with previous encountered groups that can occur in the current segment.
+      ordSet.clear();
+      segmentGroupHeads = new GroupHead[groupIndex.numOrd()];
+      for (GroupHead collectedGroup : collectedGroups) {
+        int ord = groupIndex.binarySearchLookup(collectedGroup.groupValue, scratchBytesRef);
+        if (ord >= 0) {
+          ordSet.put(ord);
+          segmentGroupHeads[ord] = collectedGroup;
+
+          for (int i = 0; i < sortsIndex.length; i++) {
+            if (fields[i].getType() == SortField.Type.SCORE) {
+              continue;
+            }
+
+            collectedGroup.sortOrds[i] = sortsIndex[i].binarySearchLookup(collectedGroup.sortValues[i], scratchBytesRef);
+          }
+        }
+      }
+    }
+
+    class GroupHead extends AbstractAllGroupHeadsCollector.GroupHead<BytesRef> {
+
+      BytesRef[] sortValues;
+      int[] sortOrds;
+      float[] scores;
+
+      private GroupHead(int doc, BytesRef groupValue) throws IOException {
+        super(groupValue, doc + readerContext.docBase);
+        sortValues = new BytesRef[sortsIndex.length];
+        sortOrds = new int[sortsIndex.length];
+        scores = new float[sortsIndex.length];
+        for (int i = 0; i < sortsIndex.length; i++) {
+          if (fields[i].getType() == SortField.Type.SCORE) {
+            scores[i] = scorer.score();
+          } else {
+            sortValues[i] = sortsIndex[i].getTerm(doc, new BytesRef());
+            sortOrds[i] = sortsIndex[i].getOrd(doc);
+          }
+        }
+
+      }
+
+      public int compare(int compIDX, int doc) throws IOException {
+        if (fields[compIDX].getType() == SortField.Type.SCORE) {
+          float score = scorer.score();
+          if (scores[compIDX] < score) {
+            return 1;
+          } else if (scores[compIDX] > score) {
+            return -1;
+          }
+          return 0;
+        } else {
+          if (sortOrds[compIDX] < 0) {
+            // The current segment doesn't contain the sort value we encountered before. Therefore the ord is negative.
+            return sortValues[compIDX].compareTo(sortsIndex[compIDX].getTerm(doc, scratchBytesRef));
+          } else {
+            return sortOrds[compIDX] - sortsIndex[compIDX].getOrd(doc);
+          }
+        }
+      }
+
+      public void updateDocHead(int doc) throws IOException {
+        for (int i = 0; i < sortsIndex.length; i++) {
+          if (fields[i].getType() == SortField.Type.SCORE) {
+            scores[i] = scorer.score();
+          } else {
+            sortValues[i] = sortsIndex[i].getTerm(doc, sortValues[i]);
+            sortOrds[i] = sortsIndex[i].getOrd(doc);
+          }
+        }
+        this.doc = doc + readerContext.docBase;
+      }
+
+    }
+
+  }
+
+
+  // AbstractAllGroupHeadsCollector optimized for ord fields.
+  static class OrdAllGroupHeadsCollector extends TermAllGroupHeadsCollector<OrdAllGroupHeadsCollector.GroupHead> {
+
+    private final SentinelIntSet ordSet;
+    private final List<GroupHead> collectedGroups;
+    private final SortField[] fields;
+
+    private FieldCache.DocTermsIndex[] sortsIndex;
+    private GroupHead[] segmentGroupHeads;
+
+    OrdAllGroupHeadsCollector(String groupField, Sort sortWithinGroup, int initialSize) {
+      super(groupField, sortWithinGroup.getSort().length);
+      ordSet = new SentinelIntSet(initialSize, -1);
+      collectedGroups = new ArrayList<GroupHead>(initialSize);
+
+      final SortField[] sortFields = sortWithinGroup.getSort();
+      fields = new SortField[sortFields.length];
+      sortsIndex = new FieldCache.DocTermsIndex[sortFields.length];
+      for (int i = 0; i < sortFields.length; i++) {
+        reversed[i] = sortFields[i].getReverse() ? -1 : 1;
+        fields[i] = sortFields[i];
+      }
+    }
+
+    protected Collection<GroupHead> getCollectedGroupHeads() {
+      return collectedGroups;
+    }
+
+    public void setScorer(Scorer scorer) throws IOException {
+    }
+
+    protected void retrieveGroupHeadAndAddIfNotExist(int doc) throws IOException {
+      int key = groupIndex.getOrd(doc);
+      GroupHead groupHead;
+      if (!ordSet.exists(key)) {
+        ordSet.put(key);
+        BytesRef term = key == 0 ? null : groupIndex.getTerm(doc, new BytesRef());
+        groupHead = new GroupHead(doc, term);
+        collectedGroups.add(groupHead);
+        segmentGroupHeads[key] = groupHead;
+        temporalResult.stop = true;
+      } else {
+        temporalResult.stop = false;
+        groupHead = segmentGroupHeads[key];
+      }
+      temporalResult.groupHead = groupHead;
+    }
+
+    public void setNextReader(IndexReader.AtomicReaderContext context) throws IOException {
+      this.readerContext = context;
+      groupIndex = FieldCache.DEFAULT.getTermsIndex(context.reader, groupField);
+      for (int i = 0; i < fields.length; i++) {
+        sortsIndex[i] = FieldCache.DEFAULT.getTermsIndex(context.reader, fields[i].getField());
+      }
+
+      // Clear ordSet and fill it with previous encountered groups that can occur in the current segment.
+      ordSet.clear();
+      segmentGroupHeads = new GroupHead[groupIndex.numOrd()];
+      for (GroupHead collectedGroup : collectedGroups) {
+        int groupOrd = groupIndex.binarySearchLookup(collectedGroup.groupValue, scratchBytesRef);
+        if (groupOrd >= 0) {
+          ordSet.put(groupOrd);
+          segmentGroupHeads[groupOrd] = collectedGroup;
+
+          for (int i = 0; i < sortsIndex.length; i++) {
+            collectedGroup.sortOrds[i] = sortsIndex[i].binarySearchLookup(collectedGroup.sortValues[i], scratchBytesRef);
+          }
+        }
+      }
+    }
+
+    class GroupHead extends AbstractAllGroupHeadsCollector.GroupHead<BytesRef> {
+
+      BytesRef[] sortValues;
+      int[] sortOrds;
+
+      private GroupHead(int doc, BytesRef groupValue) throws IOException {
+        super(groupValue, doc + readerContext.docBase);
+        sortValues = new BytesRef[sortsIndex.length];
+        sortOrds = new int[sortsIndex.length];
+        for (int i = 0; i < sortsIndex.length; i++) {
+          sortValues[i] = sortsIndex[i].getTerm(doc, new BytesRef());
+          sortOrds[i] = sortsIndex[i].getOrd(doc);
+        }
+      }
+
+      public int compare(int compIDX, int doc) throws IOException {
+        if (sortOrds[compIDX] < 0) {
+          // The current segment doesn't contain the sort value we encountered before. Therefore the ord is negative.
+          return sortValues[compIDX].compareTo(sortsIndex[compIDX].getTerm(doc, scratchBytesRef));
+        } else {
+          return sortOrds[compIDX] - sortsIndex[compIDX].getOrd(doc);
+        }
+      }
+
+      public void updateDocHead(int doc) throws IOException {
+        for (int i = 0; i < sortsIndex.length; i++) {
+          sortValues[i] = sortsIndex[i].getTerm(doc, sortValues[i]);
+          sortOrds[i] = sortsIndex[i].getOrd(doc);
+        }
+        this.doc = doc + readerContext.docBase;
+      }
+
+    }
+
+  }
+
+
+  // AbstractAllGroupHeadsCollector optimized for scores.
+  static class ScoreAllGroupHeadsCollector extends TermAllGroupHeadsCollector<ScoreAllGroupHeadsCollector.GroupHead> {
+
+    private final SentinelIntSet ordSet;
+    private final List<GroupHead> collectedGroups;
+    private final SortField[] fields;
+
+    private Scorer scorer;
+    private GroupHead[] segmentGroupHeads;
+
+    ScoreAllGroupHeadsCollector(String groupField, Sort sortWithinGroup, int initialSize) {
+      super(groupField, sortWithinGroup.getSort().length);
+      ordSet = new SentinelIntSet(initialSize, -1);
+      collectedGroups = new ArrayList<GroupHead>(initialSize);
+
+      final SortField[] sortFields = sortWithinGroup.getSort();
+      fields = new SortField[sortFields.length];
+      for (int i = 0; i < sortFields.length; i++) {
+        reversed[i] = sortFields[i].getReverse() ? -1 : 1;
+        fields[i] = sortFields[i];
+      }
+    }
+
+    protected Collection<GroupHead> getCollectedGroupHeads() {
+      return collectedGroups;
+    }
+
+    public void setScorer(Scorer scorer) throws IOException {
+      this.scorer = scorer;
+    }
+
+    protected void retrieveGroupHeadAndAddIfNotExist(int doc) throws IOException {
+      int key = groupIndex.getOrd(doc);
+      GroupHead groupHead;
+      if (!ordSet.exists(key)) {
+        ordSet.put(key);
+        BytesRef term = key == 0 ? null : groupIndex.getTerm(doc, new BytesRef());
+        groupHead = new GroupHead(doc, term);
+        collectedGroups.add(groupHead);
+        segmentGroupHeads[key] = groupHead;
+        temporalResult.stop = true;
+      } else {
+        temporalResult.stop = false;
+        groupHead = segmentGroupHeads[key];
+      }
+      temporalResult.groupHead = groupHead;
+    }
+
+    public void setNextReader(IndexReader.AtomicReaderContext context) throws IOException {
+      this.readerContext = context;
+      groupIndex = FieldCache.DEFAULT.getTermsIndex(context.reader, groupField);
+
+      // Clear ordSet and fill it with previous encountered groups that can occur in the current segment.
+      ordSet.clear();
+      segmentGroupHeads = new GroupHead[groupIndex.numOrd()];
+      for (GroupHead collectedGroup : collectedGroups) {
+        int ord = groupIndex.binarySearchLookup(collectedGroup.groupValue, scratchBytesRef);
+        if (ord >= 0) {
+          ordSet.put(ord);
+          segmentGroupHeads[ord] = collectedGroup;
+        }
+      }
+    }
+
+    class GroupHead extends AbstractAllGroupHeadsCollector.GroupHead<BytesRef> {
+
+      float[] scores;
+
+      private GroupHead(int doc, BytesRef groupValue) throws IOException {
+        super(groupValue, doc + readerContext.docBase);
+        scores = new float[fields.length];
+        float score = scorer.score();
+        for (int i = 0; i < scores.length; i++) {
+          scores[i] = score;
+        }
+      }
+
+      public int compare(int compIDX, int doc) throws IOException {
+        float score = scorer.score();
+        if (scores[compIDX] < score) {
+          return 1;
+        } else if (scores[compIDX] > score) {
+          return -1;
+        }
+        return 0;
+      }
+
+      public void updateDocHead(int doc) throws IOException {
+        float score = scorer.score();
+        for (int i = 0; i < scores.length; i++) {
+          scores[i] = score;
+        }
+        this.doc = doc + readerContext.docBase;
+      }
+
+    }
+
+  }
+
 }

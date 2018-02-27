@@ -1,483 +1,397 @@
-} catch (Exception e) {
+String nodeName = nodeList.get((repFactor * (i - 1) + (j - 1)) % nodeList.size());
 
 package org.apache.solr.cloud;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements. See the NOTICE file distributed with this
- * work for additional information regarding copyright ownership. The ASF
- * licenses this file to You under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- * 
- * http://www.apache.org/licenses/LICENSE-2.0
- * 
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
  * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
- * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
- * License for the specific language governing permissions and limitations under
- * the License.
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
-import java.io.BufferedReader;
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.IOException;
-import java.io.InputStreamReader;
-import java.net.InetAddress;
-import java.net.InetSocketAddress;
-import java.net.UnknownHostException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
-import java.util.Properties;
-import java.util.Map.Entry;
+import java.util.Set;
 
-import org.apache.lucene.util.IOUtils;
 import org.apache.solr.common.SolrException;
-import org.apache.zookeeper.server.ServerConfig;
-import org.apache.zookeeper.server.ZooKeeperServerMain;
-import org.apache.zookeeper.server.quorum.QuorumPeer;
-import org.apache.zookeeper.server.quorum.QuorumPeerConfig;
-import org.apache.zookeeper.server.quorum.QuorumPeerMain;
-import org.apache.zookeeper.server.quorum.flexible.QuorumHierarchical;
-import org.apache.zookeeper.server.quorum.flexible.QuorumMaj;
+import org.apache.solr.common.SolrException.ErrorCode;
+import org.apache.solr.common.cloud.ClosableThread;
+import org.apache.solr.common.cloud.ClusterState;
+import org.apache.solr.common.cloud.DocCollection;
+import org.apache.solr.common.cloud.Replica;
+import org.apache.solr.common.cloud.Slice;
+import org.apache.solr.common.cloud.ZkNodeProps;
+import org.apache.solr.common.cloud.ZkStateReader;
+import org.apache.solr.common.cloud.ZooKeeperException;
+import org.apache.solr.common.params.CoreAdminParams;
+import org.apache.solr.common.params.CoreAdminParams.CoreAdminAction;
+import org.apache.solr.common.params.ModifiableSolrParams;
+import org.apache.solr.common.util.StrUtils;
+import org.apache.solr.handler.component.ShardHandler;
+import org.apache.solr.handler.component.ShardRequest;
+import org.apache.solr.handler.component.ShardResponse;
+import org.apache.zookeeper.KeeperException;
+import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-
-public class SolrZkServer {
-  static org.slf4j.Logger log = LoggerFactory.getLogger(SolrZkServer.class);
+public class OverseerCollectionProcessor implements Runnable, ClosableThread {
   
-  String zkRun;
-  String zkHost;
+  public static final String NUM_SLICES = "numShards";
+  
+  public static final String REPLICATION_FACTOR = "replicationFactor";
+  
+  public static final String MAX_SHARDS_PER_NODE = "maxShardsPerNode";
+  
+  public static final String CREATE_NODE_SET = "createNodeSet";
+  
+  public static final String DELETECOLLECTION = "deletecollection";
 
-  String solrPort;
-  Properties props;
-  SolrZkServerProps zkProps;
+  public static final String CREATECOLLECTION = "createcollection";
 
-  private Thread zkThread;  // the thread running a zookeeper server, only if zkRun is set
+  public static final String RELOADCOLLECTION = "reloadcollection";
+  
+  // TODO: use from Overseer?
+  private static final String QUEUE_OPERATION = "operation";
 
-  private String dataHome;
-  private String confHome;
 
-  public SolrZkServer(String zkRun, String zkHost, String dataHome, String confHome, String solrPort) {
-    this.zkRun = zkRun;
-    this.zkHost = zkHost;
-    this.dataHome = dataHome;
-    this.confHome = confHome;
-    this.solrPort = solrPort;
+  
+  private static Logger log = LoggerFactory
+      .getLogger(OverseerCollectionProcessor.class);
+  
+  private DistributedQueue workQueue;
+  
+  private String myId;
+
+  private ShardHandler shardHandler;
+
+  private String adminPath;
+
+  private ZkStateReader zkStateReader;
+
+  private boolean isClosed;
+  
+  public OverseerCollectionProcessor(ZkStateReader zkStateReader, String myId, ShardHandler shardHandler, String adminPath) {
+    this(zkStateReader, myId, shardHandler, adminPath, Overseer.getCollectionQueue(zkStateReader.getZkClient()));
   }
 
-  public String getClientString() {
-    if (zkHost != null) return zkHost;
-    
-    if (zkProps == null) return null;
-
-    // if the string wasn't passed as zkHost, then use the standalone server we started
-    if (zkRun == null) return null;
-    return "localhost:" + zkProps.getClientPortAddress().getPort();
+  protected OverseerCollectionProcessor(ZkStateReader zkStateReader, String myId, ShardHandler shardHandler, String adminPath, DistributedQueue workQueue) {
+    this.zkStateReader = zkStateReader;
+    this.myId = myId;
+    this.shardHandler = shardHandler;
+    this.adminPath = adminPath;
+    this.workQueue = workQueue;
   }
-
-  public void parseConfig() {
-    if (zkProps == null) {
-      zkProps = new SolrZkServerProps();
-      // set default data dir
-      // TODO: use something based on IP+port???  support ensemble all from same solr home?
-      zkProps.setDataDir(dataHome);
-      zkProps.zkRun = zkRun;
-      zkProps.solrPort = solrPort;
-    }
-    
-    try {
-      props = SolrZkServerProps.getProperties(confHome + '/' + "zoo.cfg");
-      SolrZkServerProps.injectServers(props, zkRun, zkHost);
-      zkProps.parseProperties(props);
-      if (zkProps.getClientPortAddress() == null) {
-        zkProps.setClientPort(Integer.parseInt(solrPort)+1000);
-      }
-    } catch (QuorumPeerConfig.ConfigException e) {
-      if (zkRun != null)
-        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, e);
-    } catch (IOException e) {
-      if (zkRun != null)
-      throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, e);
-    }
-  }
-
-  public Map<Long, QuorumPeer.QuorumServer> getServers() {
-    return zkProps.getServers();
-  }
-
-  public void start() {
-    if (zkRun == null) return;
-
-    zkThread = new Thread() {
-      @Override
-      public void run() {
-        try {
-          if (zkProps.getServers().size() > 1) {
-            QuorumPeerMain zkServer = new QuorumPeerMain();
-            zkServer.runFromConfig(zkProps);
-          } else {
-            ServerConfig sc = new ServerConfig();
-            sc.readFrom(zkProps);
-            ZooKeeperServerMain zkServer = new ZooKeeperServerMain();
-            zkServer.runFromConfig(sc);
-          }
-          log.info("ZooKeeper Server exited.");
-        } catch (Throwable e) {
-          log.error("ZooKeeper Server ERROR", e);
-          throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, e);
-        }
-      }
-    };
-
-    if (zkProps.getServers().size() > 1) {
-      log.info("STARTING EMBEDDED ENSEMBLE ZOOKEEPER SERVER at port " + zkProps.getClientPortAddress().getPort());
-    } else {
-      log.info("STARTING EMBEDDED STANDALONE ZOOKEEPER SERVER at port " + zkProps.getClientPortAddress().getPort());
-    }
-
-    zkThread.setDaemon(true);
-    zkThread.start();
-    try {
-      Thread.sleep(500); // pause for ZooKeeper to start
-    } catch (Exception e) {
-      log.error("STARTING ZOOKEEPER", e);
-    }
-  }
-
-  public void stop() {
-    if (zkRun == null) return;
-    zkThread.interrupt();
-  }
-}
-
-
-
-
-// Allows us to set a default for the data dir before parsing
-// zoo.cfg (which validates that there is a dataDir)
-class SolrZkServerProps extends QuorumPeerConfig {
-  protected static org.slf4j.Logger LOG = LoggerFactory.getLogger(QuorumPeerConfig.class);
-
-  String solrPort; // port that Solr is listening on
-  String zkRun;
-
-  /**
-   * Parse a ZooKeeper configuration file
-   * @param path the patch of the configuration file
-   * @throws ConfigException error processing configuration
-   */
-  public static Properties getProperties(String path) throws ConfigException {
-    File configFile = new File(path);
-
-    LOG.info("Reading configuration from: " + configFile);
-
-    try {
-      if (!configFile.exists()) {
-        throw new IllegalArgumentException(configFile.toString()
-            + " file is missing");
-      }
-
-      Properties cfg = new Properties();
-      FileInputStream in = new FileInputStream(configFile);
-      try {
-        cfg.load(new InputStreamReader(in, IOUtils.CHARSET_UTF_8));
-      } finally {
-        in.close();
-      }
-
-      return cfg;
-
-    } catch (IOException e) {
-      throw new ConfigException("Error processing " + path, e);
-    } catch (IllegalArgumentException e) {
-      throw new ConfigException("Error processing " + path, e);
-    }
-  }
-
-
-  // Adds server.x if they don't exist, based on zkHost if it does exist.
-  // Given zkHost=localhost:1111,localhost:2222 this will inject
-  // server.0=localhost:1112:1113
-  // server.1=localhost:2223:2224
-  public static void injectServers(Properties props, String zkRun, String zkHost) {
-
-    // if clientPort not already set, use zkRun
-    if (zkRun != null && props.getProperty("clientPort")==null) {
-      int portIdx = zkRun.lastIndexOf(':');
-      if (portIdx > 0) {
-        String portStr = zkRun.substring(portIdx+1);
-        props.setProperty("clientPort", portStr);
-      }
-    }
-
-    boolean hasServers = hasServers(props);
-
-    if (!hasServers && zkHost != null) {
-      int alg = Integer.parseInt(props.getProperty("electionAlg","3").trim());
-      String[] hosts = zkHost.split(",");
-      int serverNum = 0;
-      for (String hostAndPort : hosts) {
-        hostAndPort = hostAndPort.trim();
-        int portIdx = hostAndPort.lastIndexOf(':');
-        String clientPortStr = hostAndPort.substring(portIdx+1);
-        int clientPort = Integer.parseInt(clientPortStr);
-        String host = hostAndPort.substring(0,portIdx);
-
-        String serverStr = host + ':' + (clientPort+1);
-        // zk leader election algorithms other than 0 need an extra port for leader election.
-        if (alg != 0) {
-          serverStr = serverStr + ':' + (clientPort+2);
-        }
-
-        props.setProperty("server."+serverNum, serverStr);
-        serverNum++;
-      }
-    }
-  }
-
-  public static boolean hasServers(Properties props) {
-    for (Object key : props.keySet())
-      if (((String)key).startsWith("server."))
-        return true;
-    return false;
-  }
-
-  // called by the modified version of parseProperties
-  // when the myid file is missing.
-  public Long getMyServerId() {
-    if (zkRun == null && solrPort == null) return null;
-
-    Map<Long, QuorumPeer.QuorumServer> slist = getServers();
-
-    String myHost = "localhost";
-    InetSocketAddress thisAddr = null;
-
-    if (zkRun != null && zkRun.length()>0) {
-      String parts[] = zkRun.split(":");
-      myHost = parts[0];
-      thisAddr = new InetSocketAddress(myHost, Integer.parseInt(parts[1]) + 1);
-    } else {
-      // default to localhost:<solrPort+1001>
-      thisAddr = new InetSocketAddress(myHost, Integer.parseInt(solrPort)+1001);
-    }
-
-
-    // first try a straight match by host
-    Long me = null;
-    boolean multiple = false;
-    int port = 0;
-    for (QuorumPeer.QuorumServer server : slist.values()) {
-      if (server.addr.getHostName().equals(myHost)) {
-        multiple = me!=null;
-        me = server.id;
-        port = server.addr.getPort();
-      }
-    }
-
-    if (!multiple) {
-      // only one host matched... assume it's me.
-      setClientPort(port - 1);
-      return me;
-    }
-
-    if (me == null) {
-      // no hosts matched.
-      return null;
-    }
-
-
-    // multiple matches... try to figure out by port.
-    for (QuorumPeer.QuorumServer server : slist.values()) {
-      if (server.addr.equals(thisAddr)) {
-        if (clientPortAddress == null || clientPortAddress.getPort() <= 0)
-          setClientPort(server.addr.getPort() - 1);
-        return server.id;
-      }
-    }
-
-    return null;
-  }
-
-
-
-  public void setDataDir(String dataDir) {
-    this.dataDir = dataDir;
-  }
-
-  public void setClientPort(int clientPort) {
-    if (clientPortAddress != null) {
-      try {
-        this.clientPortAddress = new InetSocketAddress(
-                InetAddress.getByName(clientPortAddress.getHostName()), clientPort);
-      } catch (UnknownHostException e) {
-        throw new RuntimeException(e);
-      }
-    } else {
-      this.clientPortAddress = new InetSocketAddress(clientPort);
-    }
-  }
-
-
-  // NOTE: copied from ZooKeeper 3.2
-  /**
-   * Parse config from a Properties.
-   * @param zkProp Properties to parse from.
-   */
+  
   @Override
-  public void parseProperties(Properties zkProp)
-      throws IOException, ConfigException {
-    for (Entry<Object, Object> entry : zkProp.entrySet()) {
-      String key = entry.getKey().toString().trim();
-      String value = entry.getValue().toString().trim();
-      if (key.equals("dataDir")) {
-        dataDir = value;
-      } else if (key.equals("dataLogDir")) {
-        dataLogDir = value;
-      } else if (key.equals("clientPort")) {
-        setClientPort(Integer.parseInt(value));
-      } else if (key.equals("tickTime")) {
-        tickTime = Integer.parseInt(value);
-      } else if (key.equals("initLimit")) {
-        initLimit = Integer.parseInt(value);
-      } else if (key.equals("syncLimit")) {
-        syncLimit = Integer.parseInt(value);
-      } else if (key.equals("electionAlg")) {
-        electionAlg = Integer.parseInt(value);
-      } else if (key.equals("maxClientCnxns")) {
-        maxClientCnxns = Integer.parseInt(value);
-      } else if (key.startsWith("server.")) {
-        int dot = key.indexOf('.');
-        long sid = Long.parseLong(key.substring(dot + 1));
-        String parts[] = value.split(":");
-        if ((parts.length != 2) && (parts.length != 3)) {
-          LOG.error(value
-              + " does not have the form host:port or host:port:port");
+  public void run() {
+    log.info("Process current queue of collection messages");
+    while (amILeader() && !isClosed) {
+      try {
+        byte[] head = workQueue.peek(true);
+        
+        //if (head != null) {    // should not happen since we block above
+          final ZkNodeProps message = ZkNodeProps.load(head);
+          final String operation = message.getStr(QUEUE_OPERATION);
+        try {
+          boolean success = processMessage(message, operation);
+          if (!success) {
+            // TODO: what to do on failure / partial failure
+            // if we fail, do we clean up then ?
+            SolrException.log(log,
+                "Collection " + operation + " of " + message.getStr("name")
+                    + " failed");
+          }
+        } catch(Throwable t) {
+          SolrException.log(log,
+              "Collection " + operation + " of " + message.getStr("name")
+                  + " failed", t);
         }
-        InetSocketAddress addr = new InetSocketAddress(parts[0],
-            Integer.parseInt(parts[1]));
-        if (parts.length == 2) {
-          servers.put(Long.valueOf(sid), new QuorumPeer.QuorumServer(sid, addr));
-        } else if (parts.length == 3) {
-          InetSocketAddress electionAddr = new InetSocketAddress(
-              parts[0], Integer.parseInt(parts[2]));
-          servers.put(Long.valueOf(sid), new QuorumPeer.QuorumServer(sid, addr,
-              electionAddr));
-        }
-      } else if (key.startsWith("group")) {
-        int dot = key.indexOf('.');
-        long gid = Long.parseLong(key.substring(dot + 1));
-
-        numGroups++;
-
-        String parts[] = value.split(":");
-        for(String s : parts){
-          long sid = Long.parseLong(s);
-          if(serverGroup.containsKey(sid))
-            throw new ConfigException("Server " + sid + "is in multiple groups");
-          else
-            serverGroup.put(sid, gid);
-        }
-
-      } else if(key.startsWith("weight")) {
-        int dot = key.indexOf('.');
-        long sid = Long.parseLong(key.substring(dot + 1));
-        serverWeight.put(sid, Long.parseLong(value));
-      } else {
-        System.setProperty("zookeeper." + key, value);
-      }
-    }
-    if (dataDir == null) {
-      throw new IllegalArgumentException("dataDir is not set");
-    }
-    if (dataLogDir == null) {
-      dataLogDir = dataDir;
-    } else {
-      if (!new File(dataLogDir).isDirectory()) {
-        throw new IllegalArgumentException("dataLogDir " + dataLogDir
-            + " is missing.");
-      }
-    }
-
-    if (tickTime == 0) {
-      throw new IllegalArgumentException("tickTime is not set");
-    }
-    if (servers.size() > 1) {
-      if (initLimit == 0) {
-        throw new IllegalArgumentException("initLimit is not set");
-      }
-      if (syncLimit == 0) {
-        throw new IllegalArgumentException("syncLimit is not set");
-      }
-      /*
-      * If using FLE, then every server requires a separate election
-      * port.
-      */
-      if (electionAlg != 0) {
-        for (QuorumPeer.QuorumServer s : servers.values()) {
-          if (s.electionAddr == null)
-            throw new IllegalArgumentException(
-                "Missing election port for server: " + s.id);
-        }
-      }
-
-      /*
-      * Default of quorum config is majority
-      */
-      if(serverGroup.size() > 0){
-        if(servers.size() != serverGroup.size())
-          throw new ConfigException("Every server must be in exactly one group");
-        /*
-         * The deafult weight of a server is 1
-         */
-        for(QuorumPeer.QuorumServer s : servers.values()){
-          if(!serverWeight.containsKey(s.id))
-            serverWeight.put(s.id, (long) 1);
-        }
-
-        /*
-                      * Set the quorumVerifier to be QuorumHierarchical
-                      */
-        quorumVerifier = new QuorumHierarchical(numGroups,
-            serverWeight, serverGroup);
-      } else {
-        /*
-                      * The default QuorumVerifier is QuorumMaj
-                      */
-
-        LOG.info("Defaulting to majority quorums");
-        quorumVerifier = new QuorumMaj(servers.size());
-      }
-
-      File myIdFile = new File(dataDir, "myid");
-      if (!myIdFile.exists()) {
-        ///////////////// ADDED FOR SOLR //////
-        Long myid = getMyServerId();
-        if (myid != null) {
-          serverId = myid;
+        //}
+        
+        
+        workQueue.poll();
+       
+      } catch (KeeperException e) {
+        if (e.code() == KeeperException.Code.SESSIONEXPIRED
+            || e.code() == KeeperException.Code.CONNECTIONLOSS) {
+          log.warn("Overseer cannot talk to ZK");
           return;
         }
-        if (zkRun == null) return;
-        //////////////// END ADDED FOR SOLR //////
-        throw new IllegalArgumentException(myIdFile.toString()
-            + " file is missing");
-      }
-
-      BufferedReader br = new BufferedReader(new InputStreamReader(new FileInputStream(myIdFile), IOUtils.CHARSET_UTF_8));
-      String myIdString;
-      try {
-        myIdString = br.readLine();
-      } finally {
-        br.close();
-      }
-      try {
-        serverId = Long.parseLong(myIdString);
-      } catch (NumberFormatException e) {
-        throw new IllegalArgumentException("serverid " + myIdString
-            + " is not a number");
+        SolrException.log(log, "", e);
+        throw new ZooKeeperException(SolrException.ErrorCode.SERVER_ERROR, "",
+            e);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        return;
       }
     }
   }
+  
+  public void close() {
+    isClosed = true;
+  }
+  
+  protected boolean amILeader() {
+    try {
+      ZkNodeProps props = ZkNodeProps.load(zkStateReader.getZkClient().getData(
+          "/overseer_elect/leader", null, null, true));
+      if (myId.equals(props.getStr("id"))) {
+        return true;
+      }
+    } catch (KeeperException e) {
+      log.warn("", e);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+    }
+    log.info("According to ZK I (id=" + myId + ") am no longer a leader.");
+    return false;
+  }
+  
+  protected boolean processMessage(ZkNodeProps message, String operation) {
+    if (CREATECOLLECTION.equals(operation)) {
+      return createCollection(zkStateReader.getClusterState(), message);
+    } else if (DELETECOLLECTION.equals(operation)) {
+      ModifiableSolrParams params = new ModifiableSolrParams();
+      params.set(CoreAdminParams.ACTION, CoreAdminAction.UNLOAD.toString());
+      params.set(CoreAdminParams.DELETE_INSTANCE_DIR, true);
+      return collectionCmd(zkStateReader.getClusterState(), message, params);
+    } else if (RELOADCOLLECTION.equals(operation)) {
+      ModifiableSolrParams params = new ModifiableSolrParams();
+      params.set(CoreAdminParams.ACTION, CoreAdminAction.RELOAD.toString());
+      return collectionCmd(zkStateReader.getClusterState(), message, params);
+    }
+    // unknown command, toss it from our queue
+    return true;
+  }
 
+  private boolean createCollection(ClusterState clusterState, ZkNodeProps message) {
+    String collectionName = message.getStr("name");
+    if (clusterState.getCollections().contains(collectionName)) {
+      SolrException.log(log, "collection already exists: " + collectionName);
+      return false;
+    }
+    
+    try {
+      // look at the replication factor and see if it matches reality
+      // if it does not, find best nodes to create more cores
+      
+      int repFactor = msgStrToInt(message, REPLICATION_FACTOR, 1);
+      int numSlices = msgStrToInt(message, NUM_SLICES, 0);
+      int maxShardsPerNode = msgStrToInt(message, MAX_SHARDS_PER_NODE, 1);
+      String createNodeSetStr; 
+      List<String> createNodeList = ((createNodeSetStr = message.getStr(CREATE_NODE_SET)) == null)?null:StrUtils.splitSmart(createNodeSetStr, ",", true);
+      
+      if (repFactor <= 0) {
+        SolrException.log(log, REPLICATION_FACTOR + " must be > 0");
+        return false;
+      }
+      
+      if (numSlices < 0) {
+        SolrException.log(log, NUM_SLICES + " must be > 0");
+        return false;
+      }
+      
+      String configName = message.getStr("collection.configName");
+      
+      // we need to look at every node and see how many cores it serves
+      // add our new cores to existing nodes serving the least number of cores
+      // but (for now) require that each core goes on a distinct node.
+      
+      // TODO: add smarter options that look at the current number of cores per
+      // node?
+      // for now we just go random
+      Set<String> nodes = clusterState.getLiveNodes();
+      List<String> nodeList = new ArrayList<String>(nodes.size());
+      nodeList.addAll(nodes);
+      if (createNodeList != null) nodeList.retainAll(createNodeList);
+      Collections.shuffle(nodeList);
+      
+      if (nodeList.size() <= 0) {
+        log.error("Cannot create collection " + collectionName
+            + ". No live Solr-instaces" + ((createNodeList != null)?" among Solr-instances specified in " + CREATE_NODE_SET:""));
+        return false;
+      }
+      
+      if (repFactor > nodeList.size()) {
+        log.warn("Specified "
+            + REPLICATION_FACTOR
+            + " of "
+            + repFactor
+            + " on collection "
+            + collectionName
+            + " is higher than or equal to the number of Solr instances currently live ("
+            + nodeList.size()
+            + "). Its unusual to run two replica of the same slice on the same Solr-instance.");
+      }
+      
+      int maxShardsAllowedToCreate = maxShardsPerNode * nodeList.size();
+      int requestedShardsToCreate = numSlices * repFactor;
+      if (maxShardsAllowedToCreate < requestedShardsToCreate) {
+        log.error("Cannot create collection " + collectionName + ". Value of "
+            + MAX_SHARDS_PER_NODE + " is " + maxShardsPerNode
+            + ", and the number of live nodes is " + nodeList.size()
+            + ". This allows a maximum of " + maxShardsAllowedToCreate
+            + " to be created. Value of " + NUM_SLICES + " is " + numSlices
+            + " and value of " + REPLICATION_FACTOR + " is " + repFactor
+            + ". This requires " + requestedShardsToCreate
+            + " shards to be created (higher than the allowed number)");
+        return false;
+      }
+      
+      for (int i = 1; i <= numSlices; i++) {
+        for (int j = 1; j <= repFactor; j++) {
+          String nodeName = nodeList.get(((i - 1) + (j - 1)) % nodeList.size());
+          String sliceName = "shard" + i;
+          String shardName = collectionName + "_" + sliceName + "_replica" + j;
+          log.info("Creating shard " + shardName + " as part of slice "
+              + sliceName + " of collection " + collectionName + " on "
+              + nodeName);
+          
+          // Need to create new params for each request
+          ModifiableSolrParams params = new ModifiableSolrParams();
+          params.set(CoreAdminParams.ACTION, CoreAdminAction.CREATE.toString());
+          
+          params.set(CoreAdminParams.NAME, shardName);
+          params.set("collection.configName", configName);
+          params.set(CoreAdminParams.COLLECTION, collectionName);
+          params.set(CoreAdminParams.SHARD, sliceName);
+          params.set(ZkStateReader.NUM_SHARDS_PROP, numSlices);
+          
+          ShardRequest sreq = new ShardRequest();
+          params.set("qt", adminPath);
+          sreq.purpose = 1;
+          String replica = zkStateReader.getZkClient()
+            .getBaseUrlForNodeName(nodeName);
+          if (replica.startsWith("http://")) replica = replica.substring(7);
+          sreq.shards = new String[] {replica};
+          sreq.actualShards = sreq.shards;
+          sreq.params = params;
+          
+          shardHandler.submit(sreq, replica, sreq.params);
+          
+        }
+      }
+      
+      int failed = 0;
+      ShardResponse srsp;
+      do {
+        srsp = shardHandler.takeCompletedOrError();
+        if (srsp != null) {
+          Throwable e = srsp.getException();
+          if (e != null) {
+            // should we retry?
+            // TODO: we should return errors to the client
+            // TODO: what if one fails and others succeed?
+            failed++;
+            log.error("Error talking to shard: " + srsp.getShard(), e);
+          }
+        }
+      } while (srsp != null);
+      
+      // if all calls succeeded, return true
+      if (failed > 0) {
+        return false;
+      }
+      log.info("Successfully created all shards for collection "
+          + collectionName);
+      return true;
+    } catch (Exception ex) {
+      // Expecting that the necessary logging has already been performed
+      return false;
+    }
+  }
+  
+  private boolean collectionCmd(ClusterState clusterState, ZkNodeProps message, ModifiableSolrParams params) {
+    log.info("Executing Collection Cmd : " + params);
+    String collectionName = message.getStr("name");
+    
+    DocCollection coll = clusterState.getCollection(collectionName);
+    
+    if (coll == null) {
+      throw new SolrException(ErrorCode.BAD_REQUEST,
+          "Could not find collection:" + collectionName);
+    }
+    
+    for (Map.Entry<String,Slice> entry : coll.getSlicesMap().entrySet()) {
+      Slice slice = entry.getValue();
+      Map<String,Replica> shards = slice.getReplicasMap();
+      Set<Map.Entry<String,Replica>> shardEntries = shards.entrySet();
+      for (Map.Entry<String,Replica> shardEntry : shardEntries) {
+        final ZkNodeProps node = shardEntry.getValue();
+        if (clusterState.liveNodesContain(node.getStr(ZkStateReader.NODE_NAME_PROP))) {
+          // For thread safety, only simple clone the ModifiableSolrParams
+          ModifiableSolrParams cloneParams = new ModifiableSolrParams();
+          cloneParams.add(params);
+          cloneParams.set(CoreAdminParams.CORE,
+              node.getStr(ZkStateReader.CORE_NAME_PROP));
+          
+          String replica = node.getStr(ZkStateReader.BASE_URL_PROP);
+          ShardRequest sreq = new ShardRequest();
+          
+          // yes, they must use same admin handler path everywhere...
+          cloneParams.set("qt", adminPath);
+          sreq.purpose = 1;
+          // TODO: this sucks
+          if (replica.startsWith("http://")) replica = replica.substring(7);
+          sreq.shards = new String[] {replica};
+          sreq.actualShards = sreq.shards;
+          sreq.params = cloneParams;
+          log.info("Collection Admin sending CoreAdmin cmd to " + replica
+              + " params:" + sreq.params);
+          shardHandler.submit(sreq, replica, sreq.params);
+        }
+      }
+    }
+    
+    int failed = 0;
+    ShardResponse srsp;
+    do {
+      srsp = shardHandler.takeCompletedOrError();
+      if (srsp != null) {
+        Throwable e = srsp.getException();
+        if (e != null) {
+          // should we retry?
+          // TODO: we should return errors to the client
+          // TODO: what if one fails and others succeed?
+          failed++;
+          log.error("Error talking to shard: " + srsp.getShard(), e);
+        }
+      }
+    } while (srsp != null);
 
+    
+    // if all calls succeeded, return true
+    if (failed > 0) {
+      return false;
+    }
+    return true;
+  }
+  
+  private int msgStrToInt(ZkNodeProps message, String key, Integer def)
+      throws Exception {
+    String str = message.getStr(key);
+    try {
+      return str == null ? def : Integer.parseInt(str);
+    } catch (Exception ex) {
+      SolrException.log(log, "Could not parse " + key, ex);
+      throw ex;
+    }
+  }
+
+  @Override
+  public boolean isClosed() {
+    return isClosed;
+  }
 }

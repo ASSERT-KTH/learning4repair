@@ -1,6 +1,6 @@
 @Override
 
-package org.apache.lucene.search;
+package org.apache.lucene.index;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -20,429 +20,537 @@ package org.apache.lucene.search;
  */
 
 import java.io.IOException;
-import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.List;
+import java.util.Map;
 
-import org.apache.lucene.index.DocsAndPositionsEnum;
-import org.apache.lucene.index.DocsEnum;
-import org.apache.lucene.index.Term;
-import org.apache.lucene.index.TermState;
-import org.apache.lucene.index.Terms;
-import org.apache.lucene.index.TermsEnum;
-import org.apache.lucene.index.FilteredTermsEnum;
-import org.apache.lucene.util.Attribute;
-import org.apache.lucene.util.AttributeImpl;
-import org.apache.lucene.util.AttributeSource;
-import org.apache.lucene.util.Bits;
+import org.apache.lucene.analysis.tokenattributes.OffsetAttribute;
+import org.apache.lucene.analysis.tokenattributes.PayloadAttribute;
+import org.apache.lucene.codecs.FieldsConsumer;
+import org.apache.lucene.codecs.PostingsConsumer;
+import org.apache.lucene.codecs.TermStats;
+import org.apache.lucene.codecs.TermsConsumer;
+import org.apache.lucene.index.FieldInfo.IndexOptions;
 import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.UnicodeUtil;
-import org.apache.lucene.util.automaton.Automaton;
-import org.apache.lucene.util.automaton.BasicAutomata;
-import org.apache.lucene.util.automaton.BasicOperations;
-import org.apache.lucene.util.automaton.ByteRunAutomaton;
-import org.apache.lucene.util.automaton.CompiledAutomaton;
-import org.apache.lucene.util.automaton.LevenshteinAutomata;
+import org.apache.lucene.util.FixedBitSet;
+import org.apache.lucene.util.RamUsageEstimator;
 
-/** Subclass of TermsEnum for enumerating all terms that are similar
- * to the specified filter term.
- *
- * <p>Term enumerations are always ordered by
- * {@link #getComparator}.  Each term in the enumeration is
- * greater than all that precede it.</p>
- */
-public class FuzzyTermsEnum extends TermsEnum {
-  private TermsEnum actualEnum;
-  private BoostAttribute actualBoostAtt;
-  
-  private final BoostAttribute boostAtt =
-    attributes().addAttribute(BoostAttribute.class);
-  
-  private final MaxNonCompetitiveBoostAttribute maxBoostAtt;
-  private final LevenshteinAutomataAttribute dfaAtt;
-  
-  private float bottom;
-  private BytesRef bottomTerm;
+// TODO: break into separate freq and prox writers as
+// codecs; make separate container (tii/tis/skip/*) that can
+// be configured as any number of files 1..N
+final class FreqProxTermsWriterPerField extends TermsHashConsumerPerField implements Comparable<FreqProxTermsWriterPerField> {
 
-  // TODO: chicken-and-egg
-  private final Comparator<BytesRef> termComparator = BytesRef.getUTF8SortedAsUnicodeComparator();
-  
-  protected final float minSimilarity;
-  protected final float scale_factor;
-  
-  protected final int termLength;
-  
-  protected int maxEdits;
-  protected final boolean raw;
+  final FreqProxTermsWriter parent;
+  final TermsHashPerField termsHashPerField;
+  final FieldInfo fieldInfo;
+  final DocumentsWriterPerThread.DocState docState;
+  final FieldInvertState fieldState;
+  private boolean hasFreq;
+  private boolean hasProx;
+  private boolean hasOffsets;
+  PayloadAttribute payloadAttribute;
+  OffsetAttribute offsetAttribute;
 
-  protected final Terms terms;
-  private final Term term;
-  protected final int termText[];
-  protected final int realPrefixLength;
-  
-  private final boolean transpositions;
-  
-  /**
-   * Constructor for enumeration of all terms from specified <code>reader</code> which share a prefix of
-   * length <code>prefixLength</code> with <code>term</code> and which have a fuzzy similarity &gt;
-   * <code>minSimilarity</code>.
-   * <p>
-   * After calling the constructor the enumeration is already pointing to the first 
-   * valid term if such a term exists. 
-   * 
-   * @param terms Delivers terms.
-   * @param atts {@link AttributeSource} created by the rewrite method of {@link MultiTermQuery}
-   * thats contains information about competitive boosts during rewrite. It is also used
-   * to cache DFAs between segment transitions.
-   * @param term Pattern term.
-   * @param minSimilarity Minimum required similarity for terms from the reader. Pass an integer value
-   *        representing edit distance. Passing a fraction is deprecated.
-   * @param prefixLength Length of required common prefix. Default value is 0.
-   * @throws IOException if there is a low-level IO error
-   */
-  public FuzzyTermsEnum(Terms terms, AttributeSource atts, Term term, 
-      final float minSimilarity, final int prefixLength, boolean transpositions) throws IOException {
-    if (minSimilarity >= 1.0f && minSimilarity != (int)minSimilarity)
-      throw new IllegalArgumentException("fractional edit distances are not allowed");
-    if (minSimilarity < 0.0f)
-      throw new IllegalArgumentException("minimumSimilarity cannot be less than 0");
-    if(prefixLength < 0)
-      throw new IllegalArgumentException("prefixLength cannot be less than 0");
-    this.terms = terms;
-    this.term = term;
+  public FreqProxTermsWriterPerField(TermsHashPerField termsHashPerField, FreqProxTermsWriter parent, FieldInfo fieldInfo) {
+    this.termsHashPerField = termsHashPerField;
+    this.parent = parent;
+    this.fieldInfo = fieldInfo;
+    docState = termsHashPerField.docState;
+    fieldState = termsHashPerField.fieldState;
+    setIndexOptions(fieldInfo.getIndexOptions());
+  }
 
-    // convert the string into a utf32 int[] representation for fast comparisons
-    final String utf16 = term.text();
-    this.termText = new int[utf16.codePointCount(0, utf16.length())];
-    for (int cp, i = 0, j = 0; i < utf16.length(); i += Character.charCount(cp))
-           termText[j++] = cp = utf16.codePointAt(i);
-    this.termLength = termText.length;
-    this.dfaAtt = atts.addAttribute(LevenshteinAutomataAttribute.class);
-
-    //The prefix could be longer than the word.
-    //It's kind of silly though.  It means we must match the entire word.
-    this.realPrefixLength = prefixLength > termLength ? termLength : prefixLength;
-    // if minSimilarity >= 1, we treat it as number of edits
-    if (minSimilarity >= 1f) {
-      this.minSimilarity = 0; // just driven by number of edits
-      maxEdits = (int) minSimilarity;
-      raw = true;
+  @Override
+  int getStreamCount() {
+    if (!hasProx) {
+      return 1;
     } else {
-      this.minSimilarity = minSimilarity;
-      // calculate the maximum k edits for this similarity
-      maxEdits = initialMaxDistance(this.minSimilarity, termLength);
-      raw = false;
+      return 2;
     }
-    if (transpositions && maxEdits > LevenshteinAutomata.MAXIMUM_SUPPORTED_DISTANCE) {
-      throw new UnsupportedOperationException("with transpositions enabled, distances > " 
-        + LevenshteinAutomata.MAXIMUM_SUPPORTED_DISTANCE + " are not supported ");
-    }
-    this.transpositions = transpositions;
-    this.scale_factor = 1.0f / (1.0f - this.minSimilarity);
-
-    this.maxBoostAtt = atts.addAttribute(MaxNonCompetitiveBoostAttribute.class);
-    bottom = maxBoostAtt.getMaxNonCompetitiveBoost();
-    bottomTerm = maxBoostAtt.getCompetitiveTerm();
-    bottomChanged(null, true);
   }
-  
-  /**
-   * return an automata-based enum for matching up to editDistance from
-   * lastTerm, if possible
-   */
-  protected TermsEnum getAutomatonEnum(int editDistance, BytesRef lastTerm)
-      throws IOException {
-    final List<CompiledAutomaton> runAutomata = initAutomata(editDistance);
-    if (editDistance < runAutomata.size()) {
-      //if (BlockTreeTermsWriter.DEBUG) System.out.println("FuzzyTE.getAEnum: ed=" + editDistance + " lastTerm=" + (lastTerm==null ? "null" : lastTerm.utf8ToString()));
-      final CompiledAutomaton compiled = runAutomata.get(editDistance);
-      return new AutomatonFuzzyTermsEnum(terms.intersect(compiled, lastTerm == null ? null : compiled.floor(lastTerm, new BytesRef())),
-                                         runAutomata.subList(0, editDistance + 1).toArray(new CompiledAutomaton[editDistance + 1]));
+
+  @Override
+  void finish() {
+    if (hasPayloads) {
+      fieldInfo.setStorePayloads();
+    }
+  }
+
+  boolean hasPayloads;
+
+  @Override
+  void skippingLongTerm() {}
+
+  public int compareTo(FreqProxTermsWriterPerField other) {
+    return fieldInfo.name.compareTo(other.fieldInfo.name);
+  }
+
+  // Called after flush
+  void reset() {
+    // Record, up front, whether our in-RAM format will be
+    // with or without term freqs:
+    setIndexOptions(fieldInfo.getIndexOptions());
+    payloadAttribute = null;
+  }
+
+  private void setIndexOptions(IndexOptions indexOptions) {
+    if (indexOptions == null) {
+      // field could later be updated with indexed=true, so set everything on
+      hasFreq = hasProx = hasOffsets = true;
     } else {
-      return null;
+      hasFreq = indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS) >= 0;
+      hasProx = indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) >= 0;
+      hasOffsets = indexOptions.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) >= 0;
     }
   }
 
-  /** initialize levenshtein DFAs up to maxDistance, if possible */
-  private List<CompiledAutomaton> initAutomata(int maxDistance) {
-    final List<CompiledAutomaton> runAutomata = dfaAtt.automata();
-    //System.out.println("cached automata size: " + runAutomata.size());
-    if (runAutomata.size() <= maxDistance && 
-        maxDistance <= LevenshteinAutomata.MAXIMUM_SUPPORTED_DISTANCE) {
-      LevenshteinAutomata builder = 
-        new LevenshteinAutomata(UnicodeUtil.newString(termText, realPrefixLength, termText.length - realPrefixLength), transpositions);
-
-      for (int i = runAutomata.size(); i <= maxDistance; i++) {
-        Automaton a = builder.toAutomaton(i);
-        //System.out.println("compute automaton n=" + i);
-        // constant prefix
-        if (realPrefixLength > 0) {
-          Automaton prefix = BasicAutomata.makeString(
-            UnicodeUtil.newString(termText, 0, realPrefixLength));
-          a = BasicOperations.concatenate(prefix, a);
-        }
-        runAutomata.add(new CompiledAutomaton(a, true, false));
-      }
-    }
-    return runAutomata;
-  }
-
-  /** swap in a new actual enum to proxy to */
-  protected void setEnum(TermsEnum actualEnum) {
-    this.actualEnum = actualEnum;
-    this.actualBoostAtt = actualEnum.attributes().addAttribute(BoostAttribute.class);
-  }
-  
-  /**
-   * fired when the max non-competitive boost has changed. this is the hook to
-   * swap in a smarter actualEnum
-   */
-  private void bottomChanged(BytesRef lastTerm, boolean init)
-      throws IOException {
-    int oldMaxEdits = maxEdits;
-    
-    // true if the last term encountered is lexicographically equal or after the bottom term in the PQ
-    boolean termAfter = bottomTerm == null || (lastTerm != null && termComparator.compare(lastTerm, bottomTerm) >= 0);
-
-    // as long as the max non-competitive boost is >= the max boost
-    // for some edit distance, keep dropping the max edit distance.
-    while (maxEdits > 0 && (termAfter ? bottom >= calculateMaxBoost(maxEdits) : bottom > calculateMaxBoost(maxEdits)))
-      maxEdits--;
-    
-    if (oldMaxEdits != maxEdits || init) { // the maximum n has changed
-      maxEditDistanceChanged(lastTerm, maxEdits, init);
-    }
-  }
-  
-  protected void maxEditDistanceChanged(BytesRef lastTerm, int maxEdits, boolean init)
-      throws IOException {
-    TermsEnum newEnum = getAutomatonEnum(maxEdits, lastTerm);
-    // instead of assert, we do a hard check in case someone uses our enum directly
-    // assert newEnum != null;
-    if (newEnum == null) {
-      assert maxEdits > LevenshteinAutomata.MAXIMUM_SUPPORTED_DISTANCE;
-      throw new IllegalArgumentException("maxEdits cannot be > LevenshteinAutomata.MAXIMUM_SUPPORTED_DISTANCE");
-    }
-    setEnum(newEnum);
-  }
-
-  // for some raw min similarity and input term length, the maximum # of edits
-  private int initialMaxDistance(float minimumSimilarity, int termLen) {
-    return (int) ((1D-minimumSimilarity) * termLen);
-  }
-  
-  // for some number of edits, the maximum possible scaled boost
-  private float calculateMaxBoost(int nEdits) {
-    final float similarity = 1.0f - ((float) nEdits / (float) (termLength));
-    return (similarity - minSimilarity) * scale_factor;
-  }
-
-  private BytesRef queuedBottom = null;
-  
   @Override
-  public BytesRef next() throws IOException {
-    if (queuedBottom != null) {
-      bottomChanged(queuedBottom, false);
-      queuedBottom = null;
-    }
-    
-    BytesRef term = actualEnum.next();
-    boostAtt.setBoost(actualBoostAtt.getBoost());
-    
-    final float bottom = maxBoostAtt.getMaxNonCompetitiveBoost();
-    final BytesRef bottomTerm = maxBoostAtt.getCompetitiveTerm();
-    if (term != null && (bottom != this.bottom || bottomTerm != this.bottomTerm)) {
-      this.bottom = bottom;
-      this.bottomTerm = bottomTerm;
-      // clone the term before potentially doing something with it
-      // this is a rare but wonderful occurrence anyway
-      queuedBottom = BytesRef.deepCopyOf(term);
-    }
-    
-    return term;
-  }
-  
-  // proxy all other enum calls to the actual enum
-  @Override
-  public int docFreq() throws IOException {
-    return actualEnum.docFreq();
-  }
-
-  @Override
-  public long totalTermFreq() throws IOException {
-    return actualEnum.totalTermFreq();
-  }
-  
-  @Override
-  public DocsEnum docs(Bits liveDocs, DocsEnum reuse, int flags) throws IOException {
-    return actualEnum.docs(liveDocs, reuse, flags);
-  }
-  
-  @Override
-  public DocsAndPositionsEnum docsAndPositions(Bits liveDocs,
-                                               DocsAndPositionsEnum reuse, int flags) throws IOException {
-    return actualEnum.docsAndPositions(liveDocs, reuse, flags);
-  }
-  
-  @Override
-  public void seekExact(BytesRef term, TermState state) throws IOException {
-    actualEnum.seekExact(term, state);
-  }
-  
-  @Override
-  public TermState termState() throws IOException {
-    return actualEnum.termState();
-  }
-  
-  @Override
-  public Comparator<BytesRef> getComparator() {
-    return actualEnum.getComparator();
-  }
-  
-  @Override
-  public long ord() throws IOException {
-    return actualEnum.ord();
-  }
-  
-  @Override
-  public boolean seekExact(BytesRef text, boolean useCache) throws IOException {
-    return actualEnum.seekExact(text, useCache);
-  }
-
-  @Override
-  public SeekStatus seekCeil(BytesRef text, boolean useCache) throws IOException {
-    return actualEnum.seekCeil(text, useCache);
-  }
-  
-  @Override
-  public void seekExact(long ord) throws IOException {
-    actualEnum.seekExact(ord);
-  }
-  
-  @Override
-  public BytesRef term() throws IOException {
-    return actualEnum.term();
-  }
-
-  /**
-   * Implement fuzzy enumeration with Terms.intersect.
-   * <p>
-   * This is the fastest method as opposed to LinearFuzzyTermsEnum:
-   * as enumeration is logarithmic to the number of terms (instead of linear)
-   * and comparison is linear to length of the term (rather than quadratic)
-   */
-  private class AutomatonFuzzyTermsEnum extends FilteredTermsEnum {
-    private final ByteRunAutomaton matchers[];
-    
-    private final BytesRef termRef;
-    
-    private final BoostAttribute boostAtt =
-      attributes().addAttribute(BoostAttribute.class);
-    
-    public AutomatonFuzzyTermsEnum(TermsEnum tenum, CompiledAutomaton compiled[]) {
-      super(tenum, false);
-      this.matchers = new ByteRunAutomaton[compiled.length];
-      for (int i = 0; i < compiled.length; i++)
-        this.matchers[i] = compiled[i].runAutomaton;
-      termRef = new BytesRef(term.text());
-    }
-
-    /** finds the smallest Lev(n) DFA that accepts the term. */
-    @Override
-    protected AcceptStatus accept(BytesRef term) {    
-      //System.out.println("AFTE.accept term=" + term);
-      int ed = matchers.length - 1;
-      
-      // we are wrapping either an intersect() TermsEnum or an AutomatonTermsENum,
-      // so we know the outer DFA always matches.
-      // now compute exact edit distance
-      while (ed > 0) {
-        if (matches(term, ed - 1)) {
-          ed--;
-        } else {
-          break;
-        }
-      }
-      //System.out.println("CHECK term=" + term.utf8ToString() + " ed=" + ed);
-      
-      // scale to a boost and return (if similarity > minSimilarity)
-      if (ed == 0) { // exact match
-        boostAtt.setBoost(1.0F);
-        //System.out.println("  yes");
-        return AcceptStatus.YES;
-      } else {
-        final int codePointCount = UnicodeUtil.codePointCount(term);
-        final float similarity = 1.0f - ((float) ed / (float) 
-            (Math.min(codePointCount, termLength)));
-        if (similarity > minSimilarity) {
-          boostAtt.setBoost((similarity - minSimilarity) * scale_factor);
-          //System.out.println("  yes");
-          return AcceptStatus.YES;
-        } else {
-          return AcceptStatus.NO;
-        }
-      }
-    }
-    
-    /** returns true if term is within k edits of the query term */
-    final boolean matches(BytesRef term, int k) {
-      return k == 0 ? term.equals(termRef) : matchers[k].run(term.bytes, term.offset, term.length);
-    }
-  }
-
-  /** @lucene.internal */
-  public float getMinSimilarity() {
-    return minSimilarity;
-  }
-  
-  /** @lucene.internal */
-  public float getScaleFactor() {
-    return scale_factor;
-  }
-  
-  /**
-   * reuses compiled automata across different segments,
-   * because they are independent of the index
-   * @lucene.internal */
-  public static interface LevenshteinAutomataAttribute extends Attribute {
-    public List<CompiledAutomaton> automata();
-  }
-    
-  /** 
-   * Stores compiled automata as a list (indexed by edit distance)
-   * @lucene.internal */
-  public static final class LevenshteinAutomataAttributeImpl extends AttributeImpl implements LevenshteinAutomataAttribute {
-    private final List<CompiledAutomaton> automata = new ArrayList<CompiledAutomaton>();
-      
-    public List<CompiledAutomaton> automata() {
-      return automata;
-    }
-
-    @Override
-    public void clear() {
-      automata.clear();
-    }
-
-    @Override
-    public int hashCode() {
-      return automata.hashCode();
-    }
-
-    @Override
-    public boolean equals(Object other) {
-      if (this == other)
+  boolean start(IndexableField[] fields, int count) {
+    for(int i=0;i<count;i++) {
+      if (fields[i].fieldType().indexed()) {
         return true;
-      if (!(other instanceof LevenshteinAutomataAttributeImpl))
-        return false;
-      return automata.equals(((LevenshteinAutomataAttributeImpl) other).automata);
+      }
+    }
+    return false;
+  }
+
+  @Override
+  void start(IndexableField f) {
+    if (fieldState.attributeSource.hasAttribute(PayloadAttribute.class)) {
+      payloadAttribute = fieldState.attributeSource.getAttribute(PayloadAttribute.class);
+    } else {
+      payloadAttribute = null;
+    }
+    if (hasOffsets) {
+      offsetAttribute = fieldState.attributeSource.addAttribute(OffsetAttribute.class);
+    } else {
+      offsetAttribute = null;
+    }
+  }
+
+  void writeProx(final int termID, int proxCode) {
+    //System.out.println("writeProx termID=" + termID + " proxCode=" + proxCode);
+    assert hasProx;
+    final BytesRef payload;
+    if (payloadAttribute == null) {
+      payload = null;
+    } else {
+      payload = payloadAttribute.getPayload();
+    }
+
+    if (payload != null && payload.length > 0) {
+      termsHashPerField.writeVInt(1, (proxCode<<1)|1);
+      termsHashPerField.writeVInt(1, payload.length);
+      termsHashPerField.writeBytes(1, payload.bytes, payload.offset, payload.length);
+      hasPayloads = true;
+    } else {
+      termsHashPerField.writeVInt(1, proxCode<<1);
+    }
+
+    FreqProxPostingsArray postings = (FreqProxPostingsArray) termsHashPerField.postingsArray;
+    postings.lastPositions[termID] = fieldState.position;
+  }
+
+  void writeOffsets(final int termID, int offsetAccum) {
+    assert hasOffsets;
+    final int startOffset = offsetAccum + offsetAttribute.startOffset();
+    final int endOffset = offsetAccum + offsetAttribute.endOffset();
+    //System.out.println("writeOffsets termID=" + termID + " prevOffset=" + prevOffset + " startOff=" + startOffset + " endOff=" + endOffset);
+    FreqProxPostingsArray postings = (FreqProxPostingsArray) termsHashPerField.postingsArray;
+    assert startOffset - postings.lastOffsets[termID] >= 0;
+    termsHashPerField.writeVInt(1, startOffset - postings.lastOffsets[termID]);
+    termsHashPerField.writeVInt(1, endOffset - startOffset);
+
+    postings.lastOffsets[termID] = startOffset;
+  }
+
+  @Override
+  void newTerm(final int termID) {
+    // First time we're seeing this term since the last
+    // flush
+    assert docState.testPoint("FreqProxTermsWriterPerField.newTerm start");
+
+    FreqProxPostingsArray postings = (FreqProxPostingsArray) termsHashPerField.postingsArray;
+    postings.lastDocIDs[termID] = docState.docID;
+    if (!hasFreq) {
+      postings.lastDocCodes[termID] = docState.docID;
+    } else {
+      postings.lastDocCodes[termID] = docState.docID << 1;
+      postings.termFreqs[termID] = 1;
+      if (hasProx) {
+        writeProx(termID, fieldState.position);
+        if (hasOffsets) {
+          writeOffsets(termID, fieldState.offset);
+        }
+      } else {
+        assert !hasOffsets;
+      }
+    }
+    fieldState.maxTermFrequency = Math.max(1, fieldState.maxTermFrequency);
+    fieldState.uniqueTermCount++;
+  }
+
+  @Override
+  void addTerm(final int termID) {
+
+    assert docState.testPoint("FreqProxTermsWriterPerField.addTerm start");
+
+    FreqProxPostingsArray postings = (FreqProxPostingsArray) termsHashPerField.postingsArray;
+
+    assert !hasFreq || postings.termFreqs[termID] > 0;
+
+    if (!hasFreq) {
+      assert postings.termFreqs == null;
+      if (docState.docID != postings.lastDocIDs[termID]) {
+        assert docState.docID > postings.lastDocIDs[termID];
+        termsHashPerField.writeVInt(0, postings.lastDocCodes[termID]);
+        postings.lastDocCodes[termID] = docState.docID - postings.lastDocIDs[termID];
+        postings.lastDocIDs[termID] = docState.docID;
+        fieldState.uniqueTermCount++;
+      }
+    } else if (docState.docID != postings.lastDocIDs[termID]) {
+      assert docState.docID > postings.lastDocIDs[termID]:"id: "+docState.docID + " postings ID: "+ postings.lastDocIDs[termID] + " termID: "+termID;
+      // Term not yet seen in the current doc but previously
+      // seen in other doc(s) since the last flush
+
+      // Now that we know doc freq for previous doc,
+      // write it & lastDocCode
+      if (1 == postings.termFreqs[termID]) {
+        termsHashPerField.writeVInt(0, postings.lastDocCodes[termID]|1);
+      } else {
+        termsHashPerField.writeVInt(0, postings.lastDocCodes[termID]);
+        termsHashPerField.writeVInt(0, postings.termFreqs[termID]);
+      }
+      postings.termFreqs[termID] = 1;
+      fieldState.maxTermFrequency = Math.max(1, fieldState.maxTermFrequency);
+      postings.lastDocCodes[termID] = (docState.docID - postings.lastDocIDs[termID]) << 1;
+      postings.lastDocIDs[termID] = docState.docID;
+      if (hasProx) {
+        writeProx(termID, fieldState.position);
+        if (hasOffsets) {
+          postings.lastOffsets[termID] = 0;
+          writeOffsets(termID, fieldState.offset);
+        }
+      } else {
+        assert !hasOffsets;
+      }
+      fieldState.uniqueTermCount++;
+    } else {
+      fieldState.maxTermFrequency = Math.max(fieldState.maxTermFrequency, ++postings.termFreqs[termID]);
+      if (hasProx) {
+        writeProx(termID, fieldState.position-postings.lastPositions[termID]);
+      }
+      if (hasOffsets) {
+        writeOffsets(termID, fieldState.offset);
+      }
+    }
+  }
+
+  @Override
+  ParallelPostingsArray createPostingsArray(int size) {
+    return new FreqProxPostingsArray(size, hasFreq, hasProx, hasOffsets);
+  }
+
+  static final class FreqProxPostingsArray extends ParallelPostingsArray {
+    public FreqProxPostingsArray(int size, boolean writeFreqs, boolean writeProx, boolean writeOffsets) {
+      super(size);
+      if (writeFreqs) {
+        termFreqs = new int[size];
+      }
+      lastDocIDs = new int[size];
+      lastDocCodes = new int[size];
+      if (writeProx) {
+        lastPositions = new int[size];
+        if (writeOffsets) {
+          lastOffsets = new int[size];
+        }
+      } else {
+        assert !writeOffsets;
+      }
+      //System.out.println("PA init freqs=" + writeFreqs + " pos=" + writeProx + " offs=" + writeOffsets);
+    }
+
+    int termFreqs[];                                   // # times this term occurs in the current doc
+    int lastDocIDs[];                                  // Last docID where this term occurred
+    int lastDocCodes[];                                // Code for prior doc
+    int lastPositions[];                               // Last position where this term occurred
+    int lastOffsets[];                                 // Last endOffset where this term occurred
+
+    @Override
+    ParallelPostingsArray newInstance(int size) {
+      return new FreqProxPostingsArray(size, termFreqs != null, lastPositions != null, lastOffsets != null);
     }
 
     @Override
-    public void copyTo(AttributeImpl target) {
-      final List<CompiledAutomaton> targetAutomata =
-        ((LevenshteinAutomataAttribute) target).automata();
-      targetAutomata.clear();
-      targetAutomata.addAll(automata);
+    void copyTo(ParallelPostingsArray toArray, int numToCopy) {
+      assert toArray instanceof FreqProxPostingsArray;
+      FreqProxPostingsArray to = (FreqProxPostingsArray) toArray;
+
+      super.copyTo(toArray, numToCopy);
+
+      System.arraycopy(lastDocIDs, 0, to.lastDocIDs, 0, numToCopy);
+      System.arraycopy(lastDocCodes, 0, to.lastDocCodes, 0, numToCopy);
+      if (lastPositions != null) {
+        assert to.lastPositions != null;
+        System.arraycopy(lastPositions, 0, to.lastPositions, 0, numToCopy);
+      }
+      if (lastOffsets != null) {
+        assert to.lastOffsets != null;
+        System.arraycopy(lastOffsets, 0, to.lastOffsets, 0, numToCopy);
+      }
+      if (termFreqs != null) {
+        assert to.termFreqs != null;
+        System.arraycopy(termFreqs, 0, to.termFreqs, 0, numToCopy);
+      }
     }
+
+    @Override
+    int bytesPerPosting() {
+      int bytes = ParallelPostingsArray.BYTES_PER_POSTING + 2 * RamUsageEstimator.NUM_BYTES_INT;
+      if (lastPositions != null) {
+        bytes += RamUsageEstimator.NUM_BYTES_INT;
+      }
+      if (lastOffsets != null) {
+        bytes += RamUsageEstimator.NUM_BYTES_INT;
+      }
+      if (termFreqs != null) {
+        bytes += RamUsageEstimator.NUM_BYTES_INT;
+      }
+
+      return bytes;
+    }
+  }
+
+  public void abort() {}
+
+  BytesRef payload;
+
+  /* Walk through all unique text tokens (Posting
+   * instances) found in this field and serialize them
+   * into a single RAM segment. */
+  void flush(String fieldName, FieldsConsumer consumer,  final SegmentWriteState state)
+    throws IOException {
+
+    if (!fieldInfo.isIndexed()) {
+      return; // nothing to flush, don't bother the codec with the unindexed field
+    }
+    
+    final TermsConsumer termsConsumer = consumer.addField(fieldInfo);
+    final Comparator<BytesRef> termComp = termsConsumer.getComparator();
+
+    // CONFUSING: this.indexOptions holds the index options
+    // that were current when we first saw this field.  But
+    // it's possible this has changed, eg when other
+    // documents are indexed that cause a "downgrade" of the
+    // IndexOptions.  So we must decode the in-RAM buffer
+    // according to this.indexOptions, but then write the
+    // new segment to the directory according to
+    // currentFieldIndexOptions:
+    final IndexOptions currentFieldIndexOptions = fieldInfo.getIndexOptions();
+    assert currentFieldIndexOptions != null;
+
+    final boolean writeTermFreq = currentFieldIndexOptions.compareTo(IndexOptions.DOCS_AND_FREQS) >= 0;
+    final boolean writePositions = currentFieldIndexOptions.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) >= 0;
+    final boolean writeOffsets = currentFieldIndexOptions.compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS) >= 0;
+
+    final boolean readTermFreq = this.hasFreq;
+    final boolean readPositions = this.hasProx;
+    final boolean readOffsets = this.hasOffsets;
+
+    //System.out.println("flush readTF=" + readTermFreq + " readPos=" + readPositions + " readOffs=" + readOffsets);
+
+    // Make sure FieldInfo.update is working correctly!:
+    assert !writeTermFreq || readTermFreq;
+    assert !writePositions || readPositions;
+    assert !writeOffsets || readOffsets;
+
+    assert !writeOffsets || writePositions;
+
+    final Map<Term,Integer> segDeletes;
+    if (state.segDeletes != null && state.segDeletes.terms.size() > 0) {
+      segDeletes = state.segDeletes.terms;
+    } else {
+      segDeletes = null;
+    }
+
+    final int[] termIDs = termsHashPerField.sortPostings(termComp);
+    final int numTerms = termsHashPerField.bytesHash.size();
+    final BytesRef text = new BytesRef();
+    final FreqProxPostingsArray postings = (FreqProxPostingsArray) termsHashPerField.postingsArray;
+    final ByteSliceReader freq = new ByteSliceReader();
+    final ByteSliceReader prox = new ByteSliceReader();
+
+    FixedBitSet visitedDocs = new FixedBitSet(state.segmentInfo.getDocCount());
+    long sumTotalTermFreq = 0;
+    long sumDocFreq = 0;
+
+    Term protoTerm = new Term(fieldName);
+    for (int i = 0; i < numTerms; i++) {
+      final int termID = termIDs[i];
+      //System.out.println("term=" + termID);
+      // Get BytesRef
+      final int textStart = postings.textStarts[termID];
+      termsHashPerField.bytePool.setBytesRef(text, textStart);
+
+      termsHashPerField.initReader(freq, termID, 0);
+      if (readPositions || readOffsets) {
+        termsHashPerField.initReader(prox, termID, 1);
+      }
+
+      // TODO: really TermsHashPerField should take over most
+      // of this loop, including merge sort of terms from
+      // multiple threads and interacting with the
+      // TermsConsumer, only calling out to us (passing us the
+      // DocsConsumer) to handle delivery of docs/positions
+
+      final PostingsConsumer postingsConsumer = termsConsumer.startTerm(text);
+
+      final int delDocLimit;
+      if (segDeletes != null) {
+        protoTerm.bytes = text;
+        final Integer docIDUpto = segDeletes.get(protoTerm);
+        if (docIDUpto != null) {
+          delDocLimit = docIDUpto;
+        } else {
+          delDocLimit = 0;
+        }
+      } else {
+        delDocLimit = 0;
+      }
+
+      // Now termStates has numToMerge FieldMergeStates
+      // which all share the same term.  Now we must
+      // interleave the docID streams.
+      int docFreq = 0;
+      long totTF = 0;
+      int docID = 0;
+
+      while(true) {
+        //System.out.println("  cycle");
+        final int termFreq;
+        if (freq.eof()) {
+          if (postings.lastDocCodes[termID] != -1) {
+            // Return last doc
+            docID = postings.lastDocIDs[termID];
+            if (readTermFreq) {
+              termFreq = postings.termFreqs[termID];
+            } else {
+              termFreq = -1;
+            }
+            postings.lastDocCodes[termID] = -1;
+          } else {
+            // EOF
+            break;
+          }
+        } else {
+          final int code = freq.readVInt();
+          if (!readTermFreq) {
+            docID += code;
+            termFreq = -1;
+          } else {
+            docID += code >>> 1;
+            if ((code & 1) != 0) {
+              termFreq = 1;
+            } else {
+              termFreq = freq.readVInt();
+            }
+          }
+
+          assert docID != postings.lastDocIDs[termID];
+        }
+
+        docFreq++;
+        assert docID < state.segmentInfo.getDocCount(): "doc=" + docID + " maxDoc=" + state.segmentInfo.getDocCount();
+
+        // NOTE: we could check here if the docID was
+        // deleted, and skip it.  However, this is somewhat
+        // dangerous because it can yield non-deterministic
+        // behavior since we may see the docID before we see
+        // the term that caused it to be deleted.  This
+        // would mean some (but not all) of its postings may
+        // make it into the index, which'd alter the docFreq
+        // for those terms.  We could fix this by doing two
+        // passes, ie first sweep marks all del docs, and
+        // 2nd sweep does the real flush, but I suspect
+        // that'd add too much time to flush.
+        visitedDocs.set(docID);
+        postingsConsumer.startDoc(docID, writeTermFreq ? termFreq : -1);
+        if (docID < delDocLimit) {
+          // Mark it deleted.  TODO: we could also skip
+          // writing its postings; this would be
+          // deterministic (just for this Term's docs).
+          
+          // TODO: can we do this reach-around in a cleaner way????
+          if (state.liveDocs == null) {
+            state.liveDocs = docState.docWriter.codec.liveDocsFormat().newLiveDocs(state.segmentInfo.getDocCount());
+          }
+          if (state.liveDocs.get(docID)) {
+            state.delCountOnFlush++;
+            state.liveDocs.clear(docID);
+          }
+        }
+
+        totTF += termFreq;
+        
+        // Carefully copy over the prox + payload info,
+        // changing the format to match Lucene's segment
+        // format.
+
+        if (readPositions || readOffsets) {
+          // we did record positions (& maybe payload) and/or offsets
+          int position = 0;
+          int offset = 0;
+          for(int j=0;j<termFreq;j++) {
+            final BytesRef thisPayload;
+
+            if (readPositions) {
+              final int code = prox.readVInt();
+              position += code >>> 1;
+
+              if ((code & 1) != 0) {
+
+                // This position has a payload
+                final int payloadLength = prox.readVInt();
+
+                if (payload == null) {
+                  payload = new BytesRef();
+                  payload.bytes = new byte[payloadLength];
+                } else if (payload.bytes.length < payloadLength) {
+                  payload.grow(payloadLength);
+                }
+
+                prox.readBytes(payload.bytes, 0, payloadLength);
+                payload.length = payloadLength;
+                thisPayload = payload;
+
+              } else {
+                thisPayload = null;
+              }
+
+              if (readOffsets) {
+                final int startOffset = offset + prox.readVInt();
+                final int endOffset = startOffset + prox.readVInt();
+                if (writePositions) {
+                  if (writeOffsets) {
+                    assert startOffset >=0 && endOffset >= startOffset : "startOffset=" + startOffset + ",endOffset=" + endOffset + ",offset=" + offset;
+                    postingsConsumer.addPosition(position, thisPayload, startOffset, endOffset);
+                  } else {
+                    postingsConsumer.addPosition(position, thisPayload, -1, -1);
+                  }
+                }
+                offset = startOffset;
+              } else if (writePositions) {
+                postingsConsumer.addPosition(position, thisPayload, -1, -1);
+              }
+            }
+          }
+        }
+        postingsConsumer.finishDoc();
+      }
+      termsConsumer.finishTerm(text, new TermStats(docFreq, writeTermFreq ? totTF : -1));
+      sumTotalTermFreq += totTF;
+      sumDocFreq += docFreq;
+    }
+
+    termsConsumer.finish(writeTermFreq ? sumTotalTermFreq : -1, sumDocFreq, visitedDocs.cardinality());
   }
 }

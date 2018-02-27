@@ -1,6 +1,6 @@
-private String getDate(Date d, DateTools.Resolution resolution) {
+public static void beforeClass() {
 
-package org.apache.lucene.queryparser.flexible.precedence;
+package org.apache.lucene.index;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -20,629 +20,617 @@ package org.apache.lucene.queryparser.flexible.precedence;
  */
 
 import java.io.IOException;
-import java.io.Reader;
-import java.text.DateFormat;
-import java.util.Calendar;
-import java.util.Date;
-import java.util.GregorianCalendar;
-import java.util.HashMap;
-import java.util.Map;
+import java.util.Arrays;
+import java.util.HashSet;
 
-import org.apache.lucene.analysis.*;
-import org.apache.lucene.analysis.tokenattributes.OffsetAttribute;
-import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
-import org.apache.lucene.document.DateTools;
-import org.apache.lucene.queryparser.flexible.core.QueryNodeException;
-import org.apache.lucene.queryparser.flexible.core.QueryNodeParseException;
-import org.apache.lucene.queryparser.flexible.standard.config.StandardQueryConfigHandler;
-import org.apache.lucene.queryparser.flexible.standard.parser.ParseException;
-import org.apache.lucene.queryparser.util.QueryParserTestBase; // javadocs
-import org.apache.lucene.search.BooleanQuery;
-import org.apache.lucene.search.FuzzyQuery;
+import org.apache.lucene.analysis.MockAnalyzer;
+import org.apache.lucene.codecs.Codec;
+import org.apache.lucene.codecs.FieldsConsumer;
+import org.apache.lucene.codecs.FieldsProducer;
+import org.apache.lucene.codecs.PostingsConsumer;
+import org.apache.lucene.codecs.TermStats;
+import org.apache.lucene.codecs.TermsConsumer;
+import org.apache.lucene.codecs.lucene3x.Lucene3xCodec;
+import org.apache.lucene.codecs.mocksep.MockSepPostingsFormat;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.FieldType;
+import org.apache.lucene.document.TextField;
+import org.apache.lucene.index.FieldInfo.IndexOptions;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.PhraseQuery;
-import org.apache.lucene.search.PrefixQuery;
 import org.apache.lucene.search.Query;
-import org.apache.lucene.search.TermQuery;
-import org.apache.lucene.search.TermRangeQuery;
-import org.apache.lucene.search.WildcardQuery;
+import org.apache.lucene.search.ScoreDoc;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.Constants;
+import org.apache.lucene.util.InfoStream;
 import org.apache.lucene.util.LuceneTestCase;
-import org.apache.lucene.util.automaton.BasicAutomata;
-import org.apache.lucene.util.automaton.CharacterRunAutomaton;
+import org.apache.lucene.util.OpenBitSet;
+import org.apache.lucene.util._TestUtil;
+import org.junit.BeforeClass;
 
-/**
- * <p>
- * This test case tests {@link PrecedenceQueryParser}.
- * </p>
- * <p>
- * It contains all tests from {@link QueryParserTestBase}
- * with some adjusted to fit the precedence requirement, plus some precedence test cases.
- * </p>
- * 
- * @see QueryParserTestBase
- */
-//TODO: refactor this to actually extend that class, overriding the tests
-//that it adjusts to fit the precedence requirement, adding its extra tests.
-public class TestPrecedenceQueryParser extends LuceneTestCase {
+// TODO: test multiple codecs here?
 
-  public static Analyzer qpAnalyzer = new QPTestAnalyzer();
+// TODO
+//   - test across fields
+//   - fix this test to run once for all codecs
+//   - make more docs per term, to test > 1 level skipping
+//   - test all combinations of payloads/not and omitTF/not
+//   - test w/ different indexDivisor
+//   - test field where payload length rarely changes
+//   - 0-term fields
+//   - seek/skip to same term/doc i'm already on
+//   - mix in deleted docs
+//   - seek, skip beyond end -- assert returns false
+//   - seek, skip to things that don't exist -- ensure it
+//     goes to 1 before next one known to exist
+//   - skipTo(term)
+//   - skipTo(doc)
 
-  public static final class QPTestFilter extends TokenFilter {
-    /**
-     * Filter which discards the token 'stop' and which expands the token
-     * 'phrase' into 'phrase1 phrase2'
-     */
-    public QPTestFilter(TokenStream in) {
-      super(in);
+public class TestCodecs extends LuceneTestCase {
+  private static String[] fieldNames = new String[] {"one", "two", "three", "four"};
+
+  private static int NUM_TEST_ITER;
+  private final static int NUM_TEST_THREADS = 3;
+  private final static int NUM_FIELDS = 4;
+  private final static int NUM_TERMS_RAND = 50; // must be > 16 to test skipping
+  private final static int DOC_FREQ_RAND = 500; // must be > 16 to test skipping
+  private final static int TERM_DOC_FREQ_RAND = 20;
+
+  @BeforeClass
+  public static void beforeClass() throws Exception {
+    NUM_TEST_ITER = atLeast(20);
+  }
+
+  class FieldData implements Comparable<FieldData> {
+    final FieldInfo fieldInfo;
+    final TermData[] terms;
+    final boolean omitTF;
+    final boolean storePayloads;
+
+    public FieldData(final String name, final FieldInfos.Builder fieldInfos, final TermData[] terms, final boolean omitTF, final boolean storePayloads) {
+      this.omitTF = omitTF;
+      this.storePayloads = storePayloads;
+      // TODO: change this test to use all three
+      fieldInfos.addOrUpdate(name, true, false, false, storePayloads, omitTF ? IndexOptions.DOCS_ONLY : IndexOptions.DOCS_AND_FREQS_AND_POSITIONS, null, null);
+      fieldInfo = fieldInfos.fieldInfo(name);
+      this.terms = terms;
+      for(int i=0;i<terms.length;i++)
+        terms[i].field = this;
+
+      Arrays.sort(terms);
     }
 
-    private boolean inPhrase = false;
+    public int compareTo(final FieldData other) {
+      return fieldInfo.name.compareTo(other.fieldInfo.name);
+    }
 
-    private int savedStart = 0;
-    private int savedEnd = 0;
+    public void write(final FieldsConsumer consumer) throws Throwable {
+      Arrays.sort(terms);
+      final TermsConsumer termsConsumer = consumer.addField(fieldInfo);
+      long sumTotalTermCount = 0;
+      long sumDF = 0;
+      OpenBitSet visitedDocs = new OpenBitSet();
+      for (final TermData term : terms) {
+        for (int i = 0; i < term.docs.length; i++) {
+          visitedDocs.set(term.docs[i]);
+        }
+        sumDF += term.docs.length;
+        sumTotalTermCount += term.write(termsConsumer);
+      }
+      termsConsumer.finish(sumTotalTermCount, sumDF, (int) visitedDocs.cardinality());
+    }
+  }
 
-    private final CharTermAttribute termAtt = addAttribute(CharTermAttribute.class);
+  class PositionData {
+    int pos;
+    BytesRef payload;
 
-    private final OffsetAttribute offsetAtt = addAttribute(OffsetAttribute.class);
+    PositionData(final int pos, final BytesRef payload) {
+      this.pos = pos;
+      this.payload = payload;
+    }
+  }
+
+  class TermData implements Comparable<TermData> {
+    String text2;
+    final BytesRef text;
+    int[] docs;
+    PositionData[][] positions;
+    FieldData field;
+
+    public TermData(final String text, final int[] docs, final PositionData[][] positions) {
+      this.text = new BytesRef(text);
+      this.text2 = text;
+      this.docs = docs;
+      this.positions = positions;
+    }
+
+    public int compareTo(final TermData o) {
+      return text.compareTo(o.text);
+    }
+
+    public long write(final TermsConsumer termsConsumer) throws Throwable {
+      final PostingsConsumer postingsConsumer = termsConsumer.startTerm(text);
+      long totTF = 0;
+      for(int i=0;i<docs.length;i++) {
+        final int termDocFreq;
+        if (field.omitTF) {
+          termDocFreq = 0;
+        } else {
+          termDocFreq = positions[i].length;
+        }
+        postingsConsumer.startDoc(docs[i], termDocFreq);
+        if (!field.omitTF) {
+          totTF += positions[i].length;
+          for(int j=0;j<positions[i].length;j++) {
+            final PositionData pos = positions[i][j];
+            postingsConsumer.addPosition(pos.pos, pos.payload, -1, -1);
+          }
+          postingsConsumer.finishDoc();
+        }
+      }
+      termsConsumer.finishTerm(text, new TermStats(docs.length, totTF));
+      return totTF;
+    }
+  }
+
+  final private static String SEGMENT = "0";
+
+  TermData[] makeRandomTerms(final boolean omitTF, final boolean storePayloads) {
+    final int numTerms = 1+random().nextInt(NUM_TERMS_RAND);
+    //final int numTerms = 2;
+    final TermData[] terms = new TermData[numTerms];
+
+    final HashSet<String> termsSeen = new HashSet<String>();
+
+    for(int i=0;i<numTerms;i++) {
+
+      // Make term text
+      String text2;
+      while(true) {
+        text2 = _TestUtil.randomUnicodeString(random());
+        if (!termsSeen.contains(text2) && !text2.endsWith(".")) {
+          termsSeen.add(text2);
+          break;
+        }
+      }
+
+      final int docFreq = 1+random().nextInt(DOC_FREQ_RAND);
+      final int[] docs = new int[docFreq];
+      PositionData[][] positions;
+
+      if (!omitTF)
+        positions = new PositionData[docFreq][];
+      else
+        positions = null;
+
+      int docID = 0;
+      for(int j=0;j<docFreq;j++) {
+        docID += _TestUtil.nextInt(random(), 1, 10);
+        docs[j] = docID;
+
+        if (!omitTF) {
+          final int termFreq = 1+random().nextInt(TERM_DOC_FREQ_RAND);
+          positions[j] = new PositionData[termFreq];
+          int position = 0;
+          for(int k=0;k<termFreq;k++) {
+            position += _TestUtil.nextInt(random(), 1, 10);
+
+            final BytesRef payload;
+            if (storePayloads && random().nextInt(4) == 0) {
+              final byte[] bytes = new byte[1+random().nextInt(5)];
+              for(int l=0;l<bytes.length;l++) {
+                bytes[l] = (byte) random().nextInt(255);
+              }
+              payload = new BytesRef(bytes);
+            } else {
+              payload = null;
+            }
+
+            positions[j][k] = new PositionData(position, payload);
+          }
+        }
+      }
+
+      terms[i] = new TermData(text2, docs, positions);
+    }
+
+    return terms;
+  }
+
+  public void testFixedPostings() throws Throwable {
+    final int NUM_TERMS = 100;
+    final TermData[] terms = new TermData[NUM_TERMS];
+    for(int i=0;i<NUM_TERMS;i++) {
+      final int[] docs = new int[] {i};
+      final String text = Integer.toString(i, Character.MAX_RADIX);
+      terms[i] = new TermData(text, docs, null);
+    }
+
+    final FieldInfos.Builder builder = new FieldInfos.Builder();
+
+    final FieldData field = new FieldData("field", builder, terms, true, false);
+    final FieldData[] fields = new FieldData[] {field};
+    final FieldInfos fieldInfos = builder.finish();
+    final Directory dir = newDirectory();
+    this.write(fieldInfos, dir, fields, true);
+    Codec codec = Codec.getDefault();
+    final SegmentInfo si = new SegmentInfo(dir, Constants.LUCENE_MAIN_VERSION, SEGMENT, 10000, false, codec, null, null);
+
+    final FieldsProducer reader = codec.postingsFormat().fieldsProducer(new SegmentReadState(dir, si, fieldInfos, newIOContext(random()), DirectoryReader.DEFAULT_TERMS_INDEX_DIVISOR));
+
+    final FieldsEnum fieldsEnum = reader.iterator();
+    assertNotNull(fieldsEnum.next());
+    final Terms terms2 = fieldsEnum.terms();
+    assertNotNull(terms2);
+
+    final TermsEnum termsEnum = terms2.iterator(null);
+
+    DocsEnum docsEnum = null;
+    for(int i=0;i<NUM_TERMS;i++) {
+      final BytesRef term = termsEnum.next();
+      assertNotNull(term);
+      assertEquals(terms[i].text2, term.utf8ToString());
+
+      // do this twice to stress test the codec's reuse, ie,
+      // make sure it properly fully resets (rewinds) its
+      // internal state:
+      for(int iter=0;iter<2;iter++) {
+        docsEnum = _TestUtil.docs(random(), termsEnum, null,  docsEnum, false);
+        assertEquals(terms[i].docs[0], docsEnum.nextDoc());
+        assertEquals(DocIdSetIterator.NO_MORE_DOCS, docsEnum.nextDoc());
+      }
+    }
+    assertNull(termsEnum.next());
+
+    for(int i=0;i<NUM_TERMS;i++) {
+      assertEquals(termsEnum.seekCeil(new BytesRef(terms[i].text2)), TermsEnum.SeekStatus.FOUND);
+    }
+
+    assertNull(fieldsEnum.next());
+    reader.close();
+    dir.close();
+  }
+
+  public void testRandomPostings() throws Throwable {
+    final FieldInfos.Builder builder = new FieldInfos.Builder();
+
+    final FieldData[] fields = new FieldData[NUM_FIELDS];
+    for(int i=0;i<NUM_FIELDS;i++) {
+      final boolean omitTF = 0==(i%3);
+      final boolean storePayloads = 1==(i%3);
+      fields[i] = new FieldData(fieldNames[i], builder, this.makeRandomTerms(omitTF, storePayloads), omitTF, storePayloads);
+    }
+
+    final Directory dir = newDirectory();
+    final FieldInfos fieldInfos = builder.finish();
+
+    if (VERBOSE) {
+      System.out.println("TEST: now write postings");
+    }
+
+    this.write(fieldInfos, dir, fields, false);
+    Codec codec = Codec.getDefault();
+    final SegmentInfo si = new SegmentInfo(dir, Constants.LUCENE_MAIN_VERSION, SEGMENT, 10000,
+                                           false, codec, null, null);
+
+    if (VERBOSE) {
+      System.out.println("TEST: now read postings");
+    }
+    final FieldsProducer terms = codec.postingsFormat().fieldsProducer(new SegmentReadState(dir, si, fieldInfos, newIOContext(random()), DirectoryReader.DEFAULT_TERMS_INDEX_DIVISOR));
+
+    final Verify[] threads = new Verify[NUM_TEST_THREADS-1];
+    for(int i=0;i<NUM_TEST_THREADS-1;i++) {
+      threads[i] = new Verify(si, fields, terms);
+      threads[i].setDaemon(true);
+      threads[i].start();
+    }
+
+    new Verify(si, fields, terms).run();
+
+    for(int i=0;i<NUM_TEST_THREADS-1;i++) {
+      threads[i].join();
+      assert !threads[i].failed;
+    }
+
+    terms.close();
+    dir.close();
+  }
+
+  public void testSepPositionAfterMerge() throws IOException {
+    final Directory dir = newDirectory();
+    final IndexWriterConfig config = newIndexWriterConfig(TEST_VERSION_CURRENT,
+      new MockAnalyzer(random()));
+    config.setMergePolicy(newLogMergePolicy());
+    config.setCodec(_TestUtil.alwaysPostingsFormat(new MockSepPostingsFormat()));
+    final IndexWriter writer = new IndexWriter(dir, config);
+
+    try {
+      final PhraseQuery pq = new PhraseQuery();
+      pq.add(new Term("content", "bbb"));
+      pq.add(new Term("content", "ccc"));
+
+      final Document doc = new Document();
+      FieldType customType = new FieldType(TextField.TYPE_NOT_STORED);
+      customType.setOmitNorms(true);
+      doc.add(newField("content", "aaa bbb ccc ddd", customType));
+
+      // add document and force commit for creating a first segment
+      writer.addDocument(doc);
+      writer.commit();
+
+      ScoreDoc[] results = this.search(writer, pq, 5);
+      assertEquals(1, results.length);
+      assertEquals(0, results[0].doc);
+
+      // add document and force commit for creating a second segment
+      writer.addDocument(doc);
+      writer.commit();
+
+      // at this point, there should be at least two segments
+      results = this.search(writer, pq, 5);
+      assertEquals(2, results.length);
+      assertEquals(0, results[0].doc);
+
+      writer.forceMerge(1);
+
+      // optimise to merge the segments.
+      results = this.search(writer, pq, 5);
+      assertEquals(2, results.length);
+      assertEquals(0, results[0].doc);
+    }
+    finally {
+      writer.close();
+      dir.close();
+    }
+  }
+
+  private ScoreDoc[] search(final IndexWriter writer, final Query q, final int n) throws IOException {
+    final IndexReader reader = writer.getReader();
+    final IndexSearcher searcher = newSearcher(reader);
+    try {
+      return searcher.search(q, null, n).scoreDocs;
+    }
+    finally {
+      reader.close();
+    }
+  }
+
+  private class Verify extends Thread {
+    final Fields termsDict;
+    final FieldData[] fields;
+    final SegmentInfo si;
+    volatile boolean failed;
+
+    Verify(final SegmentInfo si, final FieldData[] fields, final Fields termsDict) {
+      this.fields = fields;
+      this.termsDict = termsDict;
+      this.si = si;
+    }
 
     @Override
-    public boolean incrementToken() throws IOException {
-      if (inPhrase) {
-        inPhrase = false;
-        termAtt.setEmpty().append("phrase2");
-        offsetAtt.setOffset(savedStart, savedEnd);
-        return true;
-      } else
-        while (input.incrementToken())
-          if (termAtt.toString().equals("phrase")) {
-            inPhrase = true;
-            savedStart = offsetAtt.startOffset();
-            savedEnd = offsetAtt.endOffset();
-            termAtt.setEmpty().append("phrase1");
-            offsetAtt.setOffset(savedStart, savedEnd);
-            return true;
-          } else if (!termAtt.toString().equals("stop"))
-            return true;
-      return false;
+    public void run() {
+      try {
+        this._run();
+      } catch (final Throwable t) {
+        failed = true;
+        throw new RuntimeException(t);
+      }
     }
 
-    @Override
-    public void reset() throws IOException {
-      super.reset();
-      this.inPhrase = false;
-      this.savedStart = 0;
-      this.savedEnd = 0;
+    private void verifyDocs(final int[] docs, final PositionData[][] positions, final DocsEnum docsEnum, final boolean doPos) throws Throwable {
+      for(int i=0;i<docs.length;i++) {
+        final int doc = docsEnum.nextDoc();
+        assertTrue(doc != DocIdSetIterator.NO_MORE_DOCS);
+        assertEquals(docs[i], doc);
+        if (doPos) {
+          this.verifyPositions(positions[i], ((DocsAndPositionsEnum) docsEnum));
+        }
+      }
+      assertEquals(DocIdSetIterator.NO_MORE_DOCS, docsEnum.nextDoc());
     }
-  }
 
-  public static final class QPTestAnalyzer extends Analyzer {
+    byte[] data = new byte[10];
 
-    /** Filters MockTokenizer with StopFilter. */
-    @Override
-    public final TokenStreamComponents createComponents(String fieldName, Reader reader) {
-      Tokenizer tokenizer = new MockTokenizer(reader, MockTokenizer.SIMPLE, true);
-      return new TokenStreamComponents(tokenizer, new QPTestFilter(tokenizer));
+    private void verifyPositions(final PositionData[] positions, final DocsAndPositionsEnum posEnum) throws Throwable {
+      for(int i=0;i<positions.length;i++) {
+        final int pos = posEnum.nextPosition();
+        assertEquals(positions[i].pos, pos);
+        if (positions[i].payload != null) {
+          assertTrue(posEnum.hasPayload());
+          if (random().nextInt(3) < 2) {
+            // Verify the payload bytes
+            final BytesRef otherPayload = posEnum.getPayload();
+            assertTrue("expected=" + positions[i].payload.toString() + " got=" + otherPayload.toString(), positions[i].payload.equals(otherPayload));
+          }
+        } else {
+          assertFalse(posEnum.hasPayload());
+        }
+      }
     }
-  }
 
-  private int originalMaxClauses;
+    public void _run() throws Throwable {
 
-  @Override
-  public void setUp() throws Exception {
-    super.setUp();
-    originalMaxClauses = BooleanQuery.getMaxClauseCount();
-  }
+      for(int iter=0;iter<NUM_TEST_ITER;iter++) {
+        final FieldData field = fields[random().nextInt(fields.length)];
+        final TermsEnum termsEnum = termsDict.terms(field.fieldInfo.name).iterator(null);
+        if (si.getCodec() instanceof Lucene3xCodec) {
+          // code below expects unicode sort order
+          continue;
+        }
 
-  public PrecedenceQueryParser getParser(Analyzer a) throws Exception {
-    if (a == null)
-      a = new MockAnalyzer(random(), MockTokenizer.SIMPLE, true);
-    PrecedenceQueryParser qp = new PrecedenceQueryParser();
-    qp.setAnalyzer(a);
-    qp.setDefaultOperator(StandardQueryConfigHandler.Operator.OR);
-    return qp;
-  }
+        int upto = 0;
+        // Test straight enum of the terms:
+        while(true) {
+          final BytesRef term = termsEnum.next();
+          if (term == null) {
+            break;
+          }
+          final BytesRef expected = new BytesRef(field.terms[upto++].text2);
+          assertTrue("expected=" + expected + " vs actual " + term, expected.bytesEquals(term));
+        }
+        assertEquals(upto, field.terms.length);
 
-  public Query getQuery(String query, Analyzer a) throws Exception {
-    return getParser(a).parse(query, "field");
-  }
+        // Test random seek:
+        TermData term = field.terms[random().nextInt(field.terms.length)];
+        TermsEnum.SeekStatus status = termsEnum.seekCeil(new BytesRef(term.text2));
+        assertEquals(status, TermsEnum.SeekStatus.FOUND);
+        assertEquals(term.docs.length, termsEnum.docFreq());
+        if (field.omitTF) {
+          this.verifyDocs(term.docs, term.positions, _TestUtil.docs(random(), termsEnum, null, null, false), false);
+        } else {
+          this.verifyDocs(term.docs, term.positions, termsEnum.docsAndPositions(null, null, false), true);
+        }
 
-  public void assertQueryEquals(String query, Analyzer a, String result)
-      throws Exception {
-    Query q = getQuery(query, a);
-    String s = q.toString("field");
-    if (!s.equals(result)) {
-      fail("Query /" + query + "/ yielded /" + s + "/, expecting /" + result
-          + "/");
-    }
-  }
+        // Test random seek by ord:
+        final int idx = random().nextInt(field.terms.length);
+        term = field.terms[idx];
+        boolean success = false;
+        try {
+          termsEnum.seekExact(idx);
+          success = true;
+        } catch (UnsupportedOperationException uoe) {
+          // ok -- skip it
+        }
+        if (success) {
+          assertEquals(status, TermsEnum.SeekStatus.FOUND);
+          assertTrue(termsEnum.term().bytesEquals(new BytesRef(term.text2)));
+          assertEquals(term.docs.length, termsEnum.docFreq());
+          if (field.omitTF) {
+            this.verifyDocs(term.docs, term.positions, _TestUtil.docs(random(), termsEnum, null, null, false), false);
+          } else {
+            this.verifyDocs(term.docs, term.positions, termsEnum.docsAndPositions(null, null, false), true);
+          }
+        }
 
-  public void assertWildcardQueryEquals(String query, boolean lowercase,
-      String result) throws Exception {
-    PrecedenceQueryParser qp = getParser(null);
-    qp.setLowercaseExpandedTerms(lowercase);
-    Query q = qp.parse(query, "field");
-    String s = q.toString("field");
-    if (!s.equals(result)) {
-      fail("WildcardQuery /" + query + "/ yielded /" + s + "/, expecting /"
-          + result + "/");
-    }
-  }
+        // Test seek to non-existent terms:
+        if (VERBOSE) {
+          System.out.println("TEST: seek non-exist terms");
+        }
+        for(int i=0;i<100;i++) {
+          final String text2 = _TestUtil.randomUnicodeString(random()) + ".";
+          status = termsEnum.seekCeil(new BytesRef(text2));
+          assertTrue(status == TermsEnum.SeekStatus.NOT_FOUND ||
+                     status == TermsEnum.SeekStatus.END);
+        }
 
-  public void assertWildcardQueryEquals(String query, String result)
-      throws Exception {
-    PrecedenceQueryParser qp = getParser(null);
-    Query q = qp.parse(query, "field");
-    String s = q.toString("field");
-    if (!s.equals(result)) {
-      fail("WildcardQuery /" + query + "/ yielded /" + s + "/, expecting /"
-          + result + "/");
-    }
-  }
+        // Seek to each term, backwards:
+        if (VERBOSE) {
+          System.out.println("TEST: seek terms backwards");
+        }
+        for(int i=field.terms.length-1;i>=0;i--) {
+          assertEquals(Thread.currentThread().getName() + ": field=" + field.fieldInfo.name + " term=" + field.terms[i].text2, TermsEnum.SeekStatus.FOUND, termsEnum.seekCeil(new BytesRef(field.terms[i].text2)));
+          assertEquals(field.terms[i].docs.length, termsEnum.docFreq());
+        }
 
-  public Query getQueryDOA(String query, Analyzer a) throws Exception {
-    if (a == null)
-      a = new MockAnalyzer(random(), MockTokenizer.SIMPLE, true);
-    PrecedenceQueryParser qp = new PrecedenceQueryParser();
-    qp.setAnalyzer(a);
-    qp.setDefaultOperator(StandardQueryConfigHandler.Operator.AND);
-    return qp.parse(query, "field");
-  }
+        // Seek to each term by ord, backwards
+        for(int i=field.terms.length-1;i>=0;i--) {
+          try {
+            termsEnum.seekExact(i);
+            assertEquals(field.terms[i].docs.length, termsEnum.docFreq());
+            assertTrue(termsEnum.term().bytesEquals(new BytesRef(field.terms[i].text2)));
+          } catch (UnsupportedOperationException uoe) {
+          }
+        }
 
-  public void assertQueryEqualsDOA(String query, Analyzer a, String result)
-      throws Exception {
-    Query q = getQueryDOA(query, a);
-    String s = q.toString("field");
-    if (!s.equals(result)) {
-      fail("Query /" + query + "/ yielded /" + s + "/, expecting /" + result
-          + "/");
-    }
-  }
+        // Seek to non-existent empty-string term
+        status = termsEnum.seekCeil(new BytesRef(""));
+        assertNotNull(status);
+        //assertEquals(TermsEnum.SeekStatus.NOT_FOUND, status);
 
-  public void testSimple() throws Exception {
-    assertQueryEquals("term term term", null, "term term term");
-    assertQueryEquals("türm term term", null, "türm term term");
-    assertQueryEquals("ümlaut", null, "ümlaut");
+        // Make sure we're now pointing to first term
+        assertTrue(termsEnum.term().bytesEquals(new BytesRef(field.terms[0].text2)));
 
-    assertQueryEquals("a AND b", null, "+a +b");
-    assertQueryEquals("(a AND b)", null, "+a +b");
-    assertQueryEquals("c OR (a AND b)", null, "c (+a +b)");
-    assertQueryEquals("a AND NOT b", null, "+a -b");
-    assertQueryEquals("a AND -b", null, "+a -b");
-    assertQueryEquals("a AND !b", null, "+a -b");
-    assertQueryEquals("a && b", null, "+a +b");
-    assertQueryEquals("a && ! b", null, "+a -b");
+        // Test docs enum
+        termsEnum.seekCeil(new BytesRef(""));
+        upto = 0;
+        do {
+          term = field.terms[upto];
+          if (random().nextInt(3) == 1) {
+            final DocsEnum docs;
+            final DocsEnum docsAndFreqs;
+            final DocsAndPositionsEnum postings;
+            if (!field.omitTF) {
+              postings = termsEnum.docsAndPositions(null, null, false);
+              if (postings != null) {
+                docs = docsAndFreqs = postings;
+              } else {
+                docs = docsAndFreqs = _TestUtil.docs(random(), termsEnum, null, null, true);
+              }
+            } else {
+              postings = null;
+              docsAndFreqs = null;
+              docs = _TestUtil.docs(random(), termsEnum, null, null, false);
+            }
+            assertNotNull(docs);
+            int upto2 = -1;
+            while(upto2 < term.docs.length-1) {
+              // Maybe skip:
+              final int left = term.docs.length-upto2;
+              int doc;
+              if (random().nextInt(3) == 1 && left >= 1) {
+                final int inc = 1+random().nextInt(left-1);
+                upto2 += inc;
+                if (random().nextInt(2) == 1) {
+                  doc = docs.advance(term.docs[upto2]);
+                  assertEquals(term.docs[upto2], doc);
+                } else {
+                  doc = docs.advance(1+term.docs[upto2]);
+                  if (doc == DocIdSetIterator.NO_MORE_DOCS) {
+                    // skipped past last doc
+                    assert upto2 == term.docs.length-1;
+                    break;
+                  } else {
+                    // skipped to next doc
+                    assert upto2 < term.docs.length-1;
+                    if (doc >= term.docs[1+upto2]) {
+                      upto2++;
+                    }
+                  }
+                }
+              } else {
+                doc = docs.nextDoc();
+                assertTrue(doc != -1);
+                upto2++;
+              }
+              assertEquals(term.docs[upto2], doc);
+              if (!field.omitTF) {
+                assertEquals(term.positions[upto2].length, postings.freq());
+                if (random().nextInt(2) == 1) {
+                  this.verifyPositions(term.positions[upto2], postings);
+                }
+              }
+            }
 
-    assertQueryEquals("a OR b", null, "a b");
-    assertQueryEquals("a || b", null, "a b");
+            assertEquals(DocIdSetIterator.NO_MORE_DOCS, docs.nextDoc());
+          }
+          upto++;
 
-    assertQueryEquals("+term -term term", null, "+term -term term");
-    assertQueryEquals("foo:term AND field:anotherTerm", null,
-        "+foo:term +anotherterm");
-    assertQueryEquals("term AND \"phrase phrase\"", null,
-        "+term +\"phrase phrase\"");
-    assertQueryEquals("\"hello there\"", null, "\"hello there\"");
-    assertTrue(getQuery("a AND b", null) instanceof BooleanQuery);
-    assertTrue(getQuery("hello", null) instanceof TermQuery);
-    assertTrue(getQuery("\"hello there\"", null) instanceof PhraseQuery);
+        } while (termsEnum.next() != null);
 
-    assertQueryEquals("germ term^2.0", null, "germ term^2.0");
-    assertQueryEquals("(term)^2.0", null, "term^2.0");
-    assertQueryEquals("(germ term)^2.0", null, "(germ term)^2.0");
-    assertQueryEquals("term^2.0", null, "term^2.0");
-    assertQueryEquals("term^2", null, "term^2.0");
-    assertQueryEquals("\"germ term\"^2.0", null, "\"germ term\"^2.0");
-    assertQueryEquals("\"term germ\"^2", null, "\"term germ\"^2.0");
-
-    assertQueryEquals("(foo OR bar) AND (baz OR boo)", null,
-        "+(foo bar) +(baz boo)");
-    assertQueryEquals("((a OR b) AND NOT c) OR d", null, "(+(a b) -c) d");
-    assertQueryEquals("+(apple \"steve jobs\") -(foo bar baz)", null,
-        "+(apple \"steve jobs\") -(foo bar baz)");
-    assertQueryEquals("+title:(dog OR cat) -author:\"bob dole\"", null,
-        "+(title:dog title:cat) -author:\"bob dole\"");
-
-    PrecedenceQueryParser qp = new PrecedenceQueryParser();
-    qp.setAnalyzer(new MockAnalyzer(random()));
-    // make sure OR is the default:
-    assertEquals(StandardQueryConfigHandler.Operator.OR, qp.getDefaultOperator());
-    qp.setDefaultOperator(StandardQueryConfigHandler.Operator.AND);
-    assertEquals(StandardQueryConfigHandler.Operator.AND, qp.getDefaultOperator());
-    qp.setDefaultOperator(StandardQueryConfigHandler.Operator.OR);
-    assertEquals(StandardQueryConfigHandler.Operator.OR, qp.getDefaultOperator());
-
-    assertQueryEquals("a OR !b", null, "a -b");
-    assertQueryEquals("a OR ! b", null, "a -b");
-    assertQueryEquals("a OR -b", null, "a -b");
-  }
-
-  public void testPunct() throws Exception {
-    Analyzer a = new MockAnalyzer(random(), MockTokenizer.WHITESPACE, false);
-    assertQueryEquals("a&b", a, "a&b");
-    assertQueryEquals("a&&b", a, "a&&b");
-    assertQueryEquals(".NET", a, ".NET");
-  }
-
-  public void testSlop() throws Exception {
-    assertQueryEquals("\"term germ\"~2", null, "\"term germ\"~2");
-    assertQueryEquals("\"term germ\"~2 flork", null, "\"term germ\"~2 flork");
-    assertQueryEquals("\"term\"~2", null, "term");
-    assertQueryEquals("\" \"~2 germ", null, "germ");
-    assertQueryEquals("\"term germ\"~2^2", null, "\"term germ\"~2^2.0");
-  }
-
-  public void testNumber() throws Exception {
-    // The numbers go away because SimpleAnalzyer ignores them
-    assertQueryEquals("3", null, "");
-    assertQueryEquals("term 1.0 1 2", null, "term");
-    assertQueryEquals("term term1 term2", null, "term term term");
-
-    Analyzer a = new MockAnalyzer(random());
-    assertQueryEquals("3", a, "3");
-    assertQueryEquals("term 1.0 1 2", a, "term 1.0 1 2");
-    assertQueryEquals("term term1 term2", a, "term term1 term2");
-  }
-
-  public void testWildcard() throws Exception {
-    assertQueryEquals("term*", null, "term*");
-    assertQueryEquals("term*^2", null, "term*^2.0");
-    assertQueryEquals("term~", null, "term~2");
-    assertQueryEquals("term~0.7", null, "term~1");
-    assertQueryEquals("term~^3", null, "term~2^3.0");
-    assertQueryEquals("term^3~", null, "term~2^3.0");
-    assertQueryEquals("term*germ", null, "term*germ");
-    assertQueryEquals("term*germ^3", null, "term*germ^3.0");
-
-    assertTrue(getQuery("term*", null) instanceof PrefixQuery);
-    assertTrue(getQuery("term*^2", null) instanceof PrefixQuery);
-    assertTrue(getQuery("term~", null) instanceof FuzzyQuery);
-    assertTrue(getQuery("term~0.7", null) instanceof FuzzyQuery);
-    FuzzyQuery fq = (FuzzyQuery) getQuery("term~0.7", null);
-    assertEquals(1, fq.getMaxEdits());
-    assertEquals(FuzzyQuery.defaultPrefixLength, fq.getPrefixLength());
-    fq = (FuzzyQuery) getQuery("term~", null);
-    assertEquals(2, fq.getMaxEdits());
-    assertEquals(FuzzyQuery.defaultPrefixLength, fq.getPrefixLength());
-    try {
-      getQuery("term~1.1", null); // value > 1, throws exception
-      fail();
-    } catch (ParseException pe) {
-      // expected exception
-    }
-    assertTrue(getQuery("term*germ", null) instanceof WildcardQuery);
-
-    /*
-     * Tests to see that wild card terms are (or are not) properly lower-cased
-     * with propery parser configuration
-     */
-    // First prefix queries:
-    // by default, convert to lowercase:
-    assertWildcardQueryEquals("Term*", true, "term*");
-    // explicitly set lowercase:
-    assertWildcardQueryEquals("term*", true, "term*");
-    assertWildcardQueryEquals("Term*", true, "term*");
-    assertWildcardQueryEquals("TERM*", true, "term*");
-    // explicitly disable lowercase conversion:
-    assertWildcardQueryEquals("term*", false, "term*");
-    assertWildcardQueryEquals("Term*", false, "Term*");
-    assertWildcardQueryEquals("TERM*", false, "TERM*");
-    // Then 'full' wildcard queries:
-    // by default, convert to lowercase:
-    assertWildcardQueryEquals("Te?m", "te?m");
-    // explicitly set lowercase:
-    assertWildcardQueryEquals("te?m", true, "te?m");
-    assertWildcardQueryEquals("Te?m", true, "te?m");
-    assertWildcardQueryEquals("TE?M", true, "te?m");
-    assertWildcardQueryEquals("Te?m*gerM", true, "te?m*germ");
-    // explicitly disable lowercase conversion:
-    assertWildcardQueryEquals("te?m", false, "te?m");
-    assertWildcardQueryEquals("Te?m", false, "Te?m");
-    assertWildcardQueryEquals("TE?M", false, "TE?M");
-    assertWildcardQueryEquals("Te?m*gerM", false, "Te?m*gerM");
-    // Fuzzy queries:
-    assertWildcardQueryEquals("Term~", "term~2");
-    assertWildcardQueryEquals("Term~", true, "term~2");
-    assertWildcardQueryEquals("Term~", false, "Term~2");
-    // Range queries:
-    assertWildcardQueryEquals("[A TO C]", "[a TO c]");
-    assertWildcardQueryEquals("[A TO C]", true, "[a TO c]");
-    assertWildcardQueryEquals("[A TO C]", false, "[A TO C]");
-  }
-
-  public void testQPA() throws Exception {
-    assertQueryEquals("term term term", qpAnalyzer, "term term term");
-    assertQueryEquals("term +stop term", qpAnalyzer, "term term");
-    assertQueryEquals("term -stop term", qpAnalyzer, "term term");
-    assertQueryEquals("drop AND stop AND roll", qpAnalyzer, "+drop +roll");
-    assertQueryEquals("term phrase term", qpAnalyzer,
-        "term (phrase1 phrase2) term");
-    // note the parens in this next assertion differ from the original
-    // QueryParser behavior
-    assertQueryEquals("term AND NOT phrase term", qpAnalyzer,
-        "(+term -(phrase1 phrase2)) term");
-    assertQueryEquals("stop", qpAnalyzer, "");
-    assertQueryEquals("stop OR stop AND stop", qpAnalyzer, "");
-    assertTrue(getQuery("term term term", qpAnalyzer) instanceof BooleanQuery);
-    assertTrue(getQuery("term +stop", qpAnalyzer) instanceof TermQuery);
-  }
-
-  public void testRange() throws Exception {
-    assertQueryEquals("[ a TO z]", null, "[a TO z]");
-    assertTrue(getQuery("[ a TO z]", null) instanceof TermRangeQuery);
-    assertQueryEquals("[ a TO z ]", null, "[a TO z]");
-    assertQueryEquals("{ a TO z}", null, "{a TO z}");
-    assertQueryEquals("{ a TO z }", null, "{a TO z}");
-    assertQueryEquals("{ a TO z }^2.0", null, "{a TO z}^2.0");
-    assertQueryEquals("[ a TO z] OR bar", null, "[a TO z] bar");
-    assertQueryEquals("[ a TO z] AND bar", null, "+[a TO z] +bar");
-    assertQueryEquals("( bar blar { a TO z}) ", null, "bar blar {a TO z}");
-    assertQueryEquals("gack ( bar blar { a TO z}) ", null,
-        "gack (bar blar {a TO z})");
-  }
-
-  private String escapeDateString(String s) {
-    if (s.contains(" ")) {
-      return "\"" + s + "\"";
-    } else {
-      return s;
+        assertEquals(upto, field.terms.length);
+      }
     }
   }
 
-  public String getDate(String s) throws Exception {
-    DateFormat df = DateFormat.getDateInstance(DateFormat.SHORT);
-    return DateTools.dateToString(df.parse(s), DateTools.Resolution.DAY);
-  }
+  private void write(final FieldInfos fieldInfos, final Directory dir, final FieldData[] fields, boolean allowPreFlex) throws Throwable {
 
-  private String getLocalizedDate(int year, int month, int day,
-      boolean extendLastDate) {
-    DateFormat df = DateFormat.getDateInstance(DateFormat.SHORT);
-    Calendar calendar = new GregorianCalendar();
-    calendar.set(year, month, day);
-    if (extendLastDate) {
-      calendar.set(Calendar.HOUR_OF_DAY, 23);
-      calendar.set(Calendar.MINUTE, 59);
-      calendar.set(Calendar.SECOND, 59);
-      calendar.set(Calendar.MILLISECOND, 999);
+    final int termIndexInterval = _TestUtil.nextInt(random(), 13, 27);
+    final Codec codec = Codec.getDefault();
+    final SegmentInfo si = new SegmentInfo(dir, Constants.LUCENE_MAIN_VERSION, SEGMENT, 10000, false, codec, null, null);
+    final SegmentWriteState state = new SegmentWriteState(InfoStream.getDefault(), dir, si, fieldInfos, termIndexInterval, null, newIOContext(random()));
+
+    final FieldsConsumer consumer = codec.postingsFormat().fieldsConsumer(state);
+    Arrays.sort(fields);
+    for (final FieldData field : fields) {
+      if (!allowPreFlex && codec instanceof Lucene3xCodec) {
+        // code below expects unicode sort order
+        continue;
+      }
+      field.write(consumer);
     }
-    return df.format(calendar.getTime());
+    consumer.close();
   }
-
-  public void testDateRange() throws Exception {
-    String startDate = getLocalizedDate(2002, 1, 1, false);
-    String endDate = getLocalizedDate(2002, 1, 4, false);
-    Calendar endDateExpected = new GregorianCalendar();
-    endDateExpected.set(2002, 1, 4, 23, 59, 59);
-    endDateExpected.set(Calendar.MILLISECOND, 999);
-    final String defaultField = "default";
-    final String monthField = "month";
-    final String hourField = "hour";
-    PrecedenceQueryParser qp = new PrecedenceQueryParser(new MockAnalyzer(random()));
-
-    Map<CharSequence, DateTools.Resolution> fieldMap = new HashMap<CharSequence,DateTools.Resolution>();
-    // set a field specific date resolution
-    fieldMap.put(monthField, DateTools.Resolution.MONTH);
-    qp.setDateResolution(fieldMap);
-
-    // set default date resolution to MILLISECOND
-    qp.setDateResolution(DateTools.Resolution.MILLISECOND);
-
-    // set second field specific date resolution
-    fieldMap.put(hourField, DateTools.Resolution.HOUR);
-    qp.setDateResolution(fieldMap);
-
-    // for this field no field specific date resolution has been set,
-    // so verify if the default resolution is used
-    assertDateRangeQueryEquals(qp, defaultField, startDate, endDate,
-        endDateExpected.getTime(), DateTools.Resolution.MILLISECOND);
-
-    // verify if field specific date resolutions are used for these two fields
-    assertDateRangeQueryEquals(qp, monthField, startDate, endDate,
-        endDateExpected.getTime(), DateTools.Resolution.MONTH);
-
-    assertDateRangeQueryEquals(qp, hourField, startDate, endDate,
-        endDateExpected.getTime(), DateTools.Resolution.HOUR);
-  }
-
-  /** for testing DateTools support */
-  private String getDate(String s, DateTools.Resolution resolution) throws Exception {
-    DateFormat df = DateFormat.getDateInstance(DateFormat.SHORT);
-    return getDate(df.parse(s), resolution);
-  }
-
-  /** for testing DateTools support */
-  private String getDate(Date d, DateTools.Resolution resolution) throws Exception {
-    return DateTools.dateToString(d, resolution);
-  }
-
-  public void assertQueryEquals(PrecedenceQueryParser qp, String field, String query,
-      String result) throws Exception {
-    Query q = qp.parse(query, field);
-    String s = q.toString(field);
-    if (!s.equals(result)) {
-      fail("Query /" + query + "/ yielded /" + s + "/, expecting /" + result
-          + "/");
-    }
-  }
-
-  public void assertDateRangeQueryEquals(PrecedenceQueryParser qp, String field,
-      String startDate, String endDate, Date endDateInclusive,
-      DateTools.Resolution resolution) throws Exception {
-    assertQueryEquals(qp, field, field + ":[" + escapeDateString(startDate)
-        + " TO " + escapeDateString(endDate) + "]", "["
-        + getDate(startDate, resolution) + " TO "
-        + getDate(endDateInclusive, resolution) + "]");
-    assertQueryEquals(qp, field, field + ":{" + escapeDateString(startDate)
-        + " TO " + escapeDateString(endDate) + "}", "{"
-        + getDate(startDate, resolution) + " TO "
-        + getDate(endDate, resolution) + "}");
-  }
-
-  public void testEscaped() throws Exception {
-    Analyzer a = new MockAnalyzer(random(), MockTokenizer.WHITESPACE, false);
-
-    assertQueryEquals("a\\-b:c", a, "a-b:c");
-    assertQueryEquals("a\\+b:c", a, "a+b:c");
-    assertQueryEquals("a\\:b:c", a, "a:b:c");
-    assertQueryEquals("a\\\\b:c", a, "a\\b:c");
-
-    assertQueryEquals("a:b\\-c", a, "a:b-c");
-    assertQueryEquals("a:b\\+c", a, "a:b+c");
-    assertQueryEquals("a:b\\:c", a, "a:b:c");
-    assertQueryEquals("a:b\\\\c", a, "a:b\\c");
-
-    assertQueryEquals("a:b\\-c*", a, "a:b-c*");
-    assertQueryEquals("a:b\\+c*", a, "a:b+c*");
-    assertQueryEquals("a:b\\:c*", a, "a:b:c*");
-
-    assertQueryEquals("a:b\\\\c*", a, "a:b\\c*");
-
-    assertQueryEquals("a:b\\-?c", a, "a:b-?c");
-    assertQueryEquals("a:b\\+?c", a, "a:b+?c");
-    assertQueryEquals("a:b\\:?c", a, "a:b:?c");
-
-    assertQueryEquals("a:b\\\\?c", a, "a:b\\?c");
-
-    assertQueryEquals("a:b\\-c~", a, "a:b-c~2");
-    assertQueryEquals("a:b\\+c~", a, "a:b+c~2");
-    assertQueryEquals("a:b\\:c~", a, "a:b:c~2");
-    assertQueryEquals("a:b\\\\c~", a, "a:b\\c~2");
-
-    assertQueryEquals("[ a\\- TO a\\+ ]", null, "[a- TO a+]");
-    assertQueryEquals("[ a\\: TO a\\~ ]", null, "[a: TO a~]");
-    assertQueryEquals("[ a\\\\ TO a\\* ]", null, "[a\\ TO a*]");
-  }
-
-  public void testTabNewlineCarriageReturn() throws Exception {
-    assertQueryEqualsDOA("+weltbank +worlbank", null, "+weltbank +worlbank");
-
-    assertQueryEqualsDOA("+weltbank\n+worlbank", null, "+weltbank +worlbank");
-    assertQueryEqualsDOA("weltbank \n+worlbank", null, "+weltbank +worlbank");
-    assertQueryEqualsDOA("weltbank \n +worlbank", null, "+weltbank +worlbank");
-
-    assertQueryEqualsDOA("+weltbank\r+worlbank", null, "+weltbank +worlbank");
-    assertQueryEqualsDOA("weltbank \r+worlbank", null, "+weltbank +worlbank");
-    assertQueryEqualsDOA("weltbank \r +worlbank", null, "+weltbank +worlbank");
-
-    assertQueryEqualsDOA("+weltbank\r\n+worlbank", null, "+weltbank +worlbank");
-    assertQueryEqualsDOA("weltbank \r\n+worlbank", null, "+weltbank +worlbank");
-    assertQueryEqualsDOA("weltbank \r\n +worlbank", null, "+weltbank +worlbank");
-    assertQueryEqualsDOA("weltbank \r \n +worlbank", null,
-        "+weltbank +worlbank");
-
-    assertQueryEqualsDOA("+weltbank\t+worlbank", null, "+weltbank +worlbank");
-    assertQueryEqualsDOA("weltbank \t+worlbank", null, "+weltbank +worlbank");
-    assertQueryEqualsDOA("weltbank \t +worlbank", null, "+weltbank +worlbank");
-  }
-
-  public void testSimpleDAO() throws Exception {
-    assertQueryEqualsDOA("term term term", null, "+term +term +term");
-    assertQueryEqualsDOA("term +term term", null, "+term +term +term");
-    assertQueryEqualsDOA("term term +term", null, "+term +term +term");
-    assertQueryEqualsDOA("term +term +term", null, "+term +term +term");
-    assertQueryEqualsDOA("-term term term", null, "-term +term +term");
-  }
-
-  public void testBoost() throws Exception {
-    CharacterRunAutomaton stopSet = new CharacterRunAutomaton(BasicAutomata.makeString("on"));
-    Analyzer oneStopAnalyzer = new MockAnalyzer(random(), MockTokenizer.SIMPLE, true, stopSet, true);
-
-    PrecedenceQueryParser qp = new PrecedenceQueryParser();
-    qp.setAnalyzer(oneStopAnalyzer);
-    Query q = qp.parse("on^1.0", "field");
-    assertNotNull(q);
-    q = qp.parse("\"hello\"^2.0", "field");
-    assertNotNull(q);
-    assertEquals(q.getBoost(), (float) 2.0, (float) 0.5);
-    q = qp.parse("hello^2.0", "field");
-    assertNotNull(q);
-    assertEquals(q.getBoost(), (float) 2.0, (float) 0.5);
-    q = qp.parse("\"on\"^1.0", "field");
-    assertNotNull(q);
-
-    q = getParser(new MockAnalyzer(random(), MockTokenizer.SIMPLE, true, MockTokenFilter.ENGLISH_STOPSET, true)).parse("the^3",
-        "field");
-    assertNotNull(q);
-  }
-
-  public void testException() throws Exception {
-    try {
-      assertQueryEquals("\"some phrase", null, "abc");
-      fail("ParseException expected, not thrown");
-    } catch (QueryNodeParseException expected) {
-    }
-  }
-
-  public void testBooleanQuery() throws Exception {
-    BooleanQuery.setMaxClauseCount(2);
-    try {
-      getParser(new MockAnalyzer(random(), MockTokenizer.WHITESPACE, false)).parse("one two three", "field");
-      fail("ParseException expected due to too many boolean clauses");
-    } catch (QueryNodeException expected) {
-      // too many boolean clauses, so ParseException is expected
-    }
-  }
-  
-  // LUCENE-792
-  public void testNOT() throws Exception {
-    Analyzer a = new MockAnalyzer(random(), MockTokenizer.WHITESPACE, false);
-    assertQueryEquals("NOT foo AND bar", a, "-foo +bar");
-  }
-
-  /**
-   * This test differs from the original QueryParser, showing how the precedence
-   * issue has been corrected.
-   */
-  public void testPrecedence() throws Exception {
-    PrecedenceQueryParser parser = getParser(new MockAnalyzer(random(), MockTokenizer.WHITESPACE, false));
-    Query query1 = parser.parse("A AND B OR C AND D", "field");
-    Query query2 = parser.parse("(A AND B) OR (C AND D)", "field");
-    assertEquals(query1, query2);
-
-    query1 = parser.parse("A OR B C", "field");
-    query2 = parser.parse("(A B) C", "field");
-    assertEquals(query1, query2);
-
-    query1 = parser.parse("A AND B C", "field");
-    query2 = parser.parse("(+A +B) C", "field");
-    assertEquals(query1, query2);
-
-    query1 = parser.parse("A AND NOT B", "field");
-    query2 = parser.parse("+A -B", "field");
-    assertEquals(query1, query2);
-
-    query1 = parser.parse("A OR NOT B", "field");
-    query2 = parser.parse("A -B", "field");
-    assertEquals(query1, query2);
-
-    query1 = parser.parse("A OR NOT B AND C", "field");
-    query2 = parser.parse("A (-B +C)", "field");
-    assertEquals(query1, query2);
-    
-    parser.setDefaultOperator(StandardQueryConfigHandler.Operator.AND);
-    query1 = parser.parse("A AND B OR C AND D", "field");
-    query2 = parser.parse("(A AND B) OR (C AND D)", "field");
-    assertEquals(query1, query2);
-
-    query1 = parser.parse("A AND B C", "field");
-    query2 = parser.parse("(A B) C", "field");
-    assertEquals(query1, query2);
-
-    query1 = parser.parse("A AND B C", "field");
-    query2 = parser.parse("(+A +B) C", "field");
-    assertEquals(query1, query2);
-
-    query1 = parser.parse("A AND NOT B", "field");
-    query2 = parser.parse("+A -B", "field");
-    assertEquals(query1, query2);
-
-    query1 = parser.parse("A AND NOT B OR C", "field");
-    query2 = parser.parse("(+A -B) OR C", "field");
-    assertEquals(query1, query2);
-    
-  }
-
-  @Override
-  public void tearDown() throws Exception {
-    BooleanQuery.setMaxClauseCount(originalMaxClauses);
-    super.tearDown();
-  }
-
 }

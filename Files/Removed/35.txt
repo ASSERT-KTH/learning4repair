@@ -1,11 +1,10 @@
 /**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -15,715 +14,272 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.cassandra.service;
 
-import java.io.IOError;
+package org.apache.mahout.vectorizer.collocations.llr;
+
 import java.io.IOException;
-import java.util.*;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
-import java.util.concurrent.Callable;
-import java.util.concurrent.Future;
-import java.lang.management.ManagementFactory;
+import java.util.List;
+import java.util.Map;
 
-import org.apache.commons.lang.StringUtils;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.DoubleWritable;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.Mapper;
+import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.input.SequenceFileInputFormat;
+import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+import org.apache.hadoop.mapreduce.lib.output.SequenceFileOutputFormat;
+import org.apache.hadoop.util.ToolRunner;
+import org.apache.lucene.analysis.Analyzer;
+import org.apache.lucene.analysis.standard.StandardAnalyzer;
+import org.apache.mahout.common.AbstractJob;
+import org.apache.mahout.common.ClassUtils;
+import org.apache.mahout.common.HadoopUtil;
+import org.apache.mahout.common.commandline.DefaultOptionCreator;
+import org.apache.mahout.common.lucene.AnalyzerUtils;
+import org.apache.mahout.vectorizer.DocumentProcessor;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.db.*;
-import org.apache.cassandra.io.DataInputBuffer;
-import java.net.InetAddress;
-import org.apache.cassandra.net.IAsyncResult;
-import org.apache.cassandra.net.Message;
-import org.apache.cassandra.net.MessagingService;
-import org.apache.cassandra.utils.TimedStatsDeque;
-import org.apache.cassandra.utils.FBUtilities;
-import org.apache.cassandra.utils.Pair;
-import org.apache.cassandra.locator.TokenMetadata;
-import org.apache.cassandra.dht.IPartitioner;
-import org.apache.cassandra.dht.Range;
-import org.apache.cassandra.dht.Token;
-import org.apache.cassandra.gms.FailureDetector;
-import org.apache.cassandra.concurrent.StageManager;
+/** Driver for LLR Collocation discovery mapreduce job */
+public final class CollocDriver extends AbstractJob {
+  //public static final String DEFAULT_OUTPUT_DIRECTORY = "output";
 
-import org.apache.log4j.Logger;
+  public static final String SUBGRAM_OUTPUT_DIRECTORY = "subgrams";
 
-import javax.management.MBeanServer;
-import javax.management.ObjectName;
+  public static final String NGRAM_OUTPUT_DIRECTORY = "ngrams";
 
+  public static final String EMIT_UNIGRAMS = "emit-unigrams";
 
-public class StorageProxy implements StorageProxyMBean
-{
-    private static Logger logger = Logger.getLogger(StorageProxy.class);
+  public static final boolean DEFAULT_EMIT_UNIGRAMS = false;
 
-    // mbean stuff
-    private static TimedStatsDeque readStats = new TimedStatsDeque(60000);
-    private static TimedStatsDeque rangeStats = new TimedStatsDeque(60000);
-    private static TimedStatsDeque writeStats = new TimedStatsDeque(60000);
+  private static final int DEFAULT_MAX_NGRAM_SIZE = 2;
 
-    private StorageProxy() {}
-    static
-    {
-        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
-        try
-        {
-            mbs.registerMBean(new StorageProxy(), new ObjectName("org.apache.cassandra.service:type=StorageProxy"));
-        }
-        catch (Exception e)
-        {
-            throw new RuntimeException(e);
-        }
+  private static final int DEFAULT_PASS1_NUM_REDUCE_TASKS = 1;
+
+  private static final Logger log = LoggerFactory.getLogger(CollocDriver.class);
+
+  public static void main(String[] args) throws Exception {
+    ToolRunner.run(new CollocDriver(), args);
+  }
+
+  @Override
+  public int run(String[] args) throws Exception {
+    addInputOption();
+    addOutputOption();
+    addOption(DefaultOptionCreator.numReducersOption().create());
+
+    addOption("maxNGramSize",
+              "ng",
+              "(Optional) The max size of ngrams to create (2 = bigrams, 3 = trigrams, etc) default: 2",
+              String.valueOf(DEFAULT_MAX_NGRAM_SIZE));
+    addOption("minSupport", "s", "(Optional) Minimum Support. Default Value: "
+        + CollocReducer.DEFAULT_MIN_SUPPORT, String.valueOf(CollocReducer.DEFAULT_MIN_SUPPORT));
+    addOption("minLLR", "ml", "(Optional)The minimum Log Likelihood Ratio(Float)  Default is "
+        + LLRReducer.DEFAULT_MIN_LLR, String.valueOf(LLRReducer.DEFAULT_MIN_LLR));
+    addOption(DefaultOptionCreator.overwriteOption().create());
+    addOption("analyzerName", "a", "The class name of the analyzer to use for preprocessing", null);
+
+    addFlag("preprocess", "p", "If set, input is SequenceFile<Text,Text> where the value is the document, "
+        + " which will be tokenized using the specified analyzer.");
+    addFlag("unigram", "u", "If set, unigrams will be emitted in the final output alongside collocations");
+
+    Map<String, List<String>> argMap = parseArguments(args);
+
+    if (argMap == null) {
+      return -1;
     }
 
-    private static Comparator<String> keyComparator = new Comparator<String>()
-    {
-        public int compare(String o1, String o2)
-        {
-            IPartitioner p = StorageService.getPartitioner();
-            return p.getDecoratedKeyComparator().compare(p.decorateKey(o1), p.decorateKey(o2));
-        }
-    };
+    Path input = getInputPath();
+    Path output = getOutputPath();
 
-    private static Comparator<Row> rowComparator = new Comparator<Row>()
-    {
-        public int compare(Row r1, Row r2)
-        {
-            return keyComparator.compare(r1.key, r2.key);
-        }
-    };
-
-    /**
-     * Use this method to have this RowMutation applied
-     * across all replicas. This method will take care
-     * of the possibility of a replica being down and hint
-     * the data across to some other replica.
-     *
-     * This is the ZERO consistency level. We do not wait for replies.
-     *
-     * @param rm the mutation to be applied across the replicas
-    */
-    public static void insert(final RowMutation rm)
-    {
-        long startTime = System.currentTimeMillis();
-        try
-        {
-            List<InetAddress> naturalEndpoints = StorageService.instance().getNaturalEndpoints(rm.key());
-            Map<InetAddress, InetAddress> endpointMap = StorageService.instance().getHintedEndpointMap(rm.key(), naturalEndpoints);
-            Message unhintedMessage = null; // lazy initialize for non-local, unhinted writes
-
-            // 3 cases:
-            // 1. local, unhinted write: run directly on write stage
-            // 2. non-local, unhinted write: send row mutation message
-            // 3. hinted write: add hint header, and send message
-            for (Map.Entry<InetAddress, InetAddress> entry : endpointMap.entrySet())
-            {
-                InetAddress target = entry.getKey();
-                InetAddress hintedTarget = entry.getValue();
-                if (target.equals(hintedTarget))
-                {
-                    if (target.equals(FBUtilities.getLocalAddress()))
-                    {
-                        if (logger.isDebugEnabled())
-                            logger.debug("insert writing local key " + rm.key());
-                        Runnable runnable = new Runnable()
-                        {
-                            public void run()
-                            {
-                                try
-                                {
-                                    rm.apply();
-                                }
-                                catch (IOException e)
-                                {
-                                    throw new IOError(e);
-                                }
-                            }
-                        };
-                        StageManager.getStage(StageManager.mutationStage_).execute(runnable);
-                    }
-                    else
-                    {
-                        if (unhintedMessage == null)
-                            unhintedMessage = rm.makeRowMutationMessage();
-                        if (logger.isDebugEnabled())
-                            logger.debug("insert writing key " + rm.key() + " to " + unhintedMessage.getMessageId() + "@" + target);
-                        MessagingService.instance().sendOneWay(unhintedMessage, target);
-                    }
-                }
-                else
-                {
-                    Message hintedMessage = rm.makeRowMutationMessage();
-                    hintedMessage.addHeader(RowMutation.HINT, target.getAddress());
-                    if (logger.isDebugEnabled())
-                        logger.debug("insert writing key " + rm.key() + " to " + unhintedMessage.getMessageId() + "@" + hintedTarget + " for " + target);
-                    MessagingService.instance().sendOneWay(hintedMessage, hintedTarget);
-                }
-            }
-        }
-        catch (IOException e)
-        {
-            throw new RuntimeException("error inserting key " + rm.key(), e);
-        }
-        finally
-        {
-            writeStats.add(System.currentTimeMillis() - startTime);
-        }
+    int maxNGramSize = DEFAULT_MAX_NGRAM_SIZE;
+    if (hasOption("maxNGramSize")) {
+      try {
+        maxNGramSize = Integer.parseInt(getOption("maxNGramSize"));
+      } catch (NumberFormatException ex) {
+        log.warn("Could not parse ngram size option");
+      }
     }
+    log.info("Maximum n-gram size is: {}", maxNGramSize);
+
+    if (hasOption(DefaultOptionCreator.OVERWRITE_OPTION)) {
+      HadoopUtil.delete(getConf(), output);
+    }
+
+    int minSupport = CollocReducer.DEFAULT_MIN_SUPPORT;
+    if (getOption("minSupport") != null) {
+      minSupport = Integer.parseInt(getOption("minSupport"));
+    }
+    log.info("Minimum Support value: {}", minSupport);
+
+    float minLLRValue = LLRReducer.DEFAULT_MIN_LLR;
+    if (getOption("minLLR") != null) {
+      minLLRValue = Float.parseFloat(getOption("minLLR"));
+    }
+    log.info("Minimum LLR value: {}", minLLRValue);
+
+    int reduceTasks = DEFAULT_PASS1_NUM_REDUCE_TASKS;
+    if (getOption("maxRed") != null) {
+      reduceTasks = Integer.parseInt(getOption("maxRed"));
+    }
+    log.info("Number of pass1 reduce tasks: {}", reduceTasks);
+
+    boolean emitUnigrams = argMap.containsKey("emitUnigrams");
+
+    if (argMap.containsKey("preprocess")) {
+      log.info("Input will be preprocessed");
+      Class<? extends Analyzer> analyzerClass = StandardAnalyzer.class;
+      if (getOption("analyzerName") != null) {
+        String className = getOption("analyzerName");
+        analyzerClass = Class.forName(className).asSubclass(Analyzer.class);
+        // try instantiating it, b/c there isn't any point in setting it if
+        // you can't instantiate it
+        AnalyzerUtils.createAnalyzer(analyzerClass);
+      }
+
+      Path tokenizedPath = new Path(output, DocumentProcessor.TOKENIZED_DOCUMENT_OUTPUT_FOLDER);
+
+      DocumentProcessor.tokenizeDocuments(input, analyzerClass, tokenizedPath, getConf());
+      input = tokenizedPath;
+    } else {
+      log.info("Input will NOT be preprocessed");
+    }
+
+    // parse input and extract collocations
+    long ngramCount =
+      generateCollocations(input, output, getConf(), emitUnigrams, maxNGramSize, reduceTasks, minSupport);
+
+    // tally collocations and perform LLR calculation
+    computeNGramsPruneByLLR(output, getConf(), ngramCount, emitUnigrams, minLLRValue, reduceTasks);
+
+    return 0;
+  }
+
+  /**
+   * Generate all ngrams for the {@link org.apache.mahout.vectorizer.DictionaryVectorizer} job
+   * 
+   * @param input
+   *          input path containing tokenized documents
+   * @param output
+   *          output path where ngrams are generated including unigrams
+   * @param baseConf
+   *          job configuration
+   * @param maxNGramSize
+   *          minValue = 2.
+   * @param minSupport
+   *          minimum support to prune ngrams including unigrams
+   * @param minLLRValue
+   *          minimum threshold to prune ngrams
+   * @param reduceTasks
+   *          number of reducers used
+   */
+  public static void generateAllGrams(Path input,
+                                      Path output,
+                                      Configuration baseConf,
+                                      int maxNGramSize,
+                                      int minSupport,
+                                      float minLLRValue,
+                                      int reduceTasks)
+    throws IOException, InterruptedException, ClassNotFoundException {
+    // parse input and extract collocations
+    long ngramCount = generateCollocations(input, output, baseConf, true, maxNGramSize, reduceTasks, minSupport);
+
+    // tally collocations and perform LLR calculation
+    computeNGramsPruneByLLR(output, baseConf, ngramCount, true, minLLRValue, reduceTasks);
+  }
+
+  /**
+   * pass1: generate collocations, ngrams
+   */
+  private static long generateCollocations(Path input,
+                                           Path output,
+                                           Configuration baseConf,
+                                           boolean emitUnigrams,
+                                           int maxNGramSize,
+                                           int reduceTasks,
+                                           int minSupport)
+    throws IOException, ClassNotFoundException, InterruptedException {
+
+    Configuration con = new Configuration(baseConf);
+    con.setBoolean(EMIT_UNIGRAMS, emitUnigrams);
+    con.setInt(CollocMapper.MAX_SHINGLE_SIZE, maxNGramSize);
+    con.setInt(CollocReducer.MIN_SUPPORT, minSupport);
     
-    public static void insertBlocking(final RowMutation rm, int consistency_level) throws UnavailableException, TimedOutException
-    {
-        long startTime = System.currentTimeMillis();
-        try
-        {
-            List<InetAddress> naturalEndpoints = StorageService.instance().getNaturalEndpoints(rm.key());
-            Map<InetAddress, InetAddress> endpointMap = StorageService.instance().getHintedEndpointMap(rm.key(), naturalEndpoints);
-            int blockFor = determineBlockFor(naturalEndpoints.size(), endpointMap.size(), consistency_level);
+    Job job = new Job(con);
+    job.setJobName(CollocDriver.class.getSimpleName() + ".generateCollocations:" + input);
+    job.setJarByClass(CollocDriver.class);
+    
+    job.setMapOutputKeyClass(GramKey.class);
+    job.setMapOutputValueClass(Gram.class);
+    job.setPartitionerClass(GramKeyPartitioner.class);
+    job.setGroupingComparatorClass(GramKeyGroupComparator.class);
 
-            // avoid starting a write we know can't achieve the required consistency
-            int liveNodes = 0;
-            for (Map.Entry<InetAddress, InetAddress> entry : endpointMap.entrySet())
-            {
-                if (entry.getKey().equals(entry.getValue()))
-                {
-                    liveNodes++;
-                }
-            }
-            if (liveNodes < blockFor)
-            {
-                throw new UnavailableException();
-            }
+    job.setOutputKeyClass(Gram.class);
+    job.setOutputValueClass(Gram.class);
 
-            // send out the writes, as in insert() above, but this time with a callback that tracks responses
-            final WriteResponseHandler responseHandler = StorageService.instance().getWriteResponseHandler(blockFor, consistency_level);
-            Message unhintedMessage = null;
-            for (Map.Entry<InetAddress, InetAddress> entry : endpointMap.entrySet())
-            {
-                InetAddress target = entry.getKey();
-                InetAddress hintedTarget = entry.getValue();
+    job.setCombinerClass(CollocCombiner.class);
 
-                if (target.equals(hintedTarget))
-                {
-                    if (target.equals(FBUtilities.getLocalAddress()))
-                    {
-                        if (logger.isDebugEnabled())
-                            logger.debug("insert writing local key " + rm.key());
-                        Runnable runnable = new Runnable()
-                        {
-                            public void run()
-                            {
-                                try
-                                {
-                                    rm.apply();
-                                    responseHandler.localResponse();
-                                }
-                                catch (IOException e)
-                                {
-                                    throw new IOError(e);
-                                }
-                            }
-                        };
-                        StageManager.getStage(StageManager.mutationStage_).execute(runnable);
-                    }
-                    else
-                    {
-                        if (unhintedMessage == null)
-                        {
-                            unhintedMessage = rm.makeRowMutationMessage();
-                            MessagingService.instance().addCallback(responseHandler, unhintedMessage.getMessageId());
-                        }
-                        if (logger.isDebugEnabled())
-                            logger.debug("insert writing key " + rm.key() + " to " + unhintedMessage.getMessageId() + "@" + target);
-                        MessagingService.instance().sendOneWay(unhintedMessage, target);
-                    }
-                }
-                else
-                {
-                    // (hints aren't part of the callback since they don't count towards consistency until they are on the final destination node)
-                    Message hintedMessage = rm.makeRowMutationMessage();
-                    hintedMessage.addHeader(RowMutation.HINT, target.getAddress());
-                    if (logger.isDebugEnabled())
-                        logger.debug("insert writing key " + rm.key() + " to " + hintedMessage.getMessageId() + "@" + hintedTarget + " for " + target);
-                    MessagingService.instance().sendOneWay(hintedMessage, hintedTarget);
-                }
-            }
+    FileInputFormat.setInputPaths(job, input);
 
-            // wait for writes.  throws timeoutexception if necessary
-            responseHandler.get();
-        }
-        catch (TimeoutException e)
-        {
-            throw new TimedOutException();
-        }
-        catch (IOException e)
-        {
-            throw new RuntimeException("error writing key " + rm.key(), e);
-        }
-        finally
-        {
-            writeStats.add(System.currentTimeMillis() - startTime);
-        }
+    Path outputPath = new Path(output, SUBGRAM_OUTPUT_DIRECTORY);
+    FileOutputFormat.setOutputPath(job, outputPath);
+
+    job.setInputFormatClass(SequenceFileInputFormat.class);
+    job.setMapperClass(CollocMapper.class);
+
+    job.setOutputFormatClass(SequenceFileOutputFormat.class);
+    job.setReducerClass(CollocReducer.class);
+    job.setNumReduceTasks(reduceTasks);
+    
+    boolean succeeded = job.waitForCompletion(true);
+    if (!succeeded) {
+      throw new IllegalStateException("Job failed!");
     }
 
-    private static int determineBlockFor(int naturalTargets, int hintedTargets, int consistency_level)
-    {
-        assert naturalTargets >= 1;
-        assert hintedTargets >= naturalTargets;
+    return job.getCounters().findCounter(CollocMapper.Count.NGRAM_TOTAL).getValue();
+  }
 
-        int bootstrapTargets = hintedTargets - naturalTargets;
-        int blockFor;
-        if (consistency_level == ConsistencyLevel.ONE)
-        {
-            blockFor = 1 + bootstrapTargets;
-        }
-        else if (consistency_level == ConsistencyLevel.QUORUM)
-        {
-            blockFor = (naturalTargets / 2) + 1 + bootstrapTargets;
-        }
-        else if (consistency_level == ConsistencyLevel.DCQUORUM || consistency_level == ConsistencyLevel.DCQUORUMSYNC)
-        {
-            // TODO this is broken
-            blockFor = naturalTargets;
-        }
-        else if (consistency_level == ConsistencyLevel.ALL)
-        {
-            blockFor = naturalTargets + bootstrapTargets;
-        }
-        else
-        {
-            throw new UnsupportedOperationException("invalid consistency level " + consistency_level);
-        }
-        return blockFor;
-    }    
+  /**
+   * pass2: perform the LLR calculation
+   */
+  private static void computeNGramsPruneByLLR(Path output,
+                                              Configuration baseConf,
+                                              long nGramTotal,
+                                              boolean emitUnigrams,
+                                              float minLLRValue,
+                                              int reduceTasks)
+    throws IOException, InterruptedException, ClassNotFoundException {
+    Configuration conf = new Configuration(baseConf);
+    conf.setLong(LLRReducer.NGRAM_TOTAL, nGramTotal);
+    conf.setBoolean(EMIT_UNIGRAMS, emitUnigrams);
+    conf.setFloat(LLRReducer.MIN_LLR, minLLRValue);
 
-    /**
-     * Read the data from one replica.  If there is no reply, read the data from another.  In the event we get
-     * the data we perform consistency checks and figure out if any repairs need to be done to the replicas.
-     * @param commands a set of commands to perform reads
-     * @return the row associated with command.key
-     * @throws Exception
-     */
-    private static List<Row> weakReadRemote(List<ReadCommand> commands) throws IOException, UnavailableException, TimedOutException
-    {
-        if (logger.isDebugEnabled())
-            logger.debug("weakreadremote reading " + StringUtils.join(commands, ", "));
+    Job job = new Job(conf);
+    job.setJobName(CollocDriver.class.getSimpleName() + ".computeNGrams: " + output);
+    job.setJarByClass(CollocDriver.class);
+    
+    job.setMapOutputKeyClass(Gram.class);
+    job.setMapOutputValueClass(Gram.class);
 
-        List<Row> rows = new ArrayList<Row>();
-        List<IAsyncResult> iars = new ArrayList<IAsyncResult>();
-        int commandIndex = 0;
+    job.setOutputKeyClass(Text.class);
+    job.setOutputValueClass(DoubleWritable.class);
 
-        for (ReadCommand command: commands)
-        {
-            InetAddress endPoint = StorageService.instance().findSuitableEndPoint(command.key);
-            Message message = command.makeReadMessage();
+    FileInputFormat.setInputPaths(job, new Path(output, SUBGRAM_OUTPUT_DIRECTORY));
+    Path outPath = new Path(output, NGRAM_OUTPUT_DIRECTORY);
+    FileOutputFormat.setOutputPath(job, outPath);
 
-            if (logger.isDebugEnabled())
-                logger.debug("weakreadremote reading " + command + " from " + message.getMessageId() + "@" + endPoint);
-            message.addHeader(ReadCommand.DO_REPAIR, ReadCommand.DO_REPAIR.getBytes());
-            iars.add(MessagingService.instance().sendRR(message, endPoint));
-        }
+    job.setMapperClass(Mapper.class);
+    job.setInputFormatClass(SequenceFileInputFormat.class);
+    job.setOutputFormatClass(SequenceFileOutputFormat.class);
+    job.setReducerClass(LLRReducer.class);
+    job.setNumReduceTasks(reduceTasks);
 
-        for (IAsyncResult iar: iars)
-        {
-            byte[] body;
-            try
-            {
-                body = iar.get(DatabaseDescriptor.getRpcTimeout(), TimeUnit.MILLISECONDS);
-            }
-            catch (TimeoutException e)
-            {
-                throw new TimedOutException();
-            }
-            DataInputBuffer bufIn = new DataInputBuffer();
-            bufIn.reset(body, body.length);
-            ReadResponse response = ReadResponse.serializer().deserialize(bufIn);
-            if (response.row() != null)
-                rows.add(response.row());
-            commandIndex++;
-        }
-        return rows;
+    boolean succeeded = job.waitForCompletion(true);
+    if (!succeeded) {
+      throw new IllegalStateException("Job failed!");
     }
-
-    /**
-     * Performs the actual reading of a row out of the StorageService, fetching
-     * a specific set of column names from a given column family.
-     */
-    public static List<Row> readProtocol(List<ReadCommand> commands, int consistency_level)
-            throws IOException, UnavailableException, TimedOutException
-    {
-        long startTime = System.currentTimeMillis();
-
-        List<Row> rows = new ArrayList<Row>();
-
-        if (consistency_level == ConsistencyLevel.ONE)
-        {
-            List<ReadCommand> localCommands = new ArrayList<ReadCommand>();
-            List<ReadCommand> remoteCommands = new ArrayList<ReadCommand>();
-
-            for (ReadCommand command: commands)
-            {
-                List<InetAddress> endpoints = StorageService.instance().getNaturalEndpoints(command.key);
-                boolean foundLocal = endpoints.contains(FBUtilities.getLocalAddress());
-                //TODO: Throw InvalidRequest if we're in bootstrap mode?
-                if (foundLocal && !StorageService.instance().isBootstrapMode())
-                {
-                    localCommands.add(command);
-                }
-                else
-                {
-                    remoteCommands.add(command);
-                }
-            }
-            if (localCommands.size() > 0)
-                rows.addAll(weakReadLocal(localCommands));
-
-            if (remoteCommands.size() > 0)
-                rows.addAll(weakReadRemote(remoteCommands));
-        }
-        else
-        {
-            assert consistency_level >= ConsistencyLevel.QUORUM;
-            rows = strongRead(commands, consistency_level);
-        }
-
-        readStats.add(System.currentTimeMillis() - startTime);
-
-        return rows;
-    }
-
-    /*
-     * This function executes the read protocol.
-        // 1. Get the N nodes from storage service where the data needs to be
-        // replicated
-        // 2. Construct a message for read\write
-         * 3. Set one of the messages to get the data and the rest to get the digest
-        // 4. SendRR ( to all the nodes above )
-        // 5. Wait for a response from at least X nodes where X <= N and the data node
-         * 6. If the digest matches return the data.
-         * 7. else carry out read repair by getting data from all the nodes.
-        // 5. return success
-     */
-    private static List<Row> strongRead(List<ReadCommand> commands, int consistency_level) throws IOException, UnavailableException, TimedOutException
-    {
-        List<QuorumResponseHandler<Row>> quorumResponseHandlers = new ArrayList<QuorumResponseHandler<Row>>();
-        List<InetAddress[]> commandEndPoints = new ArrayList<InetAddress[]>();
-        List<Row> rows = new ArrayList<Row>();
-
-        int commandIndex = 0;
-
-        for (ReadCommand command: commands)
-        {
-            // TODO: throw a thrift exception if we do not have N nodes
-            assert !command.isDigestQuery();
-            ReadCommand readMessageDigestOnly = command.copy();
-            readMessageDigestOnly.setDigestQuery(true);
-            Message message = command.makeReadMessage();
-            Message messageDigestOnly = readMessageDigestOnly.makeReadMessage();
-
-            InetAddress dataPoint = StorageService.instance().findSuitableEndPoint(command.key);
-            List<InetAddress> endpointList = StorageService.instance().getNaturalEndpoints(command.key);
-
-            InetAddress[] endPoints = new InetAddress[endpointList.size()];
-            Message messages[] = new Message[endpointList.size()];
-            /*
-             * data-request message is sent to dataPoint, the node that will actually get
-             * the data for us. The other replicas are only sent a digest query.
-            */
-            int n = 0;
-            for (InetAddress endpoint : endpointList)
-            {
-                if (!FailureDetector.instance().isAlive(endpoint))
-                    continue;
-                Message m = endpoint.equals(dataPoint) ? message : messageDigestOnly;
-                endPoints[n] = endpoint;
-                messages[n++] = m;
-                if (logger.isDebugEnabled())
-                    logger.debug("strongread reading " + (m == message ? "data" : "digest") + " for " + command + " from " + m.getMessageId() + "@" + endpoint);
-            }
-            if (n < DatabaseDescriptor.getQuorum())
-                throw new UnavailableException();
-            QuorumResponseHandler<Row> quorumResponseHandler = new QuorumResponseHandler<Row>(DatabaseDescriptor.getQuorum(), new ReadResponseResolver(command.table, DatabaseDescriptor.getQuorum()));
-            MessagingService.instance().sendRR(messages, endPoints, quorumResponseHandler);
-            quorumResponseHandlers.add(quorumResponseHandler);
-            commandEndPoints.add(endPoints);
-        }
-
-        for (QuorumResponseHandler<Row> quorumResponseHandler: quorumResponseHandlers)
-        {
-            Row row;
-            ReadCommand command = commands.get(commandIndex);
-            try
-            {
-                long startTime2 = System.currentTimeMillis();
-                row = quorumResponseHandler.get();
-                if (row != null)
-                    rows.add(row);
-
-                if (logger.isDebugEnabled())
-                    logger.debug("quorumResponseHandler: " + (System.currentTimeMillis() - startTime2) + " ms.");
-            }
-            catch (TimeoutException e)
-            {
-                throw new TimedOutException();
-            }
-            catch (DigestMismatchException ex)
-            {
-                if (DatabaseDescriptor.getConsistencyCheck())
-                {
-                    IResponseResolver<Row> readResponseResolverRepair = new ReadResponseResolver(command.table, DatabaseDescriptor.getQuorum());
-                    QuorumResponseHandler<Row> quorumResponseHandlerRepair = new QuorumResponseHandler<Row>(
-                            DatabaseDescriptor.getQuorum(),
-                            readResponseResolverRepair);
-                    logger.info("DigestMismatchException: " + ex.getMessage());
-                    Message messageRepair = command.makeReadMessage();
-                    MessagingService.instance().sendRR(messageRepair, commandEndPoints.get(commandIndex), quorumResponseHandlerRepair);
-                    try
-                    {
-                        row = quorumResponseHandlerRepair.get();
-                        if (row != null)
-                            rows.add(row);
-                    }
-                    catch (TimeoutException e)
-                    {
-                        throw new TimedOutException();
-                    }
-                    catch (DigestMismatchException e)
-                    {
-                        // TODO should this be a thrift exception?
-                        throw new RuntimeException("digest mismatch reading key " + command.key, e);
-                    }
-                }
-            }
-            commandIndex++;
-        }
-
-        return rows;
-    }
-
-    /*
-    * This function executes the read protocol locally and should be used only if consistency is not a concern.
-    * Read the data from the local disk and return if the row is NOT NULL. If the data is NULL do the read from
-    * one of the other replicas (in the same data center if possible) till we get the data. In the event we get
-    * the data we perform consistency checks and figure out if any repairs need to be done to the replicas.
-    */
-    private static List<Row> weakReadLocal(List<ReadCommand> commands)
-    {
-        List<Row> rows = new ArrayList<Row>();
-        List<Future<Object>> futures = new ArrayList<Future<Object>>();
-
-        for (ReadCommand command: commands)
-        {
-            Callable<Object> callable = new weakReadLocalCallable(command);
-            futures.add(StageManager.getStage(StageManager.readStage_).execute(callable));
-        }
-        for (Future<Object> future : futures)
-        {
-            Row row;
-            try
-            {
-                row = (Row) future.get();
-            }
-            catch (Exception e)
-            {
-                throw new RuntimeException(e);
-            }
-            rows.add(row);
-        }
-        return rows;
-    }
-
-    static List<Pair<String, Collection<IColumn>>> getRangeSlice(RangeSliceCommand command, int consistency_level) throws IOException, UnavailableException, TimedOutException
-    {
-        long startTime = System.currentTimeMillis();
-        TokenMetadata tokenMetadata = StorageService.instance().getTokenMetadata();
-
-        InetAddress endPoint = StorageService.instance().getPrimary(command.startKey.token);
-        InetAddress startEndpoint = endPoint;
-        int responseCount = determineBlockFor(DatabaseDescriptor.getReplicationFactor(), DatabaseDescriptor.getReplicationFactor(), consistency_level);
-
-        Map<String, ColumnFamily> rows = new HashMap<String, ColumnFamily>(command.max_keys);
-        do
-        {
-            Range primaryRange = StorageService.instance().getPrimaryRangeForEndPoint(endPoint);
-            List<InetAddress> endpoints = StorageService.instance().getLiveNaturalEndpoints(primaryRange.right());
-            if (endpoints.size() < responseCount)
-                throw new UnavailableException();
-
-            // to make comparing the results from each node easy, we restrict each command to the data in the primary range for this iteration
-            IPartitioner<?> p = StorageService.getPartitioner();
-            DecoratedKey startKey;
-            DecoratedKey finishKey;
-            if (primaryRange.left().equals(primaryRange.right()))
-            {
-                startKey = command.startKey;
-                finishKey = command.finishKey;
-            }
-            else
-            {
-                startKey = Collections.max(Arrays.asList(command.startKey, new DecoratedKey(primaryRange.left(), null)));
-                finishKey = command.finishKey.isEmpty()
-                                       ? new DecoratedKey(primaryRange.right(), null)
-                                       : Collections.min(Arrays.asList(command.finishKey, new DecoratedKey(primaryRange.right(), null)));
-            }
-            RangeSliceCommand c2 = new RangeSliceCommand(command.keyspace, command.column_family, command.super_column, command.predicate, startKey, finishKey, command.max_keys);
-            Message message = c2.getMessage();
-
-            // collect replies and resolve according to consistency level
-            RangeSliceResponseResolver resolver = new RangeSliceResponseResolver(command.keyspace, primaryRange, endpoints);
-            QuorumResponseHandler<Map<String, ColumnFamily>> handler = new QuorumResponseHandler<Map<String, ColumnFamily>>(responseCount, resolver);
-            if (logger.isDebugEnabled())
-                logger.debug("reading " + command + " for " + primaryRange + " from " + message.getMessageId() + "@" + endPoint);
-            for (InetAddress replicaEndpoint : endpoints)
-            {
-                MessagingService.instance().sendRR(message, replicaEndpoint, handler);
-            }
-
-            // if we're done, great, otherwise, move to the next range
-            try
-            {
-                rows.putAll(handler.get());
-            }
-            catch (TimeoutException e)
-            {
-                throw new TimedOutException();
-            }
-            catch (DigestMismatchException e)
-            {
-                throw new AssertionError(e); // no digests in range slices yet
-            }
-            if (rows.size() >= command.max_keys || resolver.completed())
-                break;
-
-            endPoint = tokenMetadata.getSuccessor(endPoint);
-        }
-        while (!endPoint.equals(startEndpoint));
-
-        List<Pair<String, Collection<IColumn>>> results = new ArrayList<Pair<String, Collection<IColumn>>>(rows.size());
-        for (Map.Entry<String, ColumnFamily> entry : rows.entrySet())
-        {
-            ColumnFamily cf = entry.getValue();
-            Collection<IColumn> columns = (cf == null) ? Collections.<IColumn>emptyList() : cf.getSortedColumns();
-            results.add(new Pair<String, Collection<IColumn>>(entry.getKey(), columns));
-        }
-        Collections.sort(results, new Comparator<Pair<String, Collection<IColumn>>>()
-        {
-            public int compare(Pair<String, Collection<IColumn>> o1, Pair<String, Collection<IColumn>> o2)
-            {
-                return keyComparator.compare(o1.left, o2.left);
-            }
-        });
-        rangeStats.add(System.currentTimeMillis() - startTime);
-        return results;
-    }
-
-    static List<String> getKeyRange(RangeCommand command) throws IOException, UnavailableException, TimedOutException
-    {
-        long startTime = System.currentTimeMillis();
-        TokenMetadata tokenMetadata = StorageService.instance().getTokenMetadata();
-        Set<String> uniqueKeys = new HashSet<String>(command.maxResults);
-
-        InetAddress endPoint = StorageService.instance().findSuitableEndPoint(command.startWith);
-        InetAddress startEndpoint = endPoint;
-
-        do
-        {
-            Message message = command.getMessage();
-            if (logger.isDebugEnabled())
-                logger.debug("reading " + command + " from " + message.getMessageId() + "@" + endPoint);
-            IAsyncResult iar = MessagingService.instance().sendRR(message, endPoint);
-
-            // read response
-            byte[] responseBody;
-            try
-            {
-                responseBody = iar.get(DatabaseDescriptor.getRpcTimeout(), TimeUnit.MILLISECONDS);
-            }
-            catch (TimeoutException e)
-            {
-                throw new TimedOutException();
-            }
-            RangeReply rangeReply = RangeReply.read(responseBody);
-            uniqueKeys.addAll(rangeReply.keys);
-
-            if (uniqueKeys.size() >= command.maxResults || rangeReply.rangeCompletedLocally)
-            {
-                break;
-            }
-
-            // set up the next query --
-            // it's tempting to try to optimize this by starting with the last key seen for the next node,
-            // but that won't work when you have a replication factor of more than one--any node, not just
-            // the one holding the keys where the range wraps, could include both the smallest keys, and the largest,
-            // so starting with the largest in our scan of the next node means we'd never see keys from the middle.
-            do
-            {
-                endPoint = tokenMetadata.getSuccessor(endPoint);
-            } while (!FailureDetector.instance().isAlive(endPoint));
-        } while (!endPoint.equals(startEndpoint));
-
-        rangeStats.add(System.currentTimeMillis() - startTime);
-        List<String> allKeys = new ArrayList<String>(uniqueKeys);
-        Collections.sort(allKeys, keyComparator);
-        return (allKeys.size() > command.maxResults)
-               ? allKeys.subList(0, command.maxResults)
-               : allKeys;
-    }
-
-    public double getReadLatency()
-    {
-        return readStats.mean();
-    }
-
-    public double getRangeLatency()
-    {
-        return rangeStats.mean();
-    }
-
-    public double getWriteLatency()
-    {
-        return writeStats.mean();
-    }
-
-    public int getReadOperations()
-    {
-        return readStats.size();
-    }
-
-    public int getRangeOperations()
-    {
-        return rangeStats.size();
-    }
-
-    public int getWriteOperations()
-    {
-        return writeStats.size();
-    }
-
-    static class weakReadLocalCallable implements Callable<Object>
-    {
-        private ReadCommand command;
-
-        weakReadLocalCallable(ReadCommand command)
-        {
-            this.command = command;
-        }
-
-        public Object call() throws IOException
-        {
-            List<InetAddress> endpoints = StorageService.instance().getLiveNaturalEndpoints(command.key);
-            /* Remove the local storage endpoint from the list. */
-            endpoints.remove(FBUtilities.getLocalAddress());
-            // TODO: throw a thrift exception if we do not have N nodes
-
-            if (logger.isDebugEnabled())
-                logger.debug("weakreadlocal reading " + command);
-
-            Table table = Table.open(command.table);
-            Row row = command.getRow(table);
-
-            // Do the consistency checks in the background and return the non NULL row
-            if (endpoints.size() > 0 && DatabaseDescriptor.getConsistencyCheck())
-                StorageService.instance().doConsistencyCheck(row, endpoints, command);
-
-            return row;
-        }
-    }
+  }
 }

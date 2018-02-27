@@ -1,4 +1,4 @@
-writer.shutdown();
+w.shutdown();
 
 package org.apache.lucene.index;
 
@@ -19,71 +19,152 @@ package org.apache.lucene.index;
  * limitations under the License.
  */
 
-import java.lang.reflect.Constructor;
-import java.lang.reflect.Method;
-import java.lang.reflect.Modifier;
-import java.util.Arrays;
+import java.io.IOException;
+import java.util.List;
 
-import org.apache.lucene.analysis.MockAnalyzer;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.Field;
+import org.apache.lucene.index.IndexWriterConfig.OpenMode;
+import org.apache.lucene.search.DocIdSet;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.search.Filter;
+import org.apache.lucene.search.TermRangeFilter;
 import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.MockDirectoryWrapper;
-import org.apache.lucene.util.LuceneTestCase;
-import org.junit.Test;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.FixedBitSet;
+import org.apache.lucene.util.IOUtils;
+import org.apache.lucene.util.Version;
 
-public class TestNoDeletionPolicy extends LuceneTestCase {
+/**
+ * Split an index based on a {@link Filter}.
+ */
 
-  @Test
-  public void testNoDeletionPolicy() throws Exception {
-    IndexDeletionPolicy idp = NoDeletionPolicy.INSTANCE;
-    idp.onInit(null);
-    idp.onCommit(null);
+public class PKIndexSplitter {
+  private final Filter docsInFirstIndex;
+  private final Directory input;
+  private final Directory dir1;
+  private final Directory dir2;
+  private final IndexWriterConfig config1;
+  private final IndexWriterConfig config2;
+  
+  /**
+   * Split an index based on a {@link Filter}. All documents that match the filter
+   * are sent to dir1, remaining ones to dir2.
+   */
+  public PKIndexSplitter(Version version, Directory input, Directory dir1, Directory dir2, Filter docsInFirstIndex) {
+    this(input, dir1, dir2, docsInFirstIndex, newDefaultConfig(version), newDefaultConfig(version));
   }
-
-  @Test
-  public void testFinalSingleton() throws Exception {
-    assertTrue(Modifier.isFinal(NoDeletionPolicy.class.getModifiers()));
-    Constructor<?>[] ctors = NoDeletionPolicy.class.getDeclaredConstructors();
-    assertEquals("expected 1 private ctor only: " + Arrays.toString(ctors), 1, ctors.length);
-    assertTrue("that 1 should be private: " + ctors[0], Modifier.isPrivate(ctors[0].getModifiers()));
+  
+  private static IndexWriterConfig newDefaultConfig(Version version) {
+    return  new IndexWriterConfig(version, null).setOpenMode(OpenMode.CREATE);
   }
-
-  @Test
-  public void testMethodsOverridden() throws Exception {
-    // Ensures that all methods of IndexDeletionPolicy are
-    // overridden/implemented. That's important to ensure that NoDeletionPolicy 
-    // overrides everything, so that no unexpected behavior/error occurs.
-    // NOTE: even though IndexDeletionPolicy is an interface today, and so all
-    // methods must be implemented by NoDeletionPolicy, this test is important
-    // in case one day IDP becomes an abstract class.
-    for (Method m : NoDeletionPolicy.class.getMethods()) {
-      // getDeclaredMethods() returns just those methods that are declared on
-      // NoDeletionPolicy. getMethods() returns those that are visible in that
-      // context, including ones from Object. So just filter out Object. If in
-      // the future IndexDeletionPolicy will become a class that extends a
-      // different class than Object, this will need to change.
-      if (m.getDeclaringClass() != Object.class) {
-        assertTrue(m + " is not overridden !", m.getDeclaringClass() == NoDeletionPolicy.class);
+  
+  public PKIndexSplitter(Directory input, Directory dir1, 
+      Directory dir2, Filter docsInFirstIndex, IndexWriterConfig config1, IndexWriterConfig config2) {
+    this.input = input;
+    this.dir1 = dir1;
+    this.dir2 = dir2;
+    this.docsInFirstIndex = docsInFirstIndex;
+    this.config1 = config1;
+    this.config2 = config2;
+  }
+  
+  /**
+   * Split an index based on a  given primary key term 
+   * and a 'middle' term.  If the middle term is present, it's
+   * sent to dir2.
+   */
+  public PKIndexSplitter(Version version, Directory input, Directory dir1, Directory dir2, Term midTerm) {
+    this(version, input, dir1, dir2,
+      new TermRangeFilter(midTerm.field(), null, midTerm.bytes(), true, false));
+  }
+  
+  public PKIndexSplitter(Directory input, Directory dir1, 
+      Directory dir2, Term midTerm, IndexWriterConfig config1, IndexWriterConfig config2) {
+    this(input, dir1, dir2,
+      new TermRangeFilter(midTerm.field(), null, midTerm.bytes(), true, false), config1, config2);
+  }
+  
+  public void split() throws IOException {
+    boolean success = false;
+    DirectoryReader reader = DirectoryReader.open(input);
+    try {
+      // pass an individual config in here since one config can not be reused!
+      createIndex(config1, dir1, reader, docsInFirstIndex, false);
+      createIndex(config2, dir2, reader, docsInFirstIndex, true);
+      success = true;
+    } finally {
+      if (success) {
+        IOUtils.close(reader);
+      } else {
+        IOUtils.closeWhileHandlingException(reader);
       }
     }
   }
-
-  @Test
-  public void testAllCommitsRemain() throws Exception {
-    Directory dir = newDirectory();
-    IndexWriter writer = new IndexWriter(dir, newIndexWriterConfig(
-        TEST_VERSION_CURRENT, new MockAnalyzer(random()))
-        .setIndexDeletionPolicy(NoDeletionPolicy.INSTANCE));
-    for (int i = 0; i < 10; i++) {
-      Document doc = new Document();
-      doc.add(newTextField("c", "a" + i, Field.Store.YES));
-      writer.addDocument(doc);
-      writer.commit();
-      assertEquals("wrong number of commits !", i + 1, DirectoryReader.listCommits(dir).size());
-    }
-    writer.close();
-    dir.close();
-  }
   
+  private void createIndex(IndexWriterConfig config, Directory target, IndexReader reader, Filter preserveFilter, boolean negateFilter) throws IOException {
+    boolean success = false;
+    final IndexWriter w = new IndexWriter(target, config);
+    try {
+      final List<AtomicReaderContext> leaves = reader.leaves();
+      final IndexReader[] subReaders = new IndexReader[leaves.size()];
+      int i = 0;
+      for (final AtomicReaderContext ctx : leaves) {
+        subReaders[i++] = new DocumentFilteredAtomicIndexReader(ctx, preserveFilter, negateFilter);
+      }
+      w.addIndexes(subReaders);
+      success = true;
+    } finally {
+      if (success) {
+        IOUtils.close(w);
+      } else {
+        IOUtils.closeWhileHandlingException(w);
+      }
+    }
+  }
+    
+  private static class DocumentFilteredAtomicIndexReader extends FilterAtomicReader {
+    final Bits liveDocs;
+    final int numDocs;
+    
+    public DocumentFilteredAtomicIndexReader(AtomicReaderContext context, Filter preserveFilter, boolean negateFilter) throws IOException {
+      super(context.reader());
+      final int maxDoc = in.maxDoc();
+      final FixedBitSet bits = new FixedBitSet(maxDoc);
+      // ignore livedocs here, as we filter them later:
+      final DocIdSet docs = preserveFilter.getDocIdSet(context, null);
+      if (docs != null) {
+        final DocIdSetIterator it = docs.iterator();
+        if (it != null) {
+          bits.or(it);
+        }
+      }
+      if (negateFilter) {
+        bits.flip(0, maxDoc);
+      }
+
+      if (in.hasDeletions()) {
+        final Bits oldLiveDocs = in.getLiveDocs();
+        assert oldLiveDocs != null;
+        final DocIdSetIterator it = bits.iterator();
+        for (int i = it.nextDoc(); i < maxDoc; i = it.nextDoc()) {
+          if (!oldLiveDocs.get(i)) {
+            // we can safely modify the current bit, as the iterator already stepped over it:
+            bits.clear(i);
+          }
+        }
+      }
+      
+      this.liveDocs = bits;
+      this.numDocs = bits.cardinality();
+    }
+    
+    @Override
+    public int numDocs() {
+      return numDocs;
+    }
+    
+    @Override
+    public Bits getLiveDocs() {
+      return liveDocs;
+    }
+  }
 }

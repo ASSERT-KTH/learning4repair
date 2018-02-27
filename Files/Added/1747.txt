@@ -1,5 +1,7 @@
 @Override
 
+package org.apache.solr.search.grouping.distributed.responseprocessor;
+
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
@@ -17,95 +19,125 @@
  * limitations under the License.
  */
 
-package org.apache.solr.schema;
-
-import org.apache.lucene.queries.function.ValueSource;
-import org.apache.lucene.queries.function.valuesource.LiteralValueSource;
-import org.apache.lucene.index.StorableField;
-import org.apache.lucene.search.Query;
-import org.apache.lucene.search.SortField;
-import com.spatial4j.core.io.ParseUtils;
-import com.spatial4j.core.context.SpatialContext;
-import com.spatial4j.core.exception.InvalidShapeException;
-import com.spatial4j.core.io.GeohashUtils;
-import com.spatial4j.core.shape.Point;
+import org.apache.lucene.search.ScoreDoc;
+import org.apache.lucene.search.Sort;
+import org.apache.lucene.search.TopDocs;
+import org.apache.lucene.search.grouping.GroupDocs;
+import org.apache.lucene.search.grouping.TopGroups;
+import org.apache.lucene.util.BytesRef;
 import org.apache.solr.common.SolrException;
-import org.apache.solr.response.TextResponseWriter;
-import org.apache.solr.search.QParser;
-import org.apache.solr.search.SolrConstantScoreQuery;
-import org.apache.solr.search.SpatialOptions;
-import org.apache.solr.search.function.ValueSourceRangeFilter;
-import org.apache.solr.search.function.distance.GeohashHaversineFunction;
-
+import org.apache.solr.common.util.NamedList;
+import org.apache.solr.handler.component.ResponseBuilder;
+import org.apache.solr.handler.component.ShardDoc;
+import org.apache.solr.handler.component.ShardRequest;
+import org.apache.solr.handler.component.ShardResponse;
+import org.apache.solr.search.Grouping;
+import org.apache.solr.search.grouping.distributed.ShardResponseProcessor;
+import org.apache.solr.search.grouping.distributed.command.QueryCommandResult;
+import org.apache.solr.search.grouping.distributed.shardresultserializer.TopGroupsResultTransformer;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
 /**
- * This is a class that represents a <a
- * href="http://en.wikipedia.org/wiki/Geohash">Geohash</a> field. The field is
- * provided as a lat/lon pair and is internally represented as a string.
- *
- * @see com.spatial4j.core.io.ParseUtils#parseLatitudeLongitude(double[], String)
+ * Concrete implementation for merging {@link TopGroups} instances from shard responses.
  */
-public class GeoHashField extends FieldType implements SpatialQueryable {
+public class TopGroupsShardResponseProcessor implements ShardResponseProcessor {
 
+  /**
+   * {@inheritDoc}
+   */
+  @SuppressWarnings("unchecked")
+  public void process(ResponseBuilder rb, ShardRequest shardRequest) {
+    Sort groupSort = rb.getGroupingSpec().getGroupSort();
+    String[] fields = rb.getGroupingSpec().getFields();
+    String[] queries = rb.getGroupingSpec().getQueries();
+    Sort sortWithinGroup = rb.getGroupingSpec().getSortWithinGroup();
 
-  private final SpatialContext ctx = SpatialContext.GEO;
-
-  @Override
-  public SortField getSortField(SchemaField field, boolean top) {
-    return getStringSort(field, top);
-  }
-
-    //QUESTION: Should we do a fast and crude one?  Or actually check distances
-  //Fast and crude could use EdgeNGrams, but that would require a different
-  //encoding.  Plus there are issues around the Equator/Prime Meridian
-  public Query createSpatialQuery(QParser parser, SpatialOptions options) {
-    double [] point = new double[0];
-    try {
-      point = ParseUtils.parsePointDouble(null, options.pointStr, 2);
-    } catch (InvalidShapeException e) {
-      throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, e);
+    // If group.format=simple group.offset doesn't make sense
+    int groupOffsetDefault;
+    if (rb.getGroupingSpec().getResponseFormat() == Grouping.Format.simple || rb.getGroupingSpec().isMain()) {
+      groupOffsetDefault = 0;
+    } else {
+      groupOffsetDefault = rb.getGroupingSpec().getGroupOffset();
     }
-    String geohash = GeohashUtils.encodeLatLon(point[0], point[1]);
-    //TODO: optimize this
-    return new SolrConstantScoreQuery(new ValueSourceRangeFilter(new GeohashHaversineFunction(getValueSource(options.field, parser),
-            new LiteralValueSource(geohash), options.radius), "0", String.valueOf(options.distance), true, true));
-  }
+    int docsPerGroupDefault = rb.getGroupingSpec().getGroupLimit();
 
-  @Override
-  public void write(TextResponseWriter writer, String name, StorableField f)
-          throws IOException {
-    writer.writeStr(name, toExternal(f), false);
-  }
-
-
-  @Override
-  public String toExternal(StorableField f) {
-    Point p = GeohashUtils.decode(f.stringValue(),ctx);
-    return p.getY() + "," + p.getX();
-  }
-
-
-  @Override
-  public String toInternal(String val) {
-    // validate that the string is of the form
-    // latitude, longitude
-    double[] latLon = new double[0];
-    try {
-      latLon = ParseUtils.parseLatitudeLongitude(null, val);
-    } catch (InvalidShapeException e) {
-      throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, e);
+    Map<String, List<TopGroups<BytesRef>>> commandTopGroups = new HashMap<String, List<TopGroups<BytesRef>>>();
+    for (String field : fields) {
+      commandTopGroups.put(field, new ArrayList<TopGroups<BytesRef>>());
     }
-    return GeohashUtils.encodeLatLon(latLon[0], latLon[1]);
+
+    Map<String, List<QueryCommandResult>> commandTopDocs = new HashMap<String, List<QueryCommandResult>>();
+    for (String query : queries) {
+      commandTopDocs.put(query, new ArrayList<QueryCommandResult>());
+    }
+
+    TopGroupsResultTransformer serializer = new TopGroupsResultTransformer(rb);
+    for (ShardResponse srsp : shardRequest.responses) {
+      NamedList<NamedList> secondPhaseResult = (NamedList<NamedList>) srsp.getSolrResponse().getResponse().get("secondPhase");
+      Map<String, ?> result = serializer.transformToNative(secondPhaseResult, groupSort, sortWithinGroup, srsp.getShard());
+      for (String field : commandTopGroups.keySet()) {
+        TopGroups<BytesRef> topGroups = (TopGroups<BytesRef>) result.get(field);
+        if (topGroups == null) {
+          continue;
+        }
+        commandTopGroups.get(field).add(topGroups);
+      }
+      for (String query : queries) {
+        commandTopDocs.get(query).add((QueryCommandResult) result.get(query));
+      }
+    }
+    try {
+      for (String groupField : commandTopGroups.keySet()) {
+        List<TopGroups<BytesRef>> topGroups = commandTopGroups.get(groupField);
+        if (topGroups.isEmpty()) {
+          continue;
+        }
+
+        TopGroups<BytesRef>[] topGroupsArr = new TopGroups[topGroups.size()];
+        rb.mergedTopGroups.put(groupField, TopGroups.merge(topGroups.toArray(topGroupsArr), groupSort, sortWithinGroup, groupOffsetDefault, docsPerGroupDefault, TopGroups.ScoreMergeMode.None));
+      }
+
+      for (String query : commandTopDocs.keySet()) {
+        List<QueryCommandResult> queryCommandResults = commandTopDocs.get(query);
+        List<TopDocs> topDocs = new ArrayList<TopDocs>(queryCommandResults.size());
+        int mergedMatches = 0;
+        for (QueryCommandResult queryCommandResult : queryCommandResults) {
+          topDocs.add(queryCommandResult.getTopDocs());
+          mergedMatches += queryCommandResult.getMatches();
+        }
+
+        int topN = rb.getGroupingSpec().getOffset() + rb.getGroupingSpec().getLimit();
+        TopDocs mergedTopDocs = TopDocs.merge(sortWithinGroup, topN, topDocs.toArray(new TopDocs[topDocs.size()]));
+        rb.mergedQueryCommandResults.put(query, new QueryCommandResult(mergedTopDocs, mergedMatches));
+      }
+
+      Map<Object, ShardDoc> resultIds = new HashMap<Object, ShardDoc>();
+      int i = 0;
+      for (TopGroups<BytesRef> topGroups : rb.mergedTopGroups.values()) {
+        for (GroupDocs<BytesRef> group : topGroups.groups) {
+          for (ScoreDoc scoreDoc : group.scoreDocs) {
+            ShardDoc solrDoc = (ShardDoc) scoreDoc;
+            solrDoc.positionInResponse = i++;
+            resultIds.put(solrDoc.id, solrDoc);
+          }
+        }
+      }
+      for (QueryCommandResult queryCommandResult : rb.mergedQueryCommandResults.values()) {
+        for (ScoreDoc scoreDoc : queryCommandResult.getTopDocs().scoreDocs) {
+          ShardDoc solrDoc = (ShardDoc) scoreDoc;
+          solrDoc.positionInResponse = i++;
+          resultIds.put(solrDoc.id, solrDoc);
+        }
+      }
+
+      rb.resultIds = resultIds;
+    } catch (IOException e) {
+      throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, e);
+    }
   }
-
-
-  @Override
-  public ValueSource getValueSource(SchemaField field, QParser parser) {
-    field.checkFieldCacheSource(parser);
-    return new StrFieldSource(field.name);
-  }
-
-
 }

@@ -1,8 +1,8 @@
-Boolean.valueOf(opNode.getForQueryRewrite()),
+Boolean.FALSE,
 
 /*
 
-   Derby - Class org.apache.derby.impl.sql.compile.Predicate
+   Derby - Class org.apache.derby.impl.sql.compile.JoinNode
 
    Licensed to the Apache Software Foundation (ASF) under one or more
    contributor license agreements.  See the NOTICE file distributed with
@@ -23,76 +23,148 @@ Boolean.valueOf(opNode.getForQueryRewrite()),
 
 package	org.apache.derby.impl.sql.compile;
 
-import org.apache.derby.impl.sql.compile.ExpressionClassBuilder;
-import org.apache.derby.impl.sql.compile.ActivationClassBuilder;
-
-import org.apache.derby.iapi.sql.compile.C_NodeTypes;
-import org.apache.derby.iapi.sql.compile.Visitable;
-import org.apache.derby.iapi.sql.compile.Visitor;
-import org.apache.derby.iapi.sql.compile.OptimizablePredicate;
-import org.apache.derby.iapi.sql.compile.Optimizable;
-
-import org.apache.derby.iapi.sql.dictionary.DataDictionary;
-
-import org.apache.derby.iapi.store.access.ScanController;
-
-import org.apache.derby.iapi.error.StandardException;
+import org.apache.derby.iapi.services.context.ContextManager;
 
 import org.apache.derby.iapi.services.compiler.MethodBuilder;
 
 import org.apache.derby.iapi.services.sanity.SanityManager;
 
-import org.apache.derby.iapi.types.DataValueDescriptor;
+import org.apache.derby.iapi.error.StandardException;
+
+import org.apache.derby.iapi.sql.compile.CompilerContext;
+import org.apache.derby.iapi.sql.compile.Optimizable;
+import org.apache.derby.iapi.sql.compile.OptimizablePredicate;
+import org.apache.derby.iapi.sql.compile.OptimizablePredicateList;
+import org.apache.derby.iapi.sql.compile.Optimizer;
+import org.apache.derby.iapi.sql.compile.Visitable;
+import org.apache.derby.iapi.sql.compile.Visitor;
+import org.apache.derby.iapi.sql.compile.CostEstimate;
+import org.apache.derby.iapi.sql.compile.RowOrdering;
+import org.apache.derby.iapi.sql.compile.C_NodeTypes;
+
+import org.apache.derby.iapi.sql.dictionary.DataDictionary;
+import org.apache.derby.iapi.sql.dictionary.TableDescriptor;
+import org.apache.derby.iapi.sql.dictionary.ConglomerateDescriptor;
+
+import org.apache.derby.iapi.types.TypeId;
+import org.apache.derby.iapi.types.DataTypeDescriptor;
+
+import org.apache.derby.iapi.reference.SQLState;
+import org.apache.derby.iapi.reference.ClassName;
+
+import org.apache.derby.iapi.sql.Activation;
+import org.apache.derby.iapi.sql.ResultSet;
+
+import org.apache.derby.iapi.store.access.TransactionController;
+
+import org.apache.derby.iapi.services.loader.GeneratedMethod;
+
+import org.apache.derby.impl.sql.compile.ActivationClassBuilder;
 
 import org.apache.derby.iapi.util.JBitSet;
+import org.apache.derby.iapi.util.PropertyUtil;
+import org.apache.derby.iapi.services.classfile.VMOpcode;
 
 import java.util.ArrayList;
-import java.util.Hashtable;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Properties;
+import java.util.Vector;
 
 /**
- * A Predicate represents a top level predicate.
+ * A JoinNode represents a join result set for either of the basic DML
+ * operations: SELECT and INSERT.  For INSERT - SELECT, any of the
+ * fields in a JoinNode can be used (the JoinNode represents
+ * the (join) SELECT statement in the INSERT - SELECT).  For INSERT,
+ * the resultColumns in the selectList will contain the names of the columns
+ * being inserted into or updated.
  *
  */
 
-public final class Predicate extends QueryTreeNode implements OptimizablePredicate,
-														Comparable
+public class JoinNode extends TableOperatorNode
 {
-	/* Top of the predicate */
-	AndNode		andNode;
-	boolean		pushable;
-	/* Bit map of referenced tables */
-	JBitSet		referencedSet;
-	/* Join clauses are placed into equivalence classes when applying transitive
-	 * closure for join clauses.  This is useful for eliminating redundant predicates.
-	 */
-	int			equivalenceClass = -1;
-	int			indexPosition;
-	protected boolean startKey;
-	protected boolean stopKey;
-	protected boolean isQualifier;
+	/* Join semantics */
+	public static final int INNERJOIN = 1;
+	public static final int CROSSJOIN = 2;
+	public static final int LEFTOUTERJOIN = 3;
+	public static final int RIGHTOUTERJOIN = 4;
+	public static final int FULLOUTERJOIN = 5;
+	public static final int UNIONJOIN = 6;
 
-	/* Hashtable used for tracking the search clause types that have been
-	 * pushed through this predicate (if an equijoin) via transitive closure.
-	 */
-	private Hashtable searchClauseHT;
+    /** If this flag is true, this node represents a natural join. */
+    private boolean naturalJoin;
 
-	// Whether or not this predicate has been scoped; see the
-	// getPredScopedForResultSet() method of this class for more.
-	private boolean scoped;
+	private boolean optimized;
+
+	private PredicateList leftPredicateList;
+	private PredicateList rightPredicateList;
+
+	protected boolean flattenableJoin = true;
+	Vector				aggregateVector;
+	SubqueryList		subqueryList;
+	ValueNode			joinClause;
+	boolean	            joinClauseNormalized;
+	PredicateList		joinPredicates;
+	ResultColumnList	usingClause;
+	//User provided optimizer overrides
+	Properties joinOrderStrategyProperties;
+
 
 	/**
-	 * Initializer.
+	 * Initializer for a JoinNode.
 	 *
-	 * @param andNode		The top of the predicate	 
-	 * @param referencedSet	Bit map of referenced tables
+	 * @param leftResult	The ResultSetNode on the left side of this join
+	 * @param rightResult	The ResultSetNode on the right side of this join
+	 * @param onClause		The ON clause
+	 * @param usingClause	The USING clause
+	 * @param selectList	The result column list for the join
+	 * @param tableProperties	Properties list associated with the table
+	 * @param joinOrderStrategyProperties	User provided optimizer overrides
+	 *
+	 * @exception StandardException		Thrown on error
 	 */
-
-	public void init(Object andNode, Object referencedSet)
+	public void init(
+					Object leftResult,
+					Object rightResult,
+					Object onClause,
+					Object usingClause,
+					Object selectList,
+					Object tableProperties,
+					Object joinOrderStrategyProperties)
+			throws StandardException
 	{
-		this.andNode = (AndNode) andNode;
-		pushable = false;
-		this.referencedSet = (JBitSet) referencedSet;
-		scoped = false;
+		super.init(leftResult, rightResult, tableProperties);
+		resultColumns = (ResultColumnList) selectList;
+		joinClause = (ValueNode) onClause;
+		joinClauseNormalized = false;
+		this.usingClause = (ResultColumnList) usingClause;
+		this.joinOrderStrategyProperties = (Properties)joinOrderStrategyProperties;
+
+		/* JoinNodes can be generated in the parser or at the end of optimization.
+		 * Those generated in the parser do not have resultColumns yet.
+		 */
+		if (resultColumns != null)
+		{
+			/* A longer term assertion */
+			if (SanityManager.DEBUG)
+			{
+				SanityManager.ASSERT((leftResultSet.getReferencedTableMap() != null &&
+									  rightResultSet.getReferencedTableMap() != null) ||
+									 (leftResultSet.getReferencedTableMap() == null &&
+	 								  rightResultSet.getReferencedTableMap() == null),
+					"left and right referencedTableMaps are expected to either both be non-null or both be null");
+			}
+
+			/* Build the referenced table map (left || right) */
+			if (leftResultSet.getReferencedTableMap() != null)
+			{
+				referencedTableMap = (JBitSet) leftResultSet.getReferencedTableMap().clone();
+				referencedTableMap.or((JBitSet) rightResultSet.getReferencedTableMap());
+			}
+		}
+		joinPredicates = (PredicateList) getNodeFactory().getNode(
+											C_NodeTypes.PREDICATE_LIST,
+											getContextManager());
 	}
 
 	/*
@@ -100,698 +172,1753 @@ public final class Predicate extends QueryTreeNode implements OptimizablePredica
 	 */
 
 	/**
-	 * @see org.apache.derby.iapi.sql.compile.OptimizablePredicate#getReferencedMap
-	 */
-	public JBitSet getReferencedMap()
-	{
-		return referencedSet;
-	}
-
-	/**
-	 * @see org.apache.derby.iapi.sql.compile.OptimizablePredicate#hasSubquery
-	 */
-	public boolean hasSubquery()
-	{
-		/* RESOLVE - Currently, we record whether or not a predicate is pushable based
-		 * on whether or not it contains a subquery or method call, but we do not
-		 * record the underlying info.
-		 */
-		return ! pushable;
-	}
-
-	/**
-	 * @see org.apache.derby.iapi.sql.compile.OptimizablePredicate#hasMethodCall
-	 */
-	public boolean hasMethodCall()
-	{
-		/* RESOLVE - Currently, we record whether or not a predicate is pushable based
-		 * on whether or not it contains a subquery or method call, but we do not
-		 * record the underlying info.
-		 */
-		return ! pushable;
-	}
-
-	/** @see OptimizablePredicate#markStartKey */
-	public void markStartKey()
-	{
-		startKey = true;
-	}
-
-	/** @see OptimizablePredicate#isStartKey */
-	public boolean isStartKey()
-	{
-		return startKey;
-	}
-
-	/** @see OptimizablePredicate#markStopKey */
-	public void markStopKey()
-	{
-		stopKey = true;
-	}
-
-	/** @see OptimizablePredicate#isStopKey */
-	public boolean isStopKey()
-	{
-		return stopKey;
-	}
-
-	/** @see OptimizablePredicate#markQualifier */
-	public void markQualifier()
-	{
-		isQualifier = true;
-	}
-
-	/** @see OptimizablePredicate#isQualifier */
-	public boolean isQualifier()
-	{
-		return isQualifier;
-	}
-
-	/** @see OptimizablePredicate#compareWithKnownConstant */
-	public boolean compareWithKnownConstant(Optimizable optTable, boolean considerParameters)
-	{
-		boolean retval = false;
-		RelationalOperator relop = getRelop();
-
-		/* if this is for "in" operator node's dynamic start/stop key, relop is
-		 * null, and it's not comparing with constant, beetle 3858
-		 */
-		if (!isRelationalOpPredicate())
-			return false;
-
-		if (relop.compareWithKnownConstant(optTable, considerParameters))
-			retval = true;
-
-		return retval;
-	}
-
-	public int hasEqualOnColumnList(int[] baseColumnPositions,
-										Optimizable optTable)
-		throws StandardException
-	{
-		RelationalOperator relop = getRelop();
-
-		if (!isRelationalOpPredicate())
-			return -1;
-		
-		if (!(relop.getOperator() == RelationalOperator.EQUALS_RELOP))
-			return -1;
-			
-		for (int i = 0; i < baseColumnPositions.length; i++)
-		{
-			ColumnReference cr = relop.getColumnOperand(optTable, 
-														baseColumnPositions[i]);
-		
-			if (cr == null)
-				continue;
-			
-			if (relop.selfComparison(cr))
-				continue;
-
-			// If I made it thus far in the loop, we've found
-			// something.
-			return i;
-		}
-		
-		return -1;
-	}
-
-	/**
-	 * @see OptimizablePredicate#getCompareValue
+	 * @see org.apache.derby.iapi.sql.compile.Optimizable#optimizeIt
 	 *
 	 * @exception StandardException		Thrown on error
 	 */
-	public DataValueDescriptor getCompareValue(Optimizable optTable)
-		throws StandardException
+	public CostEstimate optimizeIt(
+							Optimizer optimizer,
+							OptimizablePredicateList predList,
+							CostEstimate outerCost,
+							RowOrdering rowOrdering)
+			throws StandardException
+	{
+		optimizer.trace(Optimizer.CALLING_ON_JOIN_NODE, 0, 0, 0.0, null);
+
+		// It's possible that a call to optimize the left/right will cause
+		// a new "truly the best" plan to be stored in the underlying base
+		// tables.  If that happens and then we decide to skip that plan
+		// (which we might do if the call to "considerCost()" below decides
+		// the current path is infeasible or not the best) we need to be
+		// able to revert back to the "truly the best" plans that we had
+		// saved before we got here.  So with this next call we save the
+		// current plans using "this" node as the key.  If needed, we'll
+		// then make the call to revert the plans in OptimizerImpl's
+		// getNextDecoratedPermutation() method.
+		updateBestPlanMap(ADD_PLAN, this);
+
+		/*
+		** RESOLVE: Most types of Optimizables only implement estimateCost(),
+		** and leave it up to optimizeIt() in FromTable to figure out the
+		** total cost of the join.  For joins, though, we want to figure out
+		** the best plan for the join knowing how many outer rows there are -
+		** it could affect the join strategy significantly.  So we implement
+		** optimizeIt() here, which overrides the optimizeIt() in FromTable.
+		** This assumes that the join strategy for which this join node is
+		** the inner table is a nested loop join, which will not be a valid
+		** assumption when we implement other strategies like materialization
+		** (hash join can work only on base tables).
+		*/
+
+		/* RESOLVE - Need to figure out how to really optimize this node. */
+
+		// RESOLVE: NEED TO SET ROW ORDERING OF SOURCES IN THE ROW ORDERING
+		// THAT WAS PASSED IN.
+		leftResultSet = optimizeSource(
+							optimizer,
+							leftResultSet,
+							getLeftPredicateList(),
+							outerCost);
+
+		/* Move all joinPredicates down to the right.
+		 * RESOLVE - When we consider the reverse join order then
+		 * we will have to pull them back up and then push them
+		 * down to the other side when considering the reverse
+		 * join order.
+		 * RESOLVE - This logic needs to be looked at when we
+		 * implement full outer join.
+		 */
+		// Walk joinPredicates backwards due to possible deletes
+		for (int index = joinPredicates.size() - 1; index >= 0; index --)
+		{
+			JBitSet	  curBitSet;
+			Predicate predicate;
+
+			predicate = (Predicate) joinPredicates.elementAt(index);
+			if (! predicate.getPushable())
+			{
+				continue;
+			}
+			joinPredicates.removeElementAt(index);
+			getRightPredicateList().addElement(predicate);
+		}
+
+		rightResultSet = optimizeSource(
+							optimizer,
+							rightResultSet,
+							getRightPredicateList(),
+							leftResultSet.getCostEstimate());
+
+		costEstimate = getCostEstimate(optimizer);
+
+		/*
+		** We add the costs for the inner and outer table, but the number
+		** of rows is that for the inner table only.
+		*/
+		costEstimate.setCost(
+			leftResultSet.getCostEstimate().getEstimatedCost() +
+			rightResultSet.getCostEstimate().getEstimatedCost(),
+			rightResultSet.getCostEstimate().rowCount(),
+			rightResultSet.getCostEstimate().rowCount());
+
+		/*
+		** Some types of joins (e.g. outer joins) will return a different
+		** number of rows than is predicted by optimizeIt() in JoinNode.
+		** So, adjust this value now. This method does nothing for most
+		** join types.
+		*/
+		adjustNumberOfRowsReturned(costEstimate);
+
+		/*
+		** Get the cost of this result set in the context of the whole plan.
+		*/
+		getCurrentAccessPath().
+			getJoinStrategy().
+				estimateCost(
+							this,
+							predList,
+							(ConglomerateDescriptor) null,
+							outerCost,
+							optimizer,
+							costEstimate
+							);
+
+		optimizer.considerCost(this, predList, costEstimate, outerCost);
+
+		/* Optimize subqueries only once, no matter how many times we're called */
+		if ( (! optimized) && (subqueryList != null))
+		{
+			/* RESOLVE - Need to figure out how to really optimize this node.
+		 	* Also need to figure out the pushing of the joinClause.
+		 	*/
+			subqueryList.optimize(optimizer.getDataDictionary(),
+									costEstimate.rowCount());
+			subqueryList.modifyAccessPaths();
+		}
+
+		optimized = true;
+
+		return costEstimate;
+	}
+
+	/**
+	 * @see Optimizable#pushOptPredicate
+	 *
+	 * @exception StandardException		Thrown on error
+	 */
+
+	public boolean pushOptPredicate(OptimizablePredicate optimizablePredicate)
+			throws StandardException
 	{
 		if (SanityManager.DEBUG)
 		{
-			SanityManager.ASSERT(compareWithKnownConstant(optTable, true),
-				"Cannot get the compare value if not comparing with a known constant.");
+			SanityManager.ASSERT(optimizablePredicate instanceof Predicate,
+				"optimizablePredicate expected to be instanceof Predicate");
+			SanityManager.ASSERT(! optimizablePredicate.hasSubquery() &&
+								 ! optimizablePredicate.hasMethodCall(),
+				"optimizablePredicate either has a subquery or a method call");
 		}
 
-		RelationalOperator relop = getRelop();
+		/* Add the matching predicate to the joinPredicates */
+		joinPredicates.addPredicate((Predicate) optimizablePredicate);
 
-		return relop.getCompareValue(optTable);
-	}
-
-	/** @see OptimizablePredicate#equalsComparisonWithConstantExpression */
-	public boolean equalsComparisonWithConstantExpression(Optimizable optTable)
-	{
-		boolean retval = false;
-
-		if (isRelationalOpPredicate())
-		{
-			retval = getRelop().equalsComparisonWithConstantExpression(optTable);
-		}
-
-		return retval;
-	}
-
-	/** @see OptimizablePredicate#selectivity */
-	public double selectivity(Optimizable optTable)
-	throws StandardException
-	{
-		return andNode.getLeftOperand().selectivity(optTable);
-	}
-
-	/** @see OptimizablePredicate#getIndexPosition */
-	public int getIndexPosition()
-	{
-		return indexPosition;
-	}
-
-
-	/* Comparable interface */
-
-	public int compareTo(Object other)
-	{
-		Predicate	otherPred = (Predicate) other;
-
-		/* Not all operators are "equal". If the predicates are on the
-		 * same key column, then a "=" opertor takes precedence over all
-		 * other operators.  This ensures that the "=" will be both the start
-		 * and stop predicates.  Otherwise, we could end up with it being one
-		 * but not the other and get incorrect results.
-		 *
-		 * Also, we want "<>" to come after all the other operators.
-		 * Other parts of the optimizer use the first predicate on an index
-		 * column to determine the cost of using the index, so we want the
-		 * "<>" to come last because it's not useful for limiting the scan.
-		 *
-		 * In other words, P1 is before() P2 if:
-		 *		o  The P1.indexPosition < P2.indexPosition
-		 *	or  o  P1.indexPosition == P2.indexPosition and
-		 *		   P1's operator is ("=" or IS NULL) and
-		 *		   P2's operator is not ("=" or IS NULL)
-		 * or	o  P1.indexPosition == P2.indexPosition and
-		 *		   P1's operator is not ("<>" or IS NOT NULL) and
-		 *		   P2's operator is ("<>" or IS NOT NULL)
-		 *
-		 * (We have to impose an arbitrary, but reproducible ordering
-		 * on the the "=" predicates on the same column, otherwise an
-		 * ASSERTion, that after the predicates are order, Pn+1 is not
-		 * before() Pn, will be violated.
+		/* Remap all of the ColumnReferences to point to the
+		 * source of the values.
 		 */
+		RemapCRsVisitor rcrv = new RemapCRsVisitor(true);
+		((Predicate) optimizablePredicate).getAndNode().accept(rcrv);
 
-		int otherIndexPosition = otherPred.getIndexPosition();
-
-		if (indexPosition < otherIndexPosition)
-			return -1;
-
-		if (indexPosition > otherIndexPosition)
-			return 1;
-
-		// initialize these flags as if they are for "in" operator, then
-		// change them if they are not
-		//
-		boolean thisIsEquals = false, otherIsEquals = false;
-		boolean thisIsNotEquals = true, otherIsNotEquals = true;
-
-		/* The call to "isRelationalOpPredicate()" will return false
-		 * for a "probe predicate" because a probe predicate is really
-		 * a disguised IN list. But when it comes to sorting, the probe
-		 * predicate (which is of the form "<col> = ?") should be treated
-		 * as an equality--i.e. it should have precedence over any non-
-		 * equals predicate, per the comment at the start of this
-		 * method.  So that's what we're checking here.
-		 */
-		if (this.isRelationalOpPredicate() || // this is not "in" or
-			this.isInListProbePredicate())    // this is a probe predicate
-		{
-			int thisOperator = ((RelationalOperator)andNode.getLeftOperand()).getOperator();
-			thisIsEquals = (thisOperator == RelationalOperator.EQUALS_RELOP ||
-								thisOperator == RelationalOperator.IS_NULL_RELOP);
-			thisIsNotEquals = (thisOperator == RelationalOperator.NOT_EQUALS_RELOP ||
-								   thisOperator == RelationalOperator.IS_NOT_NULL_RELOP);
-		}
-
-		if (otherPred.isRelationalOpPredicate() || // other is not "in" or
-			otherPred.isInListProbePredicate())    // other is a probe predicate
-		{
-			int	otherOperator = ((RelationalOperator)(otherPred.getAndNode().getLeftOperand())).getOperator();
-			otherIsEquals = (otherOperator == RelationalOperator.EQUALS_RELOP ||
-								 otherOperator == RelationalOperator.IS_NULL_RELOP);
-			otherIsNotEquals = (otherOperator == RelationalOperator.NOT_EQUALS_RELOP ||
-								 otherOperator == RelationalOperator.IS_NOT_NULL_RELOP);
-		}
-
-		boolean thisIsBefore = (thisIsEquals && ! otherIsEquals) || ( ! thisIsNotEquals && otherIsNotEquals);
-		if (thisIsBefore)
-			return -1;
-
-		boolean otherIsBefore = (otherIsEquals && ! thisIsEquals) || ( ! otherIsNotEquals && thisIsNotEquals);
-		if (otherIsBefore)
-			return 1;
-		return 0;
+		return true;
 	}
 
 	/**
-	 * Return the andNode.
-	 *
-	 * @return AndNode	The andNode.
-	 */
-	public AndNode getAndNode()
-	{
-		return andNode;
-	}
-
-	/**
-	 * Set the andNode.
-	 *
-	 * @param andNode	The new andNode.
-	 */
-	public void setAndNode(AndNode andNode)
-	{
-		this.andNode = andNode;
-	}
-
-	/**
-	 * Return the pushable.
-	 *
-	 * @return boolean	Whether or not the predicate is pushable.
-	 */
-	public boolean getPushable()
-	{
-		return pushable;
-	}
-
-	/**
-	 * Set whether or not this predicate is pushable.  This method
-	 * is intended for use when creating a copy of the predicate, ex
-	 * for predicate pushdown.  We choose not to add this assignment
-	 * to copyFields() because the comments for that method say that
-	 * it should copy all fields _except_ the two specified at init
-	 * time; "pushable" is one of the two specified at init time.
-	 *
-	 * @param pushable Whether or not the predicate is pushable.
-	 */
-	public void setPushable(boolean pushable) {
-		this.pushable = pushable;
-	}
-
-	/**
-	 * Return the referencedSet.
-	 *
-	 * @return JBitSet	The referencedSet.
-	 */
-	public JBitSet getReferencedSet()
-	{
-		return referencedSet;
-	}
-
-	/**
-	 * Set the equivalence class, if any, for this predicate.
-	 *
-	 * @param equivalenceClass	The equivalence class for this predicate.
-	 */
-	void setEquivalenceClass(int equivalenceClass)
-	{
-		this.equivalenceClass = equivalenceClass;
-	}
-
-	/**
-	 * Get the equivalenceClass for this predicate.
-	 *
-	 * @return The equivalenceClass for this predicate.
-	 */
-	int getEquivalenceClass()
-	{
-		return equivalenceClass;
-	}
-
-	/**
-	 * Categorize this predicate.  Initially, this means
-	 * building a bit map of the referenced tables for each predicate.
+	 * @see Optimizable#modifyAccessPath
 	 *
 	 * @exception StandardException		Thrown on error
 	 */
-	public void categorize() throws StandardException
+	public Optimizable modifyAccessPath(JBitSet outerTables) throws StandardException
 	{
-		pushable = andNode.categorize(referencedSet, false);
+		super.modifyAccessPath(outerTables);
+
+		/* By the time we're done here, both the left and right
+		 * predicate lists should be empty because we pushed everything
+		 * down.
+		 */
+		if (SanityManager.DEBUG)
+		{
+			if (getLeftPredicateList().size() != 0)
+			{
+				SanityManager.THROWASSERT(
+					"getLeftPredicateList().size() expected to be 0, not " +
+					getLeftPredicateList().size());
+			}
+			if (getRightPredicateList().size() != 0)
+			{
+				SanityManager.THROWASSERT(
+					"getRightPredicateList().size() expected to be 0, not " +
+					getRightPredicateList().size());
+			}
+		}
+
+		return this;
+	}
+
+
+	/**
+	 *  Some types of joins (e.g. outer joins) will return a different
+	 *  number of rows than is predicted by optimizeIt() in JoinNode.
+	 *  So, adjust this value now. This method does nothing for most
+	 *  join types.
+	 */
+	protected void adjustNumberOfRowsReturned(CostEstimate costEstimate)
+	{
 	}
 
 	/**
-	 * Get the RelationalOperator on the left side of the AND node, if
-	 * there is one.  If the left side is not a RelationalOperator, return
-	 * null.
+	 * Return a ResultColumnList with all of the columns in this table.
+	 * (Used in expanding '*'s.)
+	 * NOTE: Since this method is for expanding a "*" in the SELECT list,
+	 * ResultColumn.expression will be a ColumnReference.
 	 *
-	 * @return	The RelationalOperator on the left side of the AND node,
-	 *			if any.
+	 * @param allTableName		The qualifier on the "*"
+	 *
+	 * @return ResultColumnList	List of result columns from this table.
+	 *
+	 * @exception StandardException		Thrown on error
 	 */
-	public RelationalOperator getRelop()
+	public ResultColumnList getAllResultColumns(TableName allTableName)
+			throws StandardException
 	{
-		
-		if (andNode.getLeftOperand() instanceof RelationalOperator)
+		/* We need special processing when there is a USING clause.
+	 	 * The resulting table will be the join columns from
+		 * the outer table followed by the non-join columns from 
+		 * left side plus the non-join columns from the right side.
+		 */
+		if (usingClause == null)
 		{
-			return (RelationalOperator) andNode.getLeftOperand();
+			return getAllResultColumnsNoUsing(allTableName);
+		}
+
+		/* Get the logical left side of the join.
+		 * This is where the join columns come from.
+		 * (For RIGHT OUTER JOIN, the left is the right
+		 * and the right is the left and the JOIN is the NIOJ).
+		 */
+		ResultSetNode	logicalLeftRS = getLogicalLeftResultSet();
+
+		// Get the join columns
+		ResultColumnList joinRCL = logicalLeftRS.getAllResultColumns(
+										null).
+											getJoinColumns(usingClause);
+
+		// Get the left and right RCLs
+		ResultColumnList leftRCL = leftResultSet.getAllResultColumns(allTableName); 
+		ResultColumnList rightRCL = rightResultSet.getAllResultColumns(allTableName); 
+
+		/* Chop the join columns out of the both left and right.
+		 * Thanks to the ANSI committee, the join columns 
+		 * do not belong to either table.
+		 */
+		if (leftRCL != null)
+		{
+			leftRCL.removeJoinColumns(usingClause);
+		}
+		if (rightRCL != null)
+		{
+			rightRCL.removeJoinColumns(usingClause);
+		}
+
+		/* If allTableName is null, then we want to return the splicing
+		 * of the join columns followed by the non-join columns from
+		 * the left followed by the non-join columns from the right.
+		 * If not, then at most 1 side should match.
+		 * NOTE: We need to make sure that the RC's VirtualColumnIds
+		 * are correct (1 .. size).
+		 */
+		if (leftRCL == null)
+		{
+			if (rightRCL == null)
+			{
+				// Both sides are null. This only happens if allTableName is
+				// non-null and doesn't match the table name of any of the
+				// join tables (DERBY-4414).
+				return null;
+			}
+			rightRCL.resetVirtualColumnIds();
+			return rightRCL;
+		}
+		else if (rightRCL == null)
+		{
+			// leftRCL is non-null, otherwise the previous leg of the if
+			// statement would have been chosen.
+			leftRCL.resetVirtualColumnIds();
+			return leftRCL;
 		}
 		else
 		{
-			return null;
+			/* Both sides are non-null.  This should only happen
+			 * if allTableName is null.
+			 */
+			if (SanityManager.DEBUG)
+			{
+				if (allTableName != null)
+				{
+					SanityManager.THROWASSERT(
+						"allTableName (" + allTableName + 
+						") expected to be null");
+				}
+			}
+			joinRCL.destructiveAppend(leftRCL);
+			joinRCL.destructiveAppend(rightRCL);
+			joinRCL.resetVirtualColumnIds();
+			return joinRCL;
 		}
 	}
 
-	public final boolean isOrList()
-    {
-        return(andNode.getLeftOperand() instanceof OrNode);
-    }
-
-    /**
-     * Is this predicate a possible Qualifier for store?
-     * <p>
-     * Current 2 types of predicates can be pushed to store: 
-     *   1) RelationalOperator - 
-     *      represented with by left operand as instance of RelationalOperator.
-     *   2) A single And'd term of a list of OR terms
-     *      represented by left operand as instance of OrNode.
-     *
-     * More checking specific operator's terms to see if they are finally
-     * pushable to store.  In the final push at execution each term of the AND 
-     * or OR must be a Relational operator with a column reference on one side 
-     * and a constant on the other.
-     *
-     *
-	 * @return true if term is wither a AND of a RelationalOperator, or an
-     *              OR of one or more Relational Operators.
-     *
-     *
-	 * @exception  StandardException  Standard exception policy.
-     **/
-	public final boolean isStoreQualifier()
-    {
-		if ((andNode.getLeftOperand() instanceof RelationalOperator) ||
-		    (andNode.getLeftOperand() instanceof OrNode))
+	/**
+	 * Return a ResultColumnList with all of the columns in this table.
+	 * (Used in expanding '*'s.)
+	 * NOTE: Since this method is for expanding a "*" in the SELECT list,
+	 * ResultColumn.expression will be a ColumnReference.
+	 * NOTE: This method is handles the case when there is no USING clause.
+	 * The caller handles the case when there is a USING clause.
+	 *
+	 * @param allTableName		The qualifier on the "*"
+	 *
+	 * @return ResultColumnList	List of result columns from this table.
+	 *
+	 * @exception StandardException		Thrown on error
+	 */
+	private ResultColumnList getAllResultColumnsNoUsing(TableName allTableName)
+			throws StandardException
+	{
+		ResultColumnList leftRCL = leftResultSet.getAllResultColumns(allTableName); 
+		ResultColumnList rightRCL = rightResultSet.getAllResultColumns(allTableName); 
+		/* If allTableName is null, then we want to return the spliced
+		 * left and right RCLs.  If not, then at most 1 side should match.
+		 */
+		if (leftRCL == null)
 		{
-            return(true);
+			return rightRCL;
+		}
+		else if (rightRCL == null)
+		{
+			return leftRCL;
 		}
 		else
 		{
-            return(false);
+			/* Both sides are non-null.  This should only happen
+			 * if allTableName is null.
+			 */
+			if (SanityManager.DEBUG)
+			{
+				if (allTableName != null)
+				{
+					SanityManager.THROWASSERT(
+						"allTableName (" + allTableName + 
+						") expected to be null");
+				}
+			}
+
+			// Return a spliced copy of the 2 lists
+			ResultColumnList tempList =
+								(ResultColumnList) getNodeFactory().getNode(
+												C_NodeTypes.RESULT_COLUMN_LIST,
+												getContextManager());
+			tempList.nondestructiveAppend(leftRCL);
+			tempList.nondestructiveAppend(rightRCL);
+			return tempList;
 		}
-    }
+	}
 
-    /**
-     * Is this predicate an pushable OR list?
-     * <p>
-     * Does the predicate represent a AND'd list of OR term's, all of which
-     * are pushable.  To be pushable each of OR terms must be a legal 
-     * qualifier, which is a column reference on one side of a Relational
-     * operator and a constant on the other.
-     *
-	 * @return true if the predicate is a pushable set of OR clauses.
-     *
-     *
-	 * @exception  StandardException  Standard exception policy.
-     **/
-	public final boolean isPushableOrClause(Optimizable optTable)
-        throws StandardException
+	/**
+	 * Try to find a ResultColumn in the table represented by this FromTable
+	 * that matches the name in the given ColumnReference.
+	 *
+	 * @param columnReference	The columnReference whose name we're looking
+	 *				for in the given table.
+	 *
+	 * @return	A ResultColumn whose expression is the ColumnNode
+	 *			that matches the ColumnReference.
+	 *		Returns null if there is no match.
+	 *
+	 * @exception StandardException		Thrown on error
+	 */
+
+	public ResultColumn getMatchingColumn(ColumnReference columnReference) throws StandardException
 	{
-        boolean ret_val = true;
+		/* Get the logical left and right sides of the join.
+		 * (For RIGHT OUTER JOIN, the left is the right
+		 * and the right is the left and the JOIN is the NIOJ).
+		 */
+		ResultSetNode	logicalLeftRS = getLogicalLeftResultSet();
+		ResultSetNode	logicalRightRS = getLogicalRightResultSet();
+		ResultColumn	leftRC = null;
+		ResultColumn	resultColumn = null;
+		ResultColumn	rightRC = null;
+		ResultColumn	usingRC = null;
 
-        if (andNode.getLeftOperand() instanceof OrNode)
-        {
-            QueryTreeNode node = andNode.getLeftOperand();
+		leftRC = logicalLeftRS.getMatchingColumn(columnReference);
 
-            while (node instanceof OrNode)
-            {
-                OrNode or_node = (OrNode) node;
+		if (leftRC != null)
+		{
+			resultColumn = leftRC;
 
-                if (or_node.getLeftOperand() instanceof RelationalOperator)
-                {
-                    // if any term of the OR clause is not a qualifier, then
-                    // reject the entire OR clause.
-                    if (!((RelationalOperator) or_node.getLeftOperand()).
-                        isQualifier(optTable, true))
-                    {
-                        // one of the terms is not a pushable Qualifier.
-                        return(false);
-                    }
+			/* Find out if the column is in the using clause */
+			if (usingClause != null)
+			{
+				usingRC = usingClause.getResultColumn(leftRC.getName());
+			}
+		}
 
-                    node = or_node.getRightOperand();
-                }
-                else
-                {
-                    // one of the terms is not a RelationalOperator
+		/* We only search on the right if the column isn't in the
+		 * USING clause.
+		 */
+		if (usingRC == null)
+		{
+			rightRC = logicalRightRS.getMatchingColumn(columnReference);
+		} else {
+			//If this column represents the join column from the
+			// right table for predicate generated for USING/NATURAL 
+			// of RIGHT OUTER JOIN then flag it such by setting 
+			// rightOuterJoinUsingClause to true.
+			// eg
+			//     select c from t1 right join t2 using (c)
+			//For "using(c)", a join predicate will be created as 
+			// follows t1.c=t2.c
+			//We are talking about column t2.c of the join predicate.
+			if (this instanceof HalfOuterJoinNode && ((HalfOuterJoinNode)this).isRightOuterJoin()) 
+			{
+    			leftRC.setRightOuterJoinUsingClause(true);
+			}
+		}
 
-                    return(false);
-                }
+		if (rightRC != null)
+		{
+			/* We must catch ambiguous column references for joins here,
+			 * since FromList only checks for ambiguous references between
+			 * nodes, not within a node.
+			 */
+			if (leftRC != null)
+			{
+				throw StandardException.newException(SQLState.LANG_AMBIGUOUS_COLUMN_NAME, 
+						 columnReference.getSQLColumnName());
+			}
+
+            // All columns on the logical right side of a "half" outer join
+            // can contain nulls. The correct nullability is set by
+            // bindResultColumns()/buildRCL(). However, if bindResultColumns()
+            // has not been called yet, the caller of this method will see
+            // the wrong nullability. This problem is logged as DERBY-2916.
+            // Until that's fixed, set the nullability here too.
+            if (this instanceof HalfOuterJoinNode) {
+                rightRC.setNullability(true);
             }
 
-            return(true);
-        }
-        else
-        {
-            // Not an OR list
-            return(false);
-        }
-	}
+			resultColumn = rightRC;
+		}
 
-	/**
-	 * Return whether or not this predicate has been used
-	 * to add a new search clause of the specified type via transitive closure.
-	 * NOTE: This can only be true if this is an equijoin
-	 * between 2 column references.
-	 *
-	 * @param ro	The search clause that we are currently considering
-	 *				as the source for transitive closure
-	 *
-	 * @return	Whether or not this predicate has been used
-	 *			to add a new search clause of the specified type via transitive 
-     *			closure.
-	 */
-	boolean transitiveSearchClauseAdded(RelationalOperator ro)
-	{
-		if (searchClauseHT == null || 
-			searchClauseHT.get(new Integer(ro.getOperator())) == null)
-		{
-			return false;
-		}
-		else
-		{
-			return true;
-		}
-	}
-
-	/**
-	 * Mark this predicate as having been used to add a new predicate
-	 * of the specified type via transitive closure on search clauses.
-	 *
-	 * @param ro	The search clause that we are currently considering
-	 *				as the source for transitive closure
-	 *
-	 */
-	void setTransitiveSearchClauseAdded(RelationalOperator ro)
-	{
-		if (searchClauseHT == null)
-		{
-			searchClauseHT = new Hashtable();
-		}
-		/* I have to remember that this ro has been added to this predicate as a
-		 * transitive search clause.
+		/* Insert will bind the underlying result sets which have
+		 * tables twice. On the 2nd bind, resultColumns != null,
+		 * we must return the RC from the JoinNode's RCL which is above
+		 * the RC that we just found above.  (Otherwise, the source
+		 * for the ColumnReference will be from the wrong ResultSet
+		 * at generate().)
 		 */
-		Integer i = new Integer(ro.getOperator());
-		searchClauseHT.put(i, i);
-	}
-
-	/**
-	 * Get the start operator for this predicate for a scan.
-	 *
-	 * @param optTable	The optimizable table, so we can tell which side of
-	 *					the operator the search column is on.
-	 *
-	 * @return	The start operator for a start key on this column.
-	 */
-	int getStartOperator(Optimizable optTable)
-	{
-		if (SanityManager.DEBUG)
+		if (resultColumns != null)
 		{
-			SanityManager.ASSERT(startKey, "Getting a start operator from a Predicate that's not a start key.");
+			int rclSize = resultColumns.size();
+			for (int index = 0; index < rclSize; index++)
+			{
+				ResultColumn rc = (ResultColumn) resultColumns.elementAt(index);
+				VirtualColumnNode vcn = (VirtualColumnNode) rc.getExpression();
+				if (resultColumn == vcn.getSourceColumn())
+				{
+					resultColumn = rc;
+					break;
+				}
+			}
 		}
 
-		/* if it's for "in" operator's dynamic start key, operator is GE,
-		 * beetle 3858
+		return resultColumn;
+	}
+
+    /**
+     * Bind the expressions under this node.
+     */
+    public void bindExpressions(FromList fromListParam)
+            throws StandardException
+    {
+        super.bindExpressions(fromListParam);
+
+        // Now that both the left and the right side of the join have been
+        // bound, we know the column names and can transform a natural join
+        // into a join with a USING clause.
+        if (naturalJoin) {
+            usingClause = getCommonColumnsForNaturalJoin();
+        }
+    }
+
+	/**
+	 * Bind the result columns of this ResultSetNode when there is no
+	 * base table to bind them to.  This is useful for SELECT statements,
+	 * where the result columns get their types from the expressions that
+	 * live under them.
+	 *
+	 * @param fromListParam		FromList to use/append to.
+	 *
+	 * @exception StandardException		Thrown on error
+	 */
+	public void bindResultColumns(FromList fromListParam)
+					throws StandardException
+	{
+		super.bindResultColumns(fromListParam);
+
+		/* Now we build our RCL */
+		buildRCL();
+
+		/* We cannot bind the join clause until after we've bound our
+		 * result columns. This is because the resultColumns from the
+		 * children are propagated and merged to create our resultColumns
+		 * in super.bindRCs().  If we bind the join clause prior to that
+		 * call, then the ColumnReferences in the join clause will point
+		 * to the children's RCLs at the time that they are bound, but
+		 * will end up pointing above themselves, to our resultColumns,
+		 * after the call to super.bindRCS().
 		 */
-		if (andNode.getLeftOperand() instanceof InListOperatorNode)
-			return ScanController.GE;
-
-		return getRelop().getStartOperator(optTable);
-	}
-
-	int getStopOperator(Optimizable optTable)
-	{
-		if (SanityManager.DEBUG)
-		{
-			SanityManager.ASSERT(stopKey, "Getting a stop operator from a Predicate that's not a stop key.");
-		}
-
-		 /* if it's for "in" operator's dynamic stop key, operator is GT,
-		  * beetle 3858
-		  */
-		if (andNode.getLeftOperand() instanceof InListOperatorNode)
-			return ScanController.GT;
-
-		return getRelop().getStopOperator(optTable);
+		deferredBindExpressions(fromListParam);
 	}
 
 	/**
-	 * Set the position of the index column that this predicate restricts
+	 * Bind the result columns for this ResultSetNode to a base table.
+	 * This is useful for INSERT and UPDATE statements, where the
+	 * result columns get their types from the table being updated or
+	 * inserted into.
+	 * If a result column list is specified, then the verification that the 
+	 * result column list does not contain any duplicates will be done when
+	 * binding them by name.
 	 *
-	 * @param indexPosition	The position of the index column that this
-	 *						predicate restricts.
+	 * @param targetTableDescriptor	The TableDescriptor for the table being
+	 *				updated or inserted into
+	 * @param targetColumnList	For INSERT statements, the user
+	 *					does not have to supply column
+	 *					names (for example, "insert into t
+	 *					values (1,2,3)".  When this
+	 *					parameter is null, it means that
+	 *					the user did not supply column
+	 *					names, and so the binding should
+	 *					be done based on order.  When it
+	 *					is not null, it means do the binding
+	 *					by name, not position.
+	 * @param statement			Calling DMLStatementNode (Insert or Update)
+	 * @param fromListParam		FromList to use/append to.
+	 *
+	 * @exception StandardException		Thrown on error
 	 */
-	void setIndexPosition(int indexPosition)
-	{
-		this.indexPosition = indexPosition;
-	}
 
-	/**
-	 * Clear the start/stop position and qualifier flags
-	 */
-	void clearScanFlags()
-	{
-		startKey = false;
-		stopKey = false;
-		isQualifier = false;
-	}
-
-	/**
-	 * Clear the qualifier flag.
-	 */
-	void clearQualifierFlag()
-	{
-		isQualifier = false;
-	}
-
-	void generateExpressionOperand(Optimizable optTable,
-										int columnPosition,
-										ExpressionClassBuilder acb,
-										MethodBuilder mb)
+	public void bindResultColumns(TableDescriptor targetTableDescriptor,
+					FromVTI targetVTI,
+					ResultColumnList targetColumnList,
+					DMLStatementNode statement,
+					FromList fromListParam)
 				throws StandardException
 	{
-		getRelop().generateExpressionOperand(optTable,
-													columnPosition,
-													acb,
-													mb);
+		super.bindResultColumns(targetTableDescriptor,
+								targetVTI,
+								targetColumnList, statement, 
+								fromListParam);
+
+		/* Now we build our RCL */
+		buildRCL();
+
+		/* We cannot bind the join clause until after we've bound our
+		 * result columns. This is because the resultColumns from the
+		 * children are propagated and merged to create our resultColumns
+		 * in super.bindRCs().  If we bind the join clause prior to that
+		 * call, then the ColumnReferences in the join clause will point
+		 * to the children's RCLs at the time that they are bound, but
+		 * will end up pointing above themselves, to our resultColumns,
+		 * after the call to super.bindRCS().
+		 */
+		deferredBindExpressions(fromListParam);
 	}
 
-	void generateAbsoluteColumnId(MethodBuilder mb,
-										Optimizable optTable)
-	{
-		getRelop().generateAbsoluteColumnId(mb, optTable);
-	}
-
-	void generateRelativeColumnId(MethodBuilder mb,
-										Optimizable optTable)
-	{
-		getRelop().generateRelativeColumnId(mb, optTable);
-	}
-
-	void generateOperator(MethodBuilder mb,
-								Optimizable optTable)
-	{
-		getRelop().generateOperator(mb, optTable);
-	}
-
-	void generateQualMethod(ExpressionClassBuilder acb,
-								MethodBuilder mb,
-								Optimizable optTable)
-					throws StandardException
-	{
-		getRelop().generateQualMethod(acb, mb, optTable);
-	}
-
-	void generateOrderedNulls(MethodBuilder mb)
-	{
-		getRelop().generateOrderedNulls(mb);
-	}
-
-	void generateNegate(MethodBuilder mb,
-								Optimizable optTable)
-	{
-		getRelop().generateNegate(mb, optTable);
-	}
-
-	void generateOrderableVariantType(MethodBuilder mb,
-								Optimizable optTable)
-					throws StandardException
-	{
-		int variantType = getRelop().getOrderableVariantType(optTable);
-		mb.push(variantType);
-
-	}
 	/**
-	 * Convert this object to a String.  See comments in QueryTreeNode.java
-	 * for how this should be done for tree printing.
+	 * Build the RCL for this node.  We propagate the RCLs up from the
+	 * children and splice them to form this node's RCL.
 	 *
-	 * @return	This object as a String
+	 * @exception StandardException		Thrown on error
 	 */
 
-	public String toString()
+	private void buildRCL() throws StandardException
 	{
+		/* NOTE - we only need to build this list if it does not already 
+		 * exist.  This can happen in the degenerate case of an insert
+		 * select with a join expression in a derived table within the select.
+		 */
+		if (resultColumns != null)
+		{
+			return;
+		}
+
+		ResultColumnList leftRCL;
+		ResultColumnList rightRCL;
+		ResultColumnList tmpRCL;
+
+		/* We get a shallow copy of the left's ResultColumnList and its 
+		 * ResultColumns.  (Copy maintains ResultColumn.expression for now.)
+		 */
+		resultColumns = leftResultSet.getResultColumns();
+		leftRCL = resultColumns.copyListAndObjects();
+		leftResultSet.setResultColumns(leftRCL);
+
+		/* Replace ResultColumn.expression with new VirtualColumnNodes
+		 * in the ProjectRestrictNode's ResultColumnList.  (VirtualColumnNodes include
+		 * pointers to source ResultSetNode, this, and source ResultColumn.)
+		 */
+		resultColumns.genVirtualColumnNodes(leftResultSet, leftRCL, false);
+
+		/*
+		** If this is a right outer join, we can get nulls on the left side,
+		** so change the types of the left result set to be nullable.
+		*/
+		if (this instanceof HalfOuterJoinNode && ((HalfOuterJoinNode)this).isRightOuterJoin())
+		{
+			resultColumns.setNullability(true);
+		}
+
+		/* Now, repeat the process with the right's RCL */
+		tmpRCL = rightResultSet.getResultColumns();
+		rightRCL = tmpRCL.copyListAndObjects();
+		rightResultSet.setResultColumns(rightRCL);
+
+		/* Replace ResultColumn.expression with new VirtualColumnNodes
+		 * in the ProjectRestrictNode's ResultColumnList.  (VirtualColumnNodes include
+		 * pointers to source ResultSetNode, this, and source ResultColumn.)
+		 */
+		tmpRCL.genVirtualColumnNodes(rightResultSet, rightRCL, false);
+		tmpRCL.adjustVirtualColumnIds(resultColumns.size());
+
+		/*
+		** If this is a left outer join, we can get nulls on the right side,
+		** so change the types of the right result set to be nullable.
+		*/
+		if (this instanceof HalfOuterJoinNode && !((HalfOuterJoinNode)this).isRightOuterJoin())
+		{
+			tmpRCL.setNullability(true);
+		}
+		
+		/* Now we append the propagated RCL from the right to the one from
+		 * the left and call it our own.
+		 */
+		resultColumns.nondestructiveAppend(tmpRCL);
+	}
+
+	private void deferredBindExpressions(FromList fromListParam)
+				throws StandardException
+	{
+		/* Bind the expressions in the join clause */
+		subqueryList = (SubqueryList) getNodeFactory().getNode(
+											C_NodeTypes.SUBQUERY_LIST,
+											getContextManager());
+		aggregateVector = new Vector();
+
+        CompilerContext cc = getCompilerContext();
+        
+		/* ON clause */
+		if (joinClause != null)
+		{
+			/* Create a new fromList with only left and right children before
+			 * binding the join clause. Valid column references in the join clause
+			 * are limited to columns from the 2 tables being joined. This
+			 * algorithm enforces that.
+			 */
+			FromList	fromList = (FromList) getNodeFactory().getNode(
+									C_NodeTypes.FROM_LIST,
+									getNodeFactory().doJoinOrderOptimization(),
+									getContextManager());
+			fromList.addElement((FromTable) leftResultSet);
+			fromList.addElement((FromTable) rightResultSet);
+
+            int previousReliability = orReliability( CompilerContext.ON_CLAUSE_RESTRICTION );
+			joinClause = joinClause.bindExpression(
+									  fromList, subqueryList,
+									  aggregateVector);
+            cc.setReliability( previousReliability );
+
+			// SQL 2003, section 7.7 SR 5
+			SelectNode.checkNoWindowFunctions(joinClause, "ON");
+
+			/*
+			** We cannot have aggregates in the ON clause.
+			** In the future, if we relax this, we'll need
+			** to be able to pass the aggregateVector up
+			** the tree.
+			*/
+			if (aggregateVector.size() > 0)
+			{
+				throw StandardException.newException(SQLState.LANG_NO_AGGREGATES_IN_ON_CLAUSE);
+			}
+		}
+		/* USING clause */
+		else if (usingClause != null)
+		{
+			/* Build a join clause from the usingClause, using the
+			 * exposed names in the left and right RSNs.
+			 * For each column in the list, we generate 2 ColumnReferences,
+			 * 1 for the left and 1 for the right.  We bind each of these
+			 * to the appropriate side and build an equality predicate
+			 * between the 2.  We bind the = and AND nodes by hand because
+			 * we have to bind the ColumnReferences a side at a time.
+			 * We need to bind the CRs a side at a time to ensure that
+			 * we don't find an bogus ambiguous column reference. (Bug 377)
+			 */
+			joinClause = (ValueNode) getNodeFactory().getNode(
+											C_NodeTypes.BOOLEAN_CONSTANT_NODE,
+											Boolean.TRUE,
+											getContextManager());
+
+			int usingSize = usingClause.size();
+			for (int index = 0; index < usingSize; index++)
+			{
+				BinaryComparisonOperatorNode equalsNode;
+				ColumnReference leftCR;
+				ColumnReference rightCR;
+				ResultColumn	rc = (ResultColumn) usingClause.elementAt(index);
+
+				/* Create and bind the left CR */
+				fromListParam.insertElementAt(leftResultSet, 0);
+				leftCR = (ColumnReference) getNodeFactory().getNode(
+							C_NodeTypes.COLUMN_REFERENCE,
+							rc.getName(),
+							((FromTable) leftResultSet).getTableName(),
+							getContextManager()); 
+				leftCR = (ColumnReference) leftCR.bindExpression(
+									  fromListParam, subqueryList,
+									  aggregateVector);
+				fromListParam.removeElementAt(0);
+
+				/* Create and bind the right CR */
+				fromListParam.insertElementAt(rightResultSet, 0);
+				rightCR = (ColumnReference) getNodeFactory().getNode(
+							C_NodeTypes.COLUMN_REFERENCE,
+							rc.getName(),
+							((FromTable) rightResultSet).getTableName(),
+							getContextManager()); 
+				rightCR = (ColumnReference) rightCR.bindExpression(
+									  fromListParam, subqueryList,
+									  aggregateVector);
+				fromListParam.removeElementAt(0);
+
+				/* Create and insert the new = condition */
+				equalsNode = (BinaryComparisonOperatorNode)
+								getNodeFactory().getNode(
+										C_NodeTypes.BINARY_EQUALS_OPERATOR_NODE,
+										leftCR,
+										rightCR,
+										getContextManager());
+				equalsNode.bindComparisonOperator();
+
+                // Create a new join clause by ANDing the new = condition and
+                // the old join clause.
+                AndNode newJoinClause = (AndNode) getNodeFactory().getNode(
+                        C_NodeTypes.AND_NODE,
+                        equalsNode,
+                        joinClause,
+                        getContextManager());
+
+                newJoinClause.postBindFixup();
+
+                joinClause = newJoinClause;
+			 }
+		}
+
+		if (joinClause != null)
+		{
+			/* If joinClause is a parameter, (where ?), then we assume
+			 * it will be a nullable boolean.
+			 */
+			if (joinClause.requiresTypeFromContext())
+			{
+				joinClause.setType(new DataTypeDescriptor(TypeId.BOOLEAN_ID, true));
+			}
+			
+			/*
+			** Is the datatype of the JOIN clause BOOLEAN?
+			**
+			** NOTE: This test is not necessary in SQL92 entry level, because
+			** it is syntactically impossible to have a non-Boolean JOIN clause
+			** in that level of the standard.  But we intend to extend the
+			** language to allow Boolean user functions in the JOIN clause,
+			** so we need to test for the error condition.
+			*/
+			TypeId joinTypeId = joinClause.getTypeId();
+
+			/* If the where clause is not a built-in type, then generate a bound 
+			 * conversion tree to a built-in type.
+			 */
+			if (joinTypeId.userType())
+			{
+				joinClause = joinClause.genSQLJavaSQLTree();
+			}
+
+			if (! joinClause.getTypeServices().getTypeId().equals(
+					TypeId.BOOLEAN_ID))
+			{
+				throw StandardException.newException(SQLState.LANG_NON_BOOLEAN_JOIN_CLAUSE, 
+						joinClause.getTypeServices().getTypeId().getSQLTypeName()
+						);
+			}
+		}
+	}
+
+    /**
+     * Generate a result column list with all the column names that appear on
+     * both sides of the join operator. Those are the columns to use as join
+     * columns in a natural join.
+     *
+     * @return RCL with all the common columns
+     * @throws StandardException on error
+     */
+    private ResultColumnList getCommonColumnsForNaturalJoin()
+            throws StandardException {
+        ResultColumnList leftRCL =
+                getLeftResultSet().getAllResultColumns(null);
+        ResultColumnList rightRCL =
+                getRightResultSet().getAllResultColumns(null);
+
+        List columnNames = extractColumnNames(leftRCL);
+        columnNames.retainAll(extractColumnNames(rightRCL));
+
+        ResultColumnList commonColumns =
+                (ResultColumnList) getNodeFactory().getNode(
+                        C_NodeTypes.RESULT_COLUMN_LIST,
+                        getContextManager());
+
+        for (Iterator it = columnNames.iterator(); it.hasNext(); ) {
+            String name = (String) it.next();
+            ResultColumn rc = (ResultColumn) getNodeFactory().getNode(
+                    C_NodeTypes.RESULT_COLUMN,
+                    name,
+                    null,
+                    getContextManager());
+            commonColumns.addResultColumn(rc);
+        }
+
+        return commonColumns;
+    }
+
+    /**
+     * Extract all the column names from a result column list.
+     *
+     * @param rcl the result column list to extract the names from
+     * @return a list of all the column names in the RCL
+     */
+    private static List extractColumnNames(ResultColumnList rcl) {
+        ArrayList names = new ArrayList();
+
+        for (int i = 0; i < rcl.size(); i++) {
+            ResultColumn rc = (ResultColumn) rcl.elementAt(i);
+            names.add(rc.getName());
+        }
+
+        return names;
+    }
+
+	/** 
+	 * Put a ProjectRestrictNode on top of each FromTable in the FromList.
+	 * ColumnReferences must continue to point to the same ResultColumn, so
+	 * that ResultColumn must percolate up to the new PRN.  However,
+	 * that ResultColumn will point to a new expression, a VirtualColumnNode, 
+	 * which points to the FromTable and the ResultColumn that is the source for
+	 * the ColumnReference.  
+	 * (The new PRN will have the original of the ResultColumnList and
+	 * the ResultColumns from that list.  The FromTable will get shallow copies
+	 * of the ResultColumnList and its ResultColumns.  ResultColumn.expression
+	 * will remain at the FromTable, with the PRN getting a new 
+	 * VirtualColumnNode for each ResultColumn.expression.)
+	 * We then project out the non-referenced columns.  If there are no referenced
+	 * columns, then the PRN's ResultColumnList will consist of a single ResultColumn
+	 * whose expression is 1.
+	 *
+	 * @param numTables			Number of tables in the DML Statement
+	 * @param gbl				The group by list, if any
+	 * @param fromList			The from list, if any
+	 *
+	 * @return The generated ProjectRestrictNode atop the original FromTable.
+	 *
+	 * @exception StandardException		Thrown on error
+	 */
+	public ResultSetNode preprocess(int numTables,
+									GroupByList gbl,
+									FromList fromList)
+								throws StandardException
+	{
+		ResultSetNode newTreeTop;
+		
+		newTreeTop = super.preprocess(numTables, gbl, fromList);
+
+		/* Put the expression trees in conjunctive normal form.
+		 * NOTE - This needs to occur before we preprocess the subqueries
+		 * because the subquery transformations assume that any subquery operator 
+		 * negation has already occurred.
+		 */
+		if (joinClause != null)
+		{
+			normExpressions();
+
+			/* Preprocess any subqueries in the join clause */
+			if (subqueryList != null)
+			{
+				/* RESOLVE - In order to flatten a subquery in
+				 * the ON clause of an inner join we'd have to pass
+				 * the various lists from the outer select through to
+				 * ResultSetNode.preprocess() and overload
+				 * normExpressions in HalfOuterJoinNode.  That's not
+				 * worth the effort, so we say that the ON clause
+				 * is not under a top level AND in normExpressions()
+				 * to ensure that subqueries in the ON clause do not
+				 * get flattened.  That allows us to pass empty lists
+				 * to joinClause.preprocess() because we know that no
+				 * flattening will take place. (Bug #1206)
+				 */
+				joinClause.preprocess(
+								numTables,
+								(FromList) getNodeFactory().getNode(
+									C_NodeTypes.FROM_LIST,
+									getNodeFactory().doJoinOrderOptimization(),
+									getContextManager()),
+								(SubqueryList) getNodeFactory().getNode(
+													C_NodeTypes.SUBQUERY_LIST,
+													getContextManager()),
+								(PredicateList) getNodeFactory().getNode(
+													C_NodeTypes.PREDICATE_LIST,
+													getContextManager()));
+			}
+
+			/* Pull apart the expression trees */
+			joinPredicates.pullExpressions(numTables, joinClause);
+			joinPredicates.categorize();
+			joinClause = null;
+		}
+
+		return newTreeTop;
+	}
+
+    /**
+     * Find the unreferenced result columns and project them out. This is used in pre-processing joins
+     * that are not flattened into the where clause.
+     */
+    void projectResultColumns() throws StandardException
+    {
+        leftResultSet.projectResultColumns();
+        rightResultSet.projectResultColumns();
+        resultColumns.pullVirtualIsReferenced();
+        super.projectResultColumns();
+    }
+    
+	/** Put the expression trees in conjunctive normal form 
+	 *
+	 * @exception StandardException		Thrown on error
+	 */
+	public void normExpressions()
+				throws StandardException
+	{
+		if (joinClauseNormalized == true) return;
+
+		/* For each expression tree:
+		 *	o Eliminate NOTs (eliminateNots())
+		 *	o Ensure that there is an AndNode on top of every
+		 *	  top level expression. (putAndsOnTop())
+		 *	o Finish the job (changeToCNF())
+		 */
+		joinClause = joinClause.eliminateNots(false);
 		if (SanityManager.DEBUG)
 		{
-			return binaryRelOpColRefsToString() + "\nreferencedSet: " +
-				referencedSet  + "\n" + "pushable: " + pushable + "\n" +
-				"isQualifier: " + isQualifier + "\n" +
-				super.toString();
+			if (!(joinClause.verifyEliminateNots()) )
+			{
+				joinClause.treePrint();
+				SanityManager.THROWASSERT(
+					"joinClause in invalid form: " + joinClause); 
+			}
 		}
-		else
+		joinClause = joinClause.putAndsOnTop();
+		if (SanityManager.DEBUG)
 		{
-			return "";
+			if (! ((joinClause instanceof AndNode) &&
+				   (joinClause.verifyPutAndsOnTop())) )
+			{
+				joinClause.treePrint();
+				SanityManager.THROWASSERT(
+					"joinClause in invalid form: " + joinClause); 
+			}
+		}
+		/* RESOLVE - ON clause is temporarily "not under a top
+		 * top level AND" until we figure out how to deal with
+		 * subqueries in the ON clause. (Bug 1206)
+		 */
+		joinClause = joinClause.changeToCNF(false);
+		if (SanityManager.DEBUG)
+		{
+			if (! ((joinClause instanceof AndNode) &&
+				   (joinClause.verifyChangeToCNF())) )
+			{
+				joinClause.treePrint();
+				SanityManager.THROWASSERT(
+					"joinClause in invalid form: " + joinClause); 
+			}
+		}
+
+		joinClauseNormalized = true;
+	}
+
+	/**
+	 * Push expressions down to the first ResultSetNode which can do expression
+	 * evaluation and has the same referenced table map.
+	 * RESOLVE - This means only pushing down single table expressions to
+	 * DistinctNodes today.  Once we have a better understanding of how
+	 * the optimizer will work, we can push down join clauses.
+	 *
+	 * @param outerPredicateList	The PredicateList from the outer RS.
+	 *
+	 * @exception StandardException		Thrown on error
+	 */
+	public void pushExpressions(PredicateList outerPredicateList)
+					throws StandardException
+	{
+		FromTable		leftFromTable = (FromTable) leftResultSet;
+		FromTable		rightFromTable = (FromTable) rightResultSet;
+
+		/* OuterJoinNodes are responsible for overriding this
+		 * method since they have different rules about where predicates
+		 * can be applied.
+		 */
+		if (SanityManager.DEBUG)
+		{
+			if (this instanceof HalfOuterJoinNode)
+			{
+				SanityManager.THROWASSERT(
+					"JN.pushExpressions() not expected to be called for " +
+					getClass().getName());
+			}
+		}
+
+		/* We try to push "pushable" 
+		 * predicates to 1 of 3 places:
+		 *	o Predicates that only reference tables
+		 *	  on the left are pushed to the leftPredicateList.
+		 *	o Predicates that only reference tables
+		 *	  on the right are pushed to the rightPredicateList.
+		 *	o Predicates which reference tables on both
+		 *	  sides (and no others) are pushed to 
+		 *	  the joinPredicates and may be pushed down
+		 *	  further during optimization.
+		 */
+		// Left only
+		pushExpressionsToLeft(outerPredicateList);
+		leftFromTable.pushExpressions(getLeftPredicateList());
+		// Right only
+		pushExpressionsToRight(outerPredicateList);
+		rightFromTable.pushExpressions(getRightPredicateList());
+		// Join predicates
+		grabJoinPredicates(outerPredicateList);
+
+		/* By the time we're done here, both the left and right
+		 * predicate lists should be empty because we pushed everything
+		 * down.
+		 */
+		if (SanityManager.DEBUG)
+		{
+			if (getLeftPredicateList().size() != 0)
+			{
+				SanityManager.THROWASSERT(
+					"getLeftPredicateList().size() expected to be 0, not " +
+					getLeftPredicateList().size());
+			}
+			if (getRightPredicateList().size() != 0)
+			{
+				SanityManager.THROWASSERT(
+					"getRightPredicateList().size() expected to be 0, not " +
+					getRightPredicateList().size());
+			}
+		}
+	}
+
+	protected void pushExpressionsToLeft(PredicateList outerPredicateList)
+		throws StandardException
+	{
+		FromTable		leftFromTable = (FromTable) leftResultSet;
+
+		JBitSet		leftReferencedTableMap = leftFromTable.getReferencedTableMap();
+
+		/* Build a list of the single table predicates on left result set
+		 * that we can push down 
+		 */
+		// Walk outerPredicateList backwards due to possible deletes
+		for (int index = outerPredicateList.size() - 1; index >= 0; index --)
+		{
+			JBitSet	  curBitSet;
+			Predicate predicate;
+
+			predicate = (Predicate) outerPredicateList.elementAt(index);
+			if (! predicate.getPushable())
+			{
+				continue;
+			}
+
+			curBitSet = predicate.getReferencedSet();
+			
+			/* Do we have a match? */
+			if (leftReferencedTableMap.contains(curBitSet))
+			{
+				/* Add the matching predicate to the push list */
+				getLeftPredicateList().addPredicate(predicate);
+
+				/* Remap all of the ColumnReferences to point to the
+				 * source of the values.
+				 * The tree is something like:
+				 *			PRN1
+				 *			  |
+				 *			 JN (this)
+				 *		   /    \
+				 *		PRN2	PRN3
+				 *        |       |
+				 *		FBT1	FBT2
+				 *
+				 * The ColumnReferences start off pointing to the RCL off of
+				 * PRN1.  For optimization, we want them to point to the
+				 * RCL off of PRN2.  In order to do that, we remap them
+				 * twice here.  If optimization pushes them down to the
+				 * base table, it will remap them again.
+				 */
+				RemapCRsVisitor rcrv = new RemapCRsVisitor(true);
+				predicate.getAndNode().accept(rcrv);
+				predicate.getAndNode().accept(rcrv);
+
+				/* Remove the matching predicate from the outer list */
+				outerPredicateList.removeElementAt(index);
+			}
+		}
+	}
+
+	private void pushExpressionsToRight(PredicateList outerPredicateList)
+		throws StandardException
+	{
+		FromTable		rightFromTable = (FromTable) rightResultSet;
+
+		JBitSet		rightReferencedTableMap = rightFromTable.getReferencedTableMap();
+
+		/* Build a list of the single table predicates on right result set
+		 * that we can push down 
+		 */
+		// Walk outerPredicateList backwards due to possible deletes
+		for (int index = outerPredicateList.size() - 1; index >= 0; index --)
+		{
+			JBitSet	  curBitSet;
+			Predicate predicate;
+
+			predicate = (Predicate) outerPredicateList.elementAt(index);
+			if (! predicate.getPushable())
+			{
+				continue;
+			}
+
+			curBitSet = predicate.getReferencedSet();
+			
+			/* Do we have a match? */
+			if (rightReferencedTableMap.contains(curBitSet))
+			{
+				/* Add the matching predicate to the push list */
+				getRightPredicateList().addPredicate(predicate);
+
+				/* Remap all of the ColumnReferences to point to the
+				 * source of the values.
+				 * The tree is something like:
+				 *			PRN1
+				 *			  |
+				 *			 JN (this)
+				 *		   /    \
+				 *		PRN2	PRN3
+				 *        |       |
+				 *		FBT1	FBT2
+				 *
+				 * The ColumnReferences start off pointing to the RCL off of
+				 * PRN1.  For optimization, we want them to point to the
+				 * RCL off of PRN3.  In order to do that, we remap them
+				 * twice here.  If optimization pushes them down to the
+				 * base table, it will remap them again.
+				 */
+				RemapCRsVisitor rcrv = new RemapCRsVisitor(true);
+				predicate.getAndNode().accept(rcrv);
+				predicate.getAndNode().accept(rcrv);
+
+				/* Remove the matching predicate from the outer list */
+				outerPredicateList.removeElementAt(index);
+			}
+		}
+	}
+
+	private void grabJoinPredicates(PredicateList outerPredicateList)
+		throws StandardException
+	{
+		FromTable		leftFromTable = (FromTable) leftResultSet;
+		FromTable		rightFromTable = (FromTable) rightResultSet;
+
+		JBitSet		leftReferencedTableMap = leftFromTable.getReferencedTableMap();
+		JBitSet		rightReferencedTableMap = rightFromTable.getReferencedTableMap();
+
+		/* Build a list of the join predicates that we can push down */
+		// Walk outerPredicateList backwards due to possible deletes
+		for (int index = outerPredicateList.size() - 1; index >= 0; index --)
+		{
+			JBitSet	  curBitSet;
+			Predicate predicate;
+
+			predicate = (Predicate) outerPredicateList.elementAt(index);
+			if (! predicate.getPushable())
+			{
+				continue;
+			}
+
+			curBitSet = predicate.getReferencedSet();
+			
+			/* Do we have a match? */
+			JBitSet innerBitSet = (JBitSet) rightReferencedTableMap.clone();
+			innerBitSet.or(leftReferencedTableMap);
+			if (innerBitSet.contains(curBitSet))
+			{
+				/* Add the matching predicate to the push list */
+				joinPredicates.addPredicate(predicate);
+
+				/* Remap all of the ColumnReferences to point to the
+				 * source of the values.
+				 * The tree is something like:
+				 *			PRN1
+				 *			  |
+				 *			 JN (this)
+				 *		   /    \
+				 *		PRN2	PRN3
+				 *        |       |
+				 *		FBT1	FBT2
+				 *
+				 * The ColumnReferences start off pointing to the RCL off of
+				 * PRN1.  For optimization, we want them to point to the
+				 * RCL off of PRN2 or PRN3.  In order to do that, we remap them
+				 * twice here.  If optimization pushes them down to the
+				 * base table, it will remap them again.
+				 */
+				RemapCRsVisitor rcrv = new RemapCRsVisitor(true);
+				predicate.getAndNode().accept(rcrv);
+				predicate.getAndNode().accept(rcrv);
+
+				/* Remove the matching predicate from the outer list */
+				outerPredicateList.removeElementAt(index);
+			}
 		}
 	}
 
 	/**
-	 * Get a string version of the column references for this predicate
-	 * IF it's a binary relational operator.  We only print out the
-	 * names of the operands if they are column references; otherwise
-	 * we just print a dummy value.  This is for debugging purposes
-	 * only--it's a convenient way to see what columns the predicate
-	 * is referencing, especially when tracing through code and printing
-	 * assert failure.
+	 * Flatten this JoinNode into the outer query block. The steps in
+	 * flattening are:
+	 *	o  Mark all ResultColumns as redundant, so that they are "skipped over"
+	 *	   at generate().
+	 *	o  Append the joinPredicates to the outer list.
+	 *	o  Create a FromList from the tables being joined and return 
+	 *	   that list so that the caller will merge the 2 lists 
+	 *
+	 * @param rcl				The RCL from the outer query
+	 * @param outerPList		PredicateList to append wherePredicates to.
+	 * @param sql				The SubqueryList from the outer query
+	 * @param gbl				The group by list, if any
+     * @param havingClause      The HAVING clause, if any
+	 *
+	 * @return FromList		The fromList from the underlying SelectNode.
+	 *
+	 * @exception StandardException		Thrown on error
 	 */
-	public String binaryRelOpColRefsToString()
+	public FromList flatten(ResultColumnList rcl,
+							PredicateList outerPList,
+							SubqueryList sql,
+                            GroupByList gbl,
+                            ValueNode havingClause)
+
+			throws StandardException
 	{
-		// We only consider binary relational operators here.
-		if (!(getAndNode().getLeftOperand()
-			instanceof BinaryRelationalOperatorNode))
+		/* OuterJoinNodes should never get here.
+		 * (They can be transformed, but never
+		 * flattened directly.)
+		 */
+		if (SanityManager.DEBUG)
 		{
-			return "";
+			if (this instanceof HalfOuterJoinNode)
+			{
+				SanityManager.THROWASSERT(
+					"JN.flatten() not expected to be called for " +
+					getClass().getName());
+			}
 		}
 
-		final String DUMMY_VAL = "<expr>";
-		java.lang.StringBuffer sBuf = new java.lang.StringBuffer();
-		BinaryRelationalOperatorNode opNode =
-			(BinaryRelationalOperatorNode)getAndNode().getLeftOperand();
+		/* Build a new FromList composed of left and right children 
+		 * NOTE: We must call FL.addElement() instead of FL.addFromTable()
+		 * since there is no exposed name. (And even if there was,
+		 * we could care less about unique exposed name checking here.)
+		 */
+		FromList	fromList = (FromList) getNodeFactory().getNode(
+									C_NodeTypes.FROM_LIST,
+									getNodeFactory().doJoinOrderOptimization(),
+									getContextManager());
+		fromList.addElement((FromTable) leftResultSet);
+		fromList.addElement((FromTable) rightResultSet);
 
-		// Get left operand's name.
-		if (opNode.getLeftOperand() instanceof ColumnReference)
+		/* Mark our RCL as redundant */
+		resultColumns.setRedundant();
+
+		/* Remap all ColumnReferences from the outer query to this node.
+		 * (We replace those ColumnReferences with clones of the matching
+		 * expression in the left and right's RCL.
+		 */
+		rcl.remapColumnReferencesToExpressions();
+		outerPList.remapColumnReferencesToExpressions();
+		if (gbl != null)
 		{
-			sBuf.append(
-				((ColumnReference)opNode.getLeftOperand()).getTableName() +
-				"." +
-				((ColumnReference)opNode.getLeftOperand()).getColumnName()
-			);
+			gbl.remapColumnReferencesToExpressions();
+		}
+
+        if (havingClause != null) {
+            havingClause.remapColumnReferencesToExpressions();
+        }
+
+
+		if (joinPredicates.size() > 0)
+		{
+			outerPList.destructiveAppend(joinPredicates);
+		}
+
+		if (subqueryList != null && subqueryList.size() > 0)
+		{
+			sql.destructiveAppend(subqueryList);
+		}
+
+		return fromList;
+	}
+
+	/**
+	 * Currently we don't reordering any outer join w/ inner joins.
+	 */
+	public boolean LOJ_reorderable(int numTables)
+				throws StandardException
+	{
+		return false;
+	}
+
+	/**
+	 * Transform any Outer Join into an Inner Join where applicable.
+	 * (Based on the existence of a null intolerant
+	 * predicate on the inner table.)
+	 *
+	 * @param predicateTree	The predicate tree for the query block
+	 *
+	 * @return The new tree top (OuterJoin or InnerJoin).
+	 *
+	 * @exception StandardException		Thrown on error
+	 */
+	public FromTable transformOuterJoins(ValueNode predicateTree, int numTables)
+		throws StandardException
+	{
+		/* Can't flatten if no predicates in where clause. */
+		if (predicateTree == null)
+		{
+            // DERBY-4712. Make sure any nested outer joins know we are non
+            // flattenable, too, since they inform their left and right sides
+            // which, is they are inner joins, a priori think they are
+            // flattenable. If left/right result sets are not outer joins,
+            // these next two calls are no-ops.
+            ((FromTable) leftResultSet).transformOuterJoins(null, numTables);
+            ((FromTable) rightResultSet).transformOuterJoins(null, numTables);
+			return this;
+		}
+
+		/* See if left or right sides can be transformed */
+		leftResultSet = ((FromTable) leftResultSet).transformOuterJoins(predicateTree, numTables);
+		rightResultSet = ((FromTable) rightResultSet).transformOuterJoins(predicateTree, numTables);
+
+		return this;
+	}
+
+    /**
+     * For joins, the tree will be (nodes are left out if the clauses
+     * are empty):
+     *
+     *      ProjectRestrictResultSet -- for the having and the select list
+     *      SortResultSet -- for the group by list
+     *      ProjectRestrictResultSet -- for the where and the select list (if no group or having)
+     *      the result set for the fromList
+     *
+	 *
+	 * @exception StandardException		Thrown on error
+     */
+	public void generate(ActivationClassBuilder acb,
+								MethodBuilder mb)
+							throws StandardException
+	{
+		generateCore(acb, mb, INNERJOIN, null, null);
+	}
+
+    /**
+     * Generate the code for a qualified join node.
+	 *
+	 * @exception StandardException		Thrown on error
+     */
+	public void generateCore(ActivationClassBuilder acb,
+								   MethodBuilder mb,
+								   int joinType) 
+			throws StandardException
+	{
+		generateCore(acb, mb, joinType, joinClause, subqueryList);
+	}
+
+	/**
+	 * Do the generation work for the join node hierarchy.
+	 *
+	 * @param acb			The ActivationClassBuilder
+	 * @param mb the method the code is to go into
+	 * @param joinType		The join type
+	 * @param joinClause	The join clause, if any
+	 * @param subquerys		The list of subqueries in the join clause, if any
+	 *
+	 * @exception StandardException		Thrown on error
+	 */
+	protected void generateCore(ActivationClassBuilder acb,
+									  MethodBuilder mb,
+									  int joinType,
+									  ValueNode joinClause,
+									  SubqueryList subquerys)
+			throws StandardException
+	{
+		/* Put the predicates back into the tree */
+		if (joinPredicates != null)
+		{
+			joinClause = joinPredicates.restorePredicates();
+			joinPredicates = null;
+		}
+
+		/* Get the next ResultSet #, so that we can number this ResultSetNode, its
+		 * ResultColumnList and ResultSet.
+		 */
+		assignResultSetNumber();
+
+		/* Set the point of attachment in all subqueries attached
+		 * to this node.
+		 */
+		if (subquerys != null && subquerys.size() > 0)
+		{
+			subquerys.setPointOfAttachment(resultSetNumber);
+		}
+
+		// build up the tree.
+
+		/* Generate the JoinResultSet */
+		/* Nested loop and hash are the only join strategy currently supporteds.  
+		 * Right outer joins are transformed into left outer joins.
+		 */
+		String			joinResultSetString;
+
+		if (joinType == LEFTOUTERJOIN)
+		{
+			joinResultSetString = 
+				((Optimizable) rightResultSet).getTrulyTheBestAccessPath().
+					getJoinStrategy().halfOuterJoinResultSetMethodName();
 		}
 		else
-			sBuf.append(DUMMY_VAL);
+		{
+			joinResultSetString = 
+				((Optimizable) rightResultSet).getTrulyTheBestAccessPath().
+					getJoinStrategy().joinResultSetMethodName();
+		}
 
-		// Get the operator type.
-		sBuf.append(" " + opNode.operator + " ");
+		acb.pushGetResultSetFactoryExpression(mb);
+		int nargs = getJoinArguments(acb, mb, joinClause);
+		mb.callMethod(VMOpcode.INVOKEINTERFACE, (String) null, joinResultSetString, ClassName.NoPutResultSet, nargs);
+	}
 
-		// Get right operand's name.
-		if (opNode.getRightOperand() instanceof ColumnReference) {
-			sBuf.append(
-				((ColumnReference)opNode.getRightOperand()).getTableName() +
-				"." +
-				((ColumnReference)opNode.getRightOperand()).getColumnName()
-			);
+	/**
+	 * Get the arguments to the join result set.
+	 *
+	 * @param acb	The ActivationClassBuilder for the class we're building.
+	 * @param mb the method the generated code is going into
+	 * @param joinClause	The join clause, if any
+	 *
+	 * @return	The array of arguments to the join result set
+	 *
+	 * @exception StandardException		Thrown on error
+	 */
+	private int getJoinArguments(ActivationClassBuilder acb,
+											MethodBuilder mb,
+											ValueNode joinClause)
+							throws StandardException
+	{
+		int numArgs = getNumJoinArguments();
+
+		leftResultSet.generate(acb, mb); // arg 1
+		mb.push(leftResultSet.resultColumns.size()); // arg 2
+		rightResultSet.generate(acb, mb); // arg 3
+		mb.push(rightResultSet.resultColumns.size()); // arg 4
+
+		// Get our final cost estimate based on child estimates.
+		costEstimate = getFinalCostEstimate();
+
+		// for the join clause, we generate an exprFun
+		// that evaluates the expression of the clause
+		// against the current row of the child's result.
+		// if the join clause is empty, we generate a function
+		// that just returns true. (Performance tradeoff: have
+		// this function for the empty join clause, or have
+		// all non-empty join clauses check for a null at runtime).
+
+   		// generate the function and initializer:
+   		// Note: Boolean lets us return nulls (boolean would not)
+   		// private Boolean exprN()
+   		// {
+   		//   return <<joinClause.generate(ps)>>;
+   		// }
+   		// static Method exprN = method pointer to exprN;
+
+		// if there is no join clause, we just pass a null Expression.
+		if (joinClause == null)
+		{
+		   	mb.pushNull(ClassName.GeneratedMethod); // arg 5
 		}
 		else
-			sBuf.append(DUMMY_VAL);
+		{
+			// this sets up the method and the static field.
+			// generates:
+			// 	Object userExprFun { }
+			MethodBuilder userExprFun = acb.newUserExprFun();
 
-		return sBuf.toString();
+			// join clause knows it is returning its value;
+
+			/* generates:
+			 *    return <joinClause.generate(acb)>;
+			 * and adds it to userExprFun
+			 */
+			joinClause.generate(acb, userExprFun);
+			userExprFun.methodReturn();
+
+			// we are done modifying userExprFun, complete it.
+			userExprFun.complete();
+
+	   		// join clause is used in the final result set as an access of the new static
+   			// field holding a reference to this new method.
+			// generates:
+			//	ActivationClass.userExprFun
+			// which is the static field that "points" to the userExprFun
+			// that evaluates the where clause.
+   			acb.pushMethodReference(mb, userExprFun); // arg 5
+		}
+
+		mb.push(resultSetNumber); // arg 6
+
+		addOuterJoinArguments(acb, mb);
+
+		// Does right side return a single row
+		oneRowRightSide(acb, mb);
+
+		// estimated row count
+		mb.push(costEstimate.rowCount());
+
+		// estimated cost
+		mb.push(costEstimate.getEstimatedCost());
+
+		//User may have supplied optimizer overrides in the sql
+		//Pass them onto execute phase so it can be shown in 
+		//run time statistics.
+		if (joinOrderStrategyProperties != null)
+			mb.push(PropertyUtil.sortProperties(joinOrderStrategyProperties));
+		else
+			mb.pushNull("java.lang.String");
+
+		return numArgs;
+
+	}
+
+	/**
+	 * @see ResultSetNode#getFinalCostEstimate
+	 *
+	 * Get the final CostEstimate for this JoinNode.
+	 *
+	 * @return	The final CostEstimate for this JoinNode, which is sum
+	 *  the costs for the inner and outer table.  The number of rows,
+	 *  though, is that for the inner table only.
+	 */
+	public CostEstimate getFinalCostEstimate()
+		throws StandardException
+	{
+		// If we already found it, just return it.
+		if (finalCostEstimate != null)
+			return finalCostEstimate;
+
+		CostEstimate leftCE = leftResultSet.getFinalCostEstimate();
+		CostEstimate rightCE = rightResultSet.getFinalCostEstimate();
+
+		finalCostEstimate = getNewCostEstimate();
+		finalCostEstimate.setCost(
+			leftCE.getEstimatedCost() + rightCE.getEstimatedCost(),
+			rightCE.rowCount(),
+			rightCE.rowCount());
+
+		return finalCostEstimate;
+	}
+
+	protected void oneRowRightSide(ActivationClassBuilder acb,
+									   MethodBuilder mb)
+		throws StandardException
+	{
+		mb.push(rightResultSet.isOneRowResultSet());
+		mb.push(rightResultSet.isNotExists());  //join is for NOT EXISTS
+	}
+
+	/**
+	 * Return the number of arguments to the join result set.  This will
+	 * be overridden for other types of joins (for example, outer joins).
+	 */
+	protected int getNumJoinArguments()
+	{
+		return 11;
+	}
+
+	/**
+	 * Generate	and add any arguments specifict to outer joins.
+	 * (Expected to be overriden, where appropriate, in subclasses.)
+	 *
+	 * @param acb		The ActivationClassBuilder
+	 * @param mb the method  the generated code is to go into
+	 *
+	 * return The number of args added
+	 *
+	 * @exception StandardException		Thrown on error
+	 */
+	 protected int addOuterJoinArguments(ActivationClassBuilder acb,
+											MethodBuilder mb)
+		 throws StandardException
+	 {
+		 return 0;
+	 }
+
+	/** 
+	 * Convert the joinType to a string.
+	 *
+	 * @param joinType			The joinType as an int.
+	 *
+	 * @return String		The joinType as a String.
+	 */
+	public static String joinTypeToString(int joinType)
+	{
+		switch(joinType)
+		{
+			case INNERJOIN:
+				return "INNER JOIN";
+
+			case CROSSJOIN:
+				return "CROSS JOIN";
+
+			case LEFTOUTERJOIN:
+				return "LEFT OUTER JOIN";
+
+			case RIGHTOUTERJOIN:
+				return "RIGHT OUTER JOIN";
+
+			case FULLOUTERJOIN:
+				return "FULL OUTER JOIN";
+
+			case UNIONJOIN:
+				return "UNION JOIN";
+
+			default:
+				if (SanityManager.DEBUG)
+				{
+					SanityManager.ASSERT(false,	"Unexpected joinType");
+				}
+				return null;
+		}
+	}
+
+	protected PredicateList getLeftPredicateList() throws StandardException
+	{
+		if (leftPredicateList == null)
+			leftPredicateList = (PredicateList) getNodeFactory().getNode(
+													C_NodeTypes.PREDICATE_LIST,
+													getContextManager());
+
+		return leftPredicateList;
+	}
+
+	protected PredicateList getRightPredicateList() throws StandardException
+	{
+		if (rightPredicateList == null)
+			rightPredicateList = (PredicateList) getNodeFactory().getNode(
+													C_NodeTypes.PREDICATE_LIST,
+													getContextManager());
+
+		return rightPredicateList;
+	}
+
+	/**
+	 * Get the lock mode for the target of an update statement
+	 * (a delete or update).  The update mode will always be row for
+	 * CurrentOfNodes.  It will be table if there is no where clause.
+	 *
+	 * @return	The lock mode
+	 */
+	public int updateTargetLockMode()
+	{
+		/* Always use row locking if we have a join node.
+		 * We can only have a join node if there is a subquery that
+		 * got flattened, hence there is a restriction.
+		 */
+		return TransactionController.MODE_RECORD;
+	}
+
+	/**
+	 * Mark this node and its children as not being a flattenable join.
+	 */
+	void notFlattenableJoin()
+	{
+		flattenableJoin = false;
+		leftResultSet.notFlattenableJoin();
+		rightResultSet.notFlattenableJoin();
+	}
+
+	/**
+	 * Is this FromTable a JoinNode which can be flattened into 
+	 * the parents FromList.
+	 *
+	 * @return boolean		Whether or not this FromTable can be flattened.
+	 */
+	public boolean isFlattenableJoinNode()
+	{
+		return flattenableJoin;
+	}
+
+	/**
+	 * Return whether or not the underlying ResultSet tree
+	 * is ordered on the specified columns.
+	 * RESOLVE - This method currently only considers the outermost table 
+	 * of the query block.
+	 *
+	 * @param	crs					The specified ColumnReference[]
+	 * @param	permuteOrdering		Whether or not the order of the CRs in the array can be permuted
+	 * @param	fbtVector			Vector that is to be filled with the FromBaseTable	
+	 *
+	 * @return	Whether the underlying ResultSet tree
+	 * is ordered on the specified column.
+	 *
+	 * @exception StandardException		Thrown on error
+	 */
+	boolean isOrderedOn(ColumnReference[] crs, boolean permuteOrdering, Vector fbtVector)
+				throws StandardException
+	{
+		/* RESOLVE - easiest thing for now is to only consider the leftmost child */
+		return leftResultSet.isOrderedOn(crs, permuteOrdering, fbtVector);
 	}
 
 	/**
@@ -805,10 +1932,72 @@ public final class Predicate extends QueryTreeNode implements OptimizablePredica
 	{
 		if (SanityManager.DEBUG)
 		{
-			printLabel(depth, "andNode: ");
-			andNode.treePrint(depth + 1);
 			super.printSubNodes(depth);
+
+			if (subqueryList != null)
+			{
+				printLabel(depth, "subqueryList: ");
+				subqueryList.treePrint(depth + 1);
+			}
+
+			if (joinClause != null)
+			{
+				printLabel(depth, "joinClause: ");
+				joinClause.treePrint(depth + 1);
+			}
+
+			if (joinPredicates.size() != 0)
+			{
+				printLabel(depth, "joinPredicates: ");
+				joinPredicates.treePrint(depth + 1);
+			}
+
+			if (usingClause != null)
+			{
+				printLabel(depth, "usingClause: ");
+				usingClause.treePrint(depth + 1);
+			}
 		}
+	}
+
+	void setSubqueryList(SubqueryList subqueryList)
+	{
+		this.subqueryList = subqueryList;
+	}
+
+	void setAggregateVector(Vector aggregateVector)
+	{
+		this.aggregateVector = aggregateVector;
+	}
+
+    /**
+     * Flag this as a natural join so that an implicit USING clause will
+     * be generated in the bind phase.
+     */
+    void setNaturalJoin() {
+        naturalJoin = true;
+    }
+
+	/**
+	 * Return the logical left result set for this qualified
+	 * join node.
+	 * (For RIGHT OUTER JOIN, the left is the right
+	 * and the right is the left and the JOIN is the NIOJ).
+	 */
+	ResultSetNode getLogicalLeftResultSet()
+	{
+		return leftResultSet;
+	}
+
+	/**
+	 * Return the logical right result set for this qualified
+	 * join node.
+	 * (For RIGHT OUTER JOIN, the left is the right
+	 * and the right is the left and the JOIN is the NIOJ).
+	 */
+	ResultSetNode getLogicalRightResultSet()
+	{
+		return rightResultSet;
 	}
 
 	/**
@@ -823,572 +2012,42 @@ public final class Predicate extends QueryTreeNode implements OptimizablePredica
 	{
 		super.acceptChildren(v);
 
-		if (andNode != null)
+		if (resultColumns != null)
 		{
-			andNode = (AndNode)andNode.accept(v);
+			resultColumns = (ResultColumnList)resultColumns.accept(v);
+		}
+
+		if (joinClause != null)
+		{
+			joinClause = (ValueNode)joinClause.accept(v);
+		}
+
+		if (usingClause != null)
+		{
+			usingClause = (ResultColumnList)usingClause.accept(v);
+		}
+
+		if (joinPredicates != null)
+		{
+			joinPredicates = (PredicateList) joinPredicates.accept(v);
 		}
 	}
 
-	/**
-	 * Copy all fields of this Predicate (except the two that
-	 * are set from 'init').
-	 *
-	 */
-
-	public void copyFields(Predicate otherPred) {
-
-		this.equivalenceClass = otherPred.getEquivalenceClass();
-		this.indexPosition = otherPred.getIndexPosition();
-		this.startKey = otherPred.isStartKey();
-		this.stopKey = otherPred.isStopKey();
-		this.isQualifier = otherPred.isQualifier();
-		this.searchClauseHT = otherPred.getSearchClauseHT();
-
-	}
-
-	/**
-	 * Get the search clause Hash Table.
-	 */
-
-	public Hashtable getSearchClauseHT() {
-		return searchClauseHT;
-	}
-
-	/**
-	 * Determine whether or not this predicate is eligible for
-	 * push-down into subqueries.  Right now the only predicates
-	 * we consider to be eligible are those which 1) are Binary
-	 * Relational operator nodes and 2) have a column reference
-	 * on BOTH sides, each of which has a reference to a base
-	 * table somewhere beneath it.
-	 *
-	 * @return Whether or not this predicate is eligible to be
-	 *  pushed into subqueries.
-	 */
-	protected boolean pushableToSubqueries()
-		throws StandardException
+	// This method returns the table references in Join node, and this may be
+	// needed for LOJ reordering.  For example, we may have the following query:
+	//       (T JOIN S) LOJ (X LOJ Y) 
+    // The top most LOJ may be a join betw T and X and thus we can reorder the
+	// LOJs.  However, as of 10/2002, we don't reorder LOJ mixed with join.
+	public JBitSet LOJgetReferencedTables(int numTables)
+				throws StandardException
 	{
-		if (!isJoinPredicate())
-			return false;
+		JBitSet map = new JBitSet(numTables);
 
-		// Make sure both column references ultimately point to base
-		// tables.  If, for example, either column reference points to a
-		// a literal or an aggregate, then we do not push the predicate.
-		// This is because pushing involves remapping the references--
-		// but if the reference doesn't have a base table beneath it,
-		// the notion of "remapping" it doesn't (seem to) apply.  RESOLVE:
-		// it might be okay to make the "remap" operation a no-op for
-		// such column references, but it's not clear whether that's
-		// always a safe option; further investigation required.
+		map = (JBitSet) leftResultSet.LOJgetReferencedTables(numTables);
+		if (map == null) return null;
+		else map.or((JBitSet) rightResultSet.LOJgetReferencedTables(numTables));
 
-		BinaryRelationalOperatorNode opNode =
-			(BinaryRelationalOperatorNode)getAndNode().getLeftOperand();
-
-		JBitSet tNums = new JBitSet(getReferencedSet().size());
-		BaseTableNumbersVisitor btnVis = new BaseTableNumbersVisitor(tNums);
-		opNode.getLeftOperand().accept(btnVis);
-		if (tNums.getFirstSetBit() == -1)
-			return false;
-
-		tNums.clearAll();
-		opNode.getRightOperand().accept(btnVis);
-		if (tNums.getFirstSetBit() == -1)
-			return false;
-
-		return true;
+		return map;
 	}
-
-	/**
-	 * Is this predicate a join predicate?  In order to be so,
-	 * it must be a binary relational operator node that has
-	 * a column reference on both sides.
-	 *
-	 * @return Whether or not this is a join predicate.
-	 */
-	protected boolean isJoinPredicate()
-	{
-		// If the predicate isn't a binary relational operator,
-		// then it's not a join predicate.
-		if (!(getAndNode().getLeftOperand()
-			instanceof BinaryRelationalOperatorNode))
-		{
-			return false;
-		}
-
-		BinaryRelationalOperatorNode opNode =
-			(BinaryRelationalOperatorNode)getAndNode().getLeftOperand();
-
-		// If both sides are column references AND they point to different
-		// tables, then this is a join pred.
-		return ((opNode.getLeftOperand() instanceof ColumnReference) &&
-			(opNode.getRightOperand() instanceof ColumnReference) &&
-			(((ColumnReference)opNode.getLeftOperand()).getTableNumber() !=
-			((ColumnReference)opNode.getRightOperand()).getTableNumber()));
-	}
-
-	/**
-	 * If this predicate's operator is a BinaryRelationalOperatorNode,
-	 * then look at the operands and return a new, equivalent predicate
-	 * that is "scoped" to the received ResultSetNode.  By "scoped" we
-	 * mean that the operands, which shold be column references, have been
-	 * mapped to the appropriate result columns in the received RSN.
-	 * This is useful for pushing predicates from outer queries down
-	 * into inner queries, in which case the column references need
-	 * to be remapped.
-	 *
-	 * For example, let V1 represent
-	 *
-	 *    select i,j from t1 UNION select i,j from t2
-	 * 
-	 * and V2 represent
-	 *
-	 *    select a,b from t3 UNION select a,b from t4
-	 * 
-	 * Then assume we have the following query:
-	 *
-	 *    select * from V1, V2 where V1.j = V2.b
-	 *
-	 * Let's further assume that this Predicate object represents the
-	 * "V1.j = V2.b" operator and that the childRSN we received
-	 * as a parameter represents one of the subqueries to which we
-	 * want to push the predicate; let's say it's:
-	 *
-	 *    select i,j from t1
-	 *
-	 * Then this method will return a new predicate whose binary
-	 * operator represents the expression "T1.j = V2.b" (that is, V1.j
-	 * will be mapped to the corresponding column in T1).  For more on
-	 * how that mapping is made, see the "getScopedOperand()" method
-	 * in BinaryRelationalOperatorNode.java.
-	 *
-	 * ASSUMPTION: We should only get to this method if we know that
-	 * at least one operand in this predicate can and should be mapped
-	 * to the received childRSN.  For an example of where that check is
-	 * made, see the pushOptPredicate() method in SetOperatorNode.java.
-	 *
-	 * @param parentRSNsTables Set of all table numbers referenced by
-	 *  the ResultSetNode that is _parent_ to the received childRSN.
-	 *  We need this to make sure we don't scope the operands to a
-	 *  ResultSetNode to which they don't apply.
-	 * @param childRSN The result set node for which we want to create
-	 *  a scoped predicate.
-	 * @param whichRC If not -1 then this tells us which ResultColumn
-	 *  in the received childRSN we need to use for the scoped predicate;
-	 *  if -1 then the column position of the scoped column reference
-	 *  will be stored in this array and passed back to the caller.
-	 * @return A new predicate whose operands have been scoped to the
-	 *  received childRSN.
-	 */
-	protected Predicate getPredScopedForResultSet(
-		JBitSet parentRSNsTables, ResultSetNode childRSN,
-		int [] whichRC) throws StandardException
-	{
-		// We only deal with binary relational operators here.
-		if (!(getAndNode().getLeftOperand()
-			instanceof BinaryRelationalOperatorNode))
-		{
-			return this;
-		}
-
-		// The predicate must have an AndNode in CNF, so we
-		// need to create an AndNode representing:
-		//    <scoped_bin_rel_op> AND TRUE
-		// First create the boolean constant for TRUE.
-		ValueNode trueNode = (ValueNode) getNodeFactory().getNode(
-			C_NodeTypes.BOOLEAN_CONSTANT_NODE,
-			Boolean.TRUE,
-			getContextManager());
-
-		BinaryRelationalOperatorNode opNode =
-			(BinaryRelationalOperatorNode)getAndNode().getLeftOperand();
-
-		// Create a new op node with left and right operands that point
-		// to the received result set's columns as appropriate.
-		BinaryRelationalOperatorNode newOpNode = 
-			(BinaryRelationalOperatorNode) getNodeFactory().getNode(
-				opNode.getNodeType(),
-				opNode.getScopedOperand(
-					BinaryRelationalOperatorNode.LEFT,
-					parentRSNsTables,
-					childRSN,
-					whichRC),
-				opNode.getScopedOperand(
-					BinaryRelationalOperatorNode.RIGHT,
-					parentRSNsTables,
-					childRSN,
-					whichRC),
-				getContextManager());
-
-		// Bind the new op node.
-		newOpNode.bindComparisonOperator();
-
-		// Create and bind a new AND node in CNF form,
-		// i.e. "<newOpNode> AND TRUE".
-		AndNode newAnd = (AndNode) getNodeFactory().getNode(
-			C_NodeTypes.AND_NODE,
-			newOpNode,
-			trueNode,
-			getContextManager());
-		newAnd.postBindFixup();
-
-		// Categorize the new AND node; among other things, this
-		// call sets up the new operators's referenced table map,
-		// which is important for correct pushing of the new
-		// predicate.
-		JBitSet tableMap = new JBitSet(
-			childRSN.getReferencedTableMap().size());
-		newAnd.categorize(tableMap, false);
-
-		// Now put the pieces together to get a new predicate.
-		Predicate newPred = (Predicate) getNodeFactory().getNode(
-			C_NodeTypes.PREDICATE,
-			newAnd,
-			tableMap,
-			getContextManager());
-
-		// Copy all of this predicates other fields into the new predicate.
-		newPred.clearScanFlags();
-		newPred.copyFields(this);
-		newPred.setPushable(getPushable());
-
-		// Take note of the fact that the new predicate is scoped for
-		// the sake of pushing; we need this information during optimization
-		// to figure out what we should and should not "pull" back up.
-		newPred.markAsScopedForPush();
-		return newPred;
-	}
-
-	/**
-	 * Indicate that this predicate is a scoped copy of some other
-	 * predicate (i.e. it was created as the result of a call to
-	 * getPredScopedForResultSet() on some other predicate).
-	 */
-	protected void markAsScopedForPush() {
-		this.scoped = true;
-	}
-
-	/**
-	 * Return whether or not this predicate is a scoped copy of
-	 * another predicate.
-	 */
-	protected boolean isScopedForPush() {
-		return scoped;
-	}
-
-	/**
-	 * When remapping a "normal" (i.e. non-scoped) predicate both
-	 * of the predicate's operands are remapped and that's it.
-	 * But when remapping a scoped predicate, things are slightly
-	 * different.  This method handles remapping of scoped predicates.
-	 *
-	 * We know that, for a scoped predicate, exactly one operand has
-	 * been scoped for a specific target result set; the other operand
-	 * is pointing to some other instance of FromTable with which the
-	 * target result set is to be joined (see getScopedOperand() in
-	 * BinaryRelationalOperatorNode.java).  For every level of the
-	 * query through which the scoped predicate is pushed, we have
-	 * to perform a remap operation of the scoped operand.  We do
-	 * *not*, however, remap the non-scoped operand.  The reason
-	 * is that the non-scoped operand is already pointing to the
-	 * result set against which it must be evaluated.  As the scoped
-	 * predicate is pushed down the query tree, the non-scoped
-	 * operand should not change where it's pointing and thus should
-	 * not be remapped.  For example, assume we have a query whose
-	 * tree has the following form:
-	 *
-	 *               SELECT[0] 
-	 *                /     \ 
-	 *              PRN      PRN 
-	 *               |        |
-	 *          SELECT[4]   UNION
-	 *           |           /   \ 
-	 *          PRN     SELECT[1]  SELECT[2] 
-	 *           |         |          | 
-	 *       <FBT:T1>     PRN        PRN 
-	 *                     |          |
-	 *                SELECT[3]  <FromBaseTable:T2> 
-	 *                     |
-	 *                    PRN
-	 *                     |
-	 *             <FromBaseTable:T3>
-	 *
-	 * Assume also that we have some predicate "SELECT[4].i = <UNION>.j".
-	 * If the optimizer decides to push the predicate to the UNION
-	 * node, it (the predicate) will be scoped to the UNION's children,
-	 * yielding something like "SELECT[4].i = SELECT[1].j" for the
-	 * left child and "SELECT[4].i = SELECT[2].j" for the right child.
-	 * These scoped predicates will then be pushed to the PRNs above
-	 * SELECT[3] and T2, respectively.  As part of that pushing
-	 * process a call to PRN.pushOptPredicate() will occur, which
-	 * brings us to this method.  So let's assume we're here for
-	 * the scoped predicate "SELECT[4].i = SELECT[1].j".  Then we want
-	 * to remap the scoped operand, "SELECT[1].j", so that it will
-	 * point to the correct column in "SELECT[3]".  We do NOT, however,
-	 * want to remap the non-scoped operand "SELECT[4].i" because that
-	 * operand is already pointing to the correct result set--namely,
-	 * to a column in SELECT[4].  That non-scoped operand should not
-	 * change regardless of how far down the UNION subtree the scoped
-	 * predicate is pushed.
-	 * 
-	 * If we did try to remap the non-scoped operand, it would end up
-	 * pointing to result sets too low in the tree, which could lead to
-	 * execution-time errors.  So when we remap a scoped predicate, we
-	 * have to make sure we only remap the scoped operand.  That's what
-	 * this method does.
-	 *
-	 * @return True if this predicate is a scoped predicate, in which
-	 *  case we performed a one-sided remap.  False if the predicate is
-	 *  not scoped; the caller can then make the calls to perform a
-	 *  "normal" remap on this predicate.
-	 */
-	protected boolean remapScopedPred()
-	{
-		if (!scoped)
-			return false;
-
-		/* Note: right now the only predicates we scope are those
-		 * which are join predicates and all scoped predicates will
-		 * have the same relational operator as the predicates from
-		 * which they were scoped.  Thus if we get here, we know
-		 * that andNode's leftOperand must be an instance of
-		 * BinaryRelationalOperatorNode (and therefore the following
-		 * cast is safe).
-		 */
-		BinaryRelationalOperatorNode binRelOp =
-			(BinaryRelationalOperatorNode)andNode.getLeftOperand();
-
-		ValueNode operand = null;
-
-		if (SanityManager.DEBUG)
-		{
-			/* If this predicate is scoped then one (and only one) of
-			 * its operands should be scoped.  Note that it's possible
-			 * for an operand to be scoped to a non-ColumnReference
-			 * value; if either operand is not a ColumnReference, then
-			 * that operand must be the scoped operand.
-			 */
-			operand = binRelOp.getLeftOperand();
-			boolean leftIsScoped =
-				!(operand instanceof ColumnReference) ||
-					((ColumnReference)operand).isScoped();
-
-			operand = binRelOp.getRightOperand();
-			boolean rightIsScoped =
-				!(operand instanceof ColumnReference) ||
-					((ColumnReference)operand).isScoped();
-
-			SanityManager.ASSERT(leftIsScoped ^ rightIsScoped,
-				"All scoped predicates should have exactly one scoped " +
-				"operand, but '" + binaryRelOpColRefsToString() +
-				"' has " + (leftIsScoped ? "TWO" : "NONE") + ".");
-		}
-
-		// Find the scoped operand and remap it.
-		operand = binRelOp.getLeftOperand();
-		if ((operand instanceof ColumnReference) &&
-			((ColumnReference)operand).isScoped())
-		{
-			// Left operand is the scoped operand.
-			((ColumnReference)operand).remapColumnReferences();
-		}
-		else
-		{
-			operand = binRelOp.getRightOperand();
-			if ((operand instanceof ColumnReference) &&
-				((ColumnReference)operand).isScoped())
-			{
-				// Right operand is the scoped operand.
-				((ColumnReference)operand).remapColumnReferences();
-			}
-
-			// Else scoped operand is not a ColumnReference, which
-			// means it can't (and doesn't need to) be remapped. So
-			// just fall through and return.
-		}
-
-		return true;
-	}
-
-	/**
-	 * Return true if this predicate is scoped AND the scoped
-	 * operand is a ColumnReference that points to a source result
-	 * set.  If the scoped operand is not a ColumnReference that
-	 * points to a source result set then it must be pointing to
-	 * some kind of expression, such as a literal (ex. 'strlit'),
-	 * an aggregate value (ex. "count(*)"), or the result of a
-	 * function (ex. "sin(i)") or operator (ex. "i+1").
-	 *
-	 * This method is used when pushing predicates to determine how
-	 * far down the query tree a scoped predicate needs to be pushed
-	 * to allow for successful evaluation of the scoped operand.  If
-	 * the scoped operand is not pointing to a source result set
-	 * then it should not be pushed any further down tree.  The reason
-	 * is that evaluation of the expression to which the operand is
-	 * pointing may depend on other values from the current level
-	 * in the tree (ex. "sin(i)" depends on the value of "i", which
-	 * could be a column at the predicate's current level).  If we
-	 * pushed the predicate further down, those values could become
-	 * inaccessible, leading to execution-time errors.
-	 *
-	 * If, on the other hand, the scoped operand *is* pointing to
-	 * a source result set, then we want to push it further down
-	 * the tree until it reaches that result set, which allows
-	 * evaluation of this predicate to occur as close to store as
-	 * possible.  This method doesn't actually do the push, it just
-	 * returns "true" and then the caller can push as appropriate.
-	 */
-	protected boolean isScopedToSourceResultSet()
-		throws StandardException
-	{
-		if (!scoped)
-			return false;
-
-		/* Note: right now the only predicates we scope are those
-		 * which are join predicates and all scoped predicates will
-		 * have the same relational operator as the predicates from
-		 * which they were scoped.  Thus if we get here, we know
-		 * that andNode's leftOperand must be an instance of
-		 * BinaryRelationalOperatorNode (and therefore the following
-		 * cast is safe).
-		 */
-		BinaryRelationalOperatorNode binRelOp =
-			(BinaryRelationalOperatorNode)andNode.getLeftOperand();
-
-		ValueNode operand = binRelOp.getLeftOperand();
-
-		/* If operand isn't a ColumnReference then is must be the
-		 * scoped operand.  This is because both operands have to
-		 * be column references in order for scoping to occur (as
-		 * per pushableToSubqueries()) and only the scoped operand
-		 * can change (esp. can become a non-ColumnReference) as
-		 * part of the scoping process.  And since it's not a
-		 * ColumnReference it can't be "a ColumnReference that
-		 * points to a source result set", so return false.
-		 */
-		if (!(operand instanceof ColumnReference))
-			return false;
-
-		/* If the operand is a ColumnReference and is scoped,
-		 * then see if it is pointing to a ResultColumn whose
-		 * expression is either another a CR or a Virtual
-		 * ColumnNode.  If it is then that operand applies
-		 * to a source result set further down the tree and
-		 * thus we return true.
-		 */
-		ValueNode exp = null;
-		ColumnReference cRef = (ColumnReference)operand;
-		if (cRef.isScoped())
-		{
-			exp = cRef.getSource().getExpression();
-			return ((exp instanceof VirtualColumnNode) ||
-				(exp instanceof ColumnReference));
-		}
-
-		operand = binRelOp.getRightOperand();
-		if (!(operand instanceof ColumnReference))
-			return false;
-
-		cRef = (ColumnReference)operand;
-		if (SanityManager.DEBUG)
-		{
-			// If we got here then the left operand was NOT the scoped
-			// operand; make sure the right one is scoped, then.
-			SanityManager.ASSERT(cRef.isScoped(),
-				"All scoped predicates should have exactly one scoped " +
-				"operand, but '" + binaryRelOpColRefsToString() +
-				"has NONE.");
-		}
-
-		exp = cRef.getSource().getExpression();
-		return ((exp instanceof VirtualColumnNode) ||
-			(exp instanceof ColumnReference));
-	}
-
-	/**
-	 * Return whether or not this predicate corresponds to a legitimate
-	 * relational operator.
-	 *
-	 * @return False if there is no relational operator for this predicate
-	 *  OR if this predicate is an internal "probe predicate" (in which
-	 *  case it "looks" like we have a relational operator but in truth
-	 *  it's a disguised IN-list operator). True otherwise.
-	 */
-	protected boolean isRelationalOpPredicate()
-	{
-		/* The isRelationalOperator() method on the ValueNode
-		 * interface tells us what we need to know, so all we have
-		 * to do is call that method on the left child of our AND node.
-		 * Note that BinaryRelationalOperatorNode.isRelationalOperator()
-		 * includes logic to determine whether or not it (the BRON) is
-		 * really a disguised IN-list operator--and if so, it will
-		 * return false (which is what we want).
-		 */
-		return andNode.getLeftOperand().isRelationalOperator();
-	}
-
-	/**
-	 * Return whether or not this predicate is an IN-list probe
-	 * predicate.
-	 */
-	protected boolean isInListProbePredicate()
-	{
-		/* The isInListProbeNode() method on the ValueNode interface
-		 * tells us what we need to know, so all we have to do is call
-		 * that method on the left child of our AND node.
-		 */
-		return andNode.getLeftOperand().isInListProbeNode();
-	}
-
-	/**
-	 * If this predicate corresponds to an IN-list, return the underlying
-	 * InListOperatorNode from which it was built.  There are two forms
-	 * to check for:
-	 *
-	 *  1. This predicate is an IN-list "probe predicate", in which case
-	 *     the underlying InListOpNode is stored within the binary relational
-	 *     operator that is the left operand of this predicate's AND node.
-	 *
-	 *  2. This predicate corresponds to an IN-list that could _not_ be
-	 *     transformed into a "probe predicate" (i.e. the IN-list contains
-	 *     one or more non-parameter, non-constant values). In that case
-	 *     the underlying InListOpNode is simply the left operand of
-	 *     this predicate's AND node.
-	 *
-	 * If this predicate does not correspond to an IN-list in any way,
-	 * this method will return null.
-	 */
-	protected InListOperatorNode getSourceInList()
-	{
-		return getSourceInList(false);
-	}
-
-	/**
-	 * Does the work of getSourceInList() above, but can also be called
-	 * directly with an argument to indicate whether or not we should
-	 * limit ourselves to probe predicates.
-	 *
-	 * @param probePredOnly If true, only get the source IN list for this
-	 *   predicate *if* it is an IN-list probe predicate.  If false,
-	 *   return the underlying InListOperatorNode (if it exists) regardless
-	 *   of whether this is a probe predicate or an un-transformed IN-list
-	 *   pred.
-	 * 
-	 * @return Underlying InListOp for this predicate (depending on
-	 *   the value of probePredOnly), or null if this predicate does
-	 *   not correspond to an IN-list in any way.
-	 */
-	protected InListOperatorNode getSourceInList(boolean probePredOnly)
-	{
-		ValueNode vn = andNode.getLeftOperand();
-		if (isInListProbePredicate())
-			return ((BinaryRelationalOperatorNode)vn).getInListOp();
-
-		if (probePredOnly)
-			return null;
-
-		if (vn instanceof InListOperatorNode)
-			return (InListOperatorNode)vn;
-
-		return null;
-	}
+	
 }

@@ -1,6 +1,4 @@
-writer.shutdown();
-
-package org.apache.lucene.index.sorter;
+iw.shutdown();
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -18,130 +16,332 @@ package org.apache.lucene.index.sorter;
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+package org.apache.solr.spelling;
 
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.List;
+import java.io.File;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.Date;
+import java.util.Map;
 
-import org.apache.lucene.analysis.MockAnalyzer;
+import org.apache.lucene.analysis.Token;
+import org.apache.lucene.analysis.core.WhitespaceAnalyzer;
 import org.apache.lucene.document.Document;
-import org.apache.lucene.document.Field.Store;
-import org.apache.lucene.document.NumericDocValuesField;
-import org.apache.lucene.document.StringField;
-import org.apache.lucene.index.AtomicReader;
-import org.apache.lucene.index.DirectoryReader;
+import org.apache.lucene.document.Field;
+import org.apache.lucene.document.TextField;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
-import org.apache.lucene.index.NumericDocValues;
-import org.apache.lucene.index.RandomIndexWriter;
-import org.apache.lucene.index.Term;
-import org.apache.lucene.search.CachingWrapperFilter;
-import org.apache.lucene.search.DocIdSet;
-import org.apache.lucene.search.DocIdSetIterator;
-import org.apache.lucene.search.Filter;
-import org.apache.lucene.search.QueryWrapperFilter;
-import org.apache.lucene.search.Sort;
-import org.apache.lucene.search.SortField;
-import org.apache.lucene.search.TermQuery;
-import org.apache.lucene.util.ArrayUtil;
-import org.apache.lucene.util.FixedBitSet;
-import org.apache.lucene.util.LuceneTestCase;
+import org.apache.lucene.search.spell.JaroWinklerDistance;
+import org.apache.lucene.search.spell.SpellChecker;
+import org.apache.lucene.search.spell.StringDistance;
+import org.apache.lucene.search.spell.SuggestMode;
+import org.apache.lucene.search.spell.SuggestWord;
+import org.apache.lucene.search.spell.SuggestWordFrequencyComparator;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.util.LuceneTestCase.SuppressTempFileChecks;
+import org.apache.solr.SolrTestCaseJ4;
+import org.apache.solr.common.util.NamedList;
+import org.apache.solr.core.SolrCore;
+import org.apache.solr.handler.component.SpellCheckComponent;
+import org.apache.solr.search.SolrIndexSearcher;
+import org.apache.solr.util.RefCounted;
+import org.junit.AfterClass;
+import org.junit.BeforeClass;
+import org.junit.Test;
 
-public class TestBlockJoinSorter extends LuceneTestCase {
+/**
+ * @since solr 1.3
+ */
+@SuppressTempFileChecks(bugUrl = "https://issues.apache.org/jira/browse/SOLR-1877 Spellcheck IndexReader leak bug?")
+public class IndexBasedSpellCheckerTest extends SolrTestCaseJ4 {
+  protected static SpellingQueryConverter queryConverter;
 
-  private static class FixedBitSetCachingWrapperFilter extends CachingWrapperFilter {
+  protected static String[] DOCS = new String[]{
+          "This is a title",
+          "The quick reb fox jumped over the lazy brown dogs.",
+          "This is a document",
+          "another document",
+          "red fox",
+          "green bun",
+          "green bud"
+  };
 
-    public FixedBitSetCachingWrapperFilter(Filter filter) {
-      super(filter);
+
+  @BeforeClass
+  public static void beforeClass() throws Exception {
+    initCore("solrconfig.xml","schema.xml");
+    //Index something with a title
+    for (int i = 0; i < DOCS.length; i++) {
+      assertNull(h.validateUpdate(adoc("id", String.valueOf(i), "title", DOCS[i])));
     }
+    assertNull(h.validateUpdate(commit()));
+    queryConverter = new SimpleQueryConverter();
+  }
+  
+  @AfterClass
+  public static void afterClass() {
+    queryConverter = null;
+  }
 
+  @Test
+  public void testComparator() throws Exception {
+    SpellCheckComponent component = (SpellCheckComponent) h.getCore().getSearchComponent("spellcheck");
+    assertNotNull(component);
+    AbstractLuceneSpellChecker spellChecker;
+    Comparator<SuggestWord> comp;
+    spellChecker = (AbstractLuceneSpellChecker) component.getSpellChecker("freq");
+    assertNotNull(spellChecker);
+    comp = spellChecker.getSpellChecker().getComparator();
+    assertNotNull(comp);
+    assertTrue(comp instanceof SuggestWordFrequencyComparator);
+
+    spellChecker = (AbstractLuceneSpellChecker) component.getSpellChecker("fqcn");
+    assertNotNull(spellChecker);
+    comp = spellChecker.getSpellChecker().getComparator();
+    assertNotNull(comp);
+    assertTrue(comp instanceof SampleComparator);
+
+
+  }
+
+  @Test
+  public void testSpelling() throws Exception {
+    IndexBasedSpellChecker checker = new IndexBasedSpellChecker();
+
+    NamedList spellchecker = new NamedList();
+    spellchecker.add("classname", IndexBasedSpellChecker.class.getName());
+
+    File indexDir = createTempDir();
+
+    spellchecker.add(AbstractLuceneSpellChecker.INDEX_DIR, indexDir.getAbsolutePath());
+    spellchecker.add(AbstractLuceneSpellChecker.FIELD, "title");
+    spellchecker.add(AbstractLuceneSpellChecker.SPELLCHECKER_ARG_NAME, spellchecker);
+    SolrCore core = h.getCore();
+
+    String dictName = checker.init(spellchecker, core);
+    assertTrue(dictName + " is not equal to " + SolrSpellChecker.DEFAULT_DICTIONARY_NAME,
+            dictName.equals(SolrSpellChecker.DEFAULT_DICTIONARY_NAME) == true);
+    RefCounted<SolrIndexSearcher> holder = core.getSearcher();
+    SolrIndexSearcher searcher = holder.get();
+    try {
+    checker.build(core, searcher);
+
+    IndexReader reader = searcher.getIndexReader();
+    Collection<Token> tokens = queryConverter.convert("documemt");
+    SpellingOptions spellOpts = new SpellingOptions(tokens, reader);
+    SpellingResult result = checker.getSuggestions(spellOpts);
+    assertTrue("result is null and it shouldn't be", result != null);
+    //should be lowercased, b/c we are using a lowercasing analyzer
+    Map<String, Integer> suggestions = result.get(spellOpts.tokens.iterator().next());
+    assertTrue("documemt is null and it shouldn't be", suggestions != null);
+    assertTrue("documemt Size: " + suggestions.size() + " is not: " + 1, suggestions.size() == 1);
+    Map.Entry<String, Integer> entry = suggestions.entrySet().iterator().next();
+    assertTrue(entry.getKey() + " is not equal to " + "document", entry.getKey().equals("document") == true);
+    assertTrue(entry.getValue() + " does not equal: " + SpellingResult.NO_FREQUENCY_INFO, entry.getValue() == SpellingResult.NO_FREQUENCY_INFO);
+
+    //test something not in the spell checker
+    spellOpts.tokens = queryConverter.convert("super");
+    result = checker.getSuggestions(spellOpts);
+    assertTrue("result is null and it shouldn't be", result != null);
+    suggestions = result.get(spellOpts.tokens.iterator().next());
+    assertTrue("suggestions size should be 0", suggestions.size()==0);
+
+    //test something that is spelled correctly
+    spellOpts.tokens = queryConverter.convert("document");
+    result = checker.getSuggestions(spellOpts);
+    assertTrue("result is null and it shouldn't be", result != null);
+    suggestions = result.get(spellOpts.tokens.iterator().next());
+    assertTrue("suggestions is null and it shouldn't be", suggestions == null);
+
+    //Has multiple possibilities, but the exact exists, so that should be returned
+    spellOpts.tokens = queryConverter.convert("red");
+    spellOpts.count = 2;
+    result = checker.getSuggestions(spellOpts);
+    assertNotNull(result);
+    suggestions = result.get(spellOpts.tokens.iterator().next());
+    assertTrue("suggestions is not null and it should be", suggestions == null);
+
+    //Try out something which should have multiple suggestions
+    spellOpts.tokens = queryConverter.convert("bug");
+    result = checker.getSuggestions(spellOpts);
+    assertNotNull(result);
+    suggestions = result.get(spellOpts.tokens.iterator().next());
+    assertNotNull(suggestions);
+    assertTrue("suggestions Size: " + suggestions.size() + " is not: " + 2, suggestions.size() == 2);
+
+    entry = suggestions.entrySet().iterator().next();
+    assertTrue(entry.getKey() + " is equal to " + "bug and it shouldn't be", entry.getKey().equals("bug") == false);
+    assertTrue(entry.getValue() + " does not equal: " + SpellingResult.NO_FREQUENCY_INFO, entry.getValue() == SpellingResult.NO_FREQUENCY_INFO);
+
+    entry = suggestions.entrySet().iterator().next();
+    assertTrue(entry.getKey() + " is equal to " + "bug and it shouldn't be", entry.getKey().equals("bug") == false);
+    assertTrue(entry.getValue() + " does not equal: " + SpellingResult.NO_FREQUENCY_INFO, entry.getValue() == SpellingResult.NO_FREQUENCY_INFO);
+    } finally {
+      holder.decref();
+    }
+  }
+
+  @Test
+  public void testExtendedResults() throws Exception {
+    IndexBasedSpellChecker checker = new IndexBasedSpellChecker();
+    NamedList spellchecker = new NamedList();
+    spellchecker.add("classname", IndexBasedSpellChecker.class.getName());
+
+    File indexDir = createTempDir();
+    indexDir.mkdirs();
+    spellchecker.add(AbstractLuceneSpellChecker.INDEX_DIR, indexDir.getAbsolutePath());
+    spellchecker.add(AbstractLuceneSpellChecker.FIELD, "title");
+    spellchecker.add(AbstractLuceneSpellChecker.SPELLCHECKER_ARG_NAME, spellchecker);
+    SolrCore core = h.getCore();
+    String dictName = checker.init(spellchecker, core);
+    assertTrue(dictName + " is not equal to " + SolrSpellChecker.DEFAULT_DICTIONARY_NAME,
+            dictName.equals(SolrSpellChecker.DEFAULT_DICTIONARY_NAME) == true);
+    RefCounted<SolrIndexSearcher> holder = core.getSearcher();
+    SolrIndexSearcher searcher = holder.get();
+    try {
+    checker.build(core, searcher);
+
+    IndexReader reader = searcher.getIndexReader();
+    Collection<Token> tokens = queryConverter.convert("documemt");
+    SpellingOptions spellOpts = new SpellingOptions(tokens, reader, 1, SuggestMode.SUGGEST_WHEN_NOT_IN_INDEX, true, 0.5f, null);
+    SpellingResult result = checker.getSuggestions(spellOpts);
+    assertTrue("result is null and it shouldn't be", result != null);
+    //should be lowercased, b/c we are using a lowercasing analyzer
+    Map<String, Integer> suggestions = result.get(spellOpts.tokens.iterator().next());
+    assertTrue("documemt is null and it shouldn't be", suggestions != null);
+    assertTrue("documemt Size: " + suggestions.size() + " is not: " + 1, suggestions.size() == 1);
+    Map.Entry<String, Integer> entry = suggestions.entrySet().iterator().next();
+    assertTrue(entry.getKey() + " is not equal to " + "document", entry.getKey().equals("document") == true);
+    assertTrue(entry.getValue() + " does not equal: " + 2, entry.getValue() == 2);
+
+    //test something not in the spell checker
+    spellOpts.tokens = queryConverter.convert("super");
+    result = checker.getSuggestions(spellOpts);
+    assertTrue("result is null and it shouldn't be", result != null);
+    suggestions = result.get(spellOpts.tokens.iterator().next());
+    assertTrue("suggestions size should be 0", suggestions.size()==0);
+
+    spellOpts.tokens = queryConverter.convert("document");
+    result = checker.getSuggestions(spellOpts);
+    assertTrue("result is null and it shouldn't be", result != null);
+    suggestions = result.get(spellOpts.tokens.iterator().next());
+    assertTrue("suggestions is not null and it should be", suggestions == null);
+    } finally {
+      holder.decref();
+    }
+  }
+
+  private class TestSpellChecker extends IndexBasedSpellChecker{
     @Override
-    protected DocIdSet cacheImpl(DocIdSetIterator iterator, AtomicReader reader)
-        throws IOException {
-      final FixedBitSet cached = new FixedBitSet(reader.maxDoc());
-      cached.or(iterator);
-      return cached;
+    public SpellChecker getSpellChecker(){
+      return spellChecker;
     }
-
   }
 
-  public void test() throws IOException {
-    final int numParents = atLeast(200);
-    IndexWriterConfig cfg = newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random()));
-    cfg.setMergePolicy(newLogMergePolicy());
-    final RandomIndexWriter writer = new RandomIndexWriter(random(), newDirectory(), cfg);
-    final Document parentDoc = new Document();
-    final NumericDocValuesField parentVal = new NumericDocValuesField("parent_val", 0L);
-    parentDoc.add(parentVal);
-    final StringField parent = new StringField("parent", "true", Store.YES);
-    parentDoc.add(parent);
-    for (int i = 0; i < numParents; ++i) {
-      List<Document> documents = new ArrayList<>();
-      final int numChildren = random().nextInt(10);
-      for (int j = 0; j < numChildren; ++j) {
-        final Document childDoc = new Document();
-        childDoc.add(new NumericDocValuesField("child_val", random().nextInt(5)));
-        documents.add(childDoc);
-      }
-      parentVal.setLongValue(random().nextInt(50));
-      documents.add(parentDoc);
-      writer.addDocuments(documents);
+  @Test
+  public void testAlternateDistance() throws Exception {
+    TestSpellChecker checker = new TestSpellChecker();
+    NamedList spellchecker = new NamedList();
+    spellchecker.add("classname", IndexBasedSpellChecker.class.getName());
+
+    File indexDir = createTempDir();
+    spellchecker.add(AbstractLuceneSpellChecker.INDEX_DIR, indexDir.getAbsolutePath());
+    spellchecker.add(AbstractLuceneSpellChecker.FIELD, "title");
+    spellchecker.add(AbstractLuceneSpellChecker.SPELLCHECKER_ARG_NAME, spellchecker);
+    spellchecker.add(AbstractLuceneSpellChecker.STRING_DISTANCE, JaroWinklerDistance.class.getName());
+    SolrCore core = h.getCore();
+    String dictName = checker.init(spellchecker, core);
+    assertTrue(dictName + " is not equal to " + SolrSpellChecker.DEFAULT_DICTIONARY_NAME,
+            dictName.equals(SolrSpellChecker.DEFAULT_DICTIONARY_NAME) == true);
+    RefCounted<SolrIndexSearcher> holder = core.getSearcher();
+    SolrIndexSearcher searcher = holder.get();
+    try {
+    checker.build(core, searcher);
+    SpellChecker sc = checker.getSpellChecker();
+    assertTrue("sc is null and it shouldn't be", sc != null);
+    StringDistance sd = sc.getStringDistance();
+    assertTrue("sd is null and it shouldn't be", sd != null);
+    assertTrue("sd is not an instance of " + JaroWinklerDistance.class.getName(), sd instanceof JaroWinklerDistance);
+    } finally {
+      holder.decref();
     }
-    writer.forceMerge(1);
-    final DirectoryReader indexReader = writer.getReader();
-    writer.close();
-
-    final AtomicReader reader = getOnlySegmentReader(indexReader);
-    final Filter parentsFilter = new FixedBitSetCachingWrapperFilter(new QueryWrapperFilter(new TermQuery(new Term("parent", "true"))));
-    final FixedBitSet parentBits = (FixedBitSet) parentsFilter.getDocIdSet(reader.getContext(), null);
-    final NumericDocValues parentValues = reader.getNumericDocValues("parent_val");
-    final NumericDocValues childValues = reader.getNumericDocValues("child_val");
-
-    final Sort parentSort = new Sort(new SortField("parent_val", SortField.Type.LONG));
-    final Sort childSort = new Sort(new SortField("child_val", SortField.Type.LONG));
-
-    final Sort sort = new Sort(new SortField("custom", new BlockJoinComparatorSource(parentsFilter, parentSort, childSort)));
-    final Sorter sorter = new Sorter(sort);
-    final Sorter.DocMap docMap = sorter.sort(reader);
-    assertEquals(reader.maxDoc(), docMap.size());
-
-    int[] children = new int[1];
-    int numChildren = 0;
-    int previousParent = -1;
-    for (int i = 0; i < docMap.size(); ++i) {
-      final int oldID = docMap.newToOld(i);
-      if (parentBits.get(oldID)) {
-        // check that we have the right children
-        for (int j = 0; j < numChildren; ++j) {
-          assertEquals(oldID, parentBits.nextSetBit(children[j]));
-        }
-        // check that children are sorted
-        for (int j = 1; j < numChildren; ++j) {
-          final int doc1 = children[j-1];
-          final int doc2 = children[j];
-          if (childValues.get(doc1) == childValues.get(doc2)) {
-            assertTrue(doc1 < doc2); // sort is stable
-          } else {
-            assertTrue(childValues.get(doc1) < childValues.get(doc2));
-          }
-        }
-        // check that parents are sorted
-        if (previousParent != -1) {
-          if (parentValues.get(previousParent) == parentValues.get(oldID)) {
-            assertTrue(previousParent < oldID);
-          } else {
-            assertTrue(parentValues.get(previousParent) < parentValues.get(oldID));
-          }
-        }
-        // reset
-        previousParent = oldID;
-        numChildren = 0;
-      } else {
-        children = ArrayUtil.grow(children, numChildren+1);
-        children[numChildren++] = oldID;
-      }
-    }
-    indexReader.close();
-    writer.w.getDirectory().close();
   }
 
+  @Test
+  public void testAlternateLocation() throws Exception {
+    String[] ALT_DOCS = new String[]{
+            "jumpin jack flash",
+            "Sargent Peppers Lonely Hearts Club Band",
+            "Born to Run",
+            "Thunder Road",
+            "Londons Burning",
+            "A Horse with No Name",
+            "Sweet Caroline"
+    };
+
+    IndexBasedSpellChecker checker = new IndexBasedSpellChecker();
+    NamedList spellchecker = new NamedList();
+    spellchecker.add("classname", IndexBasedSpellChecker.class.getName());
+    
+    File tmpDir = createTempDir();
+    File indexDir = new File(tmpDir, "spellingIdx");
+    //create a standalone index
+    File altIndexDir = new File(tmpDir, "alternateIdx" + new Date().getTime());
+    Directory dir = newFSDirectory(altIndexDir);
+    IndexWriter iw = new IndexWriter(
+        dir,
+        new IndexWriterConfig(TEST_VERSION_CURRENT, new WhitespaceAnalyzer(TEST_VERSION_CURRENT))
+    );
+    for (int i = 0; i < ALT_DOCS.length; i++) {
+      Document doc = new Document();
+      doc.add(new TextField("title", ALT_DOCS[i], Field.Store.YES));
+      iw.addDocument(doc);
+    }
+    iw.forceMerge(1);
+    iw.close();
+    dir.close();
+    indexDir.mkdirs();
+    spellchecker.add(AbstractLuceneSpellChecker.INDEX_DIR, indexDir.getAbsolutePath());
+    spellchecker.add(AbstractLuceneSpellChecker.LOCATION, altIndexDir.getAbsolutePath());
+    spellchecker.add(AbstractLuceneSpellChecker.FIELD, "title");
+    spellchecker.add(AbstractLuceneSpellChecker.SPELLCHECKER_ARG_NAME, spellchecker);
+    SolrCore core = h.getCore();
+    String dictName = checker.init(spellchecker, core);
+    assertTrue(dictName + " is not equal to " + SolrSpellChecker.DEFAULT_DICTIONARY_NAME,
+            dictName.equals(SolrSpellChecker.DEFAULT_DICTIONARY_NAME) == true);
+    RefCounted<SolrIndexSearcher> holder = core.getSearcher();
+    SolrIndexSearcher searcher = holder.get();
+    try {
+    checker.build(core, searcher);
+
+    IndexReader reader = searcher.getIndexReader();
+    Collection<Token> tokens = queryConverter.convert("flesh");
+    SpellingOptions spellOpts = new SpellingOptions(tokens, reader, 1, SuggestMode.SUGGEST_WHEN_NOT_IN_INDEX, true, 0.5f, null);
+    SpellingResult result = checker.getSuggestions(spellOpts);
+    assertTrue("result is null and it shouldn't be", result != null);
+    //should be lowercased, b/c we are using a lowercasing analyzer
+    Map<String, Integer> suggestions = result.get(spellOpts.tokens.iterator().next());
+    assertTrue("flesh is null and it shouldn't be", suggestions != null);
+    assertTrue("flesh Size: " + suggestions.size() + " is not: " + 1, suggestions.size() == 1);
+    Map.Entry<String, Integer> entry = suggestions.entrySet().iterator().next();
+    assertTrue(entry.getKey() + " is not equal to " + "flash", entry.getKey().equals("flash") == true);
+    assertTrue(entry.getValue() + " does not equal: " + 1, entry.getValue() == 1);
+
+    //test something not in the spell checker
+    spellOpts.tokens = queryConverter.convert("super");
+    result = checker.getSuggestions(spellOpts);
+    assertTrue("result is null and it shouldn't be", result != null);
+    suggestions = result.get(spellOpts.tokens.iterator().next());
+    assertTrue("suggestions size should be 0", suggestions.size()==0);
+
+    spellOpts.tokens = queryConverter.convert("Caroline");
+    result = checker.getSuggestions(spellOpts);
+    assertTrue("result is null and it shouldn't be", result != null);
+    suggestions = result.get(spellOpts.tokens.iterator().next());
+    assertTrue("suggestions is not null and it should be", suggestions == null);
+    } finally {
+      holder.decref();
+    }
+  }
 }

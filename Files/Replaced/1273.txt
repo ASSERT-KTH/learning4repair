@@ -1,13 +1,12 @@
-int port = DatabaseDescriptor.getThriftPort();
+Job job = prepareJob(corpus, output, SequenceFileInputFormat.class, CVB0DocInferenceMapper.class,
 
 /**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -17,1013 +16,523 @@ int port = DatabaseDescriptor.getThriftPort();
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+package org.apache.mahout.clustering.lda.cvb;
 
-package org.apache.cassandra.service;
+import com.google.common.base.Joiner;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.Lists;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.filecache.DistributedCache;
+import org.apache.hadoop.fs.FileStatus;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.DoubleWritable;
+import org.apache.hadoop.io.IntWritable;
+import org.apache.hadoop.io.SequenceFile;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.Reducer;
+import org.apache.hadoop.mapreduce.lib.input.SequenceFileInputFormat;
+import org.apache.hadoop.mapreduce.lib.output.SequenceFileOutputFormat;
+import org.apache.hadoop.util.ToolRunner;
+import org.apache.mahout.common.AbstractJob;
+import org.apache.mahout.common.HadoopUtil;
+import org.apache.mahout.common.Pair;
+import org.apache.mahout.common.commandline.DefaultOptionCreator;
+import org.apache.mahout.common.iterator.sequencefile.PathFilters;
+import org.apache.mahout.common.iterator.sequencefile.PathType;
+import org.apache.mahout.common.iterator.sequencefile.SequenceFileDirIterable;
+import org.apache.mahout.common.mapreduce.VectorSumReducer;
+import org.apache.mahout.math.VectorWritable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import com.facebook.thrift.*;
-import com.facebook.thrift.server.*;
-import com.facebook.thrift.server.TThreadPoolServer.Options;
-import com.facebook.thrift.transport.*;
-import com.facebook.thrift.protocol.*;
-import com.facebook.fb303.FacebookBase;
-import com.facebook.fb303.fb_status;
-import java.io.*;
-import java.util.Collection;
+import java.io.IOException;
+import java.net.URI;
 import java.util.List;
-import java.util.ArrayList;
-import java.util.Iterator;
-import java.util.Map;
-import java.util.Set;
 
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.cql.common.CqlResult;
-import org.apache.cassandra.cql.driver.CqlDriver;
-import org.apache.cassandra.db.ColumnFamily;
-import org.apache.cassandra.db.IColumn;
-import org.apache.cassandra.db.Row;
-import org.apache.cassandra.db.RowMutation;
-import org.apache.cassandra.db.RowMutationMessage;
-import org.apache.cassandra.net.EndPoint;
-import org.apache.cassandra.net.Message;
-import org.apache.cassandra.net.MessagingService;
-import org.apache.cassandra.utils.LogUtil;
-import org.apache.log4j.Logger;
 /**
- * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
+ * See {@link CachingCVB0Mapper} for more details on scalability and room for improvement.
+ * To try out this LDA implementation without using Hadoop, check out
+ * {@link InMemoryCollapsedVariationalBayes0}.  If you want to do training directly in java code
+ * with your own main(), then look to {@link ModelTrainer} and {@link TopicModel}.
+ *
+ * Usage: {@code ./bin/mahout cvb <i>options</i>}
+ * <p>
+ * Valid options include:
+ * <dl>
+ * <dt>{@code --input path}</td>
+ * <dd>Input path for {@code SequenceFile<IntWritable, VectorWritable>} document vectors. See
+ * {@link org.apache.mahout.vectorizer.SparseVectorsFromSequenceFiles}
+ *  for details on how to generate this input format.</dd>
+ * <dt>{@code --dictionary path}</dt>
+ * <dd>Path to dictionary file(s) generated during construction of input document vectors (glob
+ * expression supported). If set, this data is scanned to determine an appropriate value for option
+ * {@code --num_terms}.</dd>
+ * <dt>{@code --output path}</dt>
+ * <dd>Output path for topic-term distributions.</dd>
+ * <dt>{@code --doc_topic_output path}</dt>
+ * <dd>Output path for doc-topic distributions.</dd>
+ * <dt>{@code --num_topics k}</dt>
+ * <dd>Number of latent topics.</dd>
+ * <dt>{@code --num_terms nt}</dt>
+ * <dd>Number of unique features defined by input document vectors. If option {@code --dictionary}
+ * is defined and this option is unspecified, term count is calculated from dictionary.</dd>
+ * <dt>{@code --topic_model_temp_dir path}</dt>
+ * <dd>Path in which to store model state after each iteration.</dd>
+ * <dt>{@code --maxIter i}</dt>
+ * <dd>Maximum number of iterations to perform. If this value is less than or equal to the number of
+ * iteration states found beneath the path specified by option {@code --topic_model_temp_dir}, no
+ * further iterations are performed. Instead, output topic-term and doc-topic distributions are
+ * generated using data from the specified iteration.</dd>
+ * <dt>{@code --max_doc_topic_iters i}</dt>
+ * <dd>Maximum number of iterations per doc for p(topic|doc) learning. Defaults to {@code 10}.</dd>
+ * <dt>{@code --doc_topic_smoothing a}</dt>
+ * <dd>Smoothing for doc-topic distribution. Defaults to {@code 0.0001}.</dd>
+ * <dt>{@code --term_topic_smoothing e}</dt>
+ * <dd>Smoothing for topic-term distribution. Defaults to {@code 0.0001}.</dd>
+ * <dt>{@code --random_seed seed}</dt>
+ * <dd>Integer seed for random number generation.</dd>
+ * <dt>{@code --test_set_percentage p}</dt>
+ * <dd>Fraction of data to hold out for testing. Defaults to {@code 0.0}.</dd>
+ * <dt>{@code --iteration_block_size block}</dt>
+ * <dd>Number of iterations between perplexity checks. Defaults to {@code 10}. This option is
+ * ignored unless option {@code --test_set_percentage} is greater than zero.</dd>
+ * </dl>
  */
+public class CVB0Driver extends AbstractJob {
+  private static final Logger log = LoggerFactory.getLogger(CVB0Driver.class);
 
-public class CassandraServer extends FacebookBase implements Cassandra.Iface
-{
+  public static final String NUM_TOPICS = "num_topics";
+  public static final String NUM_TERMS = "num_terms";
+  public static final String DOC_TOPIC_SMOOTHING = "doc_topic_smoothing";
+  public static final String TERM_TOPIC_SMOOTHING = "term_topic_smoothing";
+  public static final String DICTIONARY = "dictionary";
+  public static final String DOC_TOPIC_OUTPUT = "doc_topic_output";
+  public static final String MODEL_TEMP_DIR = "topic_model_temp_dir";
+  public static final String ITERATION_BLOCK_SIZE = "iteration_block_size";
+  public static final String RANDOM_SEED = "random_seed";
+  public static final String TEST_SET_FRACTION = "test_set_fraction";
+  public static final String NUM_TRAIN_THREADS = "num_train_threads";
+  public static final String NUM_UPDATE_THREADS = "num_update_threads";
+  public static final String MAX_ITERATIONS_PER_DOC = "max_doc_topic_iters";
+  public static final String MODEL_WEIGHT = "prev_iter_mult";
+  public static final String NUM_REDUCE_TASKS = "num_reduce_tasks";
+  public static final String BACKFILL_PERPLEXITY = "backfill_perplexity";
+  private static final String MODEL_PATHS = "mahout.lda.cvb.modelPath";
 
-	private static Logger logger_ = Logger.getLogger(CassandraServer.class);
-	/*
-	 * Handle to the storage service to interact with the other machines in the
-	 * cluster.
-	 */
-	protected StorageService storageService;
+  private static final double DEFAULT_CONVERGENCE_DELTA = 0;
+  private static final double DEFAULT_DOC_TOPIC_SMOOTHING = 0.0001;
+  private static final double DEFAULT_TERM_TOPIC_SMOOTHING = 0.0001;
+  private static final int DEFAULT_ITERATION_BLOCK_SIZE = 10;
+  private static final double DEFAULT_TEST_SET_FRACTION = 0;
+  private static final int DEFAULT_NUM_TRAIN_THREADS = 4;
+  private static final int DEFAULT_NUM_UPDATE_THREADS = 1;
+  private static final int DEFAULT_MAX_ITERATIONS_PER_DOC = 10;
+  private static final int DEFAULT_NUM_REDUCE_TASKS = 10;
 
-	protected CassandraServer(String name)
-	{
-		super(name);
-		// Create the instance of the storage service
-		storageService = StorageService.instance();
-	}
+  @Override
+  public int run(String[] args) throws Exception {
+    addInputOption();
+    addOutputOption();
+    addOption(DefaultOptionCreator.maxIterationsOption().create());
+    addOption(DefaultOptionCreator.CONVERGENCE_DELTA_OPTION, "cd", "The convergence delta value",
+              String.valueOf(DEFAULT_CONVERGENCE_DELTA));
+    addOption(DefaultOptionCreator.overwriteOption().create());
 
-	public CassandraServer() throws Throwable
-	{
-		super("CassandraServer");
-		// Create the instance of the storage service
-		storageService = StorageService.instance();
-	}
+    addOption(NUM_TOPICS, "k", "Number of topics to learn", true);
+    addOption(NUM_TERMS, "nt", "Vocabulary size", false);
+    addOption(DOC_TOPIC_SMOOTHING, "a", "Smoothing for document/topic distribution",
+              String.valueOf(DEFAULT_DOC_TOPIC_SMOOTHING));
+    addOption(TERM_TOPIC_SMOOTHING, "e", "Smoothing for topic/term distribution",
+              String.valueOf(DEFAULT_TERM_TOPIC_SMOOTHING));
+    addOption(DICTIONARY, "dict", "Path to term-dictionary file(s) (glob expression supported)", false);
+    addOption(DOC_TOPIC_OUTPUT, "dt", "Output path for the training doc/topic distribution", false);
+    addOption(MODEL_TEMP_DIR, "mt", "Path to intermediate model path (useful for restarting)", false);
+    addOption(ITERATION_BLOCK_SIZE, "block", "Number of iterations per perplexity check",
+              String.valueOf(DEFAULT_ITERATION_BLOCK_SIZE));
+    addOption(RANDOM_SEED, "seed", "Random seed", false);
+    addOption(TEST_SET_FRACTION, "tf", "Fraction of data to hold out for testing",
+              String.valueOf(DEFAULT_TEST_SET_FRACTION));
+    addOption(NUM_TRAIN_THREADS, "ntt", "number of threads per mapper to train with",
+              String.valueOf(DEFAULT_NUM_TRAIN_THREADS));
+    addOption(NUM_UPDATE_THREADS, "nut", "number of threads per mapper to update the model with",
+              String.valueOf(DEFAULT_NUM_UPDATE_THREADS));
+    addOption(MAX_ITERATIONS_PER_DOC, "mipd", "max number of iterations per doc for p(topic|doc) learning",
+              String.valueOf(DEFAULT_MAX_ITERATIONS_PER_DOC));
+    addOption(NUM_REDUCE_TASKS, null, "number of reducers to use during model estimation",
+              String.valueOf(DEFAULT_NUM_REDUCE_TASKS));
+    addOption(buildOption(BACKFILL_PERPLEXITY, null, "enable backfilling of missing perplexity values", false, false,
+              null));
 
-	/*
-	 * The start function initializes the server and start's listening on the
-	 * specified port.
-	 */
-	public void start() throws Throwable
-	{
-		LogUtil.init();
-		//LogUtil.setLogLevel("com.facebook", "DEBUG");
-		// Start the storage service
-		storageService.start();
-	}
-	
-	private void validateTable(String table) throws CassandraException
-	{
-		if ( !DatabaseDescriptor.getTables().contains(table) )
-		{
-			throw new CassandraException("Table " + table + " does not exist in this schema.");
-		}
-	}
-    
-	protected ColumnFamily get_cf(String tablename, String key, String columnFamily, List<String> columNames) throws CassandraException, TException
-	{
-    	ColumnFamily cfamily = null;
-		try
-		{
-			validateTable(tablename);
-	        String[] values = RowMutation.getColumnAndColumnFamily(columnFamily);
-	        // check for  values 
-	        if( values.length < 1 )
-	        {
-	        	throw new CassandraException("Column Family " + columnFamily + " is invalid.");	        	
-	        }
-	        Row row = StorageProxy.readProtocol(tablename, key, columnFamily, columNames, StorageService.ConsistencyLevel.WEAK);
-	        if (row == null)
-			{
-				throw new CassandraException("No row exists for key " + key);			
-			}
-			Map<String, ColumnFamily> cfMap = row.getColumnFamilyMap();
-			if (cfMap == null || cfMap.size() == 0)
-			{				
-				logger_	.info("ERROR ColumnFamily " + columnFamily + " map is missing.....: " + "   key:" + key );
-				throw new CassandraException("Either the key " + key + " is not present or the columns requested are not present.");
-			}
-			cfamily = cfMap.get(values[0]);
-			if (cfamily == null)
-			{
-				logger_.info("ERROR ColumnFamily " + columnFamily + " is missing.....: " + "   key:" + key + "  ColumnFamily:" + values[0]);
-				throw new CassandraException("Either the key " + key + " is not present or the column family " + values[0] +  " is not present.");
-			}
-		}
-		catch (Throwable ex)
-		{
-			String exception = LogUtil.throwableToString(ex);
-			logger_.info( exception );
-			throw new CassandraException(exception);
-		}
-		return cfamily;
-	}
-
-    public  ArrayList<column_t> get_columns_since(String tablename, String key, String columnFamily_column, long timeStamp) throws CassandraException,TException
-	{
-		ArrayList<column_t> retlist = new ArrayList<column_t>();
-        long startTime = System.currentTimeMillis();
-		try
-		{
-			validateTable(tablename);
-	        String[] values = RowMutation.getColumnAndColumnFamily(columnFamily_column);
-	        // check for  values 
-	        if( values.length < 1 )
-	        {
-	        	throw new CassandraException("Column Family " + columnFamily_column + " is invalid.");	        	
-	        }
-	        Row row = StorageProxy.readProtocol(tablename, key, columnFamily_column, timeStamp, StorageService.ConsistencyLevel.WEAK);
-			if (row == null)
-			{
-				logger_.info("ERROR No row for this key .....: " + key);
-	        	throw new CassandraException("ERROR No row for this key .....: " + key);	        	
-			}
-
-			Map<String, ColumnFamily> cfMap = row.getColumnFamilyMap();
-			if (cfMap == null || cfMap.size() == 0)
-			{
-				logger_	.info("ERROR ColumnFamily " + columnFamily_column + " map is missing.....: " + "   key:" + key);
-				throw new CassandraException("Either the key " + key + " is not present or the columns requested are not present.");
-			}
-			ColumnFamily cfamily = cfMap.get(values[0]);
-			if (cfamily == null)
-			{
-				logger_.info("ERROR ColumnFamily " + columnFamily_column + " is missing.....: "+"   key:" + key	+ "  ColumnFamily:" + values[0]);
-				throw new CassandraException("Either the key " + key + " is not present or the columns requested" + columnFamily_column + "are not present.");
-			}
-			Collection<IColumn> columns = null;
-			if( values.length > 1 )
-			{
-				// this is the super column case 
-				IColumn column = cfamily.getColumn(values[1]);
-				if(column != null)
-					columns = column.getSubColumns();
-			}
-			else
-			{
-				columns = cfamily.getAllColumns();
-			}
-			if (columns == null || columns.size() == 0)
-			{
-				logger_	.info("ERROR Columns are missing.....: " + "   key:" + key + "  ColumnFamily:" + values[0]);
-				throw new CassandraException("ERROR Columns are missing.....: " + "   key:" + key + "  ColumnFamily:" + values[0]);
-			}
-			for(IColumn column : columns)
-			{
-				column_t thrift_column = new column_t();
-				thrift_column.columnName = column.name();
-				thrift_column.value = new String(column.value()); // This needs to be Utf8ed
-				thrift_column.timestamp = column.timestamp();
-				retlist.add(thrift_column);
-			}
-		}
-		catch (Exception ex)
-		{
-			String exception = LogUtil.throwableToString(ex);
-			logger_.info( exception );
-			throw new CassandraException(exception);
-		}
-        logger_.debug("get_slice2: " + (System.currentTimeMillis() - startTime) + " ms.");
-		return retlist;
-	}
-	
-
-    public List<column_t> get_slice_by_names(String tablename, String key, String columnFamily, List<String> columnNames) throws CassandraException, TException
-    {
-		ArrayList<column_t> retlist = new ArrayList<column_t>();
-        long startTime = System.currentTimeMillis();
-		try
-		{
-			validateTable(tablename);
-			ColumnFamily cfamily = get_cf(tablename, key, columnFamily, columnNames);
-			if (cfamily == null)
-			{
-				logger_.info("ERROR ColumnFamily " + columnFamily + " is missing.....: "
-							+"   key:" + key
-							+ "  ColumnFamily:" + columnFamily);
-				throw new CassandraException("Either the key " + key + " is not present or the columnFamily requested" + columnFamily + "is not present.");
-			}
-			Collection<IColumn> columns = null;
-			columns = cfamily.getAllColumns();
-			if (columns == null || columns.size() == 0)
-			{
-				logger_	.info("ERROR Columns are missing.....: "
-							   + "   key:" + key
-								+ "  ColumnFamily:" + columnFamily);
-				throw new CassandraException("ERROR Columns are missing.....: " + "   key:" + key + "  ColumnFamily:" + columnFamily);
-			}
-			
-			for(IColumn column : columns)
-			{
-				column_t thrift_column = new column_t();
-				thrift_column.columnName = column.name();
-				thrift_column.value = new String(column.value()); // This needs to be Utf8ed
-				thrift_column.timestamp = column.timestamp();
-				retlist.add(thrift_column);
-			}
-		}
-		catch (Exception ex)
-		{
-			String exception = LogUtil.throwableToString(ex);
-			logger_.info( exception );
-			throw new CassandraException(exception);
-		}
-		
-        logger_.debug("get_slice2: " + (System.currentTimeMillis() - startTime)
-                + " ms.");
-		return retlist;
+    if (parseArguments(args) == null) {
+      return -1;
     }
-    
-    public ArrayList<column_t> get_slice(String tablename, String key, String columnFamily_column, int start, int count) throws CassandraException,TException
-	{
-		ArrayList<column_t> retlist = new ArrayList<column_t>();
-        long startTime = System.currentTimeMillis();
-		try
-		{
-			validateTable(tablename);
-	        String[] values = RowMutation.getColumnAndColumnFamily(columnFamily_column);
-	        // check for  values 
-	        if( values.length < 1 )
-	        {
-	        	throw new CassandraException("Column Family " + columnFamily_column + " is invalid.");	        	
-	        }
-	        Row row = StorageProxy.readProtocol(tablename, key, columnFamily_column, start, count, StorageService.ConsistencyLevel.WEAK);
-			if (row == null)
-			{
-				logger_.info("ERROR No row for this key .....: " + key);
-	        	throw new CassandraException("ERROR No row for this key .....: " + key);	        	
-			}
 
-			Map<String, ColumnFamily> cfMap = row.getColumnFamilyMap();
-			if (cfMap == null || cfMap.size() == 0)
-			{
-				logger_	.info("ERROR ColumnFamily " + columnFamily_column + " map is missing.....: " + "   key:" + key);
-				throw new CassandraException("Either the key " + key + " is not present or the columns requested are not present.");
-			}
-			ColumnFamily cfamily = cfMap.get(values[0]);
-			if (cfamily == null)
-			{
-				logger_.info("ERROR ColumnFamily " + columnFamily_column + " is missing.....: "	+ "   key:" + key + "  ColumnFamily:" + values[0]);
-				throw new CassandraException("Either the key " + key + " is not present or the columns requested" + columnFamily_column + "are not present.");
-			}
-			Collection<IColumn> columns = null;
-			if( values.length > 1 )
-			{
-				// this is the super column case 
-				IColumn column = cfamily.getColumn(values[1]);
-				if(column != null)
-					columns = column.getSubColumns();
-			}
-			else
-			{
-				columns = cfamily.getAllColumns();
-			}
-			if (columns == null || columns.size() == 0)
-			{
-				logger_	.info("ERROR Columns are missing.....: " + "   key:" + key + "  ColumnFamily:" + values[0]);
-				throw new CassandraException("ERROR Columns are missing.....: " + "   key:" + key + "  ColumnFamily:" + values[0]);
-			}
-			for(IColumn column : columns)
-			{
-				column_t thrift_column = new column_t();
-				thrift_column.columnName = column.name();
-				thrift_column.value = new String(column.value()); // This needs to be Utf8ed
-				thrift_column.timestamp = column.timestamp();
-				retlist.add(thrift_column);
-			}
-		}
-		catch (Exception ex)
-		{
-			String exception = LogUtil.throwableToString(ex);
-			logger_.info( exception );
-			throw new CassandraException(exception);
-		}
-        logger_.debug("get_slice2: " + (System.currentTimeMillis() - startTime)
-                + " ms.");
-		return retlist;
-	}
-    
-    public column_t get_column(String tablename, String key, String columnFamily_column) throws CassandraException,TException
-    {
-		column_t ret = null;
-		try
-		{
-			validateTable(tablename);
-	        String[] values = RowMutation.getColumnAndColumnFamily(columnFamily_column);
-	        // check for  values 
-	        if( values.length < 2 )
-	        {
-	        	throw new CassandraException("Column Family " + columnFamily_column + " is invalid.");	        	
-	        }
-	        Row row = StorageProxy.readProtocol(tablename, key, columnFamily_column, -1, Integer.MAX_VALUE, StorageService.ConsistencyLevel.WEAK);
-			if (row == null)
-			{
-				logger_.info("ERROR No row for this key .....: " + key);
-	        	throw new CassandraException("ERROR No row for this key .....: " + key);	        	
-			}
-			
-			Map<String, ColumnFamily> cfMap = row.getColumnFamilyMap();
-			if (cfMap == null || cfMap.size() == 0)
-			{
-				logger_	.info("ERROR ColumnFamily map is missing.....: "
-							   + "   key:" + key
-								);
-				throw new CassandraException("Either the key " + key + " is not present or the columns requested are not present.");
-			}
-			ColumnFamily cfamily = cfMap.get(values[0]);
-			if (cfamily == null)
-			{
-				logger_.info("ERROR ColumnFamily  is missing.....: "
-							+"   key:" + key
-							+ "  ColumnFamily:" + values[0]);
-				throw new CassandraException("Either the key " + key + " is not present or the columns requested" + columnFamily_column + "are not present.");
-			}
-			Collection<IColumn> columns = null;
-			if( values.length > 2 )
-			{
-				// this is the super column case 
-				IColumn column = cfamily.getColumn(values[1]);
-				if(column != null)
-					columns = column.getSubColumns();
-			}
-			else
-			{
-				columns = cfamily.getAllColumns();
-			}
-			if (columns == null || columns.size() == 0)
-			{
-				logger_	.info("ERROR Columns are missing.....: "
-							   + "   key:" + key
-								+ "  ColumnFamily:" + values[0]);
-				throw new CassandraException("ERROR Columns are missing.....: " + "   key:" + key + "  ColumnFamily:" + values[0]);
-			}
-			ret = new column_t();
-			for(IColumn column : columns)
-			{
-				ret.columnName = column.name();
-				ret.value = new String(column.value());
-				ret.timestamp = column.timestamp();
-			}
-		}
-		catch (Exception ex)
-		{
-			String exception = LogUtil.throwableToString(ex);
-			logger_.info( exception );
-			throw new CassandraException(exception);
-		}
-		return ret;
+    int numTopics = Integer.parseInt(getOption(NUM_TOPICS));
+    Path inputPath = getInputPath();
+    Path topicModelOutputPath = getOutputPath();
+    int maxIterations = Integer.parseInt(getOption(DefaultOptionCreator.MAX_ITERATIONS_OPTION));
+    int iterationBlockSize = Integer.parseInt(getOption(ITERATION_BLOCK_SIZE));
+    double convergenceDelta = Double.parseDouble(getOption(DefaultOptionCreator.CONVERGENCE_DELTA_OPTION));
+    double alpha = Double.parseDouble(getOption(DOC_TOPIC_SMOOTHING));
+    double eta = Double.parseDouble(getOption(TERM_TOPIC_SMOOTHING));
+    int numTrainThreads = Integer.parseInt(getOption(NUM_TRAIN_THREADS));
+    int numUpdateThreads = Integer.parseInt(getOption(NUM_UPDATE_THREADS));
+    int maxItersPerDoc = Integer.parseInt(getOption(MAX_ITERATIONS_PER_DOC));
+    Path dictionaryPath = hasOption(DICTIONARY) ? new Path(getOption(DICTIONARY)) : null;
+    int numTerms = hasOption(NUM_TERMS)
+                 ? Integer.parseInt(getOption(NUM_TERMS))
+                 : getNumTerms(getConf(), dictionaryPath);
+    Path docTopicOutputPath = hasOption(DOC_TOPIC_OUTPUT) ? new Path(getOption(DOC_TOPIC_OUTPUT)) : null;
+    Path modelTempPath = hasOption(MODEL_TEMP_DIR)
+                       ? new Path(getOption(MODEL_TEMP_DIR))
+                       : getTempPath("topicModelState");
+    long seed = hasOption(RANDOM_SEED)
+              ? Long.parseLong(getOption(RANDOM_SEED))
+              : System.nanoTime() % 10000;
+    float testFraction = hasOption(TEST_SET_FRACTION)
+                       ? Float.parseFloat(getOption(TEST_SET_FRACTION))
+                       : 0.0f;
+    int numReduceTasks = Integer.parseInt(getOption(NUM_REDUCE_TASKS));
+    boolean backfillPerplexity = hasOption(BACKFILL_PERPLEXITY);
+
+    return run(getConf(), inputPath, topicModelOutputPath, numTopics, numTerms, alpha, eta,
+        maxIterations, iterationBlockSize, convergenceDelta, dictionaryPath, docTopicOutputPath,
+        modelTempPath, seed, testFraction, numTrainThreads, numUpdateThreads, maxItersPerDoc,
+        numReduceTasks, backfillPerplexity);
+  }
+
+  private static int getNumTerms(Configuration conf, Path dictionaryPath) throws IOException {
+    FileSystem fs = dictionaryPath.getFileSystem(conf);
+    Text key = new Text();
+    IntWritable value = new IntWritable();
+    int maxTermId = -1;
+    for (FileStatus stat : fs.globStatus(dictionaryPath)) {
+      SequenceFile.Reader reader = new SequenceFile.Reader(fs, stat.getPath(), conf);
+      while (reader.next(key, value)) {
+        maxTermId = Math.max(maxTermId, value.get());
+      }
     }
-    
+    return maxTermId + 1;
+  }
 
-    public int get_column_count(String tablename, String key, String columnFamily_column) throws CassandraException
-	{
-    	int count = -1;
-		try
-		{
-			validateTable(tablename);
-	        String[] values = RowMutation.getColumnAndColumnFamily(columnFamily_column);
-	        // check for  values 
-	        if( values.length < 1 )
-	        {
-	        	throw new CassandraException("Column Family " + columnFamily_column + " is invalid.");	        	
-	        }
-	        Row row = StorageProxy.readProtocol(tablename, key, columnFamily_column, -1, Integer.MAX_VALUE, StorageService.ConsistencyLevel.WEAK);
-			if (row == null)
-			{
-				logger_.info("ERROR No row for this key .....: " + key);
-	        	throw new CassandraException("ERROR No row for this key .....: " + key);	        	
-			}
+  public int run(Configuration conf,
+                 Path inputPath,
+                 Path topicModelOutputPath,
+                 int numTopics,
+                 int numTerms,
+                 double alpha,
+                 double eta,
+                 int maxIterations,
+                 int iterationBlockSize,
+                 double convergenceDelta,
+                 Path dictionaryPath,
+                 Path docTopicOutputPath,
+                 Path topicModelStateTempPath,
+                 long randomSeed,
+                 float testFraction,
+                 int numTrainThreads,
+                 int numUpdateThreads,
+                 int maxItersPerDoc,
+                 int numReduceTasks,
+                 boolean backfillPerplexity)
+    throws ClassNotFoundException, IOException, InterruptedException {
 
-			Map<String, ColumnFamily> cfMap = row.getColumnFamilyMap();
-			if (cfMap == null || cfMap.size() == 0)
-			{
-				logger_	.info("ERROR ColumnFamily map is missing.....: "
-							   + "   key:" + key
-								);
-				throw new CassandraException("Either the key " + key + " is not present or the columns requested are not present.");
-			}
-			ColumnFamily cfamily = cfMap.get(values[0]);
-			if (cfamily == null)
-			{
-				logger_.info("ERROR ColumnFamily  is missing.....: "
-							+"   key:" + key
-							+ "  ColumnFamily:" + values[0]);
-				throw new CassandraException("Either the key " + key + " is not present or the columns requested" + columnFamily_column + "are not present.");
-			}
-			Collection<IColumn> columns = null;
-			if( values.length > 1 )
-			{
-				// this is the super column case 
-				IColumn column = cfamily.getColumn(values[1]);
-				if(column != null)
-					columns = column.getSubColumns();
-			}
-			else
-			{
-				columns = cfamily.getAllColumns();
-			}
-			if (columns == null || columns.size() == 0)
-			{
-				logger_	.info("ERROR Columns are missing.....: "
-							   + "   key:" + key
-								+ "  ColumnFamily:" + values[0]);
-				throw new CassandraException("ERROR Columns are missing.....: " + "   key:" + key + "  ColumnFamily:" + values[0]);
-			}
-			count = columns.size();
-		}
-		catch (Exception ex)
-		{
-			String exception = LogUtil.throwableToString(ex);
-			logger_.info( exception );
-			throw new CassandraException(exception);
-		}
-		return count;
-	}
+    setConf(conf);
 
-    public void insert(String tablename, String key, String columnFamily_column, String cellData, long timestamp)
-	{
-		try
-		{
-			validateTable(tablename);
-			RowMutation rm = new RowMutation(tablename, key.trim());
-			rm.add(columnFamily_column, cellData.getBytes(), timestamp);
-			StorageProxy.insert(rm);
-		}
-		catch (Exception e)
-		{
-			logger_.debug( LogUtil.throwableToString(e) );
-		}
-		return;
-	}
-    
-    public boolean batch_insert_blocking(batch_mutation_t batchMutation)
-    {
-		// 1. Get the N nodes from storage service where the data needs to be
-		// replicated
-		// 2. Construct a message for read\write
-		// 3. SendRR ( to all the nodes above )
-		// 4. Wait for a response from atleast X nodes where X <= N
-		// 5. return success
-    	boolean result = false;
-		try
-		{
-			logger_.warn(" batch_insert_blocking");
-			validateTable(batchMutation.table);
-			IResponseResolver<Boolean> writeResponseResolver = new WriteResponseResolver();
-			QuorumResponseHandler<Boolean> quorumResponseHandler = new QuorumResponseHandler<Boolean>(
-					DatabaseDescriptor.getReplicationFactor(),
-					writeResponseResolver);
-			EndPoint[] endpoints = storageService.getNStorageEndPoint(batchMutation.key);
-			// TODO: throw a thrift exception if we do not have N nodes
+    // verify arguments
+    Preconditions.checkArgument(testFraction >= 0.0 && testFraction <= 1.0,
+        "Expected 'testFraction' value in range [0, 1] but found value '%s'", testFraction);
+    Preconditions.checkArgument(!backfillPerplexity || testFraction > 0.0,
+        "Expected 'testFraction' value in range (0, 1] but found value '%s'", testFraction);
 
-			logger_.debug(" Creating the row mutation");
-			RowMutation rm = new RowMutation(batchMutation.table,
-					batchMutation.key.trim());
-			Set keys = batchMutation.cfmap.keySet();
-			Iterator keyIter = keys.iterator();
-			while (keyIter.hasNext())
-			{
-				Object key = keyIter.next(); // Get the next key.
-				List<column_t> list = batchMutation.cfmap.get(key);
-				for (column_t columnData : list)
-				{
-					rm.add(key.toString() + ":" + columnData.columnName,
-							columnData.value.getBytes(), columnData.timestamp);
+    String infoString = "Will run Collapsed Variational Bayes (0th-derivative approximation) " 
+      + "learning for LDA on {} (numTerms: {}), finding {}-topics, with document/topic prior {}, " 
+      + "topic/term prior {}.  Maximum iterations to run will be {}, unless the change in " 
+      + "perplexity is less than {}.  Topic model output (p(term|topic) for each topic) will be " 
+      + "stored {}.  Random initialization seed is {}, holding out {} of the data for perplexity " 
+      + "check\n";
+    log.info(infoString, inputPath, numTerms, numTopics, alpha, eta, maxIterations,
+             convergenceDelta, topicModelOutputPath, randomSeed, testFraction);
+    infoString = dictionaryPath == null
+               ? "" : "Dictionary to be used located " + dictionaryPath.toString() + '\n';
+    infoString += docTopicOutputPath == null
+               ? "" : "p(topic|docId) will be stored " + docTopicOutputPath.toString() + '\n';
+    log.info(infoString);
 
-				}
-			}            
-            
-			RowMutationMessage rmMsg = new RowMutationMessage(rm);           
-			Message message = new Message(StorageService.getLocalStorageEndPoint(), 
-                    StorageService.mutationStage_,
-					StorageService.mutationVerbHandler_, 
-                    new Object[]{ rmMsg }
-            );
-			MessagingService.getMessagingInstance().sendRR(message, endpoints,
-					quorumResponseHandler);
-			logger_.debug(" Calling quorum response handler's get");
-			result = quorumResponseHandler.get(); 
-                       
-			// TODO: if the result is false that means the writes to all the
-			// servers failed hence we need to throw an exception or return an
-			// error back to the client so that it can take appropriate action.
-		}
-		catch (Exception e)
-		{
-			logger_.info( LogUtil.throwableToString(e) );
-		}
-		return result;
-    	
-    }
-	public void batch_insert(batch_mutation_t batchMutation)
-	{
-		// 1. Get the N nodes from storage service where the data needs to be
-		// replicated
-		// 2. Construct a message for read\write
-		// 3. SendRR ( to all the nodes above )
-		// 4. Wait for a response from atleast X nodes where X <= N
-		// 5. return success
+    FileSystem fs = FileSystem.get(topicModelStateTempPath.toUri(), conf);
+    int iterationNumber = getCurrentIterationNumber(conf, topicModelStateTempPath, maxIterations);
+    log.info("Current iteration number: {}", iterationNumber);
 
-		try
-		{
-			logger_.debug(" batch_insert");
-			logger_.debug(" Creating the row mutation");
-			validateTable(batchMutation.table);
-			RowMutation rm = new RowMutation(batchMutation.table,
-					batchMutation.key.trim());
-			if(batchMutation.cfmap != null)
-			{
-				Set keys = batchMutation.cfmap.keySet();
-				Iterator keyIter = keys.iterator();
-				while (keyIter.hasNext())
-				{
-					Object key = keyIter.next(); // Get the next key.
-					List<column_t> list = batchMutation.cfmap.get(key);
-					for (column_t columnData : list)
-					{
-						rm.add(key.toString() + ":" + columnData.columnName,
-								columnData.value.getBytes(), columnData.timestamp);
-	
-					}
-				}
-			}
-			StorageProxy.insert(rm);
-		}
-		catch (Exception e)
-		{
-			logger_.info( LogUtil.throwableToString(e) );
-		}
-		return;
-	}
+    conf.set(NUM_TOPICS, String.valueOf(numTopics));
+    conf.set(NUM_TERMS, String.valueOf(numTerms));
+    conf.set(DOC_TOPIC_SMOOTHING, String.valueOf(alpha));
+    conf.set(TERM_TOPIC_SMOOTHING, String.valueOf(eta));
+    conf.set(RANDOM_SEED, String.valueOf(randomSeed));
+    conf.set(NUM_TRAIN_THREADS, String.valueOf(numTrainThreads));
+    conf.set(NUM_UPDATE_THREADS, String.valueOf(numUpdateThreads));
+    conf.set(MAX_ITERATIONS_PER_DOC, String.valueOf(maxItersPerDoc));
+    conf.set(MODEL_WEIGHT, "1"); // TODO
+    conf.set(TEST_SET_FRACTION, String.valueOf(testFraction));
 
-    public void remove(String tablename, String key, String columnFamily_column)
-	{
-		throw new UnsupportedOperationException();
-	}
+    List<Double> perplexities = Lists.newArrayList();
+    for (int i = 1; i <= iterationNumber; i++) {
+      // form path to model
+      Path modelPath = modelPath(topicModelStateTempPath, i);
 
-    public boolean remove(String tablename, String key, String columnFamily_column, long timestamp, int block_for)
-	{
-        logger_.debug("remove");
-        RowMutation rm = new RowMutation(tablename, key.trim());
-        rm.delete(columnFamily_column, timestamp);
-        if (block_for > 0) {
-            return StorageProxy.insertBlocking(rm);
-        } else {
-            StorageProxy.insert(rm);
-            return true;
+      // read perplexity
+      double perplexity = readPerplexity(conf, topicModelStateTempPath, i);
+      if (Double.isNaN(perplexity)) {
+        if (!(backfillPerplexity && i % iterationBlockSize == 0)) {
+          continue;
         }
-	}
+        log.info("Backfilling perplexity at iteration {}", i);
+        if (!fs.exists(modelPath)) {
+          log.error("Model path '{}' does not exist; Skipping iteration {} perplexity calculation",
+              modelPath.toString(), i);
+          continue;
+        }
+        perplexity = calculatePerplexity(conf, inputPath, modelPath, i);
+      }
 
-    public List<superColumn_t> get_slice_super_by_names(String tablename, String key, String columnFamily, List<String> superColumnNames) throws CassandraException, TException
-    {
-		ArrayList<superColumn_t> retlist = new ArrayList<superColumn_t>();
-        long startTime = System.currentTimeMillis();
-		
-		try
-		{
-			validateTable(tablename);
-			ColumnFamily cfamily = get_cf(tablename, key, columnFamily, superColumnNames);
-			if (cfamily == null)
-			{
-				logger_.info("ERROR ColumnFamily " + columnFamily + " is missing.....: "+"   key:" + key
-							+ "  ColumnFamily:" + columnFamily);
-				throw new CassandraException("Either the key " + key + " is not present or the column family requested" + columnFamily + "is not present.");
-			}
-			Collection<IColumn> columns = null;
-			columns = cfamily.getAllColumns();
-			if (columns == null || columns.size() == 0)
-			{
-				logger_	.info("ERROR Columns are missing.....: " + "   key:" + key + "  ColumnFamily:" + columnFamily);
-				throw new CassandraException("ERROR Columns are missing.....: " + "   key:" + key + "  ColumnFamily:" + columnFamily);
-			}
-			
-			for(IColumn column : columns)
-			{
-				superColumn_t thrift_superColumn = new superColumn_t();
-				thrift_superColumn.name = column.name();
-				Collection<IColumn> subColumns = column.getSubColumns();
-				if(subColumns.size() != 0 )
-				{
-					thrift_superColumn.columns = new ArrayList<column_t>();
-					for( IColumn subColumn : subColumns )
-					{
-						column_t thrift_column = new column_t();
-						thrift_column.columnName = subColumn.name();
-						thrift_column.value = new String(subColumn.value());
-						thrift_column.timestamp = subColumn.timestamp();
-						thrift_superColumn.columns.add(thrift_column);
-					}
-				}
-				retlist.add(thrift_superColumn);
-			}
-		}
-		catch (Exception ex)
-		{
-			String exception = LogUtil.throwableToString(ex);
-			logger_.info( exception );
-			throw new CassandraException(exception);
-		}
-        logger_.debug("get_slice2: " + (System.currentTimeMillis() - startTime)
-                + " ms.");
-		return retlist;
+      // register and log perplexity
+      perplexities.add(perplexity);
+      log.info("Perplexity at iteration {} = {}", i, perplexity);
     }
 
-    
-    public ArrayList<superColumn_t> get_slice_super(String tablename, String key, String columnFamily_superColumnName, int start, int count) throws CassandraException
-    {
-		ArrayList<superColumn_t> retlist = new ArrayList<superColumn_t>();
-		try
-		{
-			validateTable(tablename);
-	        String[] values = RowMutation.getColumnAndColumnFamily(columnFamily_superColumnName);
-	        // check for  values 
-	        if( values.length < 1 )
-	        {
-	        	throw new CassandraException("Column Family " + columnFamily_superColumnName + " is invalid.");	        	
-	        }
-	        Row row = StorageProxy.readProtocol(tablename, key, columnFamily_superColumnName, start, count, StorageService.ConsistencyLevel.WEAK);
-			if (row == null)
-			{
-				logger_.info("ERROR No row for this key .....: " + key);
-	        	throw new CassandraException("ERROR No row for this key .....: " + key);	        	
-			}
+    long startTime = System.currentTimeMillis();
+    while (iterationNumber < maxIterations) {
+      // test convergence
+      if (convergenceDelta > 0.0) {
+        double delta = rateOfChange(perplexities);
+        if (delta < convergenceDelta) {
+          log.info("Convergence achieved at iteration {} with perplexity {} and delta {}",
+                   iterationNumber, perplexities.get(perplexities.size() - 1), delta);
+          break;
+        }
+      }
 
-			Map<String, ColumnFamily> cfMap = row.getColumnFamilyMap();
-			if (cfMap == null || cfMap.size() == 0)
-			{
-				logger_	.info("ERROR ColumnFamily map is missing.....: "
-							   + "   key:" + key
-								);
-				throw new CassandraException("Either the key " + key + " is not present or the columns requested are not present.");
-			}
-			ColumnFamily cfamily = cfMap.get(values[0]);
-			if (cfamily == null)
-			{
-				logger_.info("ERROR ColumnFamily  is missing.....: "
-							+"   key:" + key
-							+ "  ColumnFamily:" + values[0]);
-				throw new CassandraException("Either the key " + key + " is not present or the columns requested" + columnFamily_superColumnName + "are not present.");
-			}
-			Collection<IColumn> columns = cfamily.getAllColumns();
-			if (columns == null || columns.size() == 0)
-			{
-				logger_	.info("ERROR Columns are missing.....: "
-							   + "   key:" + key
-								+ "  ColumnFamily:" + values[0]);
-				throw new CassandraException("ERROR Columns are missing.....: " + "   key:" + key + "  ColumnFamily:" + values[0]);
-			}
-			
-			for(IColumn column : columns)
-			{
-				superColumn_t thrift_superColumn = new superColumn_t();
-				thrift_superColumn.name = column.name();
-				Collection<IColumn> subColumns = column.getSubColumns();
-				if(subColumns.size() != 0 )
-				{
-					thrift_superColumn.columns = new ArrayList<column_t>();
-					for( IColumn subColumn : subColumns )
-					{
-						column_t thrift_column = new column_t();
-						thrift_column.columnName = subColumn.name();
-						thrift_column.value = new String(subColumn.value());
-						thrift_column.timestamp = subColumn.timestamp();
-						thrift_superColumn.columns.add(thrift_column);
-					}
-				}
-				retlist.add(thrift_superColumn);
-			}
-		}
-		catch (Exception ex)
-		{
-			String exception = LogUtil.throwableToString(ex);
-			logger_.info( exception );
-			throw new CassandraException(exception);
-		}
-		return retlist;
-    	
+      // update model
+      iterationNumber++;
+      log.info("About to run iteration {} of {}", iterationNumber, maxIterations);
+      Path modelInputPath = modelPath(topicModelStateTempPath, iterationNumber - 1);
+      Path modelOutputPath = modelPath(topicModelStateTempPath, iterationNumber);
+      runIteration(conf, inputPath, modelInputPath, modelOutputPath, iterationNumber,
+          maxIterations, numReduceTasks);
+
+      // calculate perplexity
+      if (testFraction > 0 && iterationNumber % iterationBlockSize == 0) {
+        perplexities.add(calculatePerplexity(conf, inputPath, modelOutputPath, iterationNumber));
+        log.info("Current perplexity = {}", perplexities.get(perplexities.size() - 1));
+        log.info("(p_{} - p_{}) / p_0 = {}; target = {}", iterationNumber, iterationNumber - iterationBlockSize,
+            rateOfChange(perplexities), convergenceDelta);
+      }
     }
-    
-    public superColumn_t get_superColumn(String tablename, String key, String columnFamily_column) throws CassandraException
-    {
-    	superColumn_t ret = null;
-		try
-		{
-			validateTable(tablename);
-	        String[] values = RowMutation.getColumnAndColumnFamily(columnFamily_column);
-	        // check for  values 
-	        if( values.length < 2 )
-	        {
-	        	throw new CassandraException("Column Family " + columnFamily_column + " is invalid.");	        	
-	        }
+    log.info("Completed {} iterations in {} seconds", iterationNumber,
+        (System.currentTimeMillis() - startTime) / 1000);
+    log.info("Perplexities: ({})", Joiner.on(", ").join(perplexities));
 
-	        Row row = StorageProxy.readProtocol(tablename, key, columnFamily_column, -1, Integer.MAX_VALUE, StorageService.ConsistencyLevel.WEAK);
-			if (row == null)
-			{
-				logger_.info("ERROR No row for this key .....: " + key);
-	        	throw new CassandraException("ERROR No row for this key .....: " + key);	        	
-			}
-
-			Map<String, ColumnFamily> cfMap = row.getColumnFamilyMap();
-			if (cfMap == null || cfMap.size() == 0)
-			{
-				logger_	.info("ERROR ColumnFamily map is missing.....: "
-							   + "   key:" + key
-								);
-				throw new CassandraException("Either the key " + key + " is not present or the columns requested are not present.");
-			}
-			ColumnFamily cfamily = cfMap.get(values[0]);
-			if (cfamily == null)
-			{
-				logger_.info("ERROR ColumnFamily  is missing.....: "
-							+"   key:" + key
-							+ "  ColumnFamily:" + values[0]);
-				throw new CassandraException("Either the key " + key + " is not present or the columns requested" + columnFamily_column + "are not present.");
-			}
-			Collection<IColumn> columns = cfamily.getAllColumns();
-			if (columns == null || columns.size() == 0)
-			{
-				logger_	.info("ERROR Columns are missing.....: "
-							   + "   key:" + key
-								+ "  ColumnFamily:" + values[0]);
-				throw new CassandraException("ERROR Columns are missing.....: " + "   key:" + key + "  ColumnFamily:" + values[0]);
-			}
-			
-			for(IColumn column : columns)
-			{
-				ret = new superColumn_t();
-				ret.name = column.name();
-				Collection<IColumn> subColumns = column.getSubColumns();
-				if(subColumns.size() != 0 )
-				{
-					ret.columns = new ArrayList<column_t>();
-					for(IColumn subColumn : subColumns)
-					{
-						column_t thrift_column = new column_t();
-						thrift_column.columnName = subColumn.name();
-						thrift_column.value = new String(subColumn.value());
-						thrift_column.timestamp = subColumn.timestamp();
-						ret.columns.add(thrift_column);
-					}
-				}
-			}
-		}
-		catch (Exception ex)
-		{
-			String exception = LogUtil.throwableToString(ex);
-			logger_.info( exception );
-			throw new CassandraException(exception);
-		}
-		return ret;
-    	
+    // write final topic-term and doc-topic distributions
+    Path finalIterationData = modelPath(topicModelStateTempPath, iterationNumber);
+    Job topicModelOutputJob = topicModelOutputPath != null
+        ? writeTopicModel(conf, finalIterationData, topicModelOutputPath)
+        : null;
+    Job docInferenceJob = docTopicOutputPath != null
+        ? writeDocTopicInference(conf, inputPath, finalIterationData, docTopicOutputPath)
+        : null;
+    if (topicModelOutputJob != null && !topicModelOutputJob.waitForCompletion(true)) {
+      return -1;
     }
-    
-    public boolean batch_insert_superColumn_blocking(batch_mutation_super_t batchMutationSuper)
-    {
-    	boolean result = false;
-		try
-		{
-			logger_.warn(" batch_insert_SuperColumn_blocking");
-			logger_.debug(" Creating the row mutation");
-			validateTable(batchMutationSuper.table);
-			RowMutation rm = new RowMutation(batchMutationSuper.table,
-					batchMutationSuper.key.trim());
-			Set keys = batchMutationSuper.cfmap.keySet();
-			Iterator keyIter = keys.iterator();
-			while (keyIter.hasNext())
-			{
-				Object key = keyIter.next(); // Get the next key.
-				List<superColumn_t> list = batchMutationSuper.cfmap.get(key);
-				for (superColumn_t superColumnData : list)
-				{
-					if(superColumnData.columns.size() != 0 )
-					{
-						for (column_t columnData : superColumnData.columns)
-						{
-							rm.add(key.toString() + ":" + superColumnData.name  +":" + columnData.columnName,
-									columnData.value.getBytes(), columnData.timestamp);
-						}
-					}
-					else
-					{
-						rm.add(key.toString() + ":" + superColumnData.name, new byte[0], 0);
-					}
-				}
-			}            
-            StorageProxy.insert(rm);
-		}
-		catch (Exception e)
-		{
-			logger_.info( LogUtil.throwableToString(e) );
-		}
-		return result;
-    	
+    if (docInferenceJob != null && !docInferenceJob.waitForCompletion(true)) {
+      return -1;
     }
-    public void batch_insert_superColumn(batch_mutation_super_t batchMutationSuper)
-    {
-		try
-		{
-			logger_.debug(" batch_insert");
-			logger_.debug(" Creating the row mutation");
-			validateTable(batchMutationSuper.table);
-			RowMutation rm = new RowMutation(batchMutationSuper.table,
-					batchMutationSuper.key.trim());
-			if(batchMutationSuper.cfmap != null)
-			{
-				Set keys = batchMutationSuper.cfmap.keySet();
-				Iterator keyIter = keys.iterator();
-				while (keyIter.hasNext())
-				{
-					Object key = keyIter.next(); // Get the next key.
-					List<superColumn_t> list = batchMutationSuper.cfmap.get(key);
-					for (superColumn_t superColumnData : list)
-					{
-						if(superColumnData.columns.size() != 0 )
-						{
-							for (column_t columnData : superColumnData.columns)
-							{
-								rm.add(key.toString() + ":" + superColumnData.name  +":" + columnData.columnName,
-										columnData.value.getBytes(), columnData.timestamp);
-							}
-						}
-						else
-						{
-							rm.add(key.toString() + ":" + superColumnData.name, new byte[0], 0);
-						}
-					}
-				} 
-			}
-            StorageProxy.insert(rm);
-		}
-		catch (Exception e)
-		{
-			logger_.info( LogUtil.throwableToString(e) );
-		}
-		return;
+    return 0;
+  }
+
+  private static double rateOfChange(List<Double> perplexities) {
+    int sz = perplexities.size();
+    if (sz < 2) {
+      return Double.MAX_VALUE;
     }
+    return Math.abs(perplexities.get(sz - 1) - perplexities.get(sz - 2)) / perplexities.get(0);
+  }
 
-    public String getStringProperty(String propertyName) throws TException
-    {
-        if (propertyName.equals("cluster name"))
-        {
-            return DatabaseDescriptor.getClusterName();
-        }
-        else if (propertyName.equals("config file"))
-        {
-            String filename = DatabaseDescriptor.getConfigFileName();
-            try
-            {
-                StringBuffer fileData = new StringBuffer(8192);
-                BufferedInputStream stream = new BufferedInputStream(new FileInputStream(filename));
-                byte[] buf = new byte[1024];
-                int numRead;
-                while( (numRead = stream.read(buf)) != -1)
-                {
-                    String str = new String(buf, 0, numRead);
-                    fileData.append(str);
-                }
-                stream.close();
-                return fileData.toString();
-            }
-            catch (IOException e)
-            {
-                return "file not found!";
-            }
-        }
-        else if (propertyName.equals("version"))
-        {
-            return getVersion();
-        }
-        else
-        {
-            return "?";
-        }
+  private double calculatePerplexity(Configuration conf, Path corpusPath, Path modelPath, int iteration)
+    throws IOException, ClassNotFoundException, InterruptedException {
+    String jobName = "Calculating perplexity for " + modelPath;
+    log.info("About to run: {}", jobName);
+
+    Path outputPath = perplexityPath(modelPath.getParent(), iteration);
+    Job job = prepareJob(corpusPath, outputPath, CachingCVB0PerplexityMapper.class, DoubleWritable.class,
+        DoubleWritable.class, DualDoubleSumReducer.class, DoubleWritable.class, DoubleWritable.class);
+
+    job.setJobName(jobName);
+    job.setCombinerClass(DualDoubleSumReducer.class);
+    job.setNumReduceTasks(1);
+    setModelPaths(job, modelPath);
+    HadoopUtil.delete(conf, outputPath);
+    if (!job.waitForCompletion(true)) {
+      throw new InterruptedException("Failed to calculate perplexity for: " + modelPath);
     }
+    return readPerplexity(conf, modelPath.getParent(), iteration);
+  }
 
-    public List<String> getStringListProperty(String propertyName) throws TException
-    {
-        if (propertyName.equals("tables"))
-        {
-            return DatabaseDescriptor.getTables();        
+  /**
+   * Sums keys and values independently.
+   */
+  public static class DualDoubleSumReducer extends
+    Reducer<DoubleWritable, DoubleWritable, DoubleWritable, DoubleWritable> {
+    private final DoubleWritable outKey = new DoubleWritable();
+    private final DoubleWritable outValue = new DoubleWritable();
+
+    @Override
+    public void run(Context context) throws IOException,
+        InterruptedException {
+      double keySum = 0.0;
+      double valueSum = 0.0;
+      while (context.nextKey()) {
+        keySum += context.getCurrentKey().get();
+        for (DoubleWritable value : context.getValues()) {
+          valueSum += value.get();
         }
-        else
-        {
-            return new ArrayList<String>();
-        }
+      }
+      outKey.set(keySum);
+      outValue.set(valueSum);
+      context.write(outKey, outValue);
     }
+  }
 
-    public String describeTable(String tableName) throws TException
-    {
-        String desc = "";
-        Map<String, CFMetaData> tableMetaData = DatabaseDescriptor.getTableMetaData(tableName);
-
-        if (tableMetaData == null)
-        {
-            return "Table " + tableName +  " not found.";
-        }
-
-        Iterator iter = tableMetaData.entrySet().iterator();
-        while (iter.hasNext())
-        {
-            Map.Entry<String, CFMetaData> pairs = (Map.Entry<String, CFMetaData>)iter.next();
-            desc = desc + pairs.getValue().pretty() + "-----\n";
-        }
-        return desc;
+  /**
+   * @param topicModelStateTemp
+   * @param iteration
+   * @return {@code double[2]} where first value is perplexity and second is model weight of those
+   *         documents sampled during perplexity computation, or {@code null} if no perplexity data
+   *         exists for the given iteration.
+   * @throws IOException
+   */
+  public static double readPerplexity(Configuration conf, Path topicModelStateTemp, int iteration)
+    throws IOException {
+    Path perplexityPath = perplexityPath(topicModelStateTemp, iteration);
+    FileSystem fs = FileSystem.get(perplexityPath.toUri(), conf);
+    if (!fs.exists(perplexityPath)) {
+      log.warn("Perplexity path {} does not exist, returning NaN", perplexityPath);
+      return Double.NaN;
     }
-
-    public CqlResult_t executeQuery(String query) throws TException
-    {
-        CqlResult_t result = new CqlResult_t();
-
-        CqlResult cqlResult = CqlDriver.executeQuery(query);
-        
-        // convert CQL result type to Thrift specific return type
-        if (cqlResult != null)
-        {
-            result.errorTxt = cqlResult.errorTxt;
-            result.resultSet = cqlResult.resultSet;
-            result.errorCode = cqlResult.errorCode;
-        }
-        return result;
+    double perplexity = 0;
+    double modelWeight = 0;
+    long n = 0;
+    for (Pair<DoubleWritable, DoubleWritable> pair : new SequenceFileDirIterable<DoubleWritable, DoubleWritable>(
+        perplexityPath, PathType.LIST, PathFilters.partFilter(), null, true, conf)) {
+      modelWeight += pair.getFirst().get();
+      perplexity += pair.getSecond().get();
+      n++;
     }
-    
-    /*
-     * This method is used to ensure that all keys
-     * prior to the specified key, as dtermined by
-     * the SSTable index bucket it falls in, are in
-     * buffer cache.  
-    */
-    public void touch (String key , boolean fData) 
-    {
-    	try
-    	{
-    		StorageProxy.touchProtocol(DatabaseDescriptor.getTables().get(0), key, fData, StorageService.ConsistencyLevel.WEAK);
-    	}
-    	catch ( Exception e)
-    	{
-			logger_.info( LogUtil.throwableToString(e) );
-    	}
-	}
-    
-    
-	public String getVersion()
-	{
-		return "1";
-	}
+    log.info("Read {} entries with total perplexity {} and model weight {}", n,
+             perplexity, modelWeight);
+    return perplexity / modelWeight;
+  }
 
-	public int getStatus()
-	{
-		return fb_status.ALIVE;
-	}
+  private Job writeTopicModel(Configuration conf, Path modelInput, Path output)
+    throws IOException, InterruptedException, ClassNotFoundException {
+    String jobName = String.format("Writing final topic/term distributions from %s to %s", modelInput, output);
+    log.info("About to run: {}", jobName);
 
-	public String getStatusDetails()
-	{
-		return null;
-	}
+    Job job = prepareJob(modelInput, output, SequenceFileInputFormat.class, CVB0TopicTermVectorNormalizerMapper.class,
+        IntWritable.class, VectorWritable.class, SequenceFileOutputFormat.class, jobName);
+    job.submit();
+    return job;
+  }
 
-	public static void main(String[] args) throws Throwable
-	{
-		int port = 9160;		
-		try
-		{
-			CassandraServer peerStorageServer = new CassandraServer();
-			peerStorageServer.start();
-			Cassandra.Processor processor = new Cassandra.Processor(
-					peerStorageServer);
-			// Transport
-			TServerSocket tServerSocket =  new TServerSocket(port);
-			 // Protocol factory
-			TProtocolFactory tProtocolFactory = new TBinaryProtocol.Factory();
-			 // ThreadPool Server
-			Options options = new Options();
-			options.minWorkerThreads = 64;
-			TThreadPoolServer serverEngine = new TThreadPoolServer(processor, tServerSocket, tProtocolFactory);
-			serverEngine.serve();
+  private Job writeDocTopicInference(Configuration conf, Path corpus, Path modelInput, Path output)
+    throws IOException, ClassNotFoundException, InterruptedException {
+    String jobName = String.format("Writing final document/topic inference from %s to %s", corpus, output);
+    log.info("About to run: {}", jobName);
 
-		}
-		catch (Exception x)
-		{
-			System.err.println("UNCAUGHT EXCEPTION IN main()");
-			x.printStackTrace();
-			System.exit(1);
-		}
+    Job job = prepareJob(corpus, outputPath, SequenceFileInputFormat.class, CVB0DocInferenceMapper.class,
+        IntWritable.class, VectorWritable.class, SequenceFileOutputFormat.class, jobName);
 
-	}
+    FileSystem fs = FileSystem.get(corpus.toUri(), conf);
+    if (modelInput != null && fs.exists(modelInput)) {
+      FileStatus[] statuses = fs.listStatus(modelInput, PathFilters.partFilter());
+      URI[] modelUris = new URI[statuses.length];
+      for (int i = 0; i < statuses.length; i++) {
+        modelUris[i] = statuses[i].getPath().toUri();
+      }
+      DistributedCache.setCacheFiles(modelUris, conf);
+      setModelPaths(job, modelInput);
+    }
+    job.submit();
+    return job;
+  }
 
+  public static Path modelPath(Path topicModelStateTempPath, int iterationNumber) {
+    return new Path(topicModelStateTempPath, "model-" + iterationNumber);
+  }
+
+  public static Path perplexityPath(Path topicModelStateTempPath, int iterationNumber) {
+    return new Path(topicModelStateTempPath, "perplexity-" + iterationNumber);
+  }
+
+  private static int getCurrentIterationNumber(Configuration config, Path modelTempDir, int maxIterations)
+    throws IOException {
+    FileSystem fs = FileSystem.get(modelTempDir.toUri(), config);
+    int iterationNumber = 1;
+    Path iterationPath = modelPath(modelTempDir, iterationNumber);
+    while (fs.exists(iterationPath) && iterationNumber <= maxIterations) {
+      log.info("Found previous state: {}", iterationPath);
+      iterationNumber++;
+      iterationPath = modelPath(modelTempDir, iterationNumber);
+    }
+    return iterationNumber - 1;
+  }
+
+  public void runIteration(Configuration conf, Path corpusInput, Path modelInput, Path modelOutput,
+                           int iterationNumber, int maxIterations, int numReduceTasks)
+    throws IOException, ClassNotFoundException, InterruptedException {
+    String jobName = String.format("Iteration %d of %d, input path: %s",
+        iterationNumber, maxIterations, modelInput);
+    log.info("About to run: {}", jobName);
+    Job job = prepareJob(corpusInput, modelOutput, CachingCVB0Mapper.class, IntWritable.class, VectorWritable.class,
+        VectorSumReducer.class, IntWritable.class, VectorWritable.class);
+    job.setCombinerClass(VectorSumReducer.class);
+    job.setNumReduceTasks(numReduceTasks);
+    job.setJobName(jobName);
+    setModelPaths(job, modelInput);
+    HadoopUtil.delete(conf, modelOutput);
+    if (!job.waitForCompletion(true)) {
+      throw new InterruptedException(String.format("Failed to complete iteration %d stage 1",
+          iterationNumber));
+    }
+  }
+
+  private static void setModelPaths(Job job, Path modelPath) throws IOException {
+    Configuration conf = job.getConfiguration();
+    if (modelPath == null || !FileSystem.get(modelPath.toUri(), conf).exists(modelPath)) {
+      return;
+    }
+    FileStatus[] statuses = FileSystem.get(modelPath.toUri(), conf).listStatus(modelPath, PathFilters.partFilter());
+    Preconditions.checkState(statuses.length > 0, "No part files found in model path '%s'", modelPath.toString());
+    String[] modelPaths = new String[statuses.length];
+    for (int i = 0; i < statuses.length; i++) {
+      modelPaths[i] = statuses[i].getPath().toUri().toString();
+    }
+    conf.setStrings(MODEL_PATHS, modelPaths);
+  }
+
+  public static Path[] getModelPaths(Configuration conf) {
+    String[] modelPathNames = conf.getStrings(MODEL_PATHS);
+    if (modelPathNames == null || modelPathNames.length == 0) {
+      return null;
+    }
+    Path[] modelPaths = new Path[modelPathNames.length];
+    for (int i = 0; i < modelPathNames.length; i++) {
+      modelPaths[i] = new Path(modelPathNames[i]);
+    }
+    return modelPaths;
+  }
+
+  public static void main(String[] args) throws Exception {
+    ToolRunner.run(new Configuration(), new CVB0Driver(), args);
+  }
 }

@@ -1,319 +1,267 @@
-@org.junit.Ignore("Fails on JDK's 1.6.0_u33 and newer as you cannot call a private constructor from subclass")
+super.end();
+
+package org.apache.lucene.analysis;
 
 /*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
- *   http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
-package org.apache.aries.blueprint.proxy;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertTrue;
+import java.io.IOException;
+import java.io.Reader;
+import java.nio.CharBuffer;
+import java.util.Random;
 
-import java.lang.reflect.InvocationHandler;
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Method;
-import java.lang.reflect.Modifier;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.concurrent.Callable;
+import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
+import org.apache.lucene.analysis.tokenattributes.OffsetAttribute;
+import org.apache.lucene.util.automaton.CharacterRunAutomaton;
+import org.apache.lucene.util.automaton.RegExp;
 
-import org.apache.aries.proxy.FinalModifierException;
-import org.apache.aries.proxy.InvocationListener;
-import org.apache.aries.proxy.UnableToProxyException;
-import org.apache.aries.proxy.impl.AbstractProxyManager;
-import org.apache.aries.proxy.impl.AsmProxyManager;
-import org.apache.aries.proxy.impl.ProxyHandler;
-import org.apache.aries.proxy.impl.SingleInstanceDispatcher;
-import org.apache.aries.proxy.impl.gen.ProxySubclassGenerator;
-import org.apache.aries.proxy.impl.gen.ProxySubclassMethodHashSet;
-import org.junit.Before;
-import org.junit.Test;
+import com.carrotsearch.randomizedtesting.RandomizedContext;
 
 /**
- * This class uses the {@link ProxySubclassGenerator} to test
+ * Tokenizer for testing.
+ * <p>
+ * This tokenizer is a replacement for {@link #WHITESPACE}, {@link #SIMPLE}, and {@link #KEYWORD}
+ * tokenizers. If you are writing a component such as a TokenFilter, its a great idea to test
+ * it wrapping this tokenizer instead for extra checks. This tokenizer has the following behavior:
+ * <ul>
+ *   <li>An internal state-machine is used for checking consumer consistency. These checks can
+ *       be disabled with {@link #setEnableChecks(boolean)}.
+ *   <li>For convenience, optionally lowercases terms that it outputs.
+ * </ul>
  */
-public class ProxySubclassGeneratorTest extends AbstractProxyTest
-{
-  private static final Class<?> FINAL_METHOD_CLASS = ProxyTestClassFinalMethod.class;
-  private static final Class<?> FINAL_CLASS = ProxyTestClassFinal.class;
-  private static final Class<?> GENERIC_CLASS = ProxyTestClassGeneric.class;
-  private static final Class<?> COVARIANT_CLASS = ProxyTestClassCovariantOverride.class;
-  private static ProxySubclassMethodHashSet<String> expectedMethods = new ProxySubclassMethodHashSet<String>(
-      12);
-  private InvocationHandler ih = null;
-  Class<?> generatedProxySubclass = null;
-  Object o = null;
-
-  /**
-   * @throws java.lang.Exception
+public class MockTokenizer extends Tokenizer {
+  /** Acts Similar to WhitespaceTokenizer */
+  public static final CharacterRunAutomaton WHITESPACE = 
+    new CharacterRunAutomaton(new RegExp("[^ \t\r\n]+").toAutomaton());
+  /** Acts Similar to KeywordTokenizer.
+   * TODO: Keyword returns an "empty" token for an empty reader... 
    */
-  @Before
-  public void setUp() throws Exception
-  {
-    ih = new FakeInvocationHandler();
-    ((FakeInvocationHandler)ih).setDelegate(getTestClass().newInstance());
-    generatedProxySubclass = getGeneratedSubclass();
-    o = getProxyInstance(generatedProxySubclass);
+  public static final CharacterRunAutomaton KEYWORD =
+    new CharacterRunAutomaton(new RegExp(".*").toAutomaton());
+  /** Acts like LetterTokenizer. */
+  // the ugly regex below is incomplete Unicode 5.2 [:Letter:]
+  public static final CharacterRunAutomaton SIMPLE =
+    new CharacterRunAutomaton(new RegExp("[A-Za-zªµºÀ-ÖØ-öø-ˁ一-鿌]+").toAutomaton());
+
+  private final CharacterRunAutomaton runAutomaton;
+  private final boolean lowerCase;
+  private final int maxTokenLength;
+  public static final int DEFAULT_MAX_TOKEN_LENGTH = Integer.MAX_VALUE;
+  private int state;
+
+  private final CharTermAttribute termAtt = addAttribute(CharTermAttribute.class);
+  private final OffsetAttribute offsetAtt = addAttribute(OffsetAttribute.class);
+  int off = 0;
+
+  // TODO: "register" with LuceneTestCase to ensure all streams are closed() ?
+  // currently, we can only check that the lifecycle is correct if someone is reusing,
+  // but not for "one-offs".
+  private static enum State { 
+    SETREADER,       // consumer set a reader input either via ctor or via reset(Reader)
+    RESET,           // consumer has called reset()
+    INCREMENT,       // consumer is consuming, has called incrementToken() == true
+    INCREMENT_FALSE, // consumer has called incrementToken() which returned false
+    END,             // consumer has called end() to perform end of stream operations
+    CLOSE            // consumer has called close() to release any resources
+  };
+  
+  private State streamState = State.CLOSE;
+  private int lastOffset = 0; // only for asserting
+  private boolean enableChecks = true;
+  
+  // evil: but we don't change the behavior with this random, we only switch up how we read
+  private final Random random = new Random(RandomizedContext.current().getRandom().nextLong());
+  
+  public MockTokenizer(AttributeFactory factory, Reader input, CharacterRunAutomaton runAutomaton, boolean lowerCase, int maxTokenLength) {
+    super(factory, input);
+    this.runAutomaton = runAutomaton;
+    this.lowerCase = lowerCase;
+    this.state = runAutomaton.getInitialState();
+    this.streamState = State.SETREADER;
+    this.maxTokenLength = maxTokenLength;
   }
 
+  public MockTokenizer(Reader input, CharacterRunAutomaton runAutomaton, boolean lowerCase, int maxTokenLength) {
+    this(AttributeFactory.DEFAULT_ATTRIBUTE_FACTORY, input, runAutomaton, lowerCase, maxTokenLength);
+  }
 
-  /**
-   * Test that the methods found declared on the generated proxy subclass are
-   * the ones that we expect.
-   */
-  @Test
-  public void testExpectedMethods() throws Exception
-  {
-    Class<?> superclass = getTestClass();
+  public MockTokenizer(Reader input, CharacterRunAutomaton runAutomaton, boolean lowerCase) {
+    this(input, runAutomaton, lowerCase, DEFAULT_MAX_TOKEN_LENGTH);
+  }
+  /** Calls {@link #MockTokenizer(Reader, CharacterRunAutomaton, boolean) MockTokenizer(Reader, WHITESPACE, true)} */
+  public MockTokenizer(Reader input) {
+    this(input, WHITESPACE, true);
+  }
 
-    do {
-      Method[] declaredMethods = superclass.getDeclaredMethods();
-      List<Method> listOfDeclaredMethods = new ArrayList<Method>();
-      for (Method m : declaredMethods) {
-        int i = m.getModifiers();
-        if (Modifier.isPrivate(i) || Modifier.isFinal(i)) {
-          // private or final don't get added
-        } else if (!(Modifier.isPublic(i) || Modifier.isPrivate(i) || Modifier.isProtected(i))) {
-          // the method is default visibility, check the package
-          if (m.getDeclaringClass().getPackage().equals(getTestClass().getPackage())) {
-            // default vis with same package gets added
-            listOfDeclaredMethods.add(m);
+  public MockTokenizer(AttributeFactory factory, Reader input, CharacterRunAutomaton runAutomaton, boolean lowerCase) {
+    this(factory, input, runAutomaton, lowerCase, DEFAULT_MAX_TOKEN_LENGTH);
+  }
+
+  /** Calls {@link #MockTokenizer(org.apache.lucene.util.AttributeSource.AttributeFactory,Reader,CharacterRunAutomaton,boolean)
+   *                MockTokenizer(AttributeFactory, Reader, WHITESPACE, true)} */
+  public MockTokenizer(AttributeFactory factory, Reader input) {
+    this(input, WHITESPACE, true);
+  }
+
+  @Override
+  public final boolean incrementToken() throws IOException {
+    assert !enableChecks || (streamState == State.RESET || streamState == State.INCREMENT) 
+                            : "incrementToken() called while in wrong state: " + streamState;
+    clearAttributes();
+    for (;;) {
+      int startOffset = off;
+      int cp = readCodePoint();
+      if (cp < 0) {
+        break;
+      } else if (isTokenChar(cp)) {
+        int endOffset;
+        do {
+          char chars[] = Character.toChars(normalize(cp));
+          for (int i = 0; i < chars.length; i++)
+            termAtt.append(chars[i]);
+          endOffset = off;
+          if (termAtt.length() >= maxTokenLength) {
+            break;
           }
+          cp = readCodePoint();
+        } while (cp >= 0 && isTokenChar(cp));
+        
+        int correctedStartOffset = correctOffset(startOffset);
+        int correctedEndOffset = correctOffset(endOffset);
+        assert correctedStartOffset >= 0;
+        assert correctedEndOffset >= 0;
+        assert correctedStartOffset >= lastOffset;
+        lastOffset = correctedStartOffset;
+        assert correctedEndOffset >= correctedStartOffset;
+        offsetAtt.setOffset(correctedStartOffset, correctedEndOffset);
+        streamState = State.INCREMENT;
+        return true;
+      }
+    }
+    streamState = State.INCREMENT_FALSE;
+    return false;
+  }
+
+  protected int readCodePoint() throws IOException {
+    int ch = readChar();
+    if (ch < 0) {
+      return ch;
+    } else {
+      assert !Character.isLowSurrogate((char) ch) : "unpaired low surrogate: " + Integer.toHexString(ch);
+      off++;
+      if (Character.isHighSurrogate((char) ch)) {
+        int ch2 = readChar();
+        if (ch2 >= 0) {
+          off++;
+          assert Character.isLowSurrogate((char) ch2) : "unpaired high surrogate: " + Integer.toHexString(ch) + ", followed by: " + Integer.toHexString(ch2);
+          return Character.toCodePoint((char) ch, (char) ch2);
         } else {
-          listOfDeclaredMethods.add(m);
+          assert false : "stream ends with unpaired high surrogate: " + Integer.toHexString(ch);
         }
       }
-
-      declaredMethods = listOfDeclaredMethods.toArray(new Method[] {});
-      ProxySubclassMethodHashSet<String> foundMethods = new ProxySubclassMethodHashSet<String>(
-          declaredMethods.length);
-      foundMethods.addMethodArray(declaredMethods);
-      // as we are using a set we shouldn't get duplicates
-      expectedMethods.addAll(foundMethods);
-      superclass = superclass.getSuperclass();
-    } while (superclass != null);
-
-    // add the getter and setter for the invocation handler to the expected
-    // set
-    // and the unwrapObject method
-    Method[] ihMethods = new Method[] {
-        generatedProxySubclass.getMethod("setInvocationHandler",
-            new Class[] { InvocationHandler.class }),
-        generatedProxySubclass.getMethod("getInvocationHandler", new Class[] {}) };
-    expectedMethods.addMethodArray(ihMethods);
-
-    Method[] generatedProxySubclassMethods = generatedProxySubclass.getDeclaredMethods();
-    ProxySubclassMethodHashSet<String> generatedMethods = new ProxySubclassMethodHashSet<String>(
-        generatedProxySubclassMethods.length);
-    generatedMethods.addMethodArray(generatedProxySubclassMethods);
-
-    // check that all the methods we have generated were expected
-    for (String gen : generatedMethods) {
-      assertTrue("Unexpected method: " + gen, expectedMethods.contains(gen));
-    }
-    // check that all the expected methods were generated
-    for (String exp : expectedMethods) {
-      assertTrue("Method was not generated: " + exp, generatedMethods.contains(exp));
-    }
-    // check the sets were the same
-    assertEquals("Sets were not the same", expectedMethods, generatedMethods);
-
-  }
-
-  /**
-   * Test a method marked final
-   */
-  @Test
-  public void testFinalMethod() throws Exception
-  {
-    try {
-      ProxySubclassGenerator.getProxySubclass(FINAL_METHOD_CLASS);
-    } catch (FinalModifierException e) {
-      assertFalse("Should have found final method not final class", e.isFinalClass());
+      return ch;
     }
   }
-
-  /**
-   * Test a class marked final
-   */
-  @Test
-  public void testFinalClass() throws Exception
-  {
-    try {
-      ProxySubclassGenerator.getProxySubclass(FINAL_CLASS);
-    } catch (FinalModifierException e) {
-      assertTrue("Should have found final class", e.isFinalClass());
-    }
-  }
-
-  /**
-   * Test a private constructor
-   */
-  @Test
-  public void testPrivateConstructor() throws Exception
-  {
-    Object o = ProxySubclassGenerator.newProxySubclassInstance(
-        ProxyTestClassPrivateConstructor.class, ih);
-    assertNotNull("The new instance was null", o);
-
-  }
   
-//  /**
-//   * Test object equality between real and proxy using a Collaborator
-//   */
-//  @Test
-//  public void testObjectEquality() throws Exception
-//  {
-//    Object delegate = getTestClass().newInstance();
-//    InvocationHandler collaborator = new Collaborator(null, null, AsmInterceptorWrapper.passThrough(delegate));
-//    Object o = ProxySubclassGenerator.newProxySubclassInstance(getTestClass(), collaborator);
-//    //Calling equals on the proxy with an arg of the unwrapped object should be true
-//    assertTrue("The proxy object should be equal to its delegate",o.equals(delegate));
-//    InvocationHandler collaborator2 = new Collaborator(null, null, AsmInterceptorWrapper.passThrough(delegate));
-//    Object o2 = ProxySubclassGenerator.newProxySubclassInstance(getTestClass(), collaborator2);
-//    //The proxy of a delegate should equal another proxy of the same delegate
-//    assertTrue("The proxy object should be equal to another proxy instance of the same delegate", o2.equals(o));
-//  }
-//  
-//  private static class ProxyTestOverridesFinalize {
-//      public boolean finalizeCalled = false;
-//      
-//      @Override
-//      protected void finalize() {
-//          finalizeCalled = true;
-//      }
-//  }
-//  
-//  @Test
-//  public void testFinalizeNotCalled() throws Exception {
-//      ProxyTestOverridesFinalize testObj = new ProxyTestOverridesFinalize();
-//      InvocationHandler ih = new Collaborator(null, null, AsmInterceptorWrapper.passThrough(testObj));
-//      Object o = ProxySubclassGenerator.newProxySubclassInstance(ProxyTestOverridesFinalize.class, ih);
-//      
-//      Method m = o.getClass().getDeclaredMethod("finalize");
-//      m.setAccessible(true);
-//      m.invoke(o);
-//      
-//      assertFalse(testObj.finalizeCalled);
-//  }
-  
-
-  /**
-   * Test a covariant override method
-   */
-  @Test
-  public void testCovariant() throws Exception
-  {
-    ((FakeInvocationHandler)ih).setDelegate(COVARIANT_CLASS.newInstance());
-    o = ProxySubclassGenerator.newProxySubclassInstance(COVARIANT_CLASS, ih);
-    generatedProxySubclass = o.getClass();
-    Method m = generatedProxySubclass.getDeclaredMethod("getCovariant", new Class[] {});
-    Object returned = m.invoke(o);
-    assertTrue("Object was of wrong type: " + returned.getClass().getSimpleName(), COVARIANT_CLASS
-        .isInstance(returned));
-  }
-  
-  /**
-   * Test a covariant override method
-   */
-  @Test
-  public void testGenerics() throws Exception
-  {
-    ((FakeInvocationHandler)ih).setDelegate(GENERIC_CLASS.newInstance());
-    super.testGenerics();
-  }
-  
-  private Class<?> getGeneratedSubclass() throws Exception
-  {
-    return getProxyClass(getTestClass());
-  }
-
-  private class FakeInvocationHandler implements InvocationHandler
-  {
-    private Object delegate = null;
-    /*
-     * (non-Javadoc)
-     * 
-     * @see java.lang.reflect.InvocationHandler#invoke(java.lang.Object,
-     * java.lang.reflect.Method, java.lang.Object[])
-     */
-    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable
-    {
-      try {
-      Object result = (delegate instanceof Callable) ? 
-          method.invoke(((Callable<?>)delegate).call(), args) : 
-          method.invoke(delegate, args) ;
-      return result;
-      } catch (InvocationTargetException ite) {
-        throw ite.getTargetException();
+  protected int readChar() throws IOException {
+    switch(random.nextInt(10)) {
+      case 0: {
+        // read(char[])
+        char c[] = new char[1];
+        int ret = input.read(c);
+        return ret < 0 ? ret : c[0];
       }
+      case 1: {
+        // read(char[], int, int)
+        char c[] = new char[2];
+        int ret = input.read(c, 1, 1);
+        return ret < 0 ? ret : c[1];
+      }
+      case 2: {
+        // read(CharBuffer)
+        char c[] = new char[1];
+        CharBuffer cb = CharBuffer.wrap(c);
+        int ret = input.read(cb);
+        return ret < 0 ? ret : c[0];
+      }
+      default: 
+        // read()
+        return input.read();
     }
-
-    void setDelegate(Object delegate){
-      this.delegate = delegate;
-    }
-    
   }
 
-  @Override
-  protected Object getProxyInstance(Class<?> proxyClass) {
-    return getProxyInstance(proxyClass, ih);
+  protected boolean isTokenChar(int c) {
+    state = runAutomaton.step(state, c);
+    if (state < 0) {
+      state = runAutomaton.getInitialState();
+      return false;
+    } else {
+      return true;
+    }
   }
   
-  private Object getProxyInstance(Class<?> proxyClass, InvocationHandler ih) {
+  protected int normalize(int c) {
+    return lowerCase ? Character.toLowerCase(c) : c;
+  }
+
+  @Override
+  public void reset() throws IOException {
+    super.reset();
+    state = runAutomaton.getInitialState();
+    lastOffset = off = 0;
+    assert !enableChecks || streamState != State.RESET : "double reset()";
+    streamState = State.RESET;
+  }
+  
+  @Override
+  public void close() throws IOException {
+    super.close();
+    // in some exceptional cases (e.g. TestIndexWriterExceptions) a test can prematurely close()
+    // these tests should disable this check, by default we check the normal workflow.
+    // TODO: investigate the CachingTokenFilter "double-close"... for now we ignore this
+    assert !enableChecks || streamState == State.END || streamState == State.CLOSE : "close() called in wrong state: " + streamState;
+    streamState = State.CLOSE;
+  }
+
+  @Override
+  boolean setReaderTestPoint() {
+    assert !enableChecks || streamState == State.CLOSE : "setReader() called in wrong state: " + streamState;
+    streamState = State.SETREADER;
+    return true;
+  }
+
+  @Override
+  public void end() throws IOException {
+    int finalOffset = correctOffset(off);
+    offsetAtt.setOffset(finalOffset, finalOffset);
+    // some tokenizers, such as limiting tokenizers, call end() before incrementToken() returns false.
+    // these tests should disable this check (in general you should consume the entire stream)
     try {
-      if(proxyClass.equals(ProxyTestClassChildOfAbstract.class))
-        return proxyClass.newInstance();
-      
-      return proxyClass.getConstructor(InvocationHandler.class).newInstance(ih);
-    } catch (Exception e) {
-      return null;
+      assert !enableChecks || streamState == State.INCREMENT_FALSE : "end() called before incrementToken() returned false!";
+    } finally {
+      streamState = State.END;
     }
   }
 
-  @Override
-  protected Class<?> getProxyClass(Class<?> clazz) {
-    try {
-      return ProxySubclassGenerator.getProxySubclass(clazz);
-    } catch (UnableToProxyException e) {
-      return null;
-    }
-  }
-
-
-  @Override
-  protected Object setDelegate(Object proxy, Callable<Object> dispatcher) {
-    AbstractProxyManager apm = new AsmProxyManager();
-    return getProxyInstance(proxy.getClass(), new ProxyHandler(apm, dispatcher, null));  
-  }
-
-
-  @Override
-  protected Object getProxyInstance(Class<?> proxyClass,
-      InvocationListener listener) {
-    AbstractProxyManager apm = new AsmProxyManager();
-    return getProxyInstance(proxyClass, new ProxyHandler(apm, new SingleInstanceDispatcher(getProxyInstance(proxyClass)), listener));  
-  }
-
-
-  @Override
-  protected Object getP3() {
-    return new ProxyTestClassGeneral();
+  /** 
+   * Toggle consumer workflow checking: if your test consumes tokenstreams normally you
+   * should leave this enabled.
+   */
+  public void setEnableChecks(boolean enableChecks) {
+    this.enableChecks = enableChecks;
   }
 }

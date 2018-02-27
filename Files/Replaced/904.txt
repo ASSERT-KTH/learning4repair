@@ -1,1097 +1,279 @@
-public final class SQLDecimal extends NumberDataType implements VariableSizeDataValue
+assert delta >= 0: "position=" + position + " lastPosition=" + lastPosition;
 
-/*
-
-   Derby - Class org.apache.derby.iapi.types.SQLDecimal
-
-   Copyright 1999, 2004 The Apache Software Foundation or its licensors, as applicable.
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-      http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
-
- */
-
-package org.apache.derby.iapi.types;
-
-import org.apache.derby.iapi.reference.SQLState;
-
-import org.apache.derby.iapi.services.io.ArrayInputStream;
-
-import org.apache.derby.iapi.services.sanity.SanityManager;
-
-import org.apache.derby.iapi.services.io.StoredFormatIds;
-import org.apache.derby.iapi.services.io.Storable;
-
-import org.apache.derby.iapi.error.StandardException;
-
-import org.apache.derby.iapi.services.cache.ClassSize;
-import org.apache.derby.iapi.services.info.JVMInfo;
-
-import java.math.BigDecimal;
-import java.math.BigInteger;
-import java.lang.Math;
-import java.lang.reflect.Method;
-import java.lang.reflect.InvocationTargetException;
-import java.io.ObjectOutput;
-import java.io.ObjectInput;
-import java.io.IOException;
-
-import java.sql.ResultSet;
-import java.sql.ResultSetMetaData;
-import java.sql.PreparedStatement;
-import java.sql.SQLException;
+package org.apache.lucene.index.codecs.standard;
 
 /**
- * SQLDecimal satisfies the DataValueDescriptor
- * interfaces (i.e., OrderableDataType). It implements a numeric/decimal column, 
- * e.g. for * storing a column value; it can be specified
- * when constructed to not allow nulls. Nullability cannot be changed
- * after construction, as it affects the storage size and mechanism.
- * <p>
- * Because OrderableDataType is a subtype of DataType,
- * SQLDecimal can play a role in either a DataType/Row
- * or a OrderableDataType/Row, interchangeably.
- * <p>
- * We assume the store has a flag for nullness of the value,
- * and simply return a 0-length array for the stored form
- * when the value is null.
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
- * @author jamie
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
-final class SQLDecimal extends NumberDataType implements VariableSizeDataValue
-{
-	static final BigDecimal ZERO = BigDecimal.valueOf(0L);
-	static final BigDecimal ONE = BigDecimal.valueOf(1L);
-	static final BigDecimal MAXLONG_PLUS_ONE = BigDecimal.valueOf(Long.MAX_VALUE).add(ONE);
-	static final BigDecimal MINLONG_MINUS_ONE = BigDecimal.valueOf(Long.MIN_VALUE).subtract(ONE);
 
+/** Consumes doc & freq, writing them using the current
+ *  index file format */
 
+import java.io.IOException;
 
-	/**
-	 * object state.  Note that scale and precision are 
-	 * always determined dynamically from value when
-	 * it is not null.
+import org.apache.lucene.index.CorruptIndexException;
+import org.apache.lucene.index.DocsEnum;
+import org.apache.lucene.index.FieldInfo;
+import org.apache.lucene.index.IndexFileNames;
+import org.apache.lucene.index.SegmentWriteState;
+import org.apache.lucene.index.codecs.PostingsWriterBase;
+import org.apache.lucene.index.codecs.TermStats;
+import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.store.RAMOutputStream;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.CodecUtil;
+import org.apache.lucene.util.IOUtils;
 
-       The field value can be null without the data value being null.
-	   In this case the value is stored in rawData and rawScale. This
-	   is to allow the minimal amount of work to read a SQLDecimal from disk.
-	   Creating the BigDecimal is expensive as it requires allocating
-	   three objects, the last two are a waste in the case the row does
-	   not qualify or the row will be written out by the sorter before being
-	   returned to the application.
-		<P>
-		This means that this field must be accessed for read indirectly through
-		the getBigDecimal() method, and when setting it the rawData field must
-		be set to null.
+/** @lucene.experimental */
+public final class StandardPostingsWriter extends PostingsWriterBase {
+  final static String CODEC = "StandardPostingsWriterImpl";
+  
+  // Increment version to change it:
+  final static int VERSION_START = 0;
+  final static int VERSION_CURRENT = VERSION_START;
 
-	 */
-	private BigDecimal	value;
+  IndexOutput freqOut;
+  IndexOutput proxOut;
+  final DefaultSkipListWriter skipListWriter;
+  /** Expert: The fraction of TermDocs entries stored in skip tables,
+   * used to accelerate {@link DocsEnum#advance(int)}.  Larger values result in
+   * smaller indexes, greater acceleration, but fewer accelerable cases, while
+   * smaller values result in bigger indexes, less acceleration and more
+   * accelerable cases. More detailed experiments would be useful here. */
+  static final int DEFAULT_SKIP_INTERVAL = 16;
+  final int skipInterval;
+  
+  /**
+   * Expert: minimum docFreq to write any skip data at all
+   */
+  final int skipMinimum;
 
-	/**
-		See comments for value
-	*/
-	private byte[]		rawData;
+  /** Expert: The maximum number of skip levels. Smaller values result in 
+   * slightly smaller indexes, but slower skipping in big posting lists.
+   */
+  final int maxSkipLevels = 10;
+  final int totalNumDocs;
+  IndexOutput termsOut;
 
-	/**
-		See comments for value
-	*/
-	private int			rawScale;
+  boolean omitTermFreqAndPositions;
+  boolean storePayloads;
+  // Starts a new term
+  long lastFreqStart;
+  long freqStart;
+  long lastProxStart;
+  long proxStart;
+  FieldInfo fieldInfo;
+  int lastPayloadLength;
+  int lastPosition;
 
-    private static final int BASE_MEMORY_USAGE = ClassSize.estimateBaseFromCatalog( SQLDecimal.class);
-    private static final int BIG_DECIMAL_MEMORY_USAGE = ClassSize.estimateBaseFromCatalog( BigDecimal.class);
+  private int pendingCount;
 
-    public int estimateMemoryUsage()
-    {
-        int sz = BASE_MEMORY_USAGE;
-        if( null != value)
-            sz += BIG_DECIMAL_MEMORY_USAGE + (value.unscaledValue().bitLength() + 8)/8;
-        if( null != rawData)
-            sz += rawData.length;
-        return sz;
+  //private String segment;
+
+  private RAMOutputStream bytesWriter = new RAMOutputStream();
+
+  public StandardPostingsWriter(SegmentWriteState state) throws IOException {
+    this(state, DEFAULT_SKIP_INTERVAL);
+  }
+  
+  public StandardPostingsWriter(SegmentWriteState state, int skipInterval) throws IOException {
+    this.skipInterval = skipInterval;
+    this.skipMinimum = skipInterval; /* set to the same for now */
+    //this.segment = state.segmentName;
+    String fileName = IndexFileNames.segmentFileName(state.segmentName, state.codecId, StandardCodec.FREQ_EXTENSION);
+    freqOut = state.directory.createOutput(fileName);
+    boolean success = false;
+    try {
+      if (state.fieldInfos.hasProx()) {
+        // At least one field does not omit TF, so create the
+        // prox file
+        fileName = IndexFileNames.segmentFileName(state.segmentName, state.codecId, StandardCodec.PROX_EXTENSION);
+        proxOut = state.directory.createOutput(fileName);
+      } else {
+        // Every field omits TF so we will write no prox file
+        proxOut = null;
+      }
+      
+      totalNumDocs = state.numDocs;
+      
+      skipListWriter = new DefaultSkipListWriter(skipInterval, maxSkipLevels,
+          state.numDocs, freqOut, proxOut);
+      success = true;
+    } finally {
+      if (!success) {
+        IOUtils.closeSafely(true, freqOut, proxOut);
+      }
     }
+  }
 
+  @Override
+  public void start(IndexOutput termsOut) throws IOException {
+    this.termsOut = termsOut;
+    CodecUtil.writeHeader(termsOut, CODEC, VERSION_CURRENT);
+    termsOut.writeInt(skipInterval);                // write skipInterval
+    termsOut.writeInt(maxSkipLevels);               // write maxSkipLevels
+    termsOut.writeInt(skipMinimum);                 // write skipMinimum
+  }
 
-	////////////////////////////////////////////////////////////////////
-	//
-	// CLASS INTERFACE
-	//
-	////////////////////////////////////////////////////////////////////
-	/** no-arg constructor, required by Formattable */
-	public SQLDecimal() 
-	{
-	}
-
-	public SQLDecimal(BigDecimal val)
-	{
-		value = val;
-	}
-
-	public SQLDecimal(BigDecimal val, int nprecision, int scale)
-			throws StandardException
-	{
-		
-		value = val;
-		if ((value != null) && (scale >= 0))
-		{
-			value = value.setScale(scale, 
-							BigDecimal.ROUND_DOWN);
-		}
-	}
-
-	public SQLDecimal(String val) 
-	{
-		value = new BigDecimal(val);
-	}
-
-	/*
-	 * DataValueDescriptor interface
-	 * (mostly implemented in DataType)
-	 *
-	 */
-
-
-	/**
-	 * @exception StandardException thrown on failure to convert
-	 */
-	public int	getInt() throws StandardException
-	{
-		BigDecimal localValue = getBigDecimal();
-		if (localValue == null)
-			return 0;
-
-		try {
-			long lv = getLong();
-
-			if ((lv >= Integer.MIN_VALUE) && (lv <= Integer.MAX_VALUE))
-				return (int) lv;
-
-		} catch (StandardException se) {
-		}
-
-		throw StandardException.newException(SQLState.LANG_OUTSIDE_RANGE_FOR_DATATYPE, "INTEGER");
-	}
-
-	/**
-	 * @exception StandardException thrown on failure to convert
-	 */
-	public byte	getByte() throws StandardException
-	{
-		BigDecimal localValue = getBigDecimal();
-
-		if (localValue == null)
-			return (byte)0;
-
-		try {
-			long lv = getLong();
-
-			if ((lv >= Byte.MIN_VALUE) && (lv <= Byte.MAX_VALUE))
-				return (byte) lv;
-
-		} catch (StandardException se) {
-		}
-
-		throw StandardException.newException(SQLState.LANG_OUTSIDE_RANGE_FOR_DATATYPE, "TINYINT");
-	}
-
-	/**
-	 * @exception StandardException thrown on failure to convert
-	 */
-	public short	getShort() throws StandardException
-	{
-		BigDecimal localValue = getBigDecimal();
-		if (localValue == null)
-			return (short)0;
-
-		try {
-			long lv = getLong();
-
-			if ((lv >= Short.MIN_VALUE) && (lv <= Short.MAX_VALUE))
-				return (short) lv;
-
-		} catch (StandardException se) {
-		}
-
-		throw StandardException.newException(SQLState.LANG_OUTSIDE_RANGE_FOR_DATATYPE, "SMALLINT");
-	}
-
-	/**
-	 * @exception StandardException thrown on failure to convert
-	 */
-	public long	getLong() throws StandardException
-	{
-		BigDecimal localValue = getBigDecimal();
-		if (localValue == null)
-			return (long)0;
-
-		// Valid range for long is
-		//   greater than Long.MIN_VALUE - 1
-		// *and*
-		//   less than Long.MAX_VALUE + 1
-		//
-		// This ensures that DECIMAL values with an integral value
-		// equal to the Long.MIN/MAX_VALUE round correctly to those values.
-		// e.g. 9223372036854775807.1  converts to 9223372036854775807
-		// this matches DB2 UDB behaviour
-
-		if (   (localValue.compareTo(SQLDecimal.MINLONG_MINUS_ONE) == 1)
-			&& (localValue.compareTo(SQLDecimal.MAXLONG_PLUS_ONE) == -1)) {
-
-			return localValue.longValue();
-		}
-
-		throw StandardException.newException(SQLState.LANG_OUTSIDE_RANGE_FOR_DATATYPE, "BIGINT");
-	}
-
-	/**
-	 * @exception StandardException thrown on failure to convert
-	 */
-	public float getFloat() throws StandardException
-	{
-		BigDecimal localValue = getBigDecimal();
-		if (localValue == null)
-			return (float)0;
-
-		// If the BigDecimal is out of range for the float
-		// then positive or negative infinity is returned.
-		float value = NumberDataType.normalizeREAL(localValue.floatValue());
-
-		return value;
-	}
-
-	/**
-	 * 
-	 * If we have a value that is greater than the maximum double,
-	 * exception is thrown.  Otherwise, ok.  If the value is less
-	 * than can be represented by a double, ti will get set to
-	 * the smallest double value.
-	 *
-	 * @exception StandardException thrown on failure to convert
-	 */
-	public double getDouble() throws StandardException
-	{
-		BigDecimal localValue = getBigDecimal();
-		if (localValue == null)
-			return (double)0;
-
-		// If the BigDecimal is out of range for double
-		// then positive or negative infinity is returned.
-		double value = NumberDataType.normalizeDOUBLE(localValue.doubleValue());
-		return value;
-	}
-
-	public BigDecimal	getBigDecimal()
-	{
-		if ((value == null) && (rawData != null)) 
-		{
-			value = new BigDecimal(new BigInteger(rawData), rawScale);
-		}
-
-		return value;
-	}
-
-    // 0 or null is false, all else is true
-	public boolean	getBoolean()
-	{
-
-		BigDecimal localValue = getBigDecimal();
-		if (localValue == null)
-			return false;
-
-		return localValue.compareTo(ZERO) != 0;
-	}
-
-	public String	getString()
-	{
-		BigDecimal localValue = getBigDecimal();
-		if (localValue == null)
-			return null;
-		else if (JVMInfo.JDK_ID < 6)
-			return localValue.toString();
-        else
-        {
-            // use reflection so we can still compile using JDK1.4
-            // if we are prepared to require 1.5 to compile then this can be a direct call
-            try {
-                return (String) toPlainString.invoke(localValue, null);
-            } catch (IllegalAccessException e) {
-                // can't happen based on the JDK spec
-                throw new IllegalAccessError("toPlainString");
-            } catch (InvocationTargetException e) {
-                Throwable t = e.getTargetException();
-                if (t instanceof RuntimeException) {
-                    throw (RuntimeException) t;
-                } else if (t instanceof Error) {
-                    throw (Error) t;
-                } else {
-                    // can't happen
-                    throw new IncompatibleClassChangeError("toPlainString");
-                }
-            }
-        }
-	}
-
-    private static final Method toPlainString;
-    static {
-        Method m;
-        try {
-            m = BigDecimal.class.getMethod("toPlainString", null);
-        } catch (NoSuchMethodException e) {
-            m = null;
-        }
-        toPlainString = m;
+  @Override
+  public void startTerm() {
+    //System.out.println("StandardW: startTerm seg=" + segment + " pendingCount=" + pendingCount);
+    freqStart = freqOut.getFilePointer();
+    if (proxOut != null) {
+      proxStart = proxOut.getFilePointer();
+      // force first payload to write its length
+      lastPayloadLength = -1;
     }
-
-	public Object	getObject()
-	{
-		/*
-		** BigDecimal is immutable
-		*/
-		return getBigDecimal();
-	}
-
-	/**
-	 * @see DataValueDescriptor#setValue
-	 *
-	 */	
-	public void setValue(Object theValue)
-		throws StandardException
-	{
-		rawData = null;
-		if ((theValue instanceof BigDecimal) ||
-			(theValue == null))
-		{
-			setValue((BigDecimal)theValue);
-		}
-		else if (theValue instanceof Number)
-		{
-			value = new BigDecimal(((Number)theValue).doubleValue());
-		}
-		else
-		{
-			genericSetObject(theValue);
-		}
-	}
-	protected void setFrom(DataValueDescriptor theValue) throws StandardException {
-
-		setValue(theValue.getBigDecimal());
-	}
-
-	public int	getLength()
-	{
-		return getDecimalValuePrecision();
-	}
-
-	// this is for DataType's error generator
-	public String getTypeName()
-	{
-		return TypeId.DECIMAL_NAME;
-	}
-
-	/*
-	 * Storable interface, implies Externalizable, TypedFormat
-	 */
-
-	/**
-		Return my format identifier.
-
-		@see org.apache.derby.iapi.services.io.TypedFormat#getTypeFormatId
-	*/
-	public int getTypeFormatId() 
-	{
-		return StoredFormatIds.SQL_DECIMAL_ID;
-	}
-
-	/*
-	 * see if the decimal value is null.
-	 */
-	/** @see Storable#isNull */
-	public boolean isNull()
-	{
-		return (value == null) && (rawData == null);
-	}
-
-	/** 
-	 * Distill the BigDecimal to a byte array and
-	 * write out: <UL>
-	 *	<LI> scale (int) </LI>
-	 *	<LI> length of byte array </LI>
-	 *	<LI> the byte array </LI> </UL>
-	 *
-	 */
-	public void writeExternal(ObjectOutput out) throws IOException 
-	{
-		// never called when value is null
-		if (SanityManager.DEBUG)
-			SanityManager.ASSERT(! isNull());
-
-		int scale;
-		byte[] byteArray;
-
-		if (value != null) {
-			scale = value.scale();
-			BigInteger bi = value.unscaledValue();
-			byteArray = bi.toByteArray();
-		} else {
-			scale = rawScale;
-			byteArray = rawData;
-		}
-
-		out.writeByte(scale);
-		out.writeByte(byteArray.length);
-		out.write(byteArray);
-	}
-
-	/** 
-	 * Note the use of rawData: we reuse the array if the
-	 * incoming array is the same length or smaller than
-	 * the array length.  
-	 * 
-	 * @see java.io.Externalizable#readExternal 
-	 */
-	public void readExternal(ObjectInput in) throws IOException 
-	{
-		// clear the previous value to ensure that the
-		// rawData value will be used
-		value = null;
-
-		rawScale = in.readUnsignedByte();
-		int size = in.readUnsignedByte();
-
-		/*
-		** Allocate a new array if the data to read
-		** is larger than the existing array, or if
-		** we don't have an array yet.
-
-        Need to use readFully below and NOT just read because read does not
-        guarantee getting size bytes back, whereas readFully does (unless EOF).
-        */
-		if ((rawData == null) || size != rawData.length)
-		{
-			rawData = new byte[size];
-		}
-		in.readFully(rawData);
-
-	}
-	public void readExternalFromArray(ArrayInputStream in) throws IOException 
-	{
-		// clear the previous value to ensure that the
-		// rawData value will be used
-		value = null;
-
-		rawScale = in.readUnsignedByte();
-		int size = in.readUnsignedByte();
-
-		/*
-		** Allocate a new array if the data to read
-		** is larger than the existing array, or if
-		** we don't have an array yet.
-
-        Need to use readFully below and NOT just read because read does not
-        guarantee getting size bytes back, whereas readFully does (unless EOF).
-        */
-		if ((rawData == null) || size != rawData.length)
-		{
-			rawData = new byte[size];
-		}
-		in.readFully(rawData);
-	}
-
-	/**
-	 * @see Storable#restoreToNull
-	 *
-	 */
-	public void restoreToNull()
-	{
-		value = null;
-		rawData = null;
-	}
-
-
-	/** @exception StandardException		Thrown on error */
-	protected int typeCompare(DataValueDescriptor arg) throws StandardException
-	{
-		BigDecimal otherValue = arg.getBigDecimal();
-
-		return getBigDecimal().compareTo(otherValue);
-	}
-
-	/*
-	 * DataValueDescriptor interface
-	 */
-
-	/**
-	 * <B> WARNING </B> clone is a shallow copy
- 	 * @see DataValueDescriptor#getClone 
-	 */
-	public DataValueDescriptor getClone()
-	{
-		return new SQLDecimal(getBigDecimal());
-	}
-
-	/**
-	 * @see DataValueDescriptor#getNewNull
-	 */
-	public DataValueDescriptor getNewNull()
-	{
-		return new SQLDecimal();
-	}
-
-	/** 
-	 * @see DataValueDescriptor#setValueFromResultSet 
-	 *
-	 * @exception SQLException		Thrown on error
-	 */
-	public void setValueFromResultSet(ResultSet resultSet, int colNumber,
-									  boolean isNullable)
-		throws SQLException
-	{
-			ResultSetMetaData rsmd = resultSet.getMetaData();
-			value = resultSet.getBigDecimal(colNumber,
-											rsmd.getScale(colNumber));
-			rawData = null;
-	}
-	/**
-		Set the value into a PreparedStatement.
-
-		@exception SQLException Error setting value in PreparedStatement
-	*/
-	public final void setInto(PreparedStatement ps, int position) throws SQLException {
-
-		if (isNull()) {
-			ps.setNull(position, java.sql.Types.DECIMAL);
-			return;
-		}
-
-		ps.setBigDecimal(position, getBigDecimal());
-	}
-	
-	/**
-	 *
-	 * <B> WARNING </B> there is no checking to make sure
-	 * that theValue doesn't exceed the precision/scale of
-	 * the current SQLDecimal.  It is just assumed that the
-	 * SQLDecimal is supposed to take the precision/scale of
-	 * the BigDecimalized String.
-	 *
-	 * @exception StandardException throws NumberFormatException
-	 *		when the String format is not recognized.
-	 */
-	public void setValue(String theValue) throws StandardException
-	{
-		rawData = null;
-
-		if (theValue == null)
-		{
-			value = null;
-		}
-		else
-		{
-		    try 
-			{
-				theValue = theValue.trim();
-		        value = new BigDecimal(theValue);
-				rawData = null;
-			} catch (NumberFormatException nfe) 
-			{
-			    throw invalidFormat();
-			}
-		}
-	}
-
-	/**
-	 * @see NumberDataValue#setValue
-	 *
-	 * @exception StandardException		Thrown on error
-	 */
-	public void setValue(double theValue) throws StandardException
-	{
-		setCoreValue(NumberDataType.normalizeDOUBLE(theValue));
-	}
-
-	/**
-	 * @see NumberDataValue#setValue
-	 *
-	 */
-	public void setValue(float theValue)
-		throws StandardException
-	{
-		setCoreValue((double)NumberDataType.normalizeREAL(theValue));
-	}
-
-	/**
-	 * @see NumberDataValue#setValue
-	 *
-	 */
-	public void setValue(long theValue)
-	{
-		value = BigDecimal.valueOf(theValue);
-		rawData = null;
-	}
-
-	/**
-	 * @see NumberDataValue#setValue
-	 *
-	 */
-	public void setValue(int theValue)
-	{
-		setValue((long)theValue);
-	}
-
-	/**
-	 * @see NumberDataValue#setValue
-	 *
-	 */
-	public void setValue(short theValue)
-	{
-		setValue((long)theValue);
-	}
-
-	/**
-	 * @see NumberDataValue#setValue
-	 *
-	 */
-	public void setValue(byte theValue)
-	{
-		setValue((long)theValue);
-	}
-
-	/**
-	 * @see NumberDataValue#setValue
-	 *
-	 */
-	public void setValue(BigDecimal theValue)
-	{
-		setCoreValue(theValue);
-	}
-
-	/**
-	 * @see NumberDataValue#setValue
-	 *
-	 */
-	public void setValue(boolean theValue)
-	{
-		setCoreValue(theValue ? ONE : ZERO);
-	}
-
-	/*
-	 * DataValueDescriptor interface
-	 */
-
-	/** @see DataValueDescriptor#typePrecedence */
-	public int typePrecedence()
-	{
-		return TypeId.DECIMAL_PRECEDENCE;
-	}
-    // END DataValueDescriptor interface
-
-	private void setCoreValue(BigDecimal theValue)
-	{
-		value = theValue;
-		rawData = null;
-	}
-
-	private void setCoreValue(double theValue) {
-		value = new BigDecimal(theValue);
-		rawData = null;
-	}
-
-	/**
-	 * Normalization method - this method may be called when putting
-	 * a value into a SQLDecimal, for example, when inserting into a SQLDecimal
-	 * column.  See NormalizeResultSet in execution.
-	 * <p>
-	 * Note that truncation is allowed on the decimal portion
-	 * of a numeric only.	
-	 *
-	 * @param desiredType	The type to normalize the source column to
-	 * @param source		The value to normalize
-	 *
-	 * @throws StandardException				Thrown for null into
-	 *											non-nullable column, and for
-	 *											truncation error
-	 */
-	public void normalize(
-				DataTypeDescriptor desiredType,
-				DataValueDescriptor source)
-						throws StandardException
-	{
-		int desiredScale = desiredType.getScale();
-		int desiredPrecision = desiredType.getPrecision();
-
-		setValue(source.getBigDecimal());
-		setWidth(desiredPrecision, desiredScale, true);
-	}
-
-
-	/*
-	** SQL Operators
-	*/
-
-
-	/**
-	 * This method implements the + operator for "double + double".
-	 *
-	 * @param addend1	One of the addends
-	 * @param addend2	The other addend
-	 * @param result	The result of a previous call to this method, null
-	 *					if not called yet
-	 *
-	 * @return	A SQLDecimal containing the result of the addition
-	 *
-	 * @exception StandardException		Thrown on error
-	 */
-
-	public NumberDataValue plus(NumberDataValue addend1,
-							NumberDataValue addend2,
-							NumberDataValue result)
-				throws StandardException
-	{
-		if (result == null)
-		{
-			result = new SQLDecimal();
-		}
-
-		if (addend1.isNull() || addend2.isNull())
-		{
-			result.setToNull();
-			return result;
-		}
-
-		result.setValue(addend1.getBigDecimal().add(addend2.getBigDecimal()));
-		return result;
-	}
-
-	/**
-	 * This method implements the - operator for "decimal - decimal".
-	 *
-	 * @param left	The value to be subtracted from
-	 * @param right	The value to be subtracted
-	 * @param result	The result of a previous call to this method, null
-	 *					if not called yet
-	 *
-	 * @return	A SQLDecimal containing the result of the subtraction
-	 *
-	 * @exception StandardException		Thrown on error
-	 */
-
-	public NumberDataValue minus(NumberDataValue left,
-							NumberDataValue right,
-							NumberDataValue result)
-				throws StandardException
-	{
-		if (result == null)
-		{
-			result = new SQLDecimal();
-		}
-
-		if (left.isNull() || right.isNull())
-		{
-			result.setToNull();
-			return result;
-		}
-
-		result.setValue(left.getBigDecimal().subtract(right.getBigDecimal()));
-		return result;
-	}
-
-	/**
-	 * This method implements the * operator for "double * double".
-	 *
-	 * @param left	The first value to be multiplied
-	 * @param right	The second value to be multiplied
-	 * @param result	The result of a previous call to this method, null
-	 *					if not called yet
-	 *
-	 * @return	A SQLDecimal containing the result of the multiplication
-	 *
-	 * @exception StandardException		Thrown on error
-	 */
-
-	public NumberDataValue times(NumberDataValue left,
-							NumberDataValue right,
-							NumberDataValue result)
-				throws StandardException
-	{
-		if (result == null)
-		{
-			result = new SQLDecimal();
-		}
-
-		if (left.isNull() || right.isNull())
-		{
-			result.setToNull();
-			return result;
-		}
-
-		result.setValue(left.getBigDecimal().multiply(right.getBigDecimal()));
-		return result;
-	}
-
-	/**
-	 * This method implements the / operator for BigDecimal/BigDecimal
-	 *
-	 * @param dividend	The numerator
-	 * @param divisor	The denominator
-	 * @param result	The result of a previous call to this method, null
-	 *					if not called yet
-	 *
-	 * @return	A SQLDecimal containing the result of the division
-	 *
-	 * @exception StandardException		Thrown on error
-	 */
-
-	public NumberDataValue divide(NumberDataValue dividend,
-							 NumberDataValue divisor,
-							 NumberDataValue result)
-				throws StandardException
-	{
-		return divide(dividend, divisor, result, -1);
-	}
-
-	/**
-	 * This method implements the / operator for BigDecimal/BigDecimal
-	 *
-	 * @param dividend	The numerator
-	 * @param divisor	The denominator
-	 * @param result	The result of a previous call to this method, null
-	 *					if not called yet
-	 * @param scale		The result scale, if < 0, calculate the scale according
-	 *					to the actual values' sizes
-	 *
-	 * @return	A SQLDecimal containing the result of the division
-	 *
-	 * @exception StandardException		Thrown on error
-	 */
-
-	public NumberDataValue divide(NumberDataValue dividend,
-							 NumberDataValue divisor,
-							 NumberDataValue result,
-							 int scale)
-				throws StandardException
-	{
-		if (result == null)
-		{
-			result = new SQLDecimal();
-		}
-
-		if (dividend.isNull() || divisor.isNull())
-		{
-			result.setToNull();
-			return result;
-		}
-
-		BigDecimal divisorBigDecimal = divisor.getBigDecimal();
-
-		if (divisorBigDecimal.compareTo(ZERO) == 0)
-		{
-			throw  StandardException.newException(SQLState.LANG_DIVIDE_BY_ZERO);
-		}
-		BigDecimal dividendBigDecimal = dividend.getBigDecimal();
-
-		/*
-		** Set the result scale to be either the passed in scale, whcih was
-		** calculated at bind time to be max(ls+rp-rs+1, 4), where ls,rp,rs
-		** are static data types' sizes, which are predictable and stable
-		** (for the whole result set column, eg.); otherwise dynamically
-		** calculates the scale according to actual values.  Beetle 3901
-		*/
-		result.setValue(dividendBigDecimal.divide(
-									divisorBigDecimal,
-									scale > -1 ? scale :
-									Math.max((dividendBigDecimal.scale() + 
-											getWholeDigits(divisorBigDecimal) +
-											1), 
-										NumberDataValue.MIN_DECIMAL_DIVIDE_SCALE),
-									BigDecimal.ROUND_DOWN));
-		return result;
-	}
-
-	/**
-	 * This method implements the unary minus operator for double.
-	 *
-	 * @param result	The result of a previous call to this method, null
-	 *					if not called yet
-	 *
-	 * @return	A SQLDecimal containing the result of the division
-	 *
-	 * @exception StandardException		Thrown on error
-	 */
-
-	public NumberDataValue minus(NumberDataValue result)
-									throws StandardException
-	{
-		if (result == null)
-		{
-			result = new SQLDecimal();
-		}
-
-		if (this.isNull())
-		{
-			result.setToNull();
-			return result;
-		}
-
-		result.setValue(getBigDecimal().negate());
-		return result;
-	}
-
-    /**
-     * This method implements the isNegative method.
-     * 
-     * @return  A boolean.  If this.value is negative, return true.
-     *          For positive values or null, return false.
-     */
-
-    protected boolean isNegative()
-    {
-        return !isNull() && (getBigDecimal().compareTo(ZERO) == -1);
-    }
+    skipListWriter.resetSkip();
+  }
+
+  // Currently, this instance is re-used across fields, so
+  // our parent calls setField whenever the field changes
+  @Override
+  public void setField(FieldInfo fieldInfo) {
+    //System.out.println("SPW: setField");
+    this.fieldInfo = fieldInfo;
+    omitTermFreqAndPositions = fieldInfo.omitTermFreqAndPositions;
+    storePayloads = fieldInfo.storePayloads;
+    //System.out.println("  set init blockFreqStart=" + freqStart);
+    //System.out.println("  set init blockProxStart=" + proxStart);
+  }
+
+  int lastDocID;
+  int df;
+  
+  /** Adds a new doc in this term.  If this returns null
+   *  then we just skip consuming positions/payloads. */
+  @Override
+  public void startDoc(int docID, int termDocFreq) throws IOException {
+    //System.out.println("StandardW:   startDoc seg=" + segment + " docID=" + docID + " tf=" + termDocFreq);
+
+    final int delta = docID - lastDocID;
     
-	/*
-	 * String display of value
-	 */
-	public String toString()
-	{
-		if (isNull())
-			return "NULL";
-		else
-			return getBigDecimal().toString();
-	}
+    if (docID < 0 || (df > 0 && delta <= 0)) {
+      throw new CorruptIndexException("docs out of order (" + docID + " <= " + lastDocID + " )");
+    }
 
-	/*
-	 * Hash code
-	 */
-	public int hashCode()
-	{
-		long longVal;
-		BigDecimal localValue = getBigDecimal();
+    if ((++df % skipInterval) == 0) {
+      skipListWriter.setSkipData(lastDocID, storePayloads, lastPayloadLength);
+      skipListWriter.bufferSkip(df);
+    }
 
-		double doubleVal = (localValue != null) ? localValue.doubleValue() : 0;
+    assert docID < totalNumDocs: "docID=" + docID + " totalNumDocs=" + totalNumDocs;
 
-		if (Double.isInfinite(doubleVal))
-		{
-			/*
-			 ** This loses the fractional part, but it probably doesn't
-			 ** matter for numbers that are big enough to overflow a double -
-			 ** it's probably rare for numbers this big to be different only in
-			 ** their fractional parts.
-			 */
-			longVal = localValue.longValue();
-		}
-		else
-		{
-			longVal = (long) doubleVal;
-			if (longVal != doubleVal)
-			{
-				longVal = Double.doubleToLongBits(doubleVal);
-			}
-		}
+    lastDocID = docID;
+    if (omitTermFreqAndPositions) {
+      freqOut.writeVInt(delta);
+    } else if (1 == termDocFreq) {
+      freqOut.writeVInt((delta<<1) | 1);
+    } else {
+      freqOut.writeVInt(delta<<1);
+      freqOut.writeVInt(termDocFreq);
+    }
 
-		return (int) (longVal ^ (longVal >> 32));
-	}
+    lastPosition = 0;
+  }
 
-	///////////////////////////////////////////////////////////////////////////////
-	//
-	// VariableSizeDataValue interface
-	//
-	///////////////////////////////////////////////////////////////////////////////
+  /** Add a new position & payload */
+  @Override
+  public void addPosition(int position, BytesRef payload) throws IOException {
+    //System.out.println("StandardW:     addPos pos=" + position + " payload=" + (payload == null ? "null" : (payload.length + " bytes")) + " proxFP=" + proxOut.getFilePointer());
+    assert !omitTermFreqAndPositions: "omitTermFreqAndPositions is true";
+    assert proxOut != null;
 
-	/**
-	 * Set the precision/scale of the to the desired values. 
-	 * Used when CASTing.  Ideally we'd recycle normalize(), but
-	 * the use is different.  
-	 *
-	 * @param desiredPrecision	the desired precision -- IGNORE_PREICISION
-	 *					if it is to be ignored.
-	 * @param desiredScale	the desired scale 
-	 * @param errorOnTrunc	throw error on truncation (ignored -- 
-	 *		always thrown if we truncate the non-decimal part of
-	 *		the value)
-	 * @return this with the target width
-	 *
-	 * @exception StandardException		Thrown on non-zero truncation
-	 *		if errorOnTrunc is true	
-	 */
-	public DataValueDescriptor setWidth(int desiredPrecision, 
-			int desiredScale,
-			boolean errorOnTrunc)
-			throws StandardException
-	{
-		if (isNull())
-			return this;
+    final int delta = position - lastPosition;
+    
+    assert delta > 0 || position == 0: "position=" + position + " lastPosition=" + lastPosition;            // not quite right (if pos=0 is repeated twice we don't catch it)
 
-		// the getWholeDigits() call will ensure via getBigDecimal()
-		// that the rawData is translated into the BigDecimal in value.
-		if (desiredPrecision != IGNORE_PRECISION &&
-			((desiredPrecision - desiredScale) <  getWholeDigits()))
-		{
-			throw StandardException.newException(SQLState.LANG_OUTSIDE_RANGE_FOR_DATATYPE, 
-									("DECIMAL/NUMERIC("+desiredPrecision+","+desiredScale+")"));
-		}
-		value = value.setScale(desiredScale, BigDecimal.ROUND_DOWN);
-		rawData = null;
-		return this;
-	}
+    lastPosition = position;
 
-	public int getDecimalValuePrecision()
-	{
-		return getPrecision(getBigDecimal());
-	}
-	/**
-	 *
-	 * @param decimalValue the big decimal
-	 *
-	 * @return the precision
-	 */	
-	private static int getPrecision(BigDecimal decimalValue)
-	{
-		if ((decimalValue == null) ||
-			 decimalValue.equals(ZERO))
-		{
-			return 0;
-		}	
+    if (storePayloads) {
+      final int payloadLength = payload == null ? 0 : payload.length;
 
-		return getWholeDigits(decimalValue) + decimalValue.scale();
-	}
+      if (payloadLength != lastPayloadLength) {
+        lastPayloadLength = payloadLength;
+        proxOut.writeVInt((delta<<1)|1);
+        proxOut.writeVInt(payloadLength);
+      } else {
+        proxOut.writeVInt(delta << 1);
+      }
 
-	public int getDecimalValueScale()
-	{
-		BigDecimal localValue = getBigDecimal();
-		return (localValue == null) ? 0 : localValue.scale();
-	}
+      if (payloadLength > 0) {
+        proxOut.writeBytes(payload.bytes, payload.offset, payloadLength);
+      }
+    } else {
+      proxOut.writeVInt(delta);
+    }
+  }
 
-	private int getWholeDigits()
-	{
-		return getWholeDigits(getBigDecimal());
-	}
+  @Override
+  public void finishDoc() {
+  }
 
-	private static int getWholeDigits(BigDecimal decimalValue)
-	{
-		if ((decimalValue == null) ||
-			 decimalValue.equals(ZERO))
-		{
-			return 0;
-		}
+  /** Called when we are done adding docs to this term */
+  @Override
+  public void finishTerm(TermStats stats) throws IOException {
+    //System.out.println("StandardW.finishTerm seg=" + segment);
+    assert stats.docFreq > 0;
 
-        /**
-         * if ONE > abs(value) then the number of whole digits is 0
-         */
-        decimalValue = decimalValue.abs();
-        if (ONE.compareTo(decimalValue) == 1)
-        {
-            return 0;
-        }
+    // TODO: wasteful we are counting this (counting # docs
+    // for this term) in two places?
+    assert stats.docFreq == df;
 
-		String s = decimalValue.toString();
-        return (decimalValue.scale() == 0) ? s.length() : s.indexOf('.');
-	}
+    final boolean isFirstTerm = pendingCount == 0;
+    //System.out.println("  isFirstTerm=" + isFirstTerm);
+
+    //System.out.println("  freqFP=" + freqStart);
+    if (isFirstTerm) {
+      bytesWriter.writeVLong(freqStart);
+    } else {
+      bytesWriter.writeVLong(freqStart-lastFreqStart);
+    }
+    lastFreqStart = freqStart;
+
+    if (df >= skipMinimum) {
+      bytesWriter.writeVInt((int) (skipListWriter.writeSkip(freqOut)-freqStart));
+    }
+
+    if (!omitTermFreqAndPositions) {
+      //System.out.println("  proxFP=" + proxStart);
+      if (isFirstTerm) {
+        bytesWriter.writeVLong(proxStart);
+      } else {
+        bytesWriter.writeVLong(proxStart - lastProxStart);
+      }
+      lastProxStart = proxStart;
+    }
+     
+    lastDocID = 0;
+    df = 0;
+    pendingCount++;
+  }
+
+  @Override
+  public void flushTermsBlock() throws IOException {
+    //System.out.println("SPW.flushBlock pendingCount=" + pendingCount);
+    termsOut.writeVInt((int) bytesWriter.getFilePointer());
+    bytesWriter.writeTo(termsOut);
+    bytesWriter.reset();
+    pendingCount = 0;
+  }
+
+  @Override
+  public void close() throws IOException {
+    IOUtils.closeSafely(false, freqOut, proxOut);
+  }
 }

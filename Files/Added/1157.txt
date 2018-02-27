@@ -19,710 +19,1154 @@ package org.apache.lucene.index;
  * limitations under the License.
  */
 
+import java.io.FileNotFoundException;
 import java.io.IOException;
-import java.util.Locale;
-import java.util.Map;
+import java.io.PrintStream;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
-import java.util.Comparator;
+import java.util.Iterator;
 import java.util.List;
-import java.util.ArrayList;
+import java.util.Map;
+import java.util.Set;
 
-import org.apache.lucene.index.MergePolicy.MergeTrigger;
-
+import org.apache.lucene.codecs.Codec;
+import org.apache.lucene.codecs.CodecUtil;
+import org.apache.lucene.codecs.LiveDocsFormat;
+import org.apache.lucene.codecs.lucene3x.Lucene3xCodec;
+import org.apache.lucene.codecs.lucene3x.Lucene3xSegmentInfoFormat;
+import org.apache.lucene.codecs.lucene3x.Lucene3xSegmentInfoReader;
+import org.apache.lucene.store.ChecksumIndexInput;
+import org.apache.lucene.store.ChecksumIndexOutput;
+import org.apache.lucene.store.DataOutput; // javadocs
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.IOContext;
+import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.store.NoSuchDirectoryException;
+import org.apache.lucene.util.IOUtils;
+import org.apache.lucene.util.StringHelper;
+import org.apache.lucene.util.ThreadInterruptedException;
 
 /**
- *  Merges segments of approximately equal size, subject to
- *  an allowed number of segments per tier.  This is similar
- *  to {@link LogByteSizeMergePolicy}, except this merge
- *  policy is able to merge non-adjacent segment, and
- *  separates how many segments are merged at once ({@link
- *  #setMaxMergeAtOnce}) from how many segments are allowed
- *  per tier ({@link #setSegmentsPerTier}).  This merge
- *  policy also does not over-merge (i.e. cascade merges). 
- *
- *  <p>For normal merging, this policy first computes a
- *  "budget" of how many segments are allowed to be in the
- *  index.  If the index is over-budget, then the policy
- *  sorts segments by decreasing size (pro-rating by percent
- *  deletes), and then finds the least-cost merge.  Merge
- *  cost is measured by a combination of the "skew" of the
- *  merge (size of largest segment divided by smallest segment),
- *  total merge size and percent deletes reclaimed,
- *  so that merges with lower skew, smaller size
- *  and those reclaiming more deletes, are
- *  favored.
- *
- *  <p>If a merge will produce a segment that's larger than
- *  {@link #setMaxMergedSegmentMB}, then the policy will
- *  merge fewer segments (down to 1 at once, if that one has
- *  deletions) to keep the segment size under budget.
- *      
- *  <p><b>NOTE</b>: this policy freely merges non-adjacent
- *  segments; if this is a problem, use {@link
- *  LogMergePolicy}.
- *
- *  <p><b>NOTE</b>: This policy always merges by byte size
- *  of the segments, always pro-rates by percent deletes,
- *  and does not apply any maximum segment size during
- *  forceMerge (unlike {@link LogByteSizeMergePolicy}).
- *
- *  @lucene.experimental
+ * A collection of segmentInfo objects with methods for operating on
+ * those segments in relation to the file system.
+ * <p>
+ * The active segments in the index are stored in the segment info file,
+ * <tt>segments_N</tt>. There may be one or more <tt>segments_N</tt> files in the
+ * index; however, the one with the largest generation is the active one (when
+ * older segments_N files are present it's because they temporarily cannot be
+ * deleted, or, a writer is in the process of committing, or a custom 
+ * {@link org.apache.lucene.index.IndexDeletionPolicy IndexDeletionPolicy}
+ * is in use). This file lists each segment by name and has details about the
+ * codec and generation of deletes.
+ * </p>
+ * <p>There is also a file <tt>segments.gen</tt>. This file contains
+ * the current generation (the <tt>_N</tt> in <tt>segments_N</tt>) of the index.
+ * This is used only as a fallback in case the current generation cannot be
+ * accurately determined by directory listing alone (as is the case for some NFS
+ * clients with time-based directory cache expiration). This file simply contains
+ * an {@link DataOutput#writeInt Int32} version header 
+ * ({@link #FORMAT_SEGMENTS_GEN_CURRENT}), followed by the
+ * generation recorded as {@link DataOutput#writeLong Int64}, written twice.</p>
+ * <p>
+ * Files:
+ * <ul>
+ *   <li><tt>segments.gen</tt>: GenHeader, Generation, Generation
+ *   <li><tt>segments_N</tt>: Header, Version, NameCounter, SegCount,
+ *    &lt;SegName, SegCodec, DelGen, DeletionCount&gt;<sup>SegCount</sup>, 
+ *    CommitUserData, Checksum
+ * </ul>
+ * </p>
+ * Data types:
+ * <p>
+ * <ul>
+ *   <li>Header --&gt; {@link CodecUtil#writeHeader CodecHeader}</li>
+ *   <li>GenHeader, NameCounter, SegCount, DeletionCount --&gt; {@link DataOutput#writeInt Int32}</li>
+ *   <li>Generation, Version, DelGen, Checksum --&gt; {@link DataOutput#writeLong Int64}</li>
+ *   <li>SegName, SegCodec --&gt; {@link DataOutput#writeString String}</li>
+ *   <li>CommitUserData --&gt; {@link DataOutput#writeStringStringMap Map&lt;String,String&gt;}</li>
+ * </ul>
+ * </p>
+ * Field Descriptions:
+ * <p>
+ * <ul>
+ *   <li>Version counts how often the index has been changed by adding or deleting
+ *       documents.</li>
+ *   <li>NameCounter is used to generate names for new segment files.</li>
+ *   <li>SegName is the name of the segment, and is used as the file name prefix for
+ *       all of the files that compose the segment's index.</li>
+ *   <li>DelGen is the generation count of the deletes file. If this is -1,
+ *       there are no deletes. Anything above zero means there are deletes 
+ *       stored by {@link LiveDocsFormat}.</li>
+ *   <li>DeletionCount records the number of deleted documents in this segment.</li>
+ *   <li>Checksum contains the CRC32 checksum of all bytes in the segments_N file up
+ *       until the checksum. This is used to verify integrity of the file on opening the
+ *       index.</li>
+ *   <li>SegCodec is the {@link Codec#getName() name} of the Codec that encoded
+ *       this segment.</li>
+ *   <li>CommitUserData stores an optional user-supplied opaque
+ *       Map&lt;String,String&gt; that was passed to 
+ *       {@link IndexWriter#setCommitData(java.util.Map)}.</li>
+ * </ul>
+ * </p>
+ * 
+ * @lucene.experimental
  */
+public final class SegmentInfos implements Cloneable, Iterable<SegmentInfoPerCommit> {
 
-// TODO
-//   - we could try to take into account whether a large
-//     merge is already running (under CMS) and then bias
-//     ourselves towards picking smaller merges if so (or,
-//     maybe CMS should do so)
+  /**
+   * The file format version for the segments_N codec header
+   */
+  public static final int VERSION_40 = 0;
 
-public class TieredMergePolicy extends MergePolicy {
+  /** Used for the segments.gen file only!
+   * Whenever you add a new format, make it 1 smaller (negative version logic)! */
+  public static final int FORMAT_SEGMENTS_GEN_CURRENT = -2;
 
-  private int maxMergeAtOnce = 10;
-  private long maxMergedSegmentBytes = 5*1024*1024*1024L;
-  private int maxMergeAtOnceExplicit = 30;
+  /** Used to name new segments. */
+  public int counter;
+  
+  /** Counts how often the index has been changed.  */
+  public long version;
 
-  private long floorSegmentBytes = 2*1024*1024L;
-  private double segsPerTier = 10.0;
-  private double forceMergeDeletesPctAllowed = 10.0;
-  private boolean useCompoundFile = true;
-  private double noCFSRatio = 0.1;
-  private long maxCFSSegmentSize = Long.MAX_VALUE;
-  private double reclaimDeletesWeight = 2.0;
+  private long generation;     // generation of the "segments_N" for the next commit
+  private long lastGeneration; // generation of the "segments_N" file we last successfully read
+                               // or wrote; this is normally the same as generation except if
+                               // there was an IOException that had interrupted a commit
 
-  /** Sole constructor, setting all settings to their
-   *  defaults. */
-  public TieredMergePolicy() {
+  /** Opaque Map&lt;String, String&gt; that user can specify during IndexWriter.commit */
+  public Map<String,String> userData = Collections.<String,String>emptyMap();
+  
+  private List<SegmentInfoPerCommit> segments = new ArrayList<SegmentInfoPerCommit>();
+  
+  /**
+   * If non-null, information about loading segments_N files
+   * will be printed here.  @see #setInfoStream.
+   */
+  private static PrintStream infoStream = null;
+
+  /** Sole constructor. Typically you call this and then
+   *  use {@link #read(Directory) or
+   *  #read(Directory,String)} to populate each {@link
+   *  SegmentInfoPerCommit}.  Alternatively, you can add/remove your
+   *  own {@link SegmentInfoPerCommit}s. */
+  public SegmentInfos() {
   }
 
-  /** Maximum number of segments to be merged at a time
-   *  during "normal" merging.  For explicit merging (eg,
-   *  forceMerge or forceMergeDeletes was called), see {@link
-   *  #setMaxMergeAtOnceExplicit}.  Default is 10. */
-  public TieredMergePolicy setMaxMergeAtOnce(int v) {
-    if (v < 2) {
-      throw new IllegalArgumentException("maxMergeAtOnce must be > 1 (got " + v + ")");
+  /** Returns {@link SegmentInfoPerCommit} at the provided
+   *  index. */
+  public SegmentInfoPerCommit info(int i) {
+    return segments.get(i);
+  }
+
+  /**
+   * Get the generation of the most recent commit to the
+   * list of index files (N in the segments_N file).
+   *
+   * @param files -- array of file names to check
+   */
+  public static long getLastCommitGeneration(String[] files) {
+    if (files == null) {
+      return -1;
     }
-    maxMergeAtOnce = v;
-    return this;
-  }
-
-  /** Returns the current maxMergeAtOnce setting.
-   *
-   * @see #setMaxMergeAtOnce */
-  public int getMaxMergeAtOnce() {
-    return maxMergeAtOnce;
-  }
-
-  // TODO: should addIndexes do explicit merging, too?  And,
-  // if user calls IW.maybeMerge "explicitly"
-
-  /** Maximum number of segments to be merged at a time,
-   *  during forceMerge or forceMergeDeletes. Default is 30. */
-  public TieredMergePolicy setMaxMergeAtOnceExplicit(int v) {
-    if (v < 2) {
-      throw new IllegalArgumentException("maxMergeAtOnceExplicit must be > 1 (got " + v + ")");
+    long max = -1;
+    for (String file : files) {
+      if (file.startsWith(IndexFileNames.SEGMENTS) && !file.equals(IndexFileNames.SEGMENTS_GEN)) {
+        long gen = generationFromSegmentsFileName(file);
+        if (gen > max) {
+          max = gen;
+        }
+      }
     }
-    maxMergeAtOnceExplicit = v;
-    return this;
+    return max;
   }
 
-  /** Returns the current maxMergeAtOnceExplicit setting.
+  /**
+   * Get the generation of the most recent commit to the
+   * index in this directory (N in the segments_N file).
    *
-   * @see #setMaxMergeAtOnceExplicit */
-  public int getMaxMergeAtOnceExplicit() {
-    return maxMergeAtOnceExplicit;
-  }
-
-  /** Maximum sized segment to produce during
-   *  normal merging.  This setting is approximate: the
-   *  estimate of the merged segment size is made by summing
-   *  sizes of to-be-merged segments (compensating for
-   *  percent deleted docs).  Default is 5 GB. */
-  public TieredMergePolicy setMaxMergedSegmentMB(double v) {
-    if (v < 0.0) {
-      throw new IllegalArgumentException("maxMergedSegmentMB must be >=0 (got " + v + ")");
+   * @param directory -- directory to search for the latest segments_N file
+   */
+  public static long getLastCommitGeneration(Directory directory) throws IOException {
+    try {
+      return getLastCommitGeneration(directory.listAll());
+    } catch (NoSuchDirectoryException nsde) {
+      return -1;
     }
-    v *= 1024 * 1024;
-    maxMergedSegmentBytes = (v > Long.MAX_VALUE) ? Long.MAX_VALUE : (long) v;
-    return this;
   }
 
-  /** Returns the current maxMergedSegmentMB setting.
+  /**
+   * Get the filename of the segments_N file for the most
+   * recent commit in the list of index files.
    *
-   * @see #getMaxMergedSegmentMB */
-  public double getMaxMergedSegmentMB() {
-    return maxMergedSegmentBytes/1024/1024.;
+   * @param files -- array of file names to check
+   */
+
+  public static String getLastCommitSegmentsFileName(String[] files) {
+    return IndexFileNames.fileNameFromGeneration(IndexFileNames.SEGMENTS,
+                                                 "",
+                                                 getLastCommitGeneration(files));
   }
 
-  /** Controls how aggressively merges that reclaim more
-   *  deletions are favored.  Higher values favor selecting
-   *  merges that reclaim deletions.  A value of 0.0 means
-   *  deletions don't impact merge selection. */
-  public TieredMergePolicy setReclaimDeletesWeight(double v) {
-    if (v < 0.0) {
-      throw new IllegalArgumentException("reclaimDeletesWeight must be >= 0.0 (got " + v + ")");
-    }
-    reclaimDeletesWeight = v;
-    return this;
-  }
-
-  /** See {@link #setReclaimDeletesWeight}. */
-  public double getReclaimDeletesWeight() {
-    return reclaimDeletesWeight;
-  }
-
-  /** Segments smaller than this are "rounded up" to this
-   *  size, ie treated as equal (floor) size for merge
-   *  selection.  This is to prevent frequent flushing of
-   *  tiny segments from allowing a long tail in the index.
-   *  Default is 2 MB. */
-  public TieredMergePolicy setFloorSegmentMB(double v) {
-    if (v <= 0.0) {
-      throw new IllegalArgumentException("floorSegmentMB must be >= 0.0 (got " + v + ")");
-    }
-    v *= 1024 * 1024;
-    floorSegmentBytes = (v > Long.MAX_VALUE) ? Long.MAX_VALUE : (long) v;
-    return this;
-  }
-
-  /** Returns the current floorSegmentMB.
+  /**
+   * Get the filename of the segments_N file for the most
+   * recent commit to the index in this Directory.
    *
-   *  @see #setFloorSegmentMB */
-  public double getFloorSegmentMB() {
-    return floorSegmentBytes/(1024*1024.);
+   * @param directory -- directory to search for the latest segments_N file
+   */
+  public static String getLastCommitSegmentsFileName(Directory directory) throws IOException {
+    return IndexFileNames.fileNameFromGeneration(IndexFileNames.SEGMENTS,
+                                                 "",
+                                                 getLastCommitGeneration(directory));
   }
 
-  /** When forceMergeDeletes is called, we only merge away a
-   *  segment if its delete percentage is over this
-   *  threshold.  Default is 10%. */ 
-  public TieredMergePolicy setForceMergeDeletesPctAllowed(double v) {
-    if (v < 0.0 || v > 100.0) {
-      throw new IllegalArgumentException("forceMergeDeletesPctAllowed must be between 0.0 and 100.0 inclusive (got " + v + ")");
-    }
-    forceMergeDeletesPctAllowed = v;
-    return this;
-  }
-
-  /** Returns the current forceMergeDeletesPctAllowed setting.
-   *
-   * @see #setForceMergeDeletesPctAllowed */
-  public double getForceMergeDeletesPctAllowed() {
-    return forceMergeDeletesPctAllowed;
-  }
-
-  /** Sets the allowed number of segments per tier.  Smaller
-   *  values mean more merging but fewer segments.
-   *
-   *  <p><b>NOTE</b>: this value should be >= the {@link
-   *  #setMaxMergeAtOnce} otherwise you'll force too much
-   *  merging to occur.</p>
-   *
-   *  <p>Default is 10.0.</p> */
-  public TieredMergePolicy setSegmentsPerTier(double v) {
-    if (v < 2.0) {
-      throw new IllegalArgumentException("segmentsPerTier must be >= 2.0 (got " + v + ")");
-    }
-    segsPerTier = v;
-    return this;
-  }
-
-  /** Returns the current segmentsPerTier setting.
-   *
-   * @see #setSegmentsPerTier */
-  public double getSegmentsPerTier() {
-    return segsPerTier;
-  }
-
-  /** Sets whether compound file format should be used for
-   *  newly flushed and newly merged segments.  Default
-   *  true. */
-  public TieredMergePolicy setUseCompoundFile(boolean useCompoundFile) {
-    this.useCompoundFile = useCompoundFile;
-    return this;
-  }
-
-  /** Returns the current useCompoundFile setting.
-   *
-   * @see  #setUseCompoundFile */
-  public boolean getUseCompoundFile() {
-    return useCompoundFile;
-  }
-
-  /** If a merged segment will be more than this percentage
-   *  of the total size of the index, leave the segment as
-   *  non-compound file even if compound file is enabled.
-   *  Set to 1.0 to always use CFS regardless of merge
-   *  size.  Default is 0.1. */
-  public TieredMergePolicy setNoCFSRatio(double noCFSRatio) {
-    if (noCFSRatio < 0.0 || noCFSRatio > 1.0) {
-      throw new IllegalArgumentException("noCFSRatio must be 0.0 to 1.0 inclusive; got " + noCFSRatio);
-    }
-    this.noCFSRatio = noCFSRatio;
-    return this;
+  /**
+   * Get the segments_N filename in use by this segment infos.
+   */
+  public String getSegmentsFileName() {
+    return IndexFileNames.fileNameFromGeneration(IndexFileNames.SEGMENTS,
+                                                 "",
+                                                 lastGeneration);
   }
   
-  /** Returns the current noCFSRatio setting.
-   *
-   * @see #setNoCFSRatio */
-  public double getNoCFSRatio() {
-    return noCFSRatio;
+  /**
+   * Parse the generation off the segments file name and
+   * return it.
+   */
+  public static long generationFromSegmentsFileName(String fileName) {
+    if (fileName.equals(IndexFileNames.SEGMENTS)) {
+      return 0;
+    } else if (fileName.startsWith(IndexFileNames.SEGMENTS)) {
+      return Long.parseLong(fileName.substring(1+IndexFileNames.SEGMENTS.length()),
+                            Character.MAX_RADIX);
+    } else {
+      throw new IllegalArgumentException("fileName \"" + fileName + "\" is not a segments file");
+    }
   }
 
-  private class SegmentByteSizeDescending implements Comparator<SegmentInfoPerCommit> {
-    public int compare(SegmentInfoPerCommit o1, SegmentInfoPerCommit o2) {
-      try {
-        final long sz1 = size(o1);
-        final long sz2 = size(o2);
-        if (sz1 > sz2) {
-          return -1;
-        } else if (sz2 > sz1) {
-          return 1;
-        } else {
-          return o1.info.name.compareTo(o2.info.name);
+
+  /**
+   * Get the next segments_N filename that will be written.
+   */
+  public String getNextSegmentFileName() {
+    long nextGeneration;
+
+    if (generation == -1) {
+      nextGeneration = 1;
+    } else {
+      nextGeneration = generation+1;
+    }
+    return IndexFileNames.fileNameFromGeneration(IndexFileNames.SEGMENTS,
+                                                 "",
+                                                 nextGeneration);
+  }
+
+  /**
+   * Read a particular segmentFileName.  Note that this may
+   * throw an IOException if a commit is in process.
+   *
+   * @param directory -- directory containing the segments file
+   * @param segmentFileName -- segment file to load
+   * @throws CorruptIndexException if the index is corrupt
+   * @throws IOException if there is a low-level IO error
+   */
+  public final void read(Directory directory, String segmentFileName) throws IOException {
+    boolean success = false;
+
+    // Clear any previous segments:
+    this.clear();
+
+    generation = generationFromSegmentsFileName(segmentFileName);
+
+    lastGeneration = generation;
+
+    ChecksumIndexInput input = new ChecksumIndexInput(directory.openInput(segmentFileName, IOContext.READ));
+    try {
+      final int format = input.readInt();
+      if (format == CodecUtil.CODEC_MAGIC) {
+        // 4.0+
+        CodecUtil.checkHeaderNoMagic(input, "segments", VERSION_40, VERSION_40);
+        version = input.readLong();
+        counter = input.readInt();
+        int numSegments = input.readInt();
+        if (numSegments < 0) {
+          throw new CorruptIndexException("invalid segment count: " + numSegments + " (resource: " + input + ")");
         }
-      } catch (IOException ioe) {
-        throw new RuntimeException(ioe);
+        for(int seg=0;seg<numSegments;seg++) {
+          String segName = input.readString();
+          Codec codec = Codec.forName(input.readString());
+          //System.out.println("SIS.read seg=" + seg + " codec=" + codec);
+          SegmentInfo info = codec.segmentInfoFormat().getSegmentInfoReader().read(directory, segName, IOContext.READ);
+          info.setCodec(codec);
+          long delGen = input.readLong();
+          int delCount = input.readInt();
+          if (delCount < 0 || delCount > info.getDocCount()) {
+            throw new CorruptIndexException("invalid deletion count: " + delCount + " (resource: " + input + ")");
+          }
+          add(new SegmentInfoPerCommit(info, delCount, delGen));
+        }
+        userData = input.readStringStringMap();
+      } else {
+        Lucene3xSegmentInfoReader.readLegacyInfos(this, directory, input, format);
+        Codec codec = Codec.forName("Lucene3x");
+        for (SegmentInfoPerCommit info : this) {
+          info.info.setCodec(codec);
+        }
+      }
+
+      final long checksumNow = input.getChecksum();
+      final long checksumThen = input.readLong();
+      if (checksumNow != checksumThen) {
+        throw new CorruptIndexException("checksum mismatch in segments file (resource: " + input + ")");
+      }
+
+      success = true;
+    } finally {
+      if (!success) {
+        // Clear any segment infos we had loaded so we
+        // have a clean slate on retry:
+        this.clear();
+        IOUtils.closeWhileHandlingException(input);
+      } else {
+        input.close();
       }
     }
   }
 
-  /** Holds score and explanation for a single candidate
-   *  merge. */
-  protected static abstract class MergeScore {
-    /** Sole constructor. (For invocation by subclass 
-     * constructors, typically implicit.) */
-    protected MergeScore() {
+  /** Find the latest commit ({@code segments_N file}) and
+   *  load all {@link SegmentInfoPerCommit}s. */
+  public final void read(Directory directory) throws IOException {
+    generation = lastGeneration = -1;
+
+    new FindSegmentsFile(directory) {
+
+      @Override
+      protected Object doBody(String segmentFileName) throws IOException {
+        read(directory, segmentFileName);
+        return null;
+      }
+    }.run();
+  }
+
+  // Only non-null after prepareCommit has been called and
+  // before finishCommit is called
+  ChecksumIndexOutput pendingSegnOutput;
+
+  private static final String SEGMENT_INFO_UPGRADE_CODEC = "SegmentInfo3xUpgrade";
+  private static final int SEGMENT_INFO_UPGRADE_VERSION = 0;
+
+  private void write(Directory directory) throws IOException {
+
+    String segmentsFileName = getNextSegmentFileName();
+    
+    // Always advance the generation on write:
+    if (generation == -1) {
+      generation = 1;
+    } else {
+      generation++;
     }
     
-    abstract double getScore();
+    ChecksumIndexOutput segnOutput = null;
+    boolean success = false;
 
-    abstract String getExplanation();
+    final Set<String> upgradedSIFiles = new HashSet<String>();
+
+    try {
+      segnOutput = new ChecksumIndexOutput(directory.createOutput(segmentsFileName, IOContext.DEFAULT));
+      CodecUtil.writeHeader(segnOutput, "segments", VERSION_40);
+      segnOutput.writeLong(version); 
+      segnOutput.writeInt(counter); // write counter
+      segnOutput.writeInt(size()); // write infos
+      for (SegmentInfoPerCommit siPerCommit : this) {
+        SegmentInfo si = siPerCommit.info;
+        segnOutput.writeString(si.name);
+        segnOutput.writeString(si.getCodec().getName());
+        segnOutput.writeLong(siPerCommit.getDelGen());
+        segnOutput.writeInt(siPerCommit.getDelCount());
+        assert si.dir == directory;
+
+        assert siPerCommit.getDelCount() <= si.getDocCount();
+
+        // If this segment is pre-4.x, perform a one-time
+        // "ugprade" to write the .si file for it:
+        String version = si.getVersion();
+        if (version == null || StringHelper.getVersionComparator().compare(version, "4.0") < 0) {
+
+          if (!segmentWasUpgraded(directory, si)) {
+
+            String markerFileName = IndexFileNames.segmentFileName(si.name, "upgraded", Lucene3xSegmentInfoFormat.UPGRADED_SI_EXTENSION);
+            si.addFile(markerFileName);
+
+            final String segmentFileName = write3xInfo(directory, si, IOContext.DEFAULT);
+            upgradedSIFiles.add(segmentFileName);
+            directory.sync(Collections.singletonList(segmentFileName));
+
+            // Write separate marker file indicating upgrade
+            // is completed.  This way, if there is a JVM
+            // kill/crash, OS crash, power loss, etc. while
+            // writing the upgraded file, the marker file
+            // will be missing:
+            si.addFile(markerFileName);
+            IndexOutput out = directory.createOutput(markerFileName, IOContext.DEFAULT);
+            try {
+              CodecUtil.writeHeader(out, SEGMENT_INFO_UPGRADE_CODEC, SEGMENT_INFO_UPGRADE_VERSION);
+            } finally {
+              out.close();
+            }
+            upgradedSIFiles.add(markerFileName);
+            directory.sync(Collections.singletonList(markerFileName));
+          }
+        }
+      }
+      segnOutput.writeStringStringMap(userData);
+      pendingSegnOutput = segnOutput;
+      success = true;
+    } finally {
+      if (!success) {
+        // We hit an exception above; try to close the file
+        // but suppress any exception:
+        IOUtils.closeWhileHandlingException(segnOutput);
+
+        for(String fileName : upgradedSIFiles) {
+          try {
+            directory.deleteFile(fileName);
+          } catch (Throwable t) {
+            // Suppress so we keep throwing the original exception
+          }
+        }
+
+        try {
+          // Try not to leave a truncated segments_N file in
+          // the index:
+          directory.deleteFile(segmentsFileName);
+        } catch (Throwable t) {
+          // Suppress so we keep throwing the original exception
+        }
+      }
+    }
   }
 
+  private static boolean segmentWasUpgraded(Directory directory, SegmentInfo si) {
+    // Check marker file:
+    String markerFileName = IndexFileNames.segmentFileName(si.name, "upgraded", Lucene3xSegmentInfoFormat.UPGRADED_SI_EXTENSION);
+    IndexInput in = null;
+    try {
+      in = directory.openInput(markerFileName, IOContext.READONCE);
+      if (CodecUtil.checkHeader(in, SEGMENT_INFO_UPGRADE_CODEC, SEGMENT_INFO_UPGRADE_VERSION, SEGMENT_INFO_UPGRADE_VERSION) == 0) {
+        return true;
+      }
+    } catch (IOException ioe) {
+      // Ignore: if something is wrong w/ the marker file,
+      // we will just upgrade again
+    } finally {
+      if (in != null) {
+        IOUtils.closeWhileHandlingException(in);
+      }
+    }
+    return false;
+  }
+
+
+  @Deprecated
+  public static String write3xInfo(Directory dir, SegmentInfo si, IOContext context) throws IOException {
+
+    // NOTE: this is NOT how 3.x is really written...
+    String fileName = IndexFileNames.segmentFileName(si.name, "", Lucene3xSegmentInfoFormat.UPGRADED_SI_EXTENSION);
+    si.addFile(fileName);
+
+    //System.out.println("UPGRADE write " + fileName);
+    boolean success = false;
+    IndexOutput output = dir.createOutput(fileName, context);
+    try {
+      // we are about to write this SI in 3.x format, dropping all codec information, etc.
+      // so it had better be a 3.x segment or you will get very confusing errors later.
+      assert si.getCodec() instanceof Lucene3xCodec : "broken test, trying to mix preflex with other codecs";
+      CodecUtil.writeHeader(output, Lucene3xSegmentInfoFormat.UPGRADED_SI_CODEC_NAME, 
+                                    Lucene3xSegmentInfoFormat.UPGRADED_SI_VERSION_CURRENT);
+      // Write the Lucene version that created this segment, since 3.1
+      output.writeString(si.getVersion());
+      output.writeInt(si.getDocCount());
+
+      output.writeStringStringMap(si.attributes());
+
+      output.writeByte((byte) (si.getUseCompoundFile() ? SegmentInfo.YES : SegmentInfo.NO));
+      output.writeStringStringMap(si.getDiagnostics());
+      output.writeStringSet(si.files());
+
+      output.close();
+
+      success = true;
+    } finally {
+      if (!success) {
+        IOUtils.closeWhileHandlingException(output);
+        try {
+          si.dir.deleteFile(fileName);
+        } catch (Throwable t) {
+          // Suppress so we keep throwing the original exception
+        }
+      }
+    }
+
+    return fileName;
+  }
+
+  /**
+   * Returns a copy of this instance, also copying each
+   * SegmentInfo.
+   */
+  
   @Override
-  public MergeSpecification findMerges(MergeTrigger mergeTrigger, SegmentInfos infos) throws IOException {
-    if (verbose()) {
-      message("findMerges: " + infos.size() + " segments");
+  public SegmentInfos clone() {
+    try {
+      final SegmentInfos sis = (SegmentInfos) super.clone();
+      // deep clone, first recreate all collections:
+      sis.segments = new ArrayList<SegmentInfoPerCommit>(size());
+      for(final SegmentInfoPerCommit info : this) {
+        assert info.info.getCodec() != null;
+        // dont directly access segments, use add method!!!
+        sis.add(info.clone());
+      }
+      sis.userData = new HashMap<String,String>(userData);
+      return sis;
+    } catch (CloneNotSupportedException e) {
+      throw new RuntimeException("should not happen", e);
     }
-    if (infos.size() == 0) {
-      return null;
+  }
+
+  /**
+   * version number when this SegmentInfos was generated.
+   */
+  public long getVersion() {
+    return version;
+  }
+
+  /** Returns current generation. */
+  public long getGeneration() {
+    return generation;
+  }
+
+  /** Returns last succesfully read or written generation. */
+  public long getLastGeneration() {
+    return lastGeneration;
+  }
+
+  /** If non-null, information about retries when loading
+   * the segments file will be printed to this.
+   */
+  public static void setInfoStream(PrintStream infoStream) {
+    SegmentInfos.infoStream = infoStream;
+  }
+
+  /* Advanced configuration of retry logic in loading
+     segments_N file */
+  private static int defaultGenLookaheadCount = 10;
+
+  /**
+   * Advanced: set how many times to try incrementing the
+   * gen when loading the segments file.  This only runs if
+   * the primary (listing directory) and secondary (opening
+   * segments.gen file) methods fail to find the segments
+   * file.
+   *
+   * @lucene.experimental
+   */
+  public static void setDefaultGenLookaheadCount(int count) {
+    defaultGenLookaheadCount = count;
+  }
+
+  /**
+   * Returns the {@code defaultGenLookaheadCount}.
+   *
+   * @see #setDefaultGenLookaheadCount
+   *
+   * @lucene.experimental
+   */
+  public static int getDefaultGenLookahedCount() {
+    return defaultGenLookaheadCount;
+  }
+
+  /**
+   * Returns {@code infoStream}.
+   *
+   * @see #setInfoStream
+   */
+  public static PrintStream getInfoStream() {
+    return infoStream;
+  }
+
+  /**
+   * Prints the given message to the infoStream. Note, this method does not
+   * check for null infoStream. It assumes this check has been performed by the
+   * caller, which is recommended to avoid the (usually) expensive message
+   * creation.
+   */
+  private static void message(String message) {
+    infoStream.println("SIS [" + Thread.currentThread().getName() + "]: " + message);
+  }
+
+  /**
+   * Utility class for executing code that needs to do
+   * something with the current segments file.  This is
+   * necessary with lock-less commits because from the time
+   * you locate the current segments file name, until you
+   * actually open it, read its contents, or check modified
+   * time, etc., it could have been deleted due to a writer
+   * commit finishing.
+   */
+  public abstract static class FindSegmentsFile {
+    
+    final Directory directory;
+
+    /** Sole constructor. */ 
+    public FindSegmentsFile(Directory directory) {
+      this.directory = directory;
     }
-    final Collection<SegmentInfoPerCommit> merging = writer.get().getMergingSegments();
-    final Collection<SegmentInfoPerCommit> toBeMerged = new HashSet<SegmentInfoPerCommit>();
 
-    final List<SegmentInfoPerCommit> infosSorted = new ArrayList<SegmentInfoPerCommit>(infos.asList());
-    Collections.sort(infosSorted, new SegmentByteSizeDescending());
-
-    // Compute total index bytes & print details about the index
-    long totIndexBytes = 0;
-    long minSegmentBytes = Long.MAX_VALUE;
-    for(SegmentInfoPerCommit info : infosSorted) {
-      final long segBytes = size(info);
-      if (verbose()) {
-        String extra = merging.contains(info) ? " [merging]" : "";
-        if (segBytes >= maxMergedSegmentBytes/2.0) {
-          extra += " [skip: too large]";
-        } else if (segBytes < floorSegmentBytes) {
-          extra += " [floored]";
-        }
-        message("  seg=" + writer.get().segString(info) + " size=" + String.format(Locale.ROOT, "%.3f", segBytes/1024/1024.) + " MB" + extra);
+    /** Locate the most recent {@code segments} file and
+     *  run {@link #doBody} on it. */
+    public Object run() throws IOException {
+      return run(null);
+    }
+    
+    /** Run {@link #doBody} on the provided commit. */
+    public Object run(IndexCommit commit) throws IOException {
+      if (commit != null) {
+        if (directory != commit.getDirectory())
+          throw new IOException("the specified commit does not match the specified Directory");
+        return doBody(commit.getSegmentsFileName());
       }
 
-      minSegmentBytes = Math.min(segBytes, minSegmentBytes);
-      // Accum total byte size
-      totIndexBytes += segBytes;
-    }
+      String segmentFileName = null;
+      long lastGen = -1;
+      long gen = 0;
+      int genLookaheadCount = 0;
+      IOException exc = null;
+      int retryCount = 0;
 
-    // If we have too-large segments, grace them out
-    // of the maxSegmentCount:
-    int tooBigCount = 0;
-    while (tooBigCount < infosSorted.size() && size(infosSorted.get(tooBigCount)) >= maxMergedSegmentBytes/2.0) {
-      totIndexBytes -= size(infosSorted.get(tooBigCount));
-      tooBigCount++;
-    }
+      boolean useFirstMethod = true;
 
-    minSegmentBytes = floorSize(minSegmentBytes);
+      // Loop until we succeed in calling doBody() without
+      // hitting an IOException.  An IOException most likely
+      // means a commit was in process and has finished, in
+      // the time it took us to load the now-old infos files
+      // (and segments files).  It's also possible it's a
+      // true error (corrupt index).  To distinguish these,
+      // on each retry we must see "forward progress" on
+      // which generation we are trying to load.  If we
+      // don't, then the original error is real and we throw
+      // it.
+      
+      // We have three methods for determining the current
+      // generation.  We try the first two in parallel (when
+      // useFirstMethod is true), and fall back to the third
+      // when necessary.
 
-    // Compute max allowed segs in the index
-    long levelSize = minSegmentBytes;
-    long bytesLeft = totIndexBytes;
-    double allowedSegCount = 0;
-    while(true) {
-      final double segCountLevel = bytesLeft / (double) levelSize;
-      if (segCountLevel < segsPerTier) {
-        allowedSegCount += Math.ceil(segCountLevel);
-        break;
-      }
-      allowedSegCount += segsPerTier;
-      bytesLeft -= segsPerTier * levelSize;
-      levelSize *= maxMergeAtOnce;
-    }
-    int allowedSegCountInt = (int) allowedSegCount;
+      while(true) {
 
-    MergeSpecification spec = null;
+        if (useFirstMethod) {
 
-    // Cycle to possibly select more than one merge:
-    while(true) {
+          // List the directory and use the highest
+          // segments_N file.  This method works well as long
+          // as there is no stale caching on the directory
+          // contents (NOTE: NFS clients often have such stale
+          // caching):
+          String[] files = null;
 
-      long mergingBytes = 0;
+          long genA = -1;
 
-      // Gather eligible segments for merging, ie segments
-      // not already being merged and not already picked (by
-      // prior iteration of this loop) for merging:
-      final List<SegmentInfoPerCommit> eligible = new ArrayList<SegmentInfoPerCommit>();
-      for(int idx = tooBigCount; idx<infosSorted.size(); idx++) {
-        final SegmentInfoPerCommit info = infosSorted.get(idx);
-        if (merging.contains(info)) {
-          mergingBytes += info.info.sizeInBytes();
-        } else if (!toBeMerged.contains(info)) {
-          eligible.add(info);
-        }
-      }
+          files = directory.listAll();
+          
+          if (files != null) {
+            genA = getLastCommitGeneration(files);
+          }
+          
+          if (infoStream != null) {
+            message("directory listing genA=" + genA);
+          }
 
-      final boolean maxMergeIsRunning = mergingBytes >= maxMergedSegmentBytes;
-
-      if (verbose()) {
-        message("  allowedSegmentCount=" + allowedSegCountInt + " vs count=" + infosSorted.size() + " (eligible count=" + eligible.size() + ") tooBigCount=" + tooBigCount);
-      }
-
-      if (eligible.size() == 0) {
-        return spec;
-      }
-
-      if (eligible.size() >= allowedSegCountInt) {
-
-        // OK we are over budget -- find best merge!
-        MergeScore bestScore = null;
-        List<SegmentInfoPerCommit> best = null;
-        boolean bestTooLarge = false;
-        long bestMergeBytes = 0;
-
-        // Consider all merge starts:
-        for(int startIdx = 0;startIdx <= eligible.size()-maxMergeAtOnce; startIdx++) {
-
-          long totAfterMergeBytes = 0;
-
-          final List<SegmentInfoPerCommit> candidate = new ArrayList<SegmentInfoPerCommit>();
-          boolean hitTooLarge = false;
-          for(int idx = startIdx;idx<eligible.size() && candidate.size() < maxMergeAtOnce;idx++) {
-            final SegmentInfoPerCommit info = eligible.get(idx);
-            final long segBytes = size(info);
-
-            if (totAfterMergeBytes + segBytes > maxMergedSegmentBytes) {
-              hitTooLarge = true;
-              // NOTE: we continue, so that we can try
-              // "packing" smaller segments into this merge
-              // to see if we can get closer to the max
-              // size; this in general is not perfect since
-              // this is really "bin packing" and we'd have
-              // to try different permutations.
-              continue;
+          // Also open segments.gen and read its
+          // contents.  Then we take the larger of the two
+          // gens.  This way, if either approach is hitting
+          // a stale cache (NFS) we have a better chance of
+          // getting the right generation.
+          long genB = -1;
+          IndexInput genInput = null;
+          try {
+            genInput = directory.openInput(IndexFileNames.SEGMENTS_GEN, IOContext.READONCE);
+          } catch (FileNotFoundException e) {
+            if (infoStream != null) {
+              message("segments.gen open: FileNotFoundException " + e);
             }
-            candidate.add(info);
-            totAfterMergeBytes += segBytes;
+          } catch (IOException e) {
+            if (infoStream != null) {
+              message("segments.gen open: IOException " + e);
+            }
+          }
+  
+          if (genInput != null) {
+            try {
+              int version = genInput.readInt();
+              if (version == FORMAT_SEGMENTS_GEN_CURRENT) {
+                long gen0 = genInput.readLong();
+                long gen1 = genInput.readLong();
+                if (infoStream != null) {
+                  message("fallback check: " + gen0 + "; " + gen1);
+                }
+                if (gen0 == gen1) {
+                  // The file is consistent.
+                  genB = gen0;
+                }
+              } else {
+                throw new IndexFormatTooNewException(genInput, version, FORMAT_SEGMENTS_GEN_CURRENT, FORMAT_SEGMENTS_GEN_CURRENT);
+              }
+            } catch (IOException err2) {
+              // rethrow any format exception
+              if (err2 instanceof CorruptIndexException) throw err2;
+            } finally {
+              genInput.close();
+            }
           }
 
-          final MergeScore score = score(candidate, hitTooLarge, mergingBytes);
-          if (verbose()) {
-            message("  maybe=" + writer.get().segString(candidate) + " score=" + score.getScore() + " " + score.getExplanation() + " tooLarge=" + hitTooLarge + " size=" + String.format(Locale.ROOT, "%.3f MB", totAfterMergeBytes/1024./1024.));
+          if (infoStream != null) {
+            message(IndexFileNames.SEGMENTS_GEN + " check: genB=" + genB);
           }
 
-          // If we are already running a max sized merge
-          // (maxMergeIsRunning), don't allow another max
-          // sized merge to kick off:
-          if ((bestScore == null || score.getScore() < bestScore.getScore()) && (!hitTooLarge || !maxMergeIsRunning)) {
-            best = candidate;
-            bestScore = score;
-            bestTooLarge = hitTooLarge;
-            bestMergeBytes = totAfterMergeBytes;
+          // Pick the larger of the two gen's:
+          gen = Math.max(genA, genB);
+
+          if (gen == -1) {
+            // Neither approach found a generation
+            throw new IndexNotFoundException("no segments* file found in " + directory + ": files: " + Arrays.toString(files));
           }
         }
-        
-        if (best != null) {
-          if (spec == null) {
-            spec = new MergeSpecification();
+
+        if (useFirstMethod && lastGen == gen && retryCount >= 2) {
+          // Give up on first method -- this is 3rd cycle on
+          // listing directory and checking gen file to
+          // attempt to locate the segments file.
+          useFirstMethod = false;
+        }
+
+        // Second method: since both directory cache and
+        // file contents cache seem to be stale, just
+        // advance the generation.
+        if (!useFirstMethod) {
+          if (genLookaheadCount < defaultGenLookaheadCount) {
+            gen++;
+            genLookaheadCount++;
+            if (infoStream != null) {
+              message("look ahead increment gen to " + gen);
+            }
+          } else {
+            // All attempts have failed -- throw first exc:
+            throw exc;
           }
-          final OneMerge merge = new OneMerge(best);
-          spec.add(merge);
-          for(SegmentInfoPerCommit info : merge.segments) {
-            toBeMerged.add(info);
+        } else if (lastGen == gen) {
+          // This means we're about to try the same
+          // segments_N last tried.
+          retryCount++;
+        } else {
+          // Segment file has advanced since our last loop
+          // (we made "progress"), so reset retryCount:
+          retryCount = 0;
+        }
+
+        lastGen = gen;
+
+        segmentFileName = IndexFileNames.fileNameFromGeneration(IndexFileNames.SEGMENTS,
+                                                                "",
+                                                                gen);
+
+        try {
+          Object v = doBody(segmentFileName);
+          if (infoStream != null) {
+            message("success on " + segmentFileName);
+          }
+          return v;
+        } catch (IOException err) {
+
+          // Save the original root cause:
+          if (exc == null) {
+            exc = err;
           }
 
-          if (verbose()) {
-            message("  add merge=" + writer.get().segString(merge.segments) + " size=" + String.format(Locale.ROOT, "%.3f MB", bestMergeBytes/1024./1024.) + " score=" + String.format(Locale.ROOT, "%.3f", bestScore.getScore()) + " " + bestScore.getExplanation() + (bestTooLarge ? " [max merge]" : ""));
+          if (infoStream != null) {
+            message("primary Exception on '" + segmentFileName + "': " + err + "'; will retry: retryCount=" + retryCount + "; gen = " + gen);
           }
-        } else {
-          return spec;
+
+          if (gen > 1 && useFirstMethod && retryCount == 1) {
+
+            // This is our second time trying this same segments
+            // file (because retryCount is 1), and, there is
+            // possibly a segments_(N-1) (because gen > 1).
+            // So, check if the segments_(N-1) exists and
+            // try it if so:
+            String prevSegmentFileName = IndexFileNames.fileNameFromGeneration(IndexFileNames.SEGMENTS,
+                                                                               "",
+                                                                               gen-1);
+
+            final boolean prevExists;
+            prevExists = directory.fileExists(prevSegmentFileName);
+
+            if (prevExists) {
+              if (infoStream != null) {
+                message("fallback to prior segment file '" + prevSegmentFileName + "'");
+              }
+              try {
+                Object v = doBody(prevSegmentFileName);
+                if (infoStream != null) {
+                  message("success on fallback " + prevSegmentFileName);
+                }
+                return v;
+              } catch (IOException err2) {
+                if (infoStream != null) {
+                  message("secondary Exception on '" + prevSegmentFileName + "': " + err2 + "'; will retry");
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    /**
+     * Subclass must implement this.  The assumption is an
+     * IOException will be thrown if something goes wrong
+     * during the processing that could have been caused by
+     * a writer committing.
+     */
+    protected abstract Object doBody(String segmentFileName) throws IOException;
+  }
+
+  // Carry over generation numbers from another SegmentInfos
+  void updateGeneration(SegmentInfos other) {
+    lastGeneration = other.lastGeneration;
+    generation = other.generation;
+  }
+
+  final void rollbackCommit(Directory dir) {
+    if (pendingSegnOutput != null) {
+      // Suppress so we keep throwing the original exception
+      // in our caller
+      IOUtils.closeWhileHandlingException(pendingSegnOutput);
+      pendingSegnOutput = null;
+
+      // Must carefully compute fileName from "generation"
+      // since lastGeneration isn't incremented:
+      final String segmentFileName = IndexFileNames.fileNameFromGeneration(IndexFileNames.SEGMENTS,
+                                                                            "",
+                                                                           generation);
+      // Suppress so we keep throwing the original exception
+      // in our caller
+      IOUtils.deleteFilesIgnoringExceptions(dir, segmentFileName);
+    }
+  }
+
+  /** Call this to start a commit.  This writes the new
+   *  segments file, but writes an invalid checksum at the
+   *  end, so that it is not visible to readers.  Once this
+   *  is called you must call {@link #finishCommit} to complete
+   *  the commit or {@link #rollbackCommit} to abort it.
+   *  <p>
+   *  Note: {@link #changed()} should be called prior to this
+   *  method if changes have been made to this {@link SegmentInfos} instance
+   *  </p>  
+   **/
+  final void prepareCommit(Directory dir) throws IOException {
+    if (pendingSegnOutput != null) {
+      throw new IllegalStateException("prepareCommit was already called");
+    }
+    write(dir);
+  }
+
+  /** Returns all file names referenced by SegmentInfo
+   *  instances matching the provided Directory (ie files
+   *  associated with any "external" segments are skipped).
+   *  The returned collection is recomputed on each
+   *  invocation.  */
+  public Collection<String> files(Directory dir, boolean includeSegmentsFile) throws IOException {
+    HashSet<String> files = new HashSet<String>();
+    if (includeSegmentsFile) {
+      final String segmentFileName = getSegmentsFileName();
+      if (segmentFileName != null) {
+        /*
+         * TODO: if lastGen == -1 we get might get null here it seems wrong to
+         * add null to the files set
+         */
+        files.add(segmentFileName);
+      }
+    }
+    final int size = size();
+    for(int i=0;i<size;i++) {
+      final SegmentInfoPerCommit info = info(i);
+      assert info.info.dir == dir;
+      if (info.info.dir == dir) {
+        files.addAll(info.files());
+      }
+    }
+    return files;
+  }
+
+  final void finishCommit(Directory dir) throws IOException {
+    if (pendingSegnOutput == null) {
+      throw new IllegalStateException("prepareCommit was not called");
+    }
+    boolean success = false;
+    try {
+      pendingSegnOutput.finishCommit();
+      success = true;
+    } finally {
+      if (!success) {
+        // Closes pendingSegnOutput & deletes partial segments_N:
+        rollbackCommit(dir);
+      } else {
+        success = false;
+        try {
+          pendingSegnOutput.close();
+          success = true;
+        } finally {
+          if (!success) {
+            // Closes pendingSegnOutput & deletes partial segments_N:
+            rollbackCommit(dir);
+          } else {
+            pendingSegnOutput = null;
+          }
+        }
+      }
+    }
+
+    // NOTE: if we crash here, we have left a segments_N
+    // file in the directory in a possibly corrupt state (if
+    // some bytes made it to stable storage and others
+    // didn't).  But, the segments_N file includes checksum
+    // at the end, which should catch this case.  So when a
+    // reader tries to read it, it will throw a
+    // CorruptIndexException, which should cause the retry
+    // logic in SegmentInfos to kick in and load the last
+    // good (previous) segments_N-1 file.
+
+    final String fileName = IndexFileNames.fileNameFromGeneration(IndexFileNames.SEGMENTS, "", generation);
+    success = false;
+    try {
+      dir.sync(Collections.singleton(fileName));
+      success = true;
+    } finally {
+      if (!success) {
+        try {
+          dir.deleteFile(fileName);
+        } catch (Throwable t) {
+          // Suppress so we keep throwing the original exception
+        }
+      }
+    }
+
+    lastGeneration = generation;
+
+    try {
+      IndexOutput genOutput = dir.createOutput(IndexFileNames.SEGMENTS_GEN, IOContext.READONCE);
+      try {
+        genOutput.writeInt(FORMAT_SEGMENTS_GEN_CURRENT);
+        genOutput.writeLong(generation);
+        genOutput.writeLong(generation);
+      } finally {
+        genOutput.close();
+        dir.sync(Collections.singleton(IndexFileNames.SEGMENTS_GEN));
+      }
+    } catch (Throwable t) {
+      // It's OK if we fail to write this file since it's
+      // used only as one of the retry fallbacks.
+      try {
+        dir.deleteFile(IndexFileNames.SEGMENTS_GEN);
+      } catch (Throwable t2) {
+        // Ignore; this file is only used in a retry
+        // fallback on init.
+      }
+      if (t instanceof ThreadInterruptedException) {
+        throw (ThreadInterruptedException) t;
+      }
+    }
+  }
+
+  /** Writes & syncs to the Directory dir, taking care to
+   *  remove the segments file on exception
+   *  <p>
+   *  Note: {@link #changed()} should be called prior to this
+   *  method if changes have been made to this {@link SegmentInfos} instance
+   *  </p>  
+   **/
+  final void commit(Directory dir) throws IOException {
+    prepareCommit(dir);
+    finishCommit(dir);
+  }
+
+  /** Returns readable description of this segment. */
+  public String toString(Directory directory) {
+    StringBuilder buffer = new StringBuilder();
+    buffer.append(getSegmentsFileName()).append(": ");
+    final int count = size();
+    for(int i = 0; i < count; i++) {
+      if (i > 0) {
+        buffer.append(' ');
+      }
+      final SegmentInfoPerCommit info = info(i);
+      buffer.append(info.toString(directory, 0));
+    }
+    return buffer.toString();
+  }
+
+  /** Return {@code userData} saved with this commit.
+   * 
+   * @see IndexWriter#commit()
+   */
+  public Map<String,String> getUserData() {
+    return userData;
+  }
+
+  void setUserData(Map<String,String> data) {
+    if (data == null) {
+      userData = Collections.<String,String>emptyMap();
+    } else {
+      userData = data;
+    }
+  }
+
+  /** Replaces all segments in this instance, but keeps
+   *  generation, version, counter so that future commits
+   *  remain write once.
+   */
+  void replace(SegmentInfos other) {
+    rollbackSegmentInfos(other.asList());
+    lastGeneration = other.lastGeneration;
+  }
+
+  /** Returns sum of all segment's docCounts.  Note that
+   *  this does not include deletions */
+  public int totalDocCount() {
+    int count = 0;
+    for(SegmentInfoPerCommit info : this) {
+      count += info.info.getDocCount();
+    }
+    return count;
+  }
+
+  /** Call this before committing if changes have been made to the
+   *  segments. */
+  public void changed() {
+    version++;
+  }
+  
+  /** applies all changes caused by committing a merge to this SegmentInfos */
+  void applyMergeChanges(MergePolicy.OneMerge merge, boolean dropSegment) {
+    final Set<SegmentInfoPerCommit> mergedAway = new HashSet<SegmentInfoPerCommit>(merge.segments);
+    boolean inserted = false;
+    int newSegIdx = 0;
+    for (int segIdx = 0, cnt = segments.size(); segIdx < cnt; segIdx++) {
+      assert segIdx >= newSegIdx;
+      final SegmentInfoPerCommit info = segments.get(segIdx);
+      if (mergedAway.contains(info)) {
+        if (!inserted && !dropSegment) {
+          segments.set(segIdx, merge.info);
+          inserted = true;
+          newSegIdx++;
         }
       } else {
-        return spec;
-      }
-    }
-  }
-
-  /** Expert: scores one merge; subclasses can override. */
-  protected MergeScore score(List<SegmentInfoPerCommit> candidate, boolean hitTooLarge, long mergingBytes) throws IOException {
-    long totBeforeMergeBytes = 0;
-    long totAfterMergeBytes = 0;
-    long totAfterMergeBytesFloored = 0;
-    for(SegmentInfoPerCommit info : candidate) {
-      final long segBytes = size(info);
-      totAfterMergeBytes += segBytes;
-      totAfterMergeBytesFloored += floorSize(segBytes);
-      totBeforeMergeBytes += info.info.sizeInBytes();
-    }
-
-    // Measure "skew" of the merge, which can range
-    // from 1.0/numSegsBeingMerged (good) to 1.0
-    // (poor):
-    final double skew;
-    if (hitTooLarge) {
-      // Pretend the merge has perfect skew; skew doesn't
-      // matter in this case because this merge will not
-      // "cascade" and so it cannot lead to N^2 merge cost
-      // over time:
-      skew = 1.0/maxMergeAtOnce;
-    } else {
-      skew = ((double) floorSize(size(candidate.get(0))))/totAfterMergeBytesFloored;
-    }
-
-    // Strongly favor merges with less skew (smaller
-    // mergeScore is better):
-    double mergeScore = skew;
-
-    // Gently favor smaller merges over bigger ones.  We
-    // don't want to make this exponent too large else we
-    // can end up doing poor merges of small segments in
-    // order to avoid the large merges:
-    mergeScore *= Math.pow(totAfterMergeBytes, 0.05);
-
-    // Strongly favor merges that reclaim deletes:
-    final double nonDelRatio = ((double) totAfterMergeBytes)/totBeforeMergeBytes;
-    mergeScore *= Math.pow(nonDelRatio, reclaimDeletesWeight);
-
-    final double finalMergeScore = mergeScore;
-
-    return new MergeScore() {
-
-      @Override
-      public double getScore() {
-        return finalMergeScore;
-      }
-
-      @Override
-      public String getExplanation() {
-        return "skew=" + String.format(Locale.ROOT, "%.3f", skew) + " nonDelRatio=" + String.format(Locale.ROOT, "%.3f", nonDelRatio);
-      }
-    };
-  }
-
-  @Override
-  public MergeSpecification findForcedMerges(SegmentInfos infos, int maxSegmentCount, Map<SegmentInfoPerCommit,Boolean> segmentsToMerge) throws IOException {
-    if (verbose()) {
-      message("findForcedMerges maxSegmentCount=" + maxSegmentCount + " infos=" + writer.get().segString(infos) + " segmentsToMerge=" + segmentsToMerge);
-    }
-
-    List<SegmentInfoPerCommit> eligible = new ArrayList<SegmentInfoPerCommit>();
-    boolean forceMergeRunning = false;
-    final Collection<SegmentInfoPerCommit> merging = writer.get().getMergingSegments();
-    boolean segmentIsOriginal = false;
-    for(SegmentInfoPerCommit info : infos) {
-      final Boolean isOriginal = segmentsToMerge.get(info);
-      if (isOriginal != null) {
-        segmentIsOriginal = isOriginal;
-        if (!merging.contains(info)) {
-          eligible.add(info);
-        } else {
-          forceMergeRunning = true;
-        }
+        segments.set(newSegIdx, info);
+        newSegIdx++;
       }
     }
 
-    if (eligible.size() == 0) {
-      return null;
-    }
-
-    if ((maxSegmentCount > 1 && eligible.size() <= maxSegmentCount) ||
-        (maxSegmentCount == 1 && eligible.size() == 1 && (!segmentIsOriginal || isMerged(eligible.get(0))))) {
-      if (verbose()) {
-        message("already merged");
-      }
-      return null;
-    }
-
-    Collections.sort(eligible, new SegmentByteSizeDescending());
-
-    if (verbose()) {
-      message("eligible=" + eligible);
-      message("forceMergeRunning=" + forceMergeRunning);
-    }
-
-    int end = eligible.size();
+    // the rest of the segments in list are duplicates, so don't remove from map, only list!
+    segments.subList(newSegIdx, segments.size()).clear();
     
-    MergeSpecification spec = null;
-
-    // Do full merges, first, backwards:
-    while(end >= maxMergeAtOnceExplicit + maxSegmentCount - 1) {
-      if (spec == null) {
-        spec = new MergeSpecification();
-      }
-      final OneMerge merge = new OneMerge(eligible.subList(end-maxMergeAtOnceExplicit, end));
-      if (verbose()) {
-        message("add merge=" + writer.get().segString(merge.segments));
-      }
-      spec.add(merge);
-      end -= maxMergeAtOnceExplicit;
+    // Either we found place to insert segment, or, we did
+    // not, but only because all segments we merged becamee
+    // deleted while we are merging, in which case it should
+    // be the case that the new segment is also all deleted,
+    // we insert it at the beginning if it should not be dropped:
+    if (!inserted && !dropSegment) {
+      segments.add(0, merge.info);
     }
-
-    if (spec == null && !forceMergeRunning) {
-      // Do final merge
-      final int numToMerge = end - maxSegmentCount + 1;
-      final OneMerge merge = new OneMerge(eligible.subList(end-numToMerge, end));
-      if (verbose()) {
-        message("add final merge=" + merge.segString(writer.get().getDirectory()));
-      }
-      spec = new MergeSpecification();
-      spec.add(merge);
-    }
-
-    return spec;
   }
 
-  @Override
-  public MergeSpecification findForcedDeletesMerges(SegmentInfos infos) throws IOException {
-    if (verbose()) {
-      message("findForcedDeletesMerges infos=" + writer.get().segString(infos) + " forceMergeDeletesPctAllowed=" + forceMergeDeletesPctAllowed);
+  List<SegmentInfoPerCommit> createBackupSegmentInfos() {
+    final List<SegmentInfoPerCommit> list = new ArrayList<SegmentInfoPerCommit>(size());
+    for(final SegmentInfoPerCommit info : this) {
+      assert info.info.getCodec() != null;
+      list.add(info.clone());
     }
-    final List<SegmentInfoPerCommit> eligible = new ArrayList<SegmentInfoPerCommit>();
-    final Collection<SegmentInfoPerCommit> merging = writer.get().getMergingSegments();
-    for(SegmentInfoPerCommit info : infos) {
-      double pctDeletes = 100.*((double) writer.get().numDeletedDocs(info))/info.info.getDocCount();
-      if (pctDeletes > forceMergeDeletesPctAllowed && !merging.contains(info)) {
-        eligible.add(info);
-      }
-    }
-
-    if (eligible.size() == 0) {
-      return null;
-    }
-
-    Collections.sort(eligible, new SegmentByteSizeDescending());
-
-    if (verbose()) {
-      message("eligible=" + eligible);
-    }
-
-    int start = 0;
-    MergeSpecification spec = null;
-
-    while(start < eligible.size()) {
-      // Don't enforce max merged size here: app is explicitly
-      // calling forceMergeDeletes, and knows this may take a
-      // long time / produce big segments (like forceMerge):
-      final int end = Math.min(start + maxMergeAtOnceExplicit, eligible.size());
-      if (spec == null) {
-        spec = new MergeSpecification();
-      }
-
-      final OneMerge merge = new OneMerge(eligible.subList(start, end));
-      if (verbose()) {
-        message("add merge=" + writer.get().segString(merge.segments));
-      }
-      spec.add(merge);
-      start = end;
-    }
-
-    return spec;
+    return list;
+  }
+  
+  void rollbackSegmentInfos(List<SegmentInfoPerCommit> infos) {
+    this.clear();
+    this.addAll(infos);
+  }
+  
+  /** Returns an <b>unmodifiable</b> {@link Iterator} of contained segments in order. */
+  // @Override (comment out until Java 6)
+  public Iterator<SegmentInfoPerCommit> iterator() {
+    return asList().iterator();
+  }
+  
+  /** Returns all contained segments as an <b>unmodifiable</b> {@link List} view. */
+  public List<SegmentInfoPerCommit> asList() {
+    return Collections.unmodifiableList(segments);
   }
 
-  @Override
-  public boolean useCompoundFile(SegmentInfos infos, SegmentInfoPerCommit mergedInfo) throws IOException {
-    if (!getUseCompoundFile()) {
-        return false;
+  /** Returns number of {@link SegmentInfoPerCommit}s. */
+  public int size() {
+    return segments.size();
+  }
+
+  /** Appends the provided {@link SegmentInfoPerCommit}. */
+  public void add(SegmentInfoPerCommit si) {
+    segments.add(si);
+  }
+  
+  /** Appends the provided {@link SegmentInfoPerCommit}s. */
+  public void addAll(Iterable<SegmentInfoPerCommit> sis) {
+    for (final SegmentInfoPerCommit si : sis) {
+      this.add(si);
     }
-    long mergedInfoSize = size(mergedInfo);
-    if (mergedInfoSize > maxCFSSegmentSize) {
-        return false;
-    }
-    if (getNoCFSRatio() >= 1.0) {
-        return true;
-    }
-    long totalSize = 0;
-    for (SegmentInfoPerCommit info : infos) {
-        totalSize += size(info);
-    }
-    return mergedInfoSize <= getNoCFSRatio() * totalSize;
+  }
+  
+  /** Clear all {@link SegmentInfoPerCommit}s. */
+  public void clear() {
+    segments.clear();
   }
 
-  @Override
-  public void close() {
+  /** Remove the provided {@link SegmentInfoPerCommit}.
+   *
+   * <p><b>WARNING</b>: O(N) cost */
+  public void remove(SegmentInfoPerCommit si) {
+    segments.remove(si);
+  }
+  
+  /** Remove the {@link SegmentInfoPerCommit} at the
+   * provided index.
+   *
+   * <p><b>WARNING</b>: O(N) cost */
+  void remove(int index) {
+    segments.remove(index);
   }
 
-  private boolean isMerged(SegmentInfoPerCommit info) {
-    IndexWriter w = writer.get();
-    assert w != null;
-    boolean hasDeletions = w.numDeletedDocs(info) > 0;
-    return !hasDeletions &&
-      !info.info.hasSeparateNorms() &&
-      info.info.dir == w.getDirectory() &&
-      (info.info.getUseCompoundFile() == useCompoundFile || noCFSRatio < 1.0 || maxCFSSegmentSize < Long.MAX_VALUE);
+  /** Return true if the provided {@link
+   *  SegmentInfoPerCommit} is contained.
+   *
+   * <p><b>WARNING</b>: O(N) cost */
+  boolean contains(SegmentInfoPerCommit si) {
+    return segments.contains(si);
   }
 
-  // Segment size in bytes, pro-rated by % deleted
-  private long size(SegmentInfoPerCommit info) throws IOException {
-    final long byteSize = info.info.sizeInBytes();    
-    final int delCount = writer.get().numDeletedDocs(info);
-    final double delRatio = (info.info.getDocCount() <= 0 ? 0.0f : ((double)delCount / (double)info.info.getDocCount()));    
-    assert delRatio <= 1.0;
-    return (long) (byteSize * (1.0-delRatio));
-  }
-
-  private long floorSize(long bytes) {
-    return Math.max(floorSegmentBytes, bytes);
-  }
-
-  private boolean verbose() {
-    final IndexWriter w = writer.get();
-    return w != null && w.infoStream.isEnabled("TMP");
-  }
-
-  private void message(String message) {
-    writer.get().infoStream.message("TMP", message);
-  }
-
-  @Override
-  public String toString() {
-    StringBuilder sb = new StringBuilder("[" + getClass().getSimpleName() + ": ");
-    sb.append("maxMergeAtOnce=").append(maxMergeAtOnce).append(", ");
-    sb.append("maxMergeAtOnceExplicit=").append(maxMergeAtOnceExplicit).append(", ");
-    sb.append("maxMergedSegmentMB=").append(maxMergedSegmentBytes/1024/1024.).append(", ");
-    sb.append("floorSegmentMB=").append(floorSegmentBytes/1024/1024.).append(", ");
-    sb.append("forceMergeDeletesPctAllowed=").append(forceMergeDeletesPctAllowed).append(", ");
-    sb.append("segmentsPerTier=").append(segsPerTier).append(", ");
-    sb.append("useCompoundFile=").append(useCompoundFile).append(", ");
-    sb.append("maxCFSSegmentSizeMB=").append(getMaxCFSSegmentSizeMB()).append(", ");
-    sb.append("noCFSRatio=").append(noCFSRatio);
-    return sb.toString();
-  }
-
-  /** Returns the largest size allowed for a compound file segment */
-  public final double getMaxCFSSegmentSizeMB() {
-    return maxCFSSegmentSize/1024/1024.;
-  }
-
-  /** If a merged segment will be more than this value,
-   *  leave the segment as
-   *  non-compound file even if compound file is enabled.
-   *  Set this to Double.POSITIVE_INFINITY (default) and noCFSRatio to 1.0
-   *  to always use CFS regardless of merge size. */
-  public final TieredMergePolicy setMaxCFSSegmentSizeMB(double v) {
-    if (v < 0.0) {
-      throw new IllegalArgumentException("maxCFSSegmentSizeMB must be >=0 (got " + v + ")");
-    }
-    v *= 1024 * 1024;
-    this.maxCFSSegmentSize = (v > Long.MAX_VALUE) ? Long.MAX_VALUE : (long) v;
-    return this;
+  /** Returns index of the provided {@link
+   *  SegmentInfoPerCommit}.
+   *
+   * <p><b>WARNING</b>: O(N) cost */
+  int indexOf(SegmentInfoPerCommit si) {
+    return segments.indexOf(si);
   }
 }

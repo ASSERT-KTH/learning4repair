@@ -1,4 +1,4 @@
-last.copyBytes(term);
+seekBytesRef.copyBytes(term);
 
 package org.apache.lucene.index;
 
@@ -20,322 +20,303 @@ package org.apache.lucene.index;
  */
 
 import java.io.IOException;
-import java.util.HashSet;
-import java.util.Iterator;
-import java.util.Random;
-import java.util.Set;
+import java.util.Comparator;
 
-import org.apache.lucene.analysis.MockAnalyzer;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.Field;
-import org.apache.lucene.document.StringField;
-import org.apache.lucene.document.TextField;
-import org.apache.lucene.store.Directory;
 import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.CharsRef;
-import org.apache.lucene.util.LuceneTestCase;
-import org.apache.lucene.util.UnicodeUtil;
+import org.apache.lucene.util.IntsRef;
+import org.apache.lucene.util.automaton.ByteRunAutomaton;
+import org.apache.lucene.util.automaton.CompiledAutomaton;
+import org.apache.lucene.util.automaton.Transition;
 
-public class TestIndexWriterUnicode extends LuceneTestCase {
+/**
+ * A FilteredTermsEnum that enumerates terms based upon what is accepted by a
+ * DFA.
+ * <p>
+ * The algorithm is such:
+ * <ol>
+ *   <li>As long as matches are successful, keep reading sequentially.
+ *   <li>When a match fails, skip to the next string in lexicographic order that
+ * does not enter a reject state.
+ * </ol>
+ * <p>
+ * The algorithm does not attempt to actually skip to the next string that is
+ * completely accepted. This is not possible when the language accepted by the
+ * FSM is not finite (i.e. * operator).
+ * </p>
+ * @lucene.experimental
+ */
+class AutomatonTermsEnum extends FilteredTermsEnum {
+  // a tableized array-based form of the DFA
+  private final ByteRunAutomaton runAutomaton;
+  // common suffix of the automaton
+  private final BytesRef commonSuffixRef;
+  // true if the automaton accepts a finite language
+  private final boolean finite;
+  // array of sorted transitions for each state, indexed by state number
+  private final Transition[][] allTransitions;
+  // for path tracking: each long records gen when we last
+  // visited the state; we use gens to avoid having to clear
+  private final long[] visited;
+  private long curGen;
+  // the reference used for seeking forwards through the term dictionary
+  private final BytesRef seekBytesRef = new BytesRef(10); 
+  // true if we are enumerating an infinite portion of the DFA.
+  // in this case it is faster to drive the query based on the terms dictionary.
+  // when this is true, linearUpperBound indicate the end of range
+  // of terms where we should simply do sequential reads instead.
+  private boolean linear = false;
+  private final BytesRef linearUpperBound = new BytesRef(10);
+  private final Comparator<BytesRef> termComp;
 
-  final String[] utf8Data = new String[] {
-    // unpaired low surrogate
-    "ab\udc17cd", "ab\ufffdcd",
-    "\udc17abcd", "\ufffdabcd",
-    "\udc17", "\ufffd",
-    "ab\udc17\udc17cd", "ab\ufffd\ufffdcd",
-    "\udc17\udc17abcd", "\ufffd\ufffdabcd",
-    "\udc17\udc17", "\ufffd\ufffd",
+  /**
+   * Construct an enumerator based upon an automaton, enumerating the specified
+   * field, working on a supplied TermsEnum
+   * <p>
+   * @lucene.experimental 
+   * <p>
+   * @param compiled CompiledAutomaton
+   */
+  public AutomatonTermsEnum(TermsEnum tenum, CompiledAutomaton compiled) throws IOException {
+    super(tenum);
+    this.finite = compiled.finite;
+    this.runAutomaton = compiled.runAutomaton;
+    assert this.runAutomaton != null;
+    this.commonSuffixRef = compiled.commonSuffixRef;
+    this.allTransitions = compiled.sortedTransitions;
 
-    // unpaired high surrogate
-    "ab\ud917cd", "ab\ufffdcd",
-    "\ud917abcd", "\ufffdabcd",
-    "\ud917", "\ufffd",
-    "ab\ud917\ud917cd", "ab\ufffd\ufffdcd",
-    "\ud917\ud917abcd", "\ufffd\ufffdabcd",
-    "\ud917\ud917", "\ufffd\ufffd",
+    // used for path tracking, where each bit is a numbered state.
+    visited = new long[runAutomaton.getSize()];
 
-    // backwards surrogates
-    "ab\udc17\ud917cd", "ab\ufffd\ufffdcd",
-    "\udc17\ud917abcd", "\ufffd\ufffdabcd",
-    "\udc17\ud917", "\ufffd\ufffd",
-    "ab\udc17\ud917\udc17\ud917cd", "ab\ufffd\ud917\udc17\ufffdcd",
-    "\udc17\ud917\udc17\ud917abcd", "\ufffd\ud917\udc17\ufffdabcd",
-    "\udc17\ud917\udc17\ud917", "\ufffd\ud917\udc17\ufffd"
-  };
-  
-  private int nextInt(int lim) {
-    return random.nextInt(lim);
-  }
-
-  private int nextInt(int start, int end) {
-    return start + nextInt(end-start);
-  }
-  
-  private boolean fillUnicode(char[] buffer, char[] expected, int offset, int count) {
-    final int len = offset + count;
-    boolean hasIllegal = false;
-
-    if (offset > 0 && buffer[offset] >= 0xdc00 && buffer[offset] < 0xe000)
-      // Don't start in the middle of a valid surrogate pair
-      offset--;
-
-    for(int i=offset;i<len;i++) {
-      int t = nextInt(6);
-      if (0 == t && i < len-1) {
-        // Make a surrogate pair
-        // High surrogate
-        expected[i] = buffer[i++] = (char) nextInt(0xd800, 0xdc00);
-        // Low surrogate
-        expected[i] = buffer[i] = (char) nextInt(0xdc00, 0xe000);
-      } else if (t <= 1)
-        expected[i] = buffer[i] = (char) nextInt(0x80);
-      else if (2 == t)
-        expected[i] = buffer[i] = (char) nextInt(0x80, 0x800);
-      else if (3 == t)
-        expected[i] = buffer[i] = (char) nextInt(0x800, 0xd800);
-      else if (4 == t)
-        expected[i] = buffer[i] = (char) nextInt(0xe000, 0xffff);
-      else if (5 == t && i < len-1) {
-        // Illegal unpaired surrogate
-        if (nextInt(10) == 7) {
-          if (random.nextBoolean())
-            buffer[i] = (char) nextInt(0xd800, 0xdc00);
-          else
-            buffer[i] = (char) nextInt(0xdc00, 0xe000);
-          expected[i++] = 0xfffd;
-          expected[i] = buffer[i] = (char) nextInt(0x800, 0xd800);
-          hasIllegal = true;
-        } else
-          expected[i] = buffer[i] = (char) nextInt(0x800, 0xd800);
-      } else {
-        expected[i] = buffer[i] = ' ';
-      }
-    }
-
-    return hasIllegal;
+    termComp = getComparator();
   }
   
-  // both start & end are inclusive
-  private final int getInt(Random r, int start, int end) {
-    return start + r.nextInt(1+end-start);
-  }
-
-  private final String asUnicodeChar(char c) {
-    return "U+" + Integer.toHexString(c);
-  }
-
-  private final String termDesc(String s) {
-    final String s0;
-    assertTrue(s.length() <= 2);
-    if (s.length() == 1) {
-      s0 = asUnicodeChar(s.charAt(0));
+  /**
+   * Returns true if the term matches the automaton. Also stashes away the term
+   * to assist with smart enumeration.
+   */
+  @Override
+  protected AcceptStatus accept(final BytesRef term) {
+    if (commonSuffixRef == null || term.endsWith(commonSuffixRef)) {
+      if (runAutomaton.run(term.bytes, term.offset, term.length))
+        return linear ? AcceptStatus.YES : AcceptStatus.YES_AND_SEEK;
+      else
+        return (linear && termComp.compare(term, linearUpperBound) < 0) ? 
+            AcceptStatus.NO : AcceptStatus.NO_AND_SEEK;
     } else {
-      s0 = asUnicodeChar(s.charAt(0)) + "," + asUnicodeChar(s.charAt(1));
+      return (linear && termComp.compare(term, linearUpperBound) < 0) ? 
+          AcceptStatus.NO : AcceptStatus.NO_AND_SEEK;
     }
-    return s0;
+  }
+  
+  @Override
+  protected BytesRef nextSeekTerm(final BytesRef term) throws IOException {
+    //System.out.println("ATE.nextSeekTerm term=" + term);
+    if (term == null) {
+      assert seekBytesRef.length == 0;
+      // return the empty term, as its valid
+      if (runAutomaton.isAccept(runAutomaton.getInitialState())) {   
+        return seekBytesRef;
+      }
+    } else {
+      seekBytesRef.copy(term);
+    }
+
+    // seek to the next possible string;
+    if (nextString()) {
+      return seekBytesRef;  // reposition
+    } else {
+      return null;          // no more possible strings can match
+    }
   }
 
-  private void checkTermsOrder(IndexReader r, Set<String> allTerms, boolean isTop) throws IOException {
-    TermsEnum terms = MultiFields.getFields(r).terms("f").iterator(null);
-
-    BytesRef last = new BytesRef();
-
-    Set<String> seenTerms = new HashSet<String>();
-
-    while(true) {
-      final BytesRef term = terms.next();
-      if (term == null) {
+  /**
+   * Sets the enum to operate in linear fashion, as we have found
+   * a looping transition at position: we set an upper bound and 
+   * act like a TermRangeQuery for this portion of the term space.
+   */
+  private void setLinear(int position) {
+    assert linear == false;
+    
+    int state = runAutomaton.getInitialState();
+    int maxInterval = 0xff;
+    for (int i = 0; i < position; i++) {
+      state = runAutomaton.step(state, seekBytesRef.bytes[i] & 0xff);
+      assert state >= 0: "state=" + state;
+    }
+    for (int i = 0; i < allTransitions[state].length; i++) {
+      Transition t = allTransitions[state][i];
+      if (t.getMin() <= (seekBytesRef.bytes[position] & 0xff) && 
+          (seekBytesRef.bytes[position] & 0xff) <= t.getMax()) {
+        maxInterval = t.getMax();
         break;
       }
-
-      assertTrue(last.compareTo(term) < 0);
-      last.copy(term);
-
-      final String s = term.utf8ToString();
-      assertTrue("term " + termDesc(s) + " was not added to index (count=" + allTerms.size() + ")", allTerms.contains(s));
-      seenTerms.add(s);
     }
-
-    if (isTop) {
-      assertTrue(allTerms.equals(seenTerms));
-    }
-
-    // Test seeking:
-    Iterator<String> it = seenTerms.iterator();
-    while(it.hasNext()) {
-      BytesRef tr = new BytesRef(it.next());
-      assertEquals("seek failed for term=" + termDesc(tr.utf8ToString()),
-                   TermsEnum.SeekStatus.FOUND,
-                   terms.seekCeil(tr));
-    }
+    // 0xff terms don't get the optimization... not worth the trouble.
+    if (maxInterval != 0xff)
+      maxInterval++;
+    int length = position + 1; /* position + maxTransition */
+    if (linearUpperBound.bytes.length < length)
+      linearUpperBound.bytes = new byte[length];
+    System.arraycopy(seekBytesRef.bytes, 0, linearUpperBound.bytes, 0, position);
+    linearUpperBound.bytes[position] = (byte) maxInterval;
+    linearUpperBound.length = length;
+    
+    linear = true;
   }
 
-  // LUCENE-510
-  public void testRandomUnicodeStrings() throws Throwable {
-    char[] buffer = new char[20];
-    char[] expected = new char[20];
-
-    BytesRef utf8 = new BytesRef(20);
-    CharsRef utf16 = new CharsRef(20);
-
-    int num = atLeast(100000);
-    for (int iter = 0; iter < num; iter++) {
-      boolean hasIllegal = fillUnicode(buffer, expected, 0, 20);
-
-      UnicodeUtil.UTF16toUTF8(buffer, 0, 20, utf8);
-      if (!hasIllegal) {
-        byte[] b = new String(buffer, 0, 20).getBytes("UTF-8");
-        assertEquals(b.length, utf8.length);
-        for(int i=0;i<b.length;i++)
-          assertEquals(b[i], utf8.bytes[i]);
-      }
-
-      UnicodeUtil.UTF8toUTF16(utf8.bytes, 0, utf8.length, utf16);
-      assertEquals(utf16.length, 20);
-      for(int i=0;i<20;i++)
-        assertEquals(expected[i], utf16.chars[i]);
-    }
-  }
-
-  // LUCENE-510
-  public void testAllUnicodeChars() throws Throwable {
-
-    BytesRef utf8 = new BytesRef(10);
-    CharsRef utf16 = new CharsRef(10);
-    char[] chars = new char[2];
-    for(int ch=0;ch<0x0010FFFF;ch++) {
-
-      if (ch == 0xd800)
-        // Skip invalid code points
-        ch = 0xe000;
-
-      int len = 0;
-      if (ch <= 0xffff) {
-        chars[len++] = (char) ch;
-      } else {
-        chars[len++] = (char) (((ch-0x0010000) >> 10) + UnicodeUtil.UNI_SUR_HIGH_START);
-        chars[len++] = (char) (((ch-0x0010000) & 0x3FFL) + UnicodeUtil.UNI_SUR_LOW_START);
-      }
-
-      UnicodeUtil.UTF16toUTF8(chars, 0, len, utf8);
-
-      String s1 = new String(chars, 0, len);
-      String s2 = new String(utf8.bytes, 0, utf8.length, "UTF-8");
-      assertEquals("codepoint " + ch, s1, s2);
-
-      UnicodeUtil.UTF8toUTF16(utf8.bytes, 0, utf8.length, utf16);
-      assertEquals("codepoint " + ch, s1, new String(utf16.chars, 0, utf16.length));
-
-      byte[] b = s1.getBytes("UTF-8");
-      assertEquals(utf8.length, b.length);
-      for(int j=0;j<utf8.length;j++)
-        assertEquals(utf8.bytes[j], b[j]);
-    }
-  }
+  private final IntsRef savedStates = new IntsRef(10);
   
-  public void testEmbeddedFFFF() throws Throwable {
-    Directory d = newDirectory();
-    IndexWriter w = new IndexWriter(d, newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer(random)));
-    Document doc = new Document();
-    doc.add(newField("field", "a a\uffffb", TextField.TYPE_UNSTORED));
-    w.addDocument(doc);
-    doc = new Document();
-    doc.add(newField("field", "a", TextField.TYPE_UNSTORED));
-    w.addDocument(doc);
-    IndexReader r = w.getReader();
-    assertEquals(1, r.docFreq(new Term("field", "a\uffffb")));
-    r.close();
-    w.close();
-    d.close();
-  }
-
-  // LUCENE-510
-  public void testInvalidUTF16() throws Throwable {
-    Directory dir = newDirectory();
-    IndexWriter w = new IndexWriter(dir, newIndexWriterConfig( TEST_VERSION_CURRENT, new TestIndexWriter.StringSplitAnalyzer()));
-    Document doc = new Document();
-
-    final int count = utf8Data.length/2;
-    for(int i=0;i<count;i++)
-      doc.add(newField("f" + i, utf8Data[2*i], TextField.TYPE_STORED));
-    w.addDocument(doc);
-    w.close();
-
-    IndexReader ir = IndexReader.open(dir, true);
-    Document doc2 = ir.document(0);
-    for(int i=0;i<count;i++) {
-      assertEquals("field " + i + " was not indexed correctly", 1, ir.docFreq(new Term("f"+i, utf8Data[2*i+1])));
-      assertEquals("field " + i + " is incorrect", utf8Data[2*i+1], doc2.getField("f"+i).stringValue());
-    }
-    ir.close();
-    dir.close();
-  }
-  
-  // Make sure terms, including ones with surrogate pairs,
-  // sort in codepoint sort order by default
-  public void testTermUTF16SortOrder() throws Throwable {
-    Random rnd = random;
-    Directory dir = newDirectory();
-    RandomIndexWriter writer = new RandomIndexWriter(rnd, dir);
-    Document d = new Document();
-    // Single segment
-    Field f = newField("f", "", StringField.TYPE_UNSTORED);
-    d.add(f);
-    char[] chars = new char[2];
-    final Set<String> allTerms = new HashSet<String>();
-
-    int num = atLeast(200);
-    for (int i = 0; i < num; i++) {
-
-      final String s;
-      if (rnd.nextBoolean()) {
-        // Single char
-        if (rnd.nextBoolean()) {
-          // Above surrogates
-          chars[0] = (char) getInt(rnd, 1+UnicodeUtil.UNI_SUR_LOW_END, 0xffff);
-        } else {
-          // Below surrogates
-          chars[0] = (char) getInt(rnd, 0, UnicodeUtil.UNI_SUR_HIGH_START-1);
+  /**
+   * Increments the byte buffer to the next String in binary order after s that will not put
+   * the machine into a reject state. If such a string does not exist, returns
+   * false.
+   * 
+   * The correctness of this method depends upon the automaton being deterministic,
+   * and having no transitions to dead states.
+   * 
+   * @return true if more possible solutions exist for the DFA
+   */
+  private boolean nextString() {
+    int state;
+    int pos = 0;
+    savedStates.grow(seekBytesRef.length+1);
+    final int[] states = savedStates.ints;
+    states[0] = runAutomaton.getInitialState();
+    
+    while (true) {
+      curGen++;
+      linear = false;
+      // walk the automaton until a character is rejected.
+      for (state = states[pos]; pos < seekBytesRef.length; pos++) {
+        visited[state] = curGen;
+        int nextState = runAutomaton.step(state, seekBytesRef.bytes[pos] & 0xff);
+        if (nextState == -1)
+          break;
+        states[pos+1] = nextState;
+        // we found a loop, record it for faster enumeration
+        if (!finite && !linear && visited[nextState] == curGen) {
+          setLinear(pos);
         }
-        s = new String(chars, 0, 1);
-      } else {
-        // Surrogate pair
-        chars[0] = (char) getInt(rnd, UnicodeUtil.UNI_SUR_HIGH_START, UnicodeUtil.UNI_SUR_HIGH_END);
-        assertTrue(((int) chars[0]) >= UnicodeUtil.UNI_SUR_HIGH_START && ((int) chars[0]) <= UnicodeUtil.UNI_SUR_HIGH_END);
-        chars[1] = (char) getInt(rnd, UnicodeUtil.UNI_SUR_LOW_START, UnicodeUtil.UNI_SUR_LOW_END);
-        s = new String(chars, 0, 2);
+        state = nextState;
       }
-      allTerms.add(s);
-      f.setValue(s);
 
-      writer.addDocument(d);
-
-      if ((1+i) % 42 == 0) {
-        writer.commit();
+      // take the useful portion, and the last non-reject state, and attempt to
+      // append characters that will match.
+      if (nextString(state, pos)) {
+        return true;
+      } else { /* no more solutions exist from this useful portion, backtrack */
+        if ((pos = backtrack(pos)) < 0) /* no more solutions at all */
+          return false;
+        final int newState = runAutomaton.step(states[pos], seekBytesRef.bytes[pos] & 0xff);
+        if (newState >= 0 && runAutomaton.isAccept(newState))
+          /* String is good to go as-is */
+          return true;
+        /* else advance further */
+        // TODO: paranoia? if we backtrack thru an infinite DFA, the loop detection is important!
+        // for now, restart from scratch for all infinite DFAs 
+        if (!finite) pos = 0;
       }
     }
-
-    IndexReader r = writer.getReader();
-
-    // Test each sub-segment
-    final IndexReader[] subs = r.getSequentialSubReaders();
-    for(int i=0;i<subs.length;i++) {
-      checkTermsOrder(subs[i], allTerms, false);
+  }
+  
+  /**
+   * Returns the next String in lexicographic order that will not put
+   * the machine into a reject state. 
+   * 
+   * This method traverses the DFA from the given position in the String,
+   * starting at the given state.
+   * 
+   * If this cannot satisfy the machine, returns false. This method will
+   * walk the minimal path, in lexicographic order, as long as possible.
+   * 
+   * If this method returns false, then there might still be more solutions,
+   * it is necessary to backtrack to find out.
+   * 
+   * @param state current non-reject state
+   * @param position useful portion of the string
+   * @return true if more possible solutions exist for the DFA from this
+   *         position
+   */
+  private boolean nextString(int state, int position) {
+    /* 
+     * the next lexicographic character must be greater than the existing
+     * character, if it exists.
+     */
+    int c = 0;
+    if (position < seekBytesRef.length) {
+      c = seekBytesRef.bytes[position] & 0xff;
+      // if the next byte is 0xff and is not part of the useful portion,
+      // then by definition it puts us in a reject state, and therefore this
+      // path is dead. there cannot be any higher transitions. backtrack.
+      if (c++ == 0xff)
+        return false;
     }
-    checkTermsOrder(r, allTerms, true);
 
-    // Test multi segment
-    r.close();
+    seekBytesRef.length = position;
+    visited[state] = curGen;
 
-    writer.forceMerge(1);
+    Transition transitions[] = allTransitions[state];
 
-    // Test single segment
-    r = writer.getReader();
-    checkTermsOrder(r, allTerms, true);
-    r.close();
-
-    writer.close();
-    dir.close();
+    // find the minimal path (lexicographic order) that is >= c
+    
+    for (int i = 0; i < transitions.length; i++) {
+      Transition transition = transitions[i];
+      if (transition.getMax() >= c) {
+        int nextChar = Math.max(c, transition.getMin());
+        // append either the next sequential char, or the minimum transition
+        seekBytesRef.grow(seekBytesRef.length + 1);
+        seekBytesRef.length++;
+        seekBytesRef.bytes[seekBytesRef.length - 1] = (byte) nextChar;
+        state = transition.getDest().getNumber();
+        /* 
+         * as long as is possible, continue down the minimal path in
+         * lexicographic order. if a loop or accept state is encountered, stop.
+         */
+        while (visited[state] != curGen && !runAutomaton.isAccept(state)) {
+          visited[state] = curGen;
+          /* 
+           * Note: we work with a DFA with no transitions to dead states.
+           * so the below is ok, if it is not an accept state,
+           * then there MUST be at least one transition.
+           */
+          transition = allTransitions[state][0];
+          state = transition.getDest().getNumber();
+          
+          // append the minimum transition
+          seekBytesRef.grow(seekBytesRef.length + 1);
+          seekBytesRef.length++;
+          seekBytesRef.bytes[seekBytesRef.length - 1] = (byte) transition.getMin();
+          
+          // we found a loop, record it for faster enumeration
+          if (!finite && !linear && visited[state] == curGen) {
+            setLinear(seekBytesRef.length-1);
+          }
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+  
+  /**
+   * Attempts to backtrack thru the string after encountering a dead end
+   * at some given position. Returns false if no more possible strings 
+   * can match.
+   * 
+   * @param position current position in the input String
+   * @return position >=0 if more possible solutions exist for the DFA
+   */
+  private int backtrack(int position) {
+    while (position-- > 0) {
+      int nextChar = seekBytesRef.bytes[position] & 0xff;
+      // if a character is 0xff its a dead-end too,
+      // because there is no higher character in binary sort order.
+      if (nextChar++ != 0xff) {
+        seekBytesRef.bytes[position] = (byte) nextChar;
+        seekBytesRef.length = position+1;
+        return position;
+      }
+    }
+    return -1; /* all solutions exhausted */
   }
 }

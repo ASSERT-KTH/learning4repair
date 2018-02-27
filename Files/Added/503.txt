@@ -1,9 +1,6 @@
-Policy.getPolicy().refresh();
+public final Map<String, Integer> mergedGroupCounts = new HashMap<String, Integer>();
 
-/*
- *
- * Derby - Class org.apache.derbyTesting.functionTests.util.SecurityManagerSetup
- *
+/**
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -11,374 +8,328 @@ Policy.getPolicy().refresh();
  * (the "License"); you may not use this file except in compliance with
  * the License.  You may obtain a copy of the License at
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing, 
- * software distributed under the License is distributed on an 
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, 
- * either express or implied. See the License for the specific 
- * language governing permissions and limitations under the License.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
-package org.apache.derbyTesting.junit;
 
-import java.io.File;
-import java.net.URL;
-import java.security.AccessController;
-import java.security.Policy;
-import java.security.PrivilegedActionException;
-import java.util.Enumeration;
-import java.util.Properties;
+package org.apache.solr.handler.component;
 
+import org.apache.lucene.search.Query;
+import org.apache.lucene.search.grouping.SearchGroup;
+import org.apache.lucene.search.grouping.TopGroups;
+import org.apache.solr.common.SolrDocument;
+import org.apache.solr.common.SolrDocumentList;
+import org.apache.solr.common.util.NamedList;
+import org.apache.solr.common.util.RTimer;
+import org.apache.solr.common.util.SimpleOrderedMap;
+import org.apache.solr.request.SolrQueryRequest;
+import org.apache.solr.request.SolrRequestInfo;
+import org.apache.solr.response.SolrQueryResponse;
+import org.apache.solr.search.DocListAndSet;
+import org.apache.solr.search.QParser;
+import org.apache.solr.search.SolrIndexSearcher;
+import org.apache.solr.search.SortSpec;
+import org.apache.solr.search.grouping.GroupingSpecification;
+import org.apache.solr.search.grouping.distributed.command.QueryCommandResult;
 
-import junit.extensions.TestSetup;
-import junit.framework.Test;
-import junit.framework.TestSuite;
+import java.util.*;
 
 /**
- * Setup for running Derby JUnit tests with the SecurityManager
- * which is the default for tests.
+ * This class is experimental and will be changing in the future.
  *
+ * @version $Id$
+ * @since solr 1.3
  */
-public final class SecurityManagerSetup extends TestSetup {
-	
-	private static final Properties classPathSet = new Properties();
-    
-    /**
-     * True if the classes are loaded from jars.
-     */
-    static boolean isJars;
-	
-	/**
-	 * True if a security manager was installed outside of the
-	 * control of this class and BaseTestCase.
-	 */
-	private static final boolean externalSecurityManagerInstalled;
-	
-	static {
-		// Determine what the set of properties
-		// describing the environment is.
-		externalSecurityManagerInstalled = determineClasspath();
-        
-	}
-	
-	private final String decoratorPolicyResource;
-	public SecurityManagerSetup(Test test, String policyResource)
-	{
-		super(test);
-		this.decoratorPolicyResource = policyResource;
-	}
-	
-	/**
-	 * Get a decorator that will ensure no security manger
-	 * is installed to run a test. Not supported for suites.
-	 * <BR>
-	 * An empty suite is returned if a security manager was installed
-	 * externally, i.e. not under the control of the BaseTestCase
-	 * and this code. In this case the code can not support the
-	 * mode of no security manager as it may not have enough information
-	 * to re-install the security manager. So the passed in test
-	 * will be skipped.
-     * 
-     * @param test Test to run without a security manager. Note that
-     * this must be an instance of BaseTestCase as this call depends
-     * on setup code in that class. Arbitrary Test instances cannot be passed in.
-	 */
-	public static Test noSecurityManager(Test test)
-	{
-		if (externalSecurityManagerInstalled)
-			return new TestSuite("skipped due to external security manager "
-                    + test.toString());
-		return new SecurityManagerSetup(test, "<NONE>");
-	}
+public class ResponseBuilder
+{
+  public SolrQueryRequest req;
+  public SolrQueryResponse rsp;
+  public boolean doHighlights;
+  public boolean doFacets;
+  public boolean doStats;
+  public boolean doTerms;
 
-	/**
-	 * "Install" no security manager.
-	 * 
-	 */
-	static void noSecurityManager()
-	{
-		installSecurityManager("<NONE>");
-	}
-	
-	/**
-	 * Install specific polciy file with the security manager
-	 * including the special case of no security manager.
-	 */
-	protected void setUp() {
-		installSecurityManager(decoratorPolicyResource);
-	}
-    
-    protected void tearDown() throws Exception
-    {
-        if ("<NONE>".equals(decoratorPolicyResource))
-            BaseTestCase.setSystemProperty("java.security.policy", "");
-        else if ( !externalSecurityManagerInstalled )
-        {
-            uninstallSecurityManager();
+  private boolean needDocList = false;
+  private boolean needDocSet = false;
+  private int fieldFlags = 0;
+  private boolean debug = false;
+
+  private QParser qparser = null;
+  private String queryString = null;
+  private Query query = null;
+  private List<Query> filters = null;
+  private SortSpec sortSpec = null;
+  private GroupingSpecification groupingSpec;
+
+  private DocListAndSet results = null;
+  private NamedList<Object> debugInfo = null;
+  private RTimer timer = null;
+
+  private Query highlightQuery = null;
+
+  public List<SearchComponent> components;
+
+  SolrRequestInfo requestInfo;
+
+  public ResponseBuilder(SolrQueryRequest req, SolrQueryResponse rsp, List<SearchComponent> components)
+  {
+    this.req = req;
+    this.rsp = rsp;
+    this.components = components;
+    this.requestInfo = SolrRequestInfo.getRequestInfo();
+  }
+
+  //////////////////////////////////////////////////////////
+  //////////////////////////////////////////////////////////
+  //// Distributed Search section
+  //////////////////////////////////////////////////////////
+  //////////////////////////////////////////////////////////
+
+  public static final String FIELD_SORT_VALUES = "fsv";
+  public static final String SHARDS = "shards";
+  public static final String IDS = "ids";
+
+  /***
+  public static final String NUMDOCS = "nd";
+  public static final String DOCFREQS = "tdf";
+  public static final String TERMS = "terms";
+  public static final String EXTRACT_QUERY_TERMS = "eqt";
+  public static final String LOCAL_SHARD = "local";
+  public static final String DOC_QUERY = "dq";
+  ***/
+
+  public static int STAGE_START           = 0;
+  public static int STAGE_PARSE_QUERY     = 1000;
+  public static int STAGE_TOP_GROUPS = 1500;
+  public static int STAGE_EXECUTE_QUERY   = 2000;
+  public static int STAGE_GET_FIELDS      = 3000;
+  public static int STAGE_DONE            = Integer.MAX_VALUE;
+
+  public int stage;  // What stage is this current request at?
+
+  //The address of the Shard
+  public String[] shards;
+  public int shards_rows = -1;
+  public int shards_start = -1;
+  public List<ShardRequest> outgoing;  // requests to be sent
+  public List<ShardRequest> finished;  // requests that have received responses from all shards
+
+
+  public int getShardNum(String shard) {
+    for (int i=0; i<shards.length; i++) {
+      if (shards[i]==shard || shards[i].equals(shard)) return i;
+    }
+    return -1;
+  }
+
+  public void addRequest(SearchComponent me, ShardRequest sreq) {
+    outgoing.add(sreq);
+    if ((sreq.purpose & ShardRequest.PURPOSE_PRIVATE)==0) {
+      // if this isn't a private request, let other components modify it.
+      for (SearchComponent component : components) {
+        if (component != me) {
+          component.modifyRequest(this, me, sreq);
         }
+      }
     }
-	
-    /**
-     * Return the name of the default policy.
-     */
-    public static String getDefaultPolicy()
-    {
-        return "org/apache/derbyTesting/functionTests/util/derby_tests.policy";
+  }
+
+  public GlobalCollectionStat globalCollectionStat;
+
+  public Map<Object, ShardDoc> resultIds;
+  // Maps uniqueKeyValue to ShardDoc, which may be used to
+  // determine order of the doc or uniqueKey in the final
+  // returned sequence.
+  // Only valid after STAGE_EXECUTE_QUERY has completed.
+
+
+  public FacetComponent.FacetInfo _facetInfo;
+  /* private... components that don't own these shouldn't use them */
+  SolrDocumentList _responseDocs;
+  StatsInfo _statsInfo;
+  TermsComponent.TermsHelper _termsHelper;
+
+  // Context fields for grouping
+  public final Map<String, Collection<SearchGroup<String>>> mergedSearchGroups = new HashMap<String, Collection<SearchGroup<String>>>();
+  public final Map<String, Map<SearchGroup<String>, Set<String>>> searchGroupToShards = new HashMap<String, Map<SearchGroup<String>, Set<String>>>();
+  public final Map<String, TopGroups<String>> mergedTopGroups = new HashMap<String, TopGroups<String>>();
+  public final Map<String, QueryCommandResult> mergedQueryCommandResults = new HashMap<String, QueryCommandResult>();
+  public final Map<Object, SolrDocument> retrievedDocuments = new HashMap<Object, SolrDocument>();
+  public int totalHitCount; // Hit count used when distributed grouping is performed.
+  // Used for timeAllowed parameter. First phase elapsed time is subtracted from the time allowed for the second phase.
+  public int firstPhaseElapsedTime;
+
+  /**
+   * Utility function to add debugging info.  This will make sure a valid
+   * debugInfo exists before adding to it.
+   */
+  public void addDebugInfo( String name, Object val )
+  {
+    if( debugInfo == null ) {
+      debugInfo = new SimpleOrderedMap<Object>();
     }
+    debugInfo.add( name, val );
+  }
 
-	/**
-	 * Install a SecurityManager with the default test policy
-	 * file:
-	 * org/apache/derbyTesting/functionTests/util/derby_tests.policy
-	 * 
-	 */
-	static void installSecurityManager()
-	{
-		installSecurityManager( getDefaultPolicy() );
-	}
-	
-	private static void installSecurityManager(String policyFile)
-			 {
+  //-------------------------------------------------------------------------
+  //-------------------------------------------------------------------------
 
-		if (externalSecurityManagerInstalled)
-			return;
-		
-		Properties set = new Properties(classPathSet);
-		setSecurityPolicy(set, policyFile);
+  public boolean isDebug() {
+    return debug;
+  }
 
-		SecurityManager sm = System.getSecurityManager();
-		if (sm != null) {
-			// SecurityManager installed, see if it has the same settings.
+  public void setDebug(boolean debug) {
+    this.debug = debug;
+  }
 
-			String  newPolicyProperty = set.getProperty("java.security.policy" );
-			if ( newPolicyProperty == null ) { newPolicyProperty = ""; } 
-                                                   
-			String  oldPolicyProperty = BaseTestCase.getSystemProperty("java.security.policy");
+  public NamedList<Object> getDebugInfo() {
+    return debugInfo;
+  }
 
-			if ( oldPolicyProperty == null ) { oldPolicyProperty = ""; }
+  public void setDebugInfo(NamedList<Object> debugInfo) {
+    this.debugInfo = debugInfo;
+  }
 
-			if ( newPolicyProperty.equals( oldPolicyProperty ) ) { return; }
-			
-			// Uninstall the current manager.
-			uninstallSecurityManager();
-		}
-		
-		// Set the system properties from the desired set.
-		for (Enumeration e = set.propertyNames(); e.hasMoreElements();) {
-			String key = (String) e.nextElement();
-			BaseTestCase.setSystemProperty(key, set.getProperty(key));
-		}
-		
-		// Check indicator for no security manager
-		if ("<NONE>".equals(set.getProperty("java.security.policy")))
-			return;
-		
-		// and install
-		AccessController.doPrivileged(new java.security.PrivilegedAction() {
+  public int getFieldFlags() {
+    return fieldFlags;
+  }
+
+  public void setFieldFlags(int fieldFlags) {
+    this.fieldFlags = fieldFlags;
+  }
+
+  public List<Query> getFilters() {
+    return filters;
+  }
+
+  public void setFilters(List<Query> filters) {
+    this.filters = filters;
+  }
+
+  public Query getHighlightQuery() {
+    return highlightQuery;
+  }
+
+  public void setHighlightQuery(Query highlightQuery) {
+    this.highlightQuery = highlightQuery;
+  }
+
+  public boolean isNeedDocList() {
+    return needDocList;
+  }
+
+  public void setNeedDocList(boolean needDocList) {
+    this.needDocList = needDocList;
+  }
+
+  public boolean isNeedDocSet() {
+    return needDocSet;
+  }
+
+  public void setNeedDocSet(boolean needDocSet) {
+    this.needDocSet = needDocSet;
+  }
+
+  public QParser getQparser() {
+    return qparser;
+  }
+
+  public void setQparser(QParser qparser) {
+    this.qparser = qparser;
+  }
+
+  public String getQueryString() {
+    return queryString;
+  }
+
+  public void setQueryString(String qstr) {
+    this.queryString = qstr;
+  }
+
+  public Query getQuery() {
+    return query;
+  }
+
+  public void setQuery(Query query) {
+    this.query = query;
+  }
+
+  public DocListAndSet getResults() {
+    return results;
+  }
+
+  public void setResults(DocListAndSet results) {
+    this.results = results;
+  }
+
+  public SortSpec getSortSpec() {
+    return sortSpec;
+  }
+
+  public void setSortSpec(SortSpec sort) {
+    this.sortSpec = sort;
+  }
+
+  public GroupingSpecification getGroupingSpec() {
+    return groupingSpec;
+  }
+
+  public void setGroupingSpec(GroupingSpecification groupingSpec) {
+    this.groupingSpec = groupingSpec;
+  }
+
+  public boolean grouping() {
+    return groupingSpec != null;
+  }
+
+  public RTimer getTimer() {
+    return timer;
+  }
+
+  public void setTimer(RTimer timer) {
+    this.timer = timer;
+  }
 
 
-                public Object run() {
-                    SecurityManager sm = new SecurityManager();
-				System.setSecurityManager(sm);
- 				return null;
-			}
-		});
+  public static class GlobalCollectionStat {
+    public final long numDocs;
 
-	}
-	
-	private static void setSecurityPolicy(Properties set,
-			String policyResource)
-	{
-		if ("<NONE>".equals(policyResource)) {
-			set.setProperty("java.security.policy", policyResource);
-			return;
-		}
-		URL policyURL = BaseTestCase.getTestResource(policyResource);
+    public final Map<String, Long> dfMap;
 
-		// maybe the passed in resource was an URL to begin with
-		if ( policyURL == null )
-		{
-			try { policyURL = new URL( policyResource ); }
-			catch (Exception e) { System.out.println( "Unreadable url: " + policyResource ); }
-		}
-
-		if (policyURL != null) {
-			set.setProperty("java.security.policy",
-					policyURL.toExternalForm());
-        }
-	}
-
-	
-	/**
-	 * Determine the settings of the classpath in order to configure
-	 * the variables used in the testing policy files.
-	 * Looks for three items:
-	 * 
-	 * Location of derbyTesting.jar via this class
-	 * Location of derby.jar via org.apache.derby.jdbc.EmbeddedSimpleDataSource
-	 * Location of derbyclient.jar via org.apache.derby.jdbc.ClientDataSource
-	 * 
-	 * Two options are supported, either all are in jar files or
-	 * all are on the classpath. Properties are set as follows:
-	 * 
-	 * <P>
-	 * Classpath:
-	 * <BR>
-	 * derbyTesting.codeclasses set to URL of classes folder
-	 * <P>
-	 * Jar files:
-	 * <BR>
-	 * derbyTesting.codejar - URL of derby.jar,
-	 * derbynet.jar and derbytools.jar, all assumed to be in the
-	 * same location.
-	 * <BR>
-	 * derbyTesting.clientjar - URL of derbyclient.jar
-	 * <BR>
-	 * derbyTesting.testjar - URL of derbyTesting.jar
-     * <BR>
-     * derbyTesting.testjarpath - File system path to derbyTesting.jar
-     * if the jar has a URL with a file protocol.
-	 * 
-	 */
-	private static boolean determineClasspath()
-	{
-		// Security manager already installed, assume that
-		// it is set up correctly.
-		if (System.getSecurityManager() != null) {		
-			return true;
-		}
-
-		//We need the junit classes to instantiate this class, so the
-		//following should not cause runtime errors.
-        URL junit = getURL(junit.framework.Test.class);
-        if (junit != null)
-            classPathSet.setProperty("derbyTesting.junit", junit.toExternalForm());
-	
-        // Load indirectly so we don't need ant-junit.jar at compile time.
-        URL antjunit = getURL("org.apache.tools.ant.taskdefs.optional.junit.JUnitTestRunner");
-        if (antjunit != null)
-            classPathSet.setProperty("derbyTesting.antjunit", antjunit.toExternalForm());
-
-		
-        /* When inserting XML values that use external DTD's, the JAXP
-         * parser needs permission to read the DTD files.  So here we set
-         * a property to hold the location of the JAXP implementation
-         * jar file.  We can then grant the JAXP impl the permissions
-         * needed for reading the DTD files.
-         */
-        String jaxp = XML.getJAXPParserLocation();
-        if (jaxp != null)
-            classPathSet.setProperty("derbyTesting.jaxpjar", jaxp);
-
-		URL testing = getURL(SecurityManagerSetup.class);
-		
-		boolean isClasspath = testing.toExternalForm().endsWith("/");
-		if (isClasspath) {
-			classPathSet.setProperty("derbyTesting.codeclasses",
-					testing.toExternalForm());
-            isJars = false;
-			return false;
-		}
-		classPathSet.setProperty("derbyTesting.testjar", stripJar(testing));
-        if (testing.getProtocol().equals("file")) {
-           File f = new File(testing.getPath());
-           classPathSet.setProperty("derbyTesting.testjarpath",
-                                               f.getAbsolutePath());
-        }
-        isJars = true;
-		
-		URL derby = getURL("org.apache.derby.jdbc.EmbeddedSimpleDataSource");
-        if (derby != null)
-		    classPathSet.setProperty("derbyTesting.codejar", stripJar(derby));
-
-		// if we attempt to check on availability of the ClientDataSource with 
-		// JSR169, attempts will be made to load classes not supported in
-		// that environment, such as javax.naming.Referenceable. See DERBY-2269.
-		if (!JDBC.vmSupportsJSR169()) {
-		    URL client = getURL("org.apache.derby.jdbc.ClientDataSource");
-		    if(client != null)
-		        classPathSet.setProperty("derbyTesting.clientjar", stripJar(client));
-		}
-	
-		return false;
-	}
-    
-    /**
-     * Return the policy file system properties for use
-     * by the old test harness. This ensures a consistent
-     * approach to setting the properties. There are the
-     * properties used to define the jar file location in
-     * any policy files.
-     */
-    public static Properties getPolicyFilePropertiesForOldHarness()
-    {
-        return classPathSet;
+    public GlobalCollectionStat(int numDocs, Map<String, Long> dfMap) {
+      this.numDocs = numDocs;
+      this.dfMap = dfMap;
     }
-	
-	/**
-	 * Strip off the last token which will be the jar name.
-	 * The returned string includes the trailing slash.
-	 * @param url
-	 * @return the jar name from the URL as a String
-	 */
-	private static String stripJar(URL url)
-	{
-		String ef = url.toExternalForm();
-		return ef.substring(0, ef.lastIndexOf('/') + 1);
-	}
-    
-    /**
-     * Get the URL of the code base from a class name.
-     * If the class cannot be loaded, null is returned.
-     */
-    static URL getURL(String className) {
-        try {
-            return getURL(Class.forName(className));
-        } catch (ClassNotFoundException e) {
-            return null;
-        }
+  }
+
+  /**
+   * Creates a SolrIndexSearcher.QueryCommand from this
+   * ResponseBuilder.  TimeAllowed is left unset.
+   */
+  public SolrIndexSearcher.QueryCommand getQueryCommand() {
+    SolrIndexSearcher.QueryCommand cmd = new SolrIndexSearcher.QueryCommand();
+    cmd.setQuery( getQuery() )
+      .setFilterList( getFilters() )
+      .setSort( getSortSpec().getSort() )
+      .setOffset( getSortSpec().getOffset() )
+      .setLen( getSortSpec().getCount() )
+      .setFlags( getFieldFlags() )
+      .setNeedDocSet( isNeedDocSet() );
+    return cmd;
+  }
+
+  /**
+   * Sets results from a SolrIndexSearcher.QueryResult.
+   */
+  public void setResult( SolrIndexSearcher.QueryResult result ) {
+    setResults( result.getDocListAndSet() );
+    if( result.isPartialResults() ) {
+      rsp.getResponseHeader().add( "partialResults", Boolean.TRUE );
     }
-	
-	/**
-	 * Get the URL of the code base from a class.
-	 */
-	static URL getURL(final Class cl)
-	{
-		return (URL)
-		   AccessController.doPrivileged(new java.security.PrivilegedAction() {
-
-			public Object run() {
-
-                /* It's possible that the class does not have a "codeSource"
-                 * associated with it (ex. if it is embedded within the JVM,
-                 * as can happen with Xalan and/or a JAXP parser), so in that
-                 * case we just return null.
-                 */
-                if (cl.getProtectionDomain().getCodeSource() == null)
-                    return null;
-
-				return cl.getProtectionDomain().getCodeSource().getLocation();
-			}
-		});
-	}
-
-    /**
-     * Remove the security manager.
-     */
-    private static void uninstallSecurityManager()
-    {
-
-            AccessController.doPrivileged
-            (
-             new java.security.PrivilegedAction()
-             {
-                 public Object run() {
-                      System.setSecurityManager(null);
-                     return null;
-                 }
-             }
-             );
-
-    }
-
+  }
 }

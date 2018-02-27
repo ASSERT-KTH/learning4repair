@@ -1,4 +1,4 @@
-package org.apache.lucene.document;
+package org.apache.lucene.util;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -16,377 +16,366 @@ package org.apache.lucene.document;
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+import java.io.IOException;
+import java.util.Arrays;
+import java.util.List;
 
-import java.io.StringReader;
+import org.apache.lucene.store.DataOutput;
 
-import org.apache.lucene.analysis.EmptyTokenizer;
-import org.apache.lucene.analysis.MockAnalyzer;
-import org.apache.lucene.index.DirectoryReader;
-import org.apache.lucene.index.DocsAndPositionsEnum;
-import org.apache.lucene.index.Fields;
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.IndexWriter;
-import org.apache.lucene.index.IndexWriterConfig;
-import org.apache.lucene.index.IndexableField;
-import org.apache.lucene.index.RandomIndexWriter;
-import org.apache.lucene.index.Term;
-import org.apache.lucene.index.Terms;
-import org.apache.lucene.index.TermsEnum;
-import org.apache.lucene.search.IndexSearcher;
-import org.apache.lucene.search.Query;
-import org.apache.lucene.search.ScoreDoc;
-import org.apache.lucene.search.TermQuery;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.LuceneTestCase;
+import static org.apache.lucene.util.RamUsageEstimator.NUM_BYTES_OBJECT_REF;
 
+/** 
+ * Class that Posting and PostingVector use to write byte
+ * streams into shared fixed-size byte[] arrays.  The idea
+ * is to allocate slices of increasing lengths For
+ * example, the first slice is 5 bytes, the next slice is
+ * 14, etc.  We start by writing our bytes into the first
+ * 5 bytes.  When we hit the end of the slice, we allocate
+ * the next slice and then write the address of the new
+ * slice into the last 4 bytes of the previous slice (the
+ * "forwarding address").
+ *
+ * Each slice is filled with 0's initially, and we mark
+ * the end with a non-zero byte.  This way the methods
+ * that are writing into the slice don't need to record
+ * its length and instead allocate a new slice once they
+ * hit a non-zero byte. 
+ * 
+ * @lucene.internal
+ **/
+public final class ByteBlockPool {
+  public final static int BYTE_BLOCK_SHIFT = 15;
+  public final static int BYTE_BLOCK_SIZE = 1 << BYTE_BLOCK_SHIFT;
+  public final static int BYTE_BLOCK_MASK = BYTE_BLOCK_SIZE - 1;
 
-/**
- * Tests {@link Document} class.
- */
-public class TestDocument extends LuceneTestCase {
-  
-  String binaryVal = "this text will be stored as a byte array in the index";
-  String binaryVal2 = "this text will be also stored as a byte array in the index";
-  
-  public void testBinaryField() throws Exception {
-    Document doc = new Document();
-    
-    FieldType ft = new FieldType();
-    ft.setStored(true);
-    IndexableField stringFld = new Field("string", binaryVal, ft);
-    IndexableField binaryFld = new StoredField("binary", binaryVal.getBytes());
-    IndexableField binaryFld2 = new StoredField("binary", binaryVal2.getBytes());
-    
-    doc.add(stringFld);
-    doc.add(binaryFld);
-    
-    assertEquals(2, doc.getFields().size());
-    
-    assertTrue(binaryFld.binaryValue() != null);
-    assertTrue(binaryFld.fieldType().stored());
-    assertFalse(binaryFld.fieldType().indexed());
-    assertFalse(binaryFld.fieldType().tokenized());
-    
-    String binaryTest = doc.getBinaryValue("binary").utf8ToString();
-    assertTrue(binaryTest.equals(binaryVal));
-    
-    String stringTest = doc.get("string");
-    assertTrue(binaryTest.equals(stringTest));
-    
-    doc.add(binaryFld2);
-    
-    assertEquals(3, doc.getFields().size());
-    
-    BytesRef[] binaryTests = doc.getBinaryValues("binary");
-    
-    assertEquals(2, binaryTests.length);
-    
-    binaryTest = binaryTests[0].utf8ToString();
-    String binaryTest2 = binaryTests[1].utf8ToString();
-    
-    assertFalse(binaryTest.equals(binaryTest2));
-    
-    assertTrue(binaryTest.equals(binaryVal));
-    assertTrue(binaryTest2.equals(binaryVal2));
-    
-    doc.removeField("string");
-    assertEquals(2, doc.getFields().size());
-    
-    doc.removeFields("binary");
-    assertEquals(0, doc.getFields().size());
-  }
-  
-  /**
-   * Tests {@link Document#removeField(String)} method for a brand new Document
-   * that has not been indexed yet.
-   * 
-   * @throws Exception on error
-   */
-  public void testRemoveForNewDocument() throws Exception {
-    Document doc = makeDocumentWithFields();
-    assertEquals(8, doc.getFields().size());
-    doc.removeFields("keyword");
-    assertEquals(6, doc.getFields().size());
-    doc.removeFields("doesnotexists"); // removing non-existing fields is
-                                       // siltenlty ignored
-    doc.removeFields("keyword"); // removing a field more than once
-    assertEquals(6, doc.getFields().size());
-    doc.removeField("text");
-    assertEquals(5, doc.getFields().size());
-    doc.removeField("text");
-    assertEquals(4, doc.getFields().size());
-    doc.removeField("text");
-    assertEquals(4, doc.getFields().size());
-    doc.removeField("doesnotexists"); // removing non-existing fields is
-                                      // siltenlty ignored
-    assertEquals(4, doc.getFields().size());
-    doc.removeFields("unindexed");
-    assertEquals(2, doc.getFields().size());
-    doc.removeFields("unstored");
-    assertEquals(0, doc.getFields().size());
-    doc.removeFields("doesnotexists"); // removing non-existing fields is
-                                       // siltenlty ignored
-    assertEquals(0, doc.getFields().size());
-  }
-  
-  public void testConstructorExceptions() {
-    FieldType ft = new FieldType();
-    ft.setStored(true);
-    new Field("name", "value", ft); // okay
-    new StringField("name", "value", Field.Store.NO); // okay
-    try {
-      new Field("name", "value", new FieldType());
-      fail();
-    } catch (IllegalArgumentException e) {
-      // expected exception
+  /** Abstract class for allocating and freeing byte
+   *  blocks. */
+  public abstract static class Allocator {
+    protected final int blockSize;
+
+    public Allocator(int blockSize) {
+      this.blockSize = blockSize;
     }
-    new Field("name", "value", ft); // okay
-    try {
-      FieldType ft2 = new FieldType();
-      ft2.setStored(true);
-      ft2.setStoreTermVectors(true);
-      new Field("name", "value", ft2);
-      fail();
-    } catch (IllegalArgumentException e) {
-      // expected exception
+
+    public abstract void recycleByteBlocks(byte[][] blocks, int start, int end);
+
+    public void recycleByteBlocks(List<byte[]> blocks) {
+      final byte[][] b = blocks.toArray(new byte[blocks.size()][]);
+      recycleByteBlocks(b, 0, b.length);
+    }
+
+    public byte[] getByteBlock() {
+      return new byte[blockSize];
     }
   }
   
-  /**
-   * Tests {@link Document#getValues(String)} method for a brand new Document
-   * that has not been indexed yet.
-   * 
-   * @throws Exception on error
-   */
-  public void testGetValuesForNewDocument() throws Exception {
-    doAssert(makeDocumentWithFields(), false);
-  }
-  
-  /**
-   * Tests {@link Document#getValues(String)} method for a Document retrieved
-   * from an index.
-   * 
-   * @throws Exception on error
-   */
-  public void testGetValuesForIndexedDocument() throws Exception {
-    Directory dir = newDirectory();
-    RandomIndexWriter writer = new RandomIndexWriter(random(), dir);
-    writer.addDocument(makeDocumentWithFields());
-    IndexReader reader = writer.getReader();
+  /** A simple {@link Allocator} that never recycles. */
+  public static final class DirectAllocator extends Allocator {
     
-    IndexSearcher searcher = newSearcher(reader);
-    
-    // search for something that does exists
-    Query query = new TermQuery(new Term("keyword", "test1"));
-    
-    // ensure that queries return expected results without DateFilter first
-    ScoreDoc[] hits = searcher.search(query, null, 1000).scoreDocs;
-    assertEquals(1, hits.length);
-    
-    doAssert(searcher.doc(hits[0].doc), true);
-    writer.close();
-    reader.close();
-    dir.close();
-  }
-
-  public void testGetValues() {
-    Document doc = makeDocumentWithFields();
-    assertEquals(new String[] {"test1", "test2"},
-                 doc.getValues("keyword"));
-    assertEquals(new String[] {"test1", "test2"},
-                 doc.getValues("text"));
-    assertEquals(new String[] {"test1", "test2"},
-                 doc.getValues("unindexed"));
-    assertEquals(new String[0],
-                 doc.getValues("nope"));
-  }
-  
-  private Document makeDocumentWithFields() {
-    Document doc = new Document();
-    FieldType stored = new FieldType();
-    stored.setStored(true);
-    doc.add(new StringField("keyword", "test1", Field.Store.YES));
-    doc.add(new StringField("keyword", "test2", Field.Store.YES));
-    doc.add(new TextField("text", "test1", Field.Store.YES));
-    doc.add(new TextField("text", "test2", Field.Store.YES));
-    doc.add(new Field("unindexed", "test1", stored));
-    doc.add(new Field("unindexed", "test2", stored));
-    doc
-        .add(new TextField("unstored", "test1", Field.Store.NO));
-    doc
-        .add(new TextField("unstored", "test2", Field.Store.NO));
-    return doc;
-  }
-  
-  private void doAssert(Document doc, boolean fromIndex) {
-    IndexableField[] keywordFieldValues = doc.getFields("keyword");
-    IndexableField[] textFieldValues = doc.getFields("text");
-    IndexableField[] unindexedFieldValues = doc.getFields("unindexed");
-    IndexableField[] unstoredFieldValues = doc.getFields("unstored");
-    
-    assertTrue(keywordFieldValues.length == 2);
-    assertTrue(textFieldValues.length == 2);
-    assertTrue(unindexedFieldValues.length == 2);
-    // this test cannot work for documents retrieved from the index
-    // since unstored fields will obviously not be returned
-    if (!fromIndex) {
-      assertTrue(unstoredFieldValues.length == 2);
+    public DirectAllocator() {
+      this(BYTE_BLOCK_SIZE);
     }
-    
-    assertTrue(keywordFieldValues[0].stringValue().equals("test1"));
-    assertTrue(keywordFieldValues[1].stringValue().equals("test2"));
-    assertTrue(textFieldValues[0].stringValue().equals("test1"));
-    assertTrue(textFieldValues[1].stringValue().equals("test2"));
-    assertTrue(unindexedFieldValues[0].stringValue().equals("test1"));
-    assertTrue(unindexedFieldValues[1].stringValue().equals("test2"));
-    // this test cannot work for documents retrieved from the index
-    // since unstored fields will obviously not be returned
-    if (!fromIndex) {
-      assertTrue(unstoredFieldValues[0].stringValue().equals("test1"));
-      assertTrue(unstoredFieldValues[1].stringValue().equals("test2"));
+
+    public DirectAllocator(int blockSize) {
+      super(blockSize);
+    }
+
+    @Override
+    public void recycleByteBlocks(byte[][] blocks, int start, int end) {
     }
   }
   
-  public void testFieldSetValue() throws Exception {
+  /** A simple {@link Allocator} that never recycles, but
+   *  tracks how much total RAM is in use. */
+  public static class DirectTrackingAllocator extends Allocator {
+    private final Counter bytesUsed;
     
-    Field field = new StringField("id", "id1", Field.Store.YES);
-    Document doc = new Document();
-    doc.add(field);
-    doc.add(new StringField("keyword", "test", Field.Store.YES));
-    
-    Directory dir = newDirectory();
-    RandomIndexWriter writer = new RandomIndexWriter(random(), dir);
-    writer.addDocument(doc);
-    field.setStringValue("id2");
-    writer.addDocument(doc);
-    field.setStringValue("id3");
-    writer.addDocument(doc);
-    
-    IndexReader reader = writer.getReader();
-    IndexSearcher searcher = newSearcher(reader);
-    
-    Query query = new TermQuery(new Term("keyword", "test"));
-    
-    // ensure that queries return expected results without DateFilter first
-    ScoreDoc[] hits = searcher.search(query, null, 1000).scoreDocs;
-    assertEquals(3, hits.length);
-    int result = 0;
-    for (int i = 0; i < 3; i++) {
-      Document doc2 = searcher.doc(hits[i].doc);
-      Field f = (Field) doc2.getField("id");
-      if (f.stringValue().equals("id1")) result |= 1;
-      else if (f.stringValue().equals("id2")) result |= 2;
-      else if (f.stringValue().equals("id3")) result |= 4;
-      else fail("unexpected id field");
+    public DirectTrackingAllocator(Counter bytesUsed) {
+      this(BYTE_BLOCK_SIZE, bytesUsed);
     }
-    writer.close();
-    reader.close();
-    dir.close();
-    assertEquals("did not see all IDs", 7, result);
-  }
-  
-  // LUCENE-3616
-  public void testInvalidFields() {
-    try {
-      new Field("foo", new EmptyTokenizer(new StringReader("")), StringField.TYPE_STORED);
-      fail("did not hit expected exc");
-    } catch (IllegalArgumentException iae) {
-      // expected
+
+    public DirectTrackingAllocator(int blockSize, Counter bytesUsed) {
+      super(blockSize);
+      this.bytesUsed = bytesUsed;
     }
-  }
 
-  // LUCENE-3682
-  public void testTransitionAPI() throws Exception {
-    Directory dir = newDirectory();
-    RandomIndexWriter w = new RandomIndexWriter(random(), dir);
+    public byte[] getByteBlock() {
+      bytesUsed.addAndGet(blockSize);
+      return new byte[blockSize];
+    }
 
-    Document doc = new Document();
-    doc.add(new Field("stored", "abc", Field.Store.YES, Field.Index.NO));
-    doc.add(new Field("stored_indexed", "abc xyz", Field.Store.YES, Field.Index.NOT_ANALYZED));
-    doc.add(new Field("stored_tokenized", "abc xyz", Field.Store.YES, Field.Index.ANALYZED));
-    doc.add(new Field("indexed", "abc xyz", Field.Store.NO, Field.Index.NOT_ANALYZED));
-    doc.add(new Field("tokenized", "abc xyz", Field.Store.NO, Field.Index.ANALYZED));
-    doc.add(new Field("tokenized_reader", new StringReader("abc xyz")));
-    doc.add(new Field("tokenized_tokenstream", w.w.getAnalyzer().tokenStream("tokenized_tokenstream", new StringReader("abc xyz"))));
-    doc.add(new Field("binary", new byte[10]));
-    doc.add(new Field("tv", "abc xyz", Field.Store.NO, Field.Index.ANALYZED, Field.TermVector.YES));
-    doc.add(new Field("tv_pos", "abc xyz", Field.Store.NO, Field.Index.ANALYZED, Field.TermVector.WITH_POSITIONS));
-    doc.add(new Field("tv_off", "abc xyz", Field.Store.NO, Field.Index.ANALYZED, Field.TermVector.WITH_OFFSETS));
-    doc.add(new Field("tv_pos_off", "abc xyz", Field.Store.NO, Field.Index.ANALYZED, Field.TermVector.WITH_POSITIONS_OFFSETS));
-    w.addDocument(doc);
-    IndexReader r = w.getReader();
-    w.close();
-
-    doc = r.document(0);
-    // 4 stored fields
-    assertEquals(4, doc.getFields().size());
-    assertEquals("abc", doc.get("stored"));
-    assertEquals("abc xyz", doc.get("stored_indexed"));
-    assertEquals("abc xyz", doc.get("stored_tokenized"));
-    final BytesRef br = doc.getBinaryValue("binary");
-    assertNotNull(br);
-    assertEquals(10, br.length);
-
-    IndexSearcher s = new IndexSearcher(r);
-    assertEquals(1, s.search(new TermQuery(new Term("stored_indexed", "abc xyz")), 1).totalHits);
-    assertEquals(1, s.search(new TermQuery(new Term("stored_tokenized", "abc")), 1).totalHits);
-    assertEquals(1, s.search(new TermQuery(new Term("stored_tokenized", "xyz")), 1).totalHits);
-    assertEquals(1, s.search(new TermQuery(new Term("indexed", "abc xyz")), 1).totalHits);
-    assertEquals(1, s.search(new TermQuery(new Term("tokenized", "abc")), 1).totalHits);
-    assertEquals(1, s.search(new TermQuery(new Term("tokenized", "xyz")), 1).totalHits);
-    assertEquals(1, s.search(new TermQuery(new Term("tokenized_reader", "abc")), 1).totalHits);
-    assertEquals(1, s.search(new TermQuery(new Term("tokenized_reader", "xyz")), 1).totalHits);
-    assertEquals(1, s.search(new TermQuery(new Term("tokenized_tokenstream", "abc")), 1).totalHits);
-    assertEquals(1, s.search(new TermQuery(new Term("tokenized_tokenstream", "xyz")), 1).totalHits);
-
-    for(String field : new String[] {"tv", "tv_pos", "tv_off", "tv_pos_off"}) {
-      Fields tvFields = r.getTermVectors(0);
-      Terms tvs = tvFields.terms(field);
-      assertNotNull(tvs);
-      assertEquals(2, tvs.size());
-      TermsEnum tvsEnum = tvs.iterator(null);
-      assertEquals(new BytesRef("abc"), tvsEnum.next());
-      final DocsAndPositionsEnum dpEnum = tvsEnum.docsAndPositions(null, null, false);
-      if (field.equals("tv")) {
-        assertNull(dpEnum);
-      } else {
-        assertNotNull(dpEnum);
+    @Override
+    public void recycleByteBlocks(byte[][] blocks, int start, int end) {
+      bytesUsed.addAndGet(-((end-start)* blockSize));
+      for (int i = start; i < end; i++) {
+        blocks[i] = null;
       }
-      assertEquals(new BytesRef("xyz"), tvsEnum.next());
-      assertNull(tvsEnum.next());
     }
+  };
 
-    r.close();
-    dir.close();
+  /**
+   * array of buffers currently used in the pool. Buffers are allocated if
+   * needed don't modify this outside of this class.
+   */
+  public byte[][] buffers = new byte[10][];
+  
+  /** index into the buffers array pointing to the current buffer used as the head */
+  private int bufferUpto = -1;                        // Which buffer we are upto
+  /** Where we are in head buffer */
+  public int byteUpto = BYTE_BLOCK_SIZE;
+
+  /** Current head buffer */
+  public byte[] buffer;
+  /** Current head offset */
+  public int byteOffset = -BYTE_BLOCK_SIZE;
+
+  private final Allocator allocator;
+
+  public ByteBlockPool(Allocator allocator) {
+    this.allocator = allocator;
   }
   
-  public void testBoost() throws Exception {
-    Directory dir = newDirectory();
-    IndexWriterConfig iwc = new IndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random()));
-    iwc.setMergePolicy(newLogMergePolicy());
-    IndexWriter iw = new IndexWriter(dir, iwc);
-    Document doc = new Document();
-    doc.add(new StringField("field1", "sometext", Field.Store.YES));
-    doc.add(new TextField("field2", "sometext", Field.Store.NO));
-    doc.add(new StringField("foo", "bar", Field.Store.NO));
-    iw.addDocument(doc); // add an 'ok' document
-    try {
-      doc = new Document();
-      // try to boost with norms omitted
-      StringField field = new StringField("foo", "baz", Field.Store.NO);
-      field.setBoost(5.0f);
-      doc.add(field);
-      iw.addDocument(doc);
-      fail("didn't get any exception, boost silently discarded");
-    } catch (UnsupportedOperationException expected) {
-      // expected
+  /**
+   * Resets the pool to its initial state reusing the first buffer and fills all
+   * buffers with <tt>0</tt> bytes before they reused or passed to
+   * {@link Allocator#recycleByteBlocks(byte[][], int, int)}. Calling
+   * {@link ByteBlockPool#nextBuffer()} is not needed after reset.
+   */
+  public void reset() {
+    reset(true, true);
+  }
+  
+  /**
+   * Expert: Resets the pool to its initial state reusing the first buffer. Calling
+   * {@link ByteBlockPool#nextBuffer()} is not needed after reset. 
+   * @param zeroFillBuffers if <code>true</code> the buffers are filled with <tt>0</tt>. 
+   *        This should be set to <code>true</code> if this pool is used with slices.
+   * @param reuseFirst if <code>true</code> the first buffer will be reused and calling
+   *        {@link ByteBlockPool#nextBuffer()} is not needed after reset iff the 
+   *        block pool was used before ie. {@link ByteBlockPool#nextBuffer()} was called before.
+   */
+  public void reset(boolean zeroFillBuffers, boolean reuseFirst) {
+    if (bufferUpto != -1) {
+      // We allocated at least one buffer
+
+      if (zeroFillBuffers) {
+        for(int i=0;i<bufferUpto;i++) {
+          // Fully zero fill buffers that we fully used
+          Arrays.fill(buffers[i], (byte) 0);
+        }
+        // Partial zero fill the final buffer
+        Arrays.fill(buffers[bufferUpto], 0, byteUpto, (byte) 0);
+      }
+     
+     if (bufferUpto > 0 || !reuseFirst) {
+       final int offset = reuseFirst ? 1 : 0;  
+       // Recycle all but the first buffer
+       allocator.recycleByteBlocks(buffers, offset, 1+bufferUpto);
+       Arrays.fill(buffers, offset, 1+bufferUpto, null);
+     }
+     if (reuseFirst) {
+       // Re-use the first buffer
+       bufferUpto = 0;
+       byteUpto = 0;
+       byteOffset = 0;
+       buffer = buffers[0];
+     } else {
+       bufferUpto = -1;
+       buffers[0] = null;
+       byteUpto = BYTE_BLOCK_SIZE;
+       byteOffset = -BYTE_BLOCK_SIZE;
+       buffer = null;
+     }
     }
-    DirectoryReader ir = DirectoryReader.open(iw, false);
-    assertEquals(1, ir.numDocs());
-    assertEquals("sometext", ir.document(0).get("field1"));
-    ir.close();
-    iw.close();
-    dir.close();
+  }
+  /**
+   * Advances the pool to its next buffer. This method should be called once
+   * after the constructor to initialize the pool. In contrast to the
+   * constructor a {@link ByteBlockPool#reset()} call will advance the pool to
+   * its first buffer immediately.
+   */
+  public void nextBuffer() {
+    if (1+bufferUpto == buffers.length) {
+      byte[][] newBuffers = new byte[ArrayUtil.oversize(buffers.length+1,
+                                                        NUM_BYTES_OBJECT_REF)][];
+      System.arraycopy(buffers, 0, newBuffers, 0, buffers.length);
+      buffers = newBuffers;
+    }
+    buffer = buffers[1+bufferUpto] = allocator.getByteBlock();
+    bufferUpto++;
+
+    byteUpto = 0;
+    byteOffset += BYTE_BLOCK_SIZE;
+  }
+  
+  /**
+   * Allocates a new slice with the given size. 
+   * @see ByteBlockPool#FIRST_LEVEL_SIZE
+   */
+  public int newSlice(final int size) {
+    if (byteUpto > BYTE_BLOCK_SIZE-size)
+      nextBuffer();
+    final int upto = byteUpto;
+    byteUpto += size;
+    buffer[byteUpto-1] = 16;
+    return upto;
+  }
+
+  // Size of each slice.  These arrays should be at most 16
+  // elements (index is encoded with 4 bits).  First array
+  // is just a compact way to encode X+1 with a max.  Second
+  // array is the length of each slice, ie first slice is 5
+  // bytes, next slice is 14 bytes, etc.
+  
+  /**
+   * An array holding the offset into the {@link ByteBlockPool#LEVEL_SIZE_ARRAY}
+   * to quickly navigate to the next slice level.
+   */
+  public final static int[] NEXT_LEVEL_ARRAY = {1, 2, 3, 4, 5, 6, 7, 8, 9, 9};
+  
+  /**
+   * An array holding the level sizes for byte slices.
+   */
+  public final static int[] LEVEL_SIZE_ARRAY = {5, 14, 20, 30, 40, 40, 80, 80, 120, 200};
+  
+  /**
+   * The first level size for new slices
+   * @see ByteBlockPool#newSlice(int)
+   */
+  public final static int FIRST_LEVEL_SIZE = LEVEL_SIZE_ARRAY[0];
+
+  /**
+   * Creates a new byte slice with the given starting size and 
+   * returns the slices offset in the pool.
+   */
+  public int allocSlice(final byte[] slice, final int upto) {
+
+    final int level = slice[upto] & 15;
+    final int newLevel = NEXT_LEVEL_ARRAY[level];
+    final int newSize = LEVEL_SIZE_ARRAY[newLevel];
+
+    // Maybe allocate another block
+    if (byteUpto > BYTE_BLOCK_SIZE-newSize)
+      nextBuffer();
+
+    final int newUpto = byteUpto;
+    final int offset = newUpto + byteOffset;
+    byteUpto += newSize;
+
+    // Copy forward the past 3 bytes (which we are about
+    // to overwrite with the forwarding address):
+    buffer[newUpto] = slice[upto-3];
+    buffer[newUpto+1] = slice[upto-2];
+    buffer[newUpto+2] = slice[upto-1];
+
+    // Write forwarding address at end of last slice:
+    slice[upto-3] = (byte) (offset >>> 24);
+    slice[upto-2] = (byte) (offset >>> 16);
+    slice[upto-1] = (byte) (offset >>> 8);
+    slice[upto] = (byte) offset;
+        
+    // Write new level:
+    buffer[byteUpto-1] = (byte) (16|newLevel);
+
+    return newUpto+3;
+  }
+
+  // Fill in a BytesRef from term's length & bytes encoded in
+  // byte block
+  public final BytesRef setBytesRef(BytesRef term, int textStart) {
+    final byte[] bytes = term.bytes = buffers[textStart >> BYTE_BLOCK_SHIFT];
+    int pos = textStart & BYTE_BLOCK_MASK;
+    if ((bytes[pos] & 0x80) == 0) {
+      // length is 1 byte
+      term.length = bytes[pos];
+      term.offset = pos+1;
+    } else {
+      // length is 2 bytes
+      term.length = (bytes[pos]&0x7f) + ((bytes[pos+1]&0xff)<<7);
+      term.offset = pos+2;
+    }
+    assert term.length >= 0;
+    return term;
+  }
+  /**
+   * Dereferences the byte block according to {@link BytesRef} offset. The offset 
+   * is interpreted as the absolute offset into the {@link ByteBlockPool}.
+   */
+  public final BytesRef deref(BytesRef bytes) {
+    final int offset = bytes.offset;
+    byte[] buffer = buffers[offset >> BYTE_BLOCK_SHIFT];
+    int pos = offset & BYTE_BLOCK_MASK;
+    bytes.bytes = buffer;
+    bytes.offset = pos;
+    return bytes;
+  }
+  
+  /**
+   * Copies the given {@link BytesRef} at the current positions (
+   * {@link #byteUpto} across buffer boundaries
+   */
+  public final void copy(final BytesRef bytes) {
+    int length = bytes.length;
+    int offset = bytes.offset;
+    int overflow = (length + byteUpto) - BYTE_BLOCK_SIZE;
+    do {
+      if (overflow <= 0) { 
+        System.arraycopy(bytes.bytes, offset, buffer, byteUpto, length);
+        byteUpto += length;
+        break;
+      } else {
+        final int bytesToCopy = length-overflow;
+        System.arraycopy(bytes.bytes, offset, buffer, byteUpto, bytesToCopy);
+        offset += bytesToCopy;
+        length -= bytesToCopy;
+        nextBuffer();
+        overflow = overflow - BYTE_BLOCK_SIZE;
+      }
+    }  while(true);
+  }
+  
+  /**
+   * Copies bytes from the pool starting at the given offset with the given  
+   * length into the given {@link BytesRef} at offset <tt>0</tt> and returns it.
+   * <p>Note: this method allows to copy across block boundaries.</p>
+   */
+  public final BytesRef copyFrom(final BytesRef bytes, final int offset, final int length) {
+    bytes.offset = 0;
+    bytes.grow(length);
+    bytes.length = length;
+    int bufferIndex = offset >> BYTE_BLOCK_SHIFT;
+    byte[] buffer = buffers[bufferIndex];
+    int pos = offset & BYTE_BLOCK_MASK;
+    int overflow = (pos + length) - BYTE_BLOCK_SIZE;
+    do {
+      if (overflow <= 0) {
+        System.arraycopy(buffer, pos, bytes.bytes, bytes.offset, bytes.length);
+        bytes.length = length;
+        bytes.offset = 0;
+        break;
+      } else {
+        final int bytesToCopy = length - overflow;
+        System.arraycopy(buffer, pos, bytes.bytes, bytes.offset, bytesToCopy);
+        pos = 0;
+        bytes.length -= bytesToCopy;
+        bytes.offset += bytesToCopy;
+        buffer = buffers[++bufferIndex];
+        overflow = overflow - BYTE_BLOCK_SIZE;
+      }
+    } while (true);
+    return bytes;
+  }
+  
+  /**
+   * Writes the pools content to the given {@link DataOutput}
+   */
+  public final void writePool(final DataOutput out) throws IOException {
+    int bytesOffset = byteOffset;
+    int block = 0;
+    while (bytesOffset > 0) {
+      out.writeBytes(buffers[block++], BYTE_BLOCK_SIZE);
+      bytesOffset -= BYTE_BLOCK_SIZE;
+    }
+    out.writeBytes(buffers[block], byteUpto);
   }
 }

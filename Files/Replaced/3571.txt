@@ -1,6 +1,6 @@
-w.shutdown();
+writer.shutdown();
 
-package org.apache.lucene.search;
+package org.apache.lucene.index;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,197 +19,384 @@ package org.apache.lucene.search;
  * limitations under the License.
  */
 
-import java.io.*;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.lucene.analysis.MockAnalyzer;
-import org.apache.lucene.document.*;
-import org.apache.lucene.index.*;
-import org.apache.lucene.search.BooleanClause.Occur;
-import org.apache.lucene.search.Scorer.ChildScorer;
-import org.apache.lucene.store.*;
-import org.apache.lucene.util.*;
-import org.junit.AfterClass;
-import org.junit.BeforeClass;
-import org.junit.Test;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.Field;
+import org.apache.lucene.document.FieldType;
+import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.Query;
+import org.apache.lucene.search.ScoreDoc;
+import org.apache.lucene.search.TermQuery;
+import org.apache.lucene.search.TopDocs;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.util.LuceneTestCase;
+import org.apache.lucene.util.TestUtil;
 
-public class TestSubScorerFreqs extends LuceneTestCase {
+public class TestStressNRT extends LuceneTestCase {
+  volatile DirectoryReader reader;
 
-  private static Directory dir;
-  private static IndexSearcher s;
+  final ConcurrentHashMap<Integer,Long> model = new ConcurrentHashMap<>();
+  Map<Integer,Long> committedModel = new HashMap<>();
+  long snapshotCount;
+  long committedModelClock;
+  volatile int lastId;
+  final String field = "val_l";
+  Object[] syncArr;
 
-  @BeforeClass
-  public static void makeIndex() throws Exception {
-    dir = new RAMDirectory();
-    RandomIndexWriter w = new RandomIndexWriter(
-        random(), dir, newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())).setMergePolicy(newLogMergePolicy()));
-    // make sure we have more than one segment occationally
-    int num = atLeast(31);
-    for (int i = 0; i < num; i++) {
-      Document doc = new Document();
-      doc.add(newTextField("f", "a b c d b c d c d d", Field.Store.NO));
-      w.addDocument(doc);
+  private void initModel(int ndocs) {
+    snapshotCount = 0;
+    committedModelClock = 0;
+    lastId = 0;
 
-      doc = new Document();
-      doc.add(newTextField("f", "a b c d", Field.Store.NO));
-      w.addDocument(doc);
+    syncArr = new Object[ndocs];
+
+    for (int i=0; i<ndocs; i++) {
+      model.put(i, -1L);
+      syncArr[i] = new Object();
     }
-
-    s = newSearcher(w.getReader());
-    w.close();
+    committedModel.putAll(model);
   }
 
-  @AfterClass
-  public static void finish() throws Exception {
-    s.getIndexReader().close();
-    s = null;
-    dir.close();
-    dir = null;
-  }
-
-  private static class CountingCollector extends FilterCollector {
-    public final Map<Integer, Map<Query, Float>> docCounts = new HashMap<>();
-
-    private final Map<Query, Scorer> subScorers = new HashMap<>();
-    private final Set<String> relationships;
-
-    public CountingCollector(Collector other) {
-      this(other, new HashSet<>(Arrays.asList("MUST", "SHOULD", "MUST_NOT")));
-    }
-
-    public CountingCollector(Collector other, Set<String> relationships) {
-      super(other);
-      this.relationships = relationships;
-    }
+  public void test() throws Exception {
+    // update variables
+    final int commitPercent = random().nextInt(20);
+    final int softCommitPercent = random().nextInt(100); // what percent of the commits are soft
+    final int deletePercent = random().nextInt(50);
+    final int deleteByQueryPercent = random().nextInt(25);
+    final int ndocs = atLeast(50);
+    final int nWriteThreads = TestUtil.nextInt(random(), 1, TEST_NIGHTLY ? 10 : 5);
+    final int maxConcurrentCommits = TestUtil.nextInt(random(), 1, TEST_NIGHTLY ? 10 : 5);   // number of committers at a time... needed if we want to avoid commit errors due to exceeding the max
     
-    public void setSubScorers(Scorer scorer, String relationship) {
-      for (ChildScorer child : scorer.getChildren()) {
-        if (scorer instanceof AssertingScorer || relationships.contains(child.relationship)) {
-          setSubScorers(child.child, child.relationship);
-        }
-      }
-      subScorers.put(scorer.getWeight().getQuery(), scorer);
+    final boolean tombstones = random().nextBoolean();
+
+    // query variables
+    final AtomicLong operations = new AtomicLong(atLeast(10000));  // number of query operations to perform in total
+
+    final int nReadThreads = TestUtil.nextInt(random(), 1, TEST_NIGHTLY ? 10 : 5);
+    initModel(ndocs);
+
+    final FieldType storedOnlyType = new FieldType();
+    storedOnlyType.setStored(true);
+
+    if (VERBOSE) {
+      System.out.println("\n");
+      System.out.println("TEST: commitPercent=" + commitPercent);
+      System.out.println("TEST: softCommitPercent=" + softCommitPercent);
+      System.out.println("TEST: deletePercent=" + deletePercent);
+      System.out.println("TEST: deleteByQueryPercent=" + deleteByQueryPercent);
+      System.out.println("TEST: ndocs=" + ndocs);
+      System.out.println("TEST: nWriteThreads=" + nWriteThreads);
+      System.out.println("TEST: nReadThreads=" + nReadThreads);
+      System.out.println("TEST: maxConcurrentCommits=" + maxConcurrentCommits);
+      System.out.println("TEST: tombstones=" + tombstones);
+      System.out.println("TEST: operations=" + operations);
+      System.out.println("\n");
     }
-    
-    public LeafCollector getLeafCollector(AtomicReaderContext context)
-        throws IOException {
-      final int docBase = context.docBase;
-      return new FilterLeafCollector(super.getLeafCollector(context)) {
-        
+
+    final AtomicInteger numCommitting = new AtomicInteger();
+
+    List<Thread> threads = new ArrayList<>();
+
+    Directory dir = newDirectory();
+
+    final RandomIndexWriter writer = new RandomIndexWriter(random(), dir, newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())));
+    writer.setDoRandomForceMergeAssert(false);
+    writer.commit();
+    reader = DirectoryReader.open(dir);
+
+    for (int i=0; i<nWriteThreads; i++) {
+      Thread thread = new Thread("WRITER"+i) {
+        Random rand = new Random(random().nextInt());
+
         @Override
-        public void collect(int doc) throws IOException {
-          final Map<Query, Float> freqs = new HashMap<Query, Float>();
-          for (Map.Entry<Query, Scorer> ent : subScorers.entrySet()) {
-            Scorer value = ent.getValue();
-            int matchId = value.docID();
-            freqs.put(ent.getKey(), matchId == doc ? value.freq() : 0.0f);
+        public void run() {
+          try {
+            while (operations.get() > 0) {
+              int oper = rand.nextInt(100);
+
+              if (oper < commitPercent) {
+                if (numCommitting.incrementAndGet() <= maxConcurrentCommits) {
+                  Map<Integer,Long> newCommittedModel;
+                  long version;
+                  DirectoryReader oldReader;
+
+                  synchronized(TestStressNRT.this) {
+                    newCommittedModel = new HashMap<>(model);  // take a snapshot
+                    version = snapshotCount++;
+                    oldReader = reader;
+                    oldReader.incRef();  // increment the reference since we will use this for reopening
+                  }
+
+                  DirectoryReader newReader;
+                  if (rand.nextInt(100) < softCommitPercent) {
+                    // assertU(h.commit("softCommit","true"));
+                    if (random().nextBoolean()) {
+                      if (VERBOSE) {
+                        System.out.println("TEST: " + Thread.currentThread().getName() + ": call writer.getReader");
+                      }
+                      newReader = writer.getReader(true);
+                    } else {
+                      if (VERBOSE) {
+                        System.out.println("TEST: " + Thread.currentThread().getName() + ": reopen reader=" + oldReader + " version=" + version);
+                      }
+                      newReader = DirectoryReader.openIfChanged(oldReader, writer.w, true);
+                    }
+                  } else {
+                    // assertU(commit());
+                    if (VERBOSE) {
+                      System.out.println("TEST: " + Thread.currentThread().getName() + ": commit+reopen reader=" + oldReader + " version=" + version);
+                    }
+                    writer.commit();
+                    if (VERBOSE) {
+                      System.out.println("TEST: " + Thread.currentThread().getName() + ": now reopen after commit");
+                    }
+                    newReader = DirectoryReader.openIfChanged(oldReader);
+                  }
+
+                  // Code below assumes newReader comes w/
+                  // extra ref:
+                  if (newReader == null) {
+                    oldReader.incRef();
+                    newReader = oldReader;
+                  }
+
+                  oldReader.decRef();
+
+                  synchronized(TestStressNRT.this) {
+                    // install the new reader if it's newest (and check the current version since another reader may have already been installed)
+                    //System.out.println(Thread.currentThread().getName() + ": newVersion=" + newReader.getVersion());
+                    assert newReader.getRefCount() > 0;
+                    assert reader.getRefCount() > 0;
+                    if (newReader.getVersion() > reader.getVersion()) {
+                      if (VERBOSE) {
+                        System.out.println("TEST: " + Thread.currentThread().getName() + ": install new reader=" + newReader);
+                      }
+                      reader.decRef();
+                      reader = newReader;
+
+                      // Silly: forces fieldInfos to be
+                      // loaded so we don't hit IOE on later
+                      // reader.toString
+                      newReader.toString();
+
+                      // install this snapshot only if it's newer than the current one
+                      if (version >= committedModelClock) {
+                        if (VERBOSE) {
+                          System.out.println("TEST: " + Thread.currentThread().getName() + ": install new model version=" + version);
+                        }
+                        committedModel = newCommittedModel;
+                        committedModelClock = version;
+                      } else {
+                        if (VERBOSE) {
+                          System.out.println("TEST: " + Thread.currentThread().getName() + ": skip install new model version=" + version);
+                        }
+                      }
+                    } else {
+                      // if the same reader, don't decRef.
+                      if (VERBOSE) {
+                        System.out.println("TEST: " + Thread.currentThread().getName() + ": skip install new reader=" + newReader);
+                      }
+                      newReader.decRef();
+                    }
+                  }
+                }
+                numCommitting.decrementAndGet();
+              } else {
+
+                int id = rand.nextInt(ndocs);
+                Object sync = syncArr[id];
+
+                // set the lastId before we actually change it sometimes to try and
+                // uncover more race conditions between writing and reading
+                boolean before = random().nextBoolean();
+                if (before) {
+                  lastId = id;
+                }
+
+                // We can't concurrently update the same document and retain our invariants of increasing values
+                // since we can't guarantee what order the updates will be executed.
+                synchronized (sync) {
+                  Long val = model.get(id);
+                  long nextVal = Math.abs(val)+1;
+
+                  if (oper < commitPercent + deletePercent) {
+                    // assertU("<delete><id>" + id + "</id></delete>");
+
+                    // add tombstone first
+                    if (tombstones) {
+                      Document d = new Document();
+                      d.add(newStringField("id", "-"+Integer.toString(id), Field.Store.YES));
+                      d.add(newField(field, Long.toString(nextVal), storedOnlyType));
+                      writer.updateDocument(new Term("id", "-"+Integer.toString(id)), d);
+                    }
+
+                    if (VERBOSE) {
+                      System.out.println("TEST: " + Thread.currentThread().getName() + ": term delDocs id:" + id + " nextVal=" + nextVal);
+                    }
+                    writer.deleteDocuments(new Term("id",Integer.toString(id)));
+                    model.put(id, -nextVal);
+                  } else if (oper < commitPercent + deletePercent + deleteByQueryPercent) {
+                    //assertU("<delete><query>id:" + id + "</query></delete>");
+
+                    // add tombstone first
+                    if (tombstones) {
+                      Document d = new Document();
+                      d.add(newStringField("id", "-"+Integer.toString(id), Field.Store.YES));
+                      d.add(newField(field, Long.toString(nextVal), storedOnlyType));
+                      writer.updateDocument(new Term("id", "-"+Integer.toString(id)), d);
+                    }
+
+                    if (VERBOSE) {
+                      System.out.println("TEST: " + Thread.currentThread().getName() + ": query delDocs id:" + id + " nextVal=" + nextVal);
+                    }
+                    writer.deleteDocuments(new TermQuery(new Term("id", Integer.toString(id))));
+                    model.put(id, -nextVal);
+                  } else {
+                    // assertU(adoc("id",Integer.toString(id), field, Long.toString(nextVal)));
+                    Document d = new Document();
+                    d.add(newStringField("id", Integer.toString(id), Field.Store.YES));
+                    d.add(newField(field, Long.toString(nextVal), storedOnlyType));
+                    if (VERBOSE) {
+                      System.out.println("TEST: " + Thread.currentThread().getName() + ": u id:" + id + " val=" + nextVal);
+                    }
+                    writer.updateDocument(new Term("id", Integer.toString(id)), d);
+                    if (tombstones) {
+                      // remove tombstone after new addition (this should be optional?)
+                      writer.deleteDocuments(new Term("id","-"+Integer.toString(id)));
+                    }
+                    model.put(id, nextVal);
+                  }
+                }
+
+                if (!before) {
+                  lastId = id;
+                }
+              }
+            }
+          } catch (Throwable e) {
+            System.out.println(Thread.currentThread().getName() + ": FAILED: unexpected exception");
+            e.printStackTrace(System.out);
+            throw new RuntimeException(e);
           }
-          docCounts.put(doc + docBase, freqs);
-          super.collect(doc);
         }
-        
-        @Override
-        public void setScorer(Scorer scorer) throws IOException {
-          super.setScorer(scorer);
-          subScorers.clear();
-          setSubScorers(scorer, "TOP");
-        }
-        
       };
+
+      threads.add(thread);
     }
 
-  }
+    for (int i=0; i<nReadThreads; i++) {
+      Thread thread = new Thread("READER"+i) {
+        Random rand = new Random(random().nextInt());
 
-  private static final float FLOAT_TOLERANCE = 0.00001F;
+        @Override
+        public void run() {
+          try {
+            IndexReader lastReader = null;
+            IndexSearcher lastSearcher = null;
 
-  @Test
-  public void testTermQuery() throws Exception {
-    TermQuery q = new TermQuery(new Term("f", "d"));
-    CountingCollector c = new CountingCollector(TopScoreDocCollector.create(10,
-        true));
-    s.search(q, null, c);
-    final int maxDocs = s.getIndexReader().maxDoc();
-    assertEquals(maxDocs, c.docCounts.size());
-    for (int i = 0; i < maxDocs; i++) {
-      Map<Query, Float> doc0 = c.docCounts.get(i);
-      assertEquals(1, doc0.size());
-      assertEquals(4.0F, doc0.get(q), FLOAT_TOLERANCE);
+            while (operations.decrementAndGet() >= 0) {
+              // bias toward a recently changed doc
+              int id = rand.nextInt(100) < 25 ? lastId : rand.nextInt(ndocs);
 
-      Map<Query, Float> doc1 = c.docCounts.get(++i);
-      assertEquals(1, doc1.size());
-      assertEquals(1.0F, doc1.get(q), FLOAT_TOLERANCE);
-    }
-  }
+              // when indexing, we update the index, then the model
+              // so when querying, we should first check the model, and then the index
 
-  @Test
-  public void testBooleanQuery() throws Exception {
-    TermQuery aQuery = new TermQuery(new Term("f", "a"));
-    TermQuery dQuery = new TermQuery(new Term("f", "d"));
-    TermQuery cQuery = new TermQuery(new Term("f", "c"));
-    TermQuery yQuery = new TermQuery(new Term("f", "y"));
+              long val;
+              DirectoryReader r;
+              synchronized(TestStressNRT.this) {
+                val = committedModel.get(id);
+                r = reader;
+                r.incRef();
+              }
 
-    BooleanQuery query = new BooleanQuery();
-    BooleanQuery inner = new BooleanQuery();
+              if (VERBOSE) {
+                System.out.println("TEST: " + Thread.currentThread().getName() + ": s id=" + id + " val=" + val + " r=" + r.getVersion());
+              }
 
-    inner.add(cQuery, Occur.SHOULD);
-    inner.add(yQuery, Occur.MUST_NOT);
-    query.add(inner, Occur.MUST);
-    query.add(aQuery, Occur.MUST);
-    query.add(dQuery, Occur.MUST);
-    
-    // Only needed in Java6; Java7+ has a @SafeVarargs annotated Arrays#asList()!
-    // see http://docs.oracle.com/javase/7/docs/api/java/lang/SafeVarargs.html
-    @SuppressWarnings("unchecked") final Iterable<Set<String>> occurList = Arrays.asList(
-        Collections.singleton("MUST"), 
-        new HashSet<>(Arrays.asList("MUST", "SHOULD"))
-    );
-    
-    for (final Set<String> occur : occurList) {
-      CountingCollector c = new CountingCollector(TopScoreDocCollector.create(
-          10, true), occur);
-      s.search(query, null, c);
-      final int maxDocs = s.getIndexReader().maxDoc();
-      assertEquals(maxDocs, c.docCounts.size());
-      boolean includeOptional = occur.contains("SHOULD");
-      for (int i = 0; i < maxDocs; i++) {
-        Map<Query, Float> doc0 = c.docCounts.get(i);
-        assertEquals(includeOptional ? 5 : 4, doc0.size());
-        assertEquals(1.0F, doc0.get(aQuery), FLOAT_TOLERANCE);
-        assertEquals(4.0F, doc0.get(dQuery), FLOAT_TOLERANCE);
-        if (includeOptional) {
-          assertEquals(3.0F, doc0.get(cQuery), FLOAT_TOLERANCE);
+              //  sreq = req("wt","json", "q","id:"+Integer.toString(id), "omitHeader","true");
+              IndexSearcher searcher;
+              if (r == lastReader) {
+                // Just re-use lastSearcher, else
+                // newSearcher may create too many thread
+                // pools (ExecutorService):
+                searcher = lastSearcher;
+              } else {
+                searcher = newSearcher(r);
+                lastReader = r;
+                lastSearcher = searcher;
+              }
+              Query q = new TermQuery(new Term("id",Integer.toString(id)));
+              TopDocs results = searcher.search(q, 10);
+
+              if (results.totalHits == 0 && tombstones) {
+                // if we couldn't find the doc, look for its tombstone
+                q = new TermQuery(new Term("id","-"+Integer.toString(id)));
+                results = searcher.search(q, 1);
+                if (results.totalHits == 0) {
+                  if (val == -1L) {
+                    // expected... no doc was added yet
+                    r.decRef();
+                    continue;
+                  }
+                  fail("No documents or tombstones found for id " + id + ", expected at least " + val + " reader=" + r);
+                }
+              }
+
+              if (results.totalHits == 0 && !tombstones) {
+                // nothing to do - we can't tell anything from a deleted doc without tombstones
+              } else {
+                // we should have found the document, or its tombstone
+                if (results.totalHits != 1) {
+                  System.out.println("FAIL: hits id:" + id + " val=" + val);
+                  for(ScoreDoc sd : results.scoreDocs) {
+                    final StoredDocument doc = r.document(sd.doc);
+                    System.out.println("  docID=" + sd.doc + " id:" + doc.get("id") + " foundVal=" + doc.get(field));
+                  }
+                  fail("id=" + id + " reader=" + r + " totalHits=" + results.totalHits);
+                }
+                StoredDocument doc = searcher.doc(results.scoreDocs[0].doc);
+                long foundVal = Long.parseLong(doc.get(field));
+                if (foundVal < Math.abs(val)) {
+                  fail("foundVal=" + foundVal + " val=" + val + " id=" + id + " reader=" + r);
+                }
+              }
+
+              r.decRef();
+            }
+          } catch (Throwable e) {
+            operations.set(-1L);
+            System.out.println(Thread.currentThread().getName() + ": FAILED: unexpected exception");
+            e.printStackTrace(System.out);
+            throw new RuntimeException(e);
+          }
         }
+      };
 
-        Map<Query, Float> doc1 = c.docCounts.get(++i);
-        assertEquals(includeOptional ? 5 : 4, doc1.size());
-        assertEquals(1.0F, doc1.get(aQuery), FLOAT_TOLERANCE);
-        assertEquals(1.0F, doc1.get(dQuery), FLOAT_TOLERANCE);
-        if (includeOptional) {
-          assertEquals(1.0F, doc1.get(cQuery), FLOAT_TOLERANCE);
-        }
-      }
-    }
-  }
-
-  @Test
-  public void testPhraseQuery() throws Exception {
-    PhraseQuery q = new PhraseQuery();
-    q.add(new Term("f", "b"));
-    q.add(new Term("f", "c"));
-    CountingCollector c = new CountingCollector(TopScoreDocCollector.create(10,
-        true));
-    s.search(q, null, c);
-    final int maxDocs = s.getIndexReader().maxDoc();
-    assertEquals(maxDocs, c.docCounts.size());
-    for (int i = 0; i < maxDocs; i++) {
-      Map<Query, Float> doc0 = c.docCounts.get(i);
-      assertEquals(1, doc0.size());
-      assertEquals(2.0F, doc0.get(q), FLOAT_TOLERANCE);
-
-      Map<Query, Float> doc1 = c.docCounts.get(++i);
-      assertEquals(1, doc1.size());
-      assertEquals(1.0F, doc1.get(q), FLOAT_TOLERANCE);
+      threads.add(thread);
     }
 
+    for (Thread thread : threads) {
+      thread.start();
+    }
+
+    for (Thread thread : threads) {
+      thread.join();
+    }
+
+    writer.close();
+    if (VERBOSE) {
+      System.out.println("TEST: close reader=" + reader);
+    }
+    reader.close();
+    dir.close();
   }
 }

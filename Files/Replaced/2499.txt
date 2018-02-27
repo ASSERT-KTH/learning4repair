@@ -1,611 +1,561 @@
-if (op == Operator.EQ && !bf.isPresent(decoratedKey.key))
+if (start >= current.endOffset) {
 
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- * 
- *   http://www.apache.org/licenses/LICENSE-2.0
- * 
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
+package org.apache.lucene.search.postingshighlight;
+
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
-package org.apache.cassandra.io.sstable;
+import java.io.IOException;
+import java.text.BreakIterator;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.PriorityQueue;
+import java.util.SortedSet;
+import java.util.TreeSet;
 
-import java.io.*;
-import java.util.*;
-import java.lang.ref.ReferenceQueue;
-import java.lang.ref.Reference;
-
-import com.google.common.base.Function;
-import com.google.common.collect.Collections2;
-import org.apache.cassandra.io.util.BufferedRandomAccessFile;
-import org.apache.cassandra.io.util.SegmentedFile;
-import org.apache.cassandra.utils.BloomFilter;
-import org.apache.cassandra.utils.FBUtilities;
-import org.apache.cassandra.utils.Pair;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import org.apache.cassandra.cache.InstrumentedCache;
-import org.apache.cassandra.dht.IPartitioner;
-import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.clock.AbstractReconciler;
-import org.apache.cassandra.db.filter.QueryFilter;
-import org.apache.cassandra.db.marshal.AbstractType;
-import org.apache.cassandra.dht.AbstractBounds;
-import org.apache.cassandra.dht.Range;
-import org.apache.cassandra.io.ICompactSerializer2;
-import org.apache.cassandra.io.util.FileDataInput;
+import org.apache.lucene.index.AtomicReader;
+import org.apache.lucene.index.AtomicReaderContext;
+import org.apache.lucene.index.DocsAndPositionsEnum;
+import org.apache.lucene.index.FieldInfo;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.IndexReaderContext;
+import org.apache.lucene.index.MultiReader;
+import org.apache.lucene.index.ReaderUtil;
+import org.apache.lucene.index.StoredFieldVisitor;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.index.Terms;
+import org.apache.lucene.index.TermsEnum;
+import org.apache.lucene.index.FieldInfo.IndexOptions;
+import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.Query;
+import org.apache.lucene.search.ScoreDoc;
+import org.apache.lucene.search.TopDocs;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.UnicodeUtil;
 
 /**
- * SSTableReaders are open()ed by Table.onStart; after that they are created by SSTableWriter.renameAndOpen.
- * Do not re-call open() on existing SSTable files; use the references kept by ColumnFamilyStore post-start instead.
+ * Simple highlighter that does not analyze fields nor use
+ * term vectors. Instead it requires 
+ * {@link IndexOptions#DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS}.
+ * <p>
+ * PostingsHighlighter treats the single original document as the whole corpus, and then scores individual
+ * passages as if they were documents in this corpus. It uses a {@link BreakIterator} to find 
+ * passages in the text; by default it breaks using {@link BreakIterator#getSentenceInstance(Locale) 
+ * getSentenceInstance(Locale.ROOT)}. It then iterates in parallel (merge sorting by offset) through 
+ * the positions of all terms from the query, coalescing those hits that occur in a single passage 
+ * into a {@link Passage}, and then scores each Passage using a separate {@link PassageScorer}. 
+ * Passages are finally formatted into highlighted snippets with a {@link PassageFormatter}.
+ * <p>
+ * <b>WARNING</b>: The code is very new and may still have some exciting bugs!
+ * <p>
+ * Example usage:
+ * <pre class="prettyprint">
+ *   // configure field with offsets at index time
+ *   FieldType offsetsType = new FieldType(TextField.TYPE_STORED);
+ *   offsetsType.setIndexOptions(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS);
+ *   Field body = new Field("body", "foobar", offsetsType);
+ *
+ *   // retrieve highlights at query time 
+ *   PostingsHighlighter highlighter = new PostingsHighlighter();
+ *   Query query = new TermQuery(new Term("body", "highlighting"));
+ *   TopDocs topDocs = searcher.search(query, n);
+ *   String highlights[] = highlighter.highlight("body", query, searcher, topDocs);
+ * </pre>
+ * <p>
+ * This is thread-safe, and can be used across different readers.
+ * @lucene.experimental
  */
-public class SSTableReader extends SSTable implements Comparable<SSTableReader>
-{
-    private static final Logger logger = LoggerFactory.getLogger(SSTableReader.class);
+public final class PostingsHighlighter {
+  
+  // TODO: maybe allow re-analysis for tiny fields? currently we require offsets,
+  // but if the analyzer is really fast and the field is tiny, this might really be
+  // unnecessary.
+  
+  /** for rewriting: we don't want slow processing from MTQs */
+  private static final IndexReader EMPTY_INDEXREADER = new MultiReader();
+  
+  /** Default maximum content size to process. Typically snippets
+   *  closer to the beginning of the document better summarize its content */
+  public static final int DEFAULT_MAX_LENGTH = 10000;
+    
+  private final int maxLength;
+  private final BreakIterator breakIterator;
+  private final PassageScorer scorer;
+  private final PassageFormatter formatter;
+  
+  /**
+   * Creates a new highlighter with default parameters.
+   */
+  public PostingsHighlighter() {
+    this(DEFAULT_MAX_LENGTH);
+  }
+  
+  /**
+   * Creates a new highlighter, specifying maximum content length.
+   * @param maxLength maximum content size to process.
+   * @throws IllegalArgumentException if <code>maxLength</code> is negative or <code>Integer.MAX_VALUE</code>
+   */
+  public PostingsHighlighter(int maxLength) {
+    this(maxLength, BreakIterator.getSentenceInstance(Locale.ROOT), new PassageScorer(), new PassageFormatter());
+  }
+  
+  /**
+   * Creates a new highlighter with custom parameters.
+   * @param maxLength maximum content size to process.
+   * @param breakIterator used for finding passage boundaries.
+   * @param scorer used for ranking passages.
+   * @param formatter used for formatting passages into highlighted snippets.
+   * @throws IllegalArgumentException if <code>maxLength</code> is negative or <code>Integer.MAX_VALUE</code>
+   */
+  public PostingsHighlighter(int maxLength, BreakIterator breakIterator, PassageScorer scorer, PassageFormatter formatter) {
+    if (maxLength < 0 || maxLength == Integer.MAX_VALUE) {
+      // two reasons: no overflow problems in BreakIterator.preceding(offset+1),
+      // our sentinel in the offsets queue uses this value to terminate.
+      throw new IllegalArgumentException("maxLength must be < Integer.MAX_VALUE");
+    }
+    if (breakIterator == null || scorer == null || formatter == null) {
+      throw new NullPointerException();
+    }
+    this.maxLength = maxLength;
+    this.breakIterator = breakIterator;
+    this.scorer = scorer;
+    this.formatter = formatter;
+  }
+  
+  /**
+   * Highlights the top passages from a single field.
+   * 
+   * @param field field name to highlight. 
+   *        Must have a stored string value and also be indexed with offsets.
+   * @param query query to highlight.
+   * @param searcher searcher that was previously used to execute the query.
+   * @param topDocs TopDocs containing the summary result documents to highlight.
+   * @return Array of formatted snippets corresponding to the documents in <code>topDocs</code>. 
+   *         If no highlights were found for a document, its value is <code>null</code>.
+   * @throws IOException if an I/O error occurred during processing
+   * @throws IllegalArgumentException if <code>field</code> was indexed without 
+   *         {@link IndexOptions#DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS}
+   */
+  public String[] highlight(String field, Query query, IndexSearcher searcher, TopDocs topDocs) throws IOException {
+    return highlight(field, query, searcher, topDocs, 1);
+  }
+  
+  /**
+   * Highlights the top-N passages from a single field.
+   * 
+   * @param field field name to highlight. 
+   *        Must have a stored string value and also be indexed with offsets.
+   * @param query query to highlight.
+   * @param searcher searcher that was previously used to execute the query.
+   * @param topDocs TopDocs containing the summary result documents to highlight.
+   * @param maxPassages The maximum number of top-N ranked passages used to 
+   *        form the highlighted snippets.
+   * @return Array of formatted snippets corresponding to the documents in <code>topDocs</code>. 
+   *         If no highlights were found for a document, its value is <code>null</code>.
+   * @throws IOException if an I/O error occurred during processing
+   * @throws IllegalArgumentException if <code>field</code> was indexed without 
+   *         {@link IndexOptions#DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS}
+   */
+  public String[] highlight(String field, Query query, IndexSearcher searcher, TopDocs topDocs, int maxPassages) throws IOException {
+    Map<String,String[]> res = highlightFields(new String[] { field }, query, searcher, topDocs, maxPassages);
+    return res.get(field);
+  }
+  
+  /**
+   * Highlights the top passages from multiple fields.
+   * <p>
+   * Conceptually, this behaves as a more efficient form of:
+   * <pre class="prettyprint">
+   * Map m = new HashMap();
+   * for (String field : fields) {
+   *   m.put(field, highlight(field, query, searcher, topDocs));
+   * }
+   * return m;
+   * </pre>
+   * 
+   * @param fields field names to highlight. 
+   *        Must have a stored string value and also be indexed with offsets.
+   * @param query query to highlight.
+   * @param searcher searcher that was previously used to execute the query.
+   * @param topDocs TopDocs containing the summary result documents to highlight.
+   * @return Map keyed on field name, containing the array of formatted snippets 
+   *         corresponding to the documents in <code>topDocs</code>. 
+   *         If no highlights were found for a document, its value is <code>null</code>.
+   * @throws IOException if an I/O error occurred during processing
+   * @throws IllegalArgumentException if <code>field</code> was indexed without 
+   *         {@link IndexOptions#DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS}
+   */
+  public Map<String,String[]> highlightFields(String fields[], Query query, IndexSearcher searcher, TopDocs topDocs) throws IOException {
+    return highlightFields(fields, query, searcher, topDocs, 1);
+  }
+  
+  /**
+   * Highlights the top-N passages from multiple fields.
+   * <p>
+   * Conceptually, this behaves as a more efficient form of:
+   * <pre class="prettyprint">
+   * Map m = new HashMap();
+   * for (String field : fields) {
+   *   m.put(field, highlight(field, query, searcher, topDocs, maxPassages));
+   * }
+   * return m;
+   * </pre>
+   * 
+   * @param fields field names to highlight. 
+   *        Must have a stored string value and also be indexed with offsets.
+   * @param query query to highlight.
+   * @param searcher searcher that was previously used to execute the query.
+   * @param topDocs TopDocs containing the summary result documents to highlight.
+   * @param maxPassages The maximum number of top-N ranked passages per-field used to 
+   *        form the highlighted snippets.
+   * @return Map keyed on field name, containing the array of formatted snippets 
+   *         corresponding to the documents in <code>topDocs</code>. 
+   *         If no highlights were found for a document, its value is <code>null</code>.
+   * @throws IOException if an I/O error occurred during processing
+   * @throws IllegalArgumentException if <code>field</code> was indexed without 
+   *         {@link IndexOptions#DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS}
+   */
+  public Map<String,String[]> highlightFields(String fields[], Query query, IndexSearcher searcher, TopDocs topDocs, int maxPassages) throws IOException {
+    final IndexReader reader = searcher.getIndexReader();
+    final ScoreDoc scoreDocs[] = topDocs.scoreDocs;
+    query = rewrite(query);
+    SortedSet<Term> queryTerms = new TreeSet<Term>();
+    query.extractTerms(queryTerms);
 
-    // guesstimated size of INDEX_INTERVAL index entries
-    private static final int INDEX_FILE_BUFFER_BYTES = 16 * IndexSummary.INDEX_INTERVAL;
+    int docids[] = new int[scoreDocs.length];
+    for (int i = 0; i < docids.length; i++) {
+      docids[i] = scoreDocs[i].doc;
+    }
+    IndexReaderContext readerContext = reader.getContext();
+    List<AtomicReaderContext> leaves = readerContext.leaves();
 
-    // `finalizers` is required to keep the PhantomReferences alive after the enclosing SSTR is itself
-    // unreferenced.  otherwise they will never get enqueued.
-    private static final Set<Reference<SSTableReader>> finalizers = new HashSet<Reference<SSTableReader>>();
-    private static final ReferenceQueue<SSTableReader> finalizerQueue = new ReferenceQueue<SSTableReader>()
-    {{
-        Runnable runnable = new Runnable()
-        {
-            public void run()
-            {
-                while (true)
-                {
-                    SSTableDeletingReference r;
-                    try
-                    {
-                        r = (SSTableDeletingReference) finalizerQueue.remove();
-                        finalizers.remove(r);
-                    }
-                    catch (InterruptedException e)
-                    {
-                        throw new RuntimeException(e);
-                    }
-                    try
-                    {
-                        r.cleanup();
-                    }
-                    catch (IOException e)
-                    {
-                        logger.error("Error deleting " + r.path, e);
-                    }
-                }
+    BreakIterator bi = (BreakIterator)breakIterator.clone();
+
+    // sort for sequential io
+    Arrays.sort(docids);
+    Arrays.sort(fields);
+    
+    // pull stored data:
+    LimitedStoredFieldVisitor visitor = new LimitedStoredFieldVisitor(fields, maxLength);
+    String contents[][] = new String[fields.length][docids.length];
+    for (int i = 0; i < docids.length; i++) {
+      searcher.doc(docids[i], visitor);
+      for (int j = 0; j < fields.length; j++) {
+        contents[j][i] = visitor.getValue(j).toString();
+      }
+      visitor.reset();
+    }
+    
+    Map<String,String[]> highlights = new HashMap<String,String[]>();
+    for (int i = 0; i < fields.length; i++) {
+      String field = fields[i];
+      Term floor = new Term(field, "");
+      Term ceiling = new Term(field, UnicodeUtil.BIG_TERM);
+      SortedSet<Term> fieldTerms = queryTerms.subSet(floor, ceiling);
+      // TODO: should we have some reasonable defaults for term pruning? (e.g. stopwords)
+      Term terms[] = fieldTerms.toArray(new Term[fieldTerms.size()]);
+      Map<Integer,String> fieldHighlights = highlightField(field, contents[i], bi, terms, docids, leaves, maxPassages);
+        
+      String[] result = new String[scoreDocs.length];
+      for (int j = 0; j < scoreDocs.length; j++) {
+        result[j] = fieldHighlights.get(scoreDocs[j].doc);
+      }
+      highlights.put(field, result);
+    }
+    return highlights;
+  }
+    
+  private Map<Integer,String> highlightField(String field, String contents[], BreakIterator bi, Term terms[], int[] docids, List<AtomicReaderContext> leaves, int maxPassages) throws IOException {  
+    Map<Integer,String> highlights = new HashMap<Integer,String>();
+    
+    // reuse in the real sense... for docs in same segment we just advance our old enum
+    DocsAndPositionsEnum postings[] = null;
+    TermsEnum termsEnum = null;
+    int lastLeaf = -1;
+    
+    for (int i = 0; i < docids.length; i++) {
+      String content = contents[i];
+      if (content.length() == 0) {
+        continue; // nothing to do
+      }
+      bi.setText(content);
+      int doc = docids[i];
+      int leaf = ReaderUtil.subIndex(doc, leaves);
+      AtomicReaderContext subContext = leaves.get(leaf);
+      AtomicReader r = subContext.reader();
+      Terms t = r.terms(field);
+      if (t == null) {
+        continue; // nothing to do
+      }
+      if (leaf != lastLeaf) {
+        termsEnum = t.iterator(null);
+        postings = new DocsAndPositionsEnum[terms.length];
+      }
+      Passage passages[] = highlightDoc(field, terms, content.length(), bi, doc - subContext.docBase, termsEnum, postings, maxPassages);
+      if (passages.length > 0) {
+        // otherwise a null snippet
+        highlights.put(doc, formatter.format(passages, content));
+      }
+      lastLeaf = leaf;
+    }
+    
+    return highlights;
+  }
+  
+  // algorithm: treat sentence snippets as miniature documents
+  // we can intersect these with the postings lists via BreakIterator.preceding(offset),s
+  // score each sentence as norm(sentenceStartOffset) * sum(weight * tf(freq))
+  private Passage[] highlightDoc(String field, Term terms[], int contentLength, BreakIterator bi, int doc, 
+      TermsEnum termsEnum, DocsAndPositionsEnum[] postings, int n) throws IOException {
+    PriorityQueue<OffsetsEnum> pq = new PriorityQueue<OffsetsEnum>();
+    float weights[] = new float[terms.length];
+    // initialize postings
+    for (int i = 0; i < terms.length; i++) {
+      DocsAndPositionsEnum de = postings[i];
+      int pDoc;
+      if (de == EMPTY) {
+        continue;
+      } else if (de == null) {
+        postings[i] = EMPTY; // initially
+        if (!termsEnum.seekExact(terms[i].bytes(), true)) {
+          continue; // term not found
+        }
+        de = postings[i] = termsEnum.docsAndPositions(null, null, DocsAndPositionsEnum.FLAG_OFFSETS);
+        if (de == null) {
+          // no positions available
+          throw new IllegalArgumentException("field '" + field + "' was indexed without offsets, cannot highlight");
+        }
+        pDoc = de.advance(doc);
+      } else {
+        pDoc = de.docID();
+        if (pDoc < doc) {
+          pDoc = de.advance(doc);
+        }
+      }
+
+      if (doc == pDoc) {
+        weights[i] = scorer.weight(contentLength, de.freq());
+        de.nextPosition();
+        pq.add(new OffsetsEnum(de, i));
+      }
+    }
+    
+    pq.add(new OffsetsEnum(EMPTY, Integer.MAX_VALUE)); // a sentinel for termination
+    
+    PriorityQueue<Passage> passageQueue = new PriorityQueue<Passage>(n, new Comparator<Passage>() {
+      @Override
+      public int compare(Passage left, Passage right) {
+        if (right.score == left.score) {
+          return right.startOffset - left.endOffset;
+        } else {
+          return right.score > left.score ? 1 : -1;
+        }
+      }
+    });
+    Passage current = new Passage();
+    
+    OffsetsEnum off;
+    while ((off = pq.poll()) != null) {
+      final DocsAndPositionsEnum dp = off.dp;
+      int start = dp.startOffset();
+      if (start == -1) {
+        throw new IllegalArgumentException("field '" + field + "' was indexed without offsets, cannot highlight");
+      }
+      int end = dp.endOffset();
+      if (start > current.endOffset) {
+        if (current.startOffset >= 0) {
+          // finalize current
+          current.score *= scorer.norm(current.startOffset);
+          // new sentence: first add 'current' to queue 
+          if (passageQueue.size() == n && current.score < passageQueue.peek().score) {
+            current.reset(); // can't compete, just reset it
+          } else {
+            passageQueue.offer(current);
+            if (passageQueue.size() > n) {
+              current = passageQueue.poll();
+              current.reset();
+            } else {
+              current = new Passage();
             }
-        };
-        new Thread(runnable, "SSTABLE-DELETER").start();
-    }};
-
-    /**
-     * maxDataAge is a timestamp in local server time (e.g. System.currentTimeMilli) which represents an uppper bound
-     * to the newest piece of data stored in the sstable. In other words, this sstable does not contain items created
-     * later than maxDataAge.
-     * 
-     * The field is not serialized to disk, so relying on it for more than what truncate does is not advised.
-     *
-     * When a new sstable is flushed, maxDataAge is set to the time of creation.
-     * When a sstable is created from compaction, maxDataAge is set to max of all merged tables.
-     *
-     * The age is in milliseconds since epoc and is local to this host.
-     */
-    public final long maxDataAge;
-
-    // indexfile and datafile: might be null before a call to load()
-    private SegmentedFile ifile;
-    private SegmentedFile dfile;
-
-    private IndexSummary indexSummary;
-    private BloomFilter bf;
-
-    private InstrumentedCache<Pair<Descriptor,DecoratedKey>, Long> keyCache;
-
-    private BloomFilterTracker bloomFilterTracker = new BloomFilterTracker();
-
-    private volatile SSTableDeletingReference phantomReference;
-
-    public static int indexInterval()
-    {
-        return IndexSummary.INDEX_INTERVAL;
-    }
-
-    public static long getApproximateKeyCount(Iterable<SSTableReader> sstables)
-    {
-        long count = 0;
-
-        for (SSTableReader sstable : sstables)
-        {
-            int indexKeyCount = sstable.getKeySamples().size();
-            count = count + (indexKeyCount + 1) * IndexSummary.INDEX_INTERVAL;
-            if (logger.isDebugEnabled())
-                logger.debug("index size for bloom filter calc for file  : " + sstable.getFilename() + "   : " + count);
+          }
         }
-
-        return count;
-    }
-
-    public static SSTableReader open(String dataFileName) throws IOException
-    {
-        return open(Descriptor.fromFilename(dataFileName));
-    }
-
-    public static SSTableReader open(Descriptor desc) throws IOException
-    {
-        return open(desc, StorageService.getPartitioner());
-    }
-
-    /** public, but only for tests */
-    public static SSTableReader open(String dataFileName, IPartitioner partitioner) throws IOException
-    {
-        return open(Descriptor.fromFilename(dataFileName), partitioner);
-    }
-
-    public static SSTableReader open(Descriptor descriptor, IPartitioner partitioner) throws IOException
-    {
-        assert partitioner != null;
-
-        long start = System.currentTimeMillis();
-        logger.info("Sampling index for " + descriptor);
-
-        SSTableReader sstable;
-        // FIXME: version conditional readers here
-        if (true)
-        {
-            sstable = internalOpen(descriptor, partitioner);
-        }
-
-        if (logger.isDebugEnabled())
-            logger.debug("INDEX LOAD TIME for " + descriptor + ": " + (System.currentTimeMillis() - start) + " ms.");
-
-        return sstable;
-    }
-
-    /** Open a RowIndexedReader which needs its state loaded from disk. */
-    static SSTableReader internalOpen(Descriptor desc, IPartitioner partitioner) throws IOException
-    {
-        SSTableReader sstable = new SSTableReader(desc, partitioner, null, null, null, null, System.currentTimeMillis());
-
-        // versions before 'c' encoded keys as utf-16 before hashing to the filter
-        if (desc.hasStringsInBloomFilter())
-        {
-            sstable.load(true);
-        }
-        else
-        {
-            sstable.load(false);
-            sstable.loadBloomFilter();
-        }
-
-        return sstable;
-    }
-
-    /**
-     * Open a RowIndexedReader which already has its state initialized (by SSTableWriter).
-     */
-    static SSTableReader internalOpen(Descriptor desc, IPartitioner partitioner, SegmentedFile ifile, SegmentedFile dfile, IndexSummary isummary, BloomFilter bf, long maxDataAge) throws IOException
-    {
-        assert desc != null && partitioner != null && ifile != null && dfile != null && isummary != null && bf != null;
-        return new SSTableReader(desc, partitioner, ifile, dfile, isummary, bf, maxDataAge);
-    }
-
-    SSTableReader(Descriptor desc,
-                     IPartitioner partitioner,
-                     SegmentedFile ifile,
-                     SegmentedFile dfile,
-                     IndexSummary indexSummary,
-                     BloomFilter bloomFilter,
-                     long maxDataAge)
-    throws IOException
-    {
-        super(desc, partitioner);
-        this.maxDataAge = maxDataAge;
-
-
-        this.ifile = ifile;
-        this.dfile = dfile;
-        this.indexSummary = indexSummary;
-        this.bf = bloomFilter;
-    }
-
-    public void setTrackedBy(SSTableTracker tracker)
-    {
-        phantomReference = new SSTableDeletingReference(tracker, this, finalizerQueue);
-        finalizers.add(phantomReference);
-        keyCache = tracker.getKeyCache();
-    }
-
-    void loadBloomFilter() throws IOException
-    {
-        DataInputStream stream = new DataInputStream(new FileInputStream(filterFilename()));
-        try
-        {
-            bf = BloomFilter.serializer().deserialize(stream);
-        }
-        finally
-        {
-            stream.close();
-        }
-    }
-
-    /**
-     * Loads ifile, dfile and indexSummary, and optionally recreates the bloom filter.
-     */
-    private void load(boolean recreatebloom) throws IOException
-    {
-        SegmentedFile.Builder ibuilder = SegmentedFile.getBuilder();
-        SegmentedFile.Builder dbuilder = SegmentedFile.getBuilder();
-
-        // we read the positions in a BRAF so we don't have to worry about an entry spanning a mmap boundary.
-        indexSummary = new IndexSummary();
-        BufferedRandomAccessFile input = new BufferedRandomAccessFile(indexFilename(), "r");
-        try
-        {
-            long indexSize = input.length();
-            if (recreatebloom)
-                // estimate key count based on index length
-                bf = BloomFilter.getFilter((int)(input.length() / 32), 15);
-            while (true)
-            {
-                long indexPosition = input.getFilePointer();
-                if (indexPosition == indexSize)
-                    break;
-
-                DecoratedKey decoratedKey = partitioner.convertFromDiskFormat(FBUtilities.readShortByteArray(input));
-                if (recreatebloom)
-                    bf.add(decoratedKey.key);
-                long dataPosition = input.readLong();
-
-                indexSummary.maybeAddEntry(decoratedKey, indexPosition);
-                ibuilder.addPotentialBoundary(indexPosition);
-                dbuilder.addPotentialBoundary(dataPosition);
+        // if we exceed limit, we are done
+        if (start >= contentLength) {
+          Passage passages[] = new Passage[passageQueue.size()];
+          passageQueue.toArray(passages);
+          for (Passage p : passages) {
+            p.sort();
+          }
+          // sort in ascending order
+          Arrays.sort(passages, new Comparator<Passage>() {
+            @Override
+            public int compare(Passage left, Passage right) {
+              return left.startOffset - right.startOffset;
             }
-            indexSummary.complete();
+          });
+          return passages;
         }
-        finally
-        {
-            input.close();
+        // advance breakiterator
+        assert BreakIterator.DONE < 0;
+        current.startOffset = Math.max(bi.preceding(start+1), 0);
+        current.endOffset = Math.min(bi.next(), contentLength);
+      }
+      int tf = 0;
+      while (true) {
+        tf++;
+        current.addMatch(start, end, terms[off.id]);
+        if (off.pos == dp.freq()) {
+          break; // removed from pq
+        } else {
+          off.pos++;
+          dp.nextPosition();
+          start = dp.startOffset();
+          end = dp.endOffset();
         }
-
-        // finalize the state of the reader
-        indexSummary.complete();
-        ifile = ibuilder.complete(indexFilename());
-        dfile = dbuilder.complete(getFilename());
-    }
-
-    /** get the position in the index file to start scanning to find the given key (at most indexInterval keys away) */
-    private IndexSummary.KeyPosition getIndexScanPosition(DecoratedKey decoratedKey)
-    {
-        assert indexSummary.getIndexPositions() != null && indexSummary.getIndexPositions().size() > 0;
-        int index = Collections.binarySearch(indexSummary.getIndexPositions(), new IndexSummary.KeyPosition(decoratedKey, -1));
-        if (index < 0)
-        {
-            // binary search gives us the first index _greater_ than the key searched for,
-            // i.e., its insertion position
-            int greaterThan = (index + 1) * -1;
-            if (greaterThan == 0)
-                return null;
-            return indexSummary.getIndexPositions().get(greaterThan - 1);
+        if (start >= current.endOffset) {
+          pq.offer(off);
+          break;
         }
-        else
-        {
-            return indexSummary.getIndexPositions().get(index);
+      }
+      current.score += weights[off.id] * scorer.tf(tf, current.endOffset - current.startOffset);
+    }
+    return new Passage[0];
+  }
+  
+  private static class OffsetsEnum implements Comparable<OffsetsEnum> {
+    DocsAndPositionsEnum dp;
+    int pos;
+    int id;
+    
+    OffsetsEnum(DocsAndPositionsEnum dp, int id) throws IOException {
+      this.dp = dp;
+      this.id = id;
+      this.pos = 1;
+    }
+
+    @Override
+    public int compareTo(OffsetsEnum other) {
+      try {
+        int off = dp.startOffset();
+        int otherOff = other.dp.startOffset();
+        if (off == otherOff) {
+          return id - other.id;
+        } else {
+          return Long.signum(((long)off) - otherOff);
         }
+      } catch (IOException e) {
+        throw new RuntimeException(e);
+      }
+    }
+  }
+  
+  private static final DocsAndPositionsEnum EMPTY = new DocsAndPositionsEnum() {
+
+    @Override
+    public int nextPosition() throws IOException { return 0; }
+
+    @Override
+    public int startOffset() throws IOException { return Integer.MAX_VALUE; }
+
+    @Override
+    public int endOffset() throws IOException { return Integer.MAX_VALUE; }
+
+    @Override
+    public BytesRef getPayload() throws IOException { return null; }
+
+    @Override
+    public int freq() throws IOException { return 0; }
+
+    @Override
+    public int docID() { return NO_MORE_DOCS; }
+
+    @Override
+    public int nextDoc() throws IOException { return NO_MORE_DOCS; }
+
+    @Override
+    public int advance(int target) throws IOException { return NO_MORE_DOCS; }
+  };
+  
+  /** 
+   * we rewrite against an empty indexreader: as we don't want things like
+   * rangeQueries that don't summarize the document
+   */
+  private static Query rewrite(Query original) throws IOException {
+    Query query = original;
+    for (Query rewrittenQuery = query.rewrite(EMPTY_INDEXREADER); rewrittenQuery != query;
+         rewrittenQuery = query.rewrite(EMPTY_INDEXREADER)) {
+      query = rewrittenQuery;
+    }
+    return query;
+  }
+  
+  private static class LimitedStoredFieldVisitor extends StoredFieldVisitor {
+    private final String fields[];
+    private final int maxLength;
+    private final StringBuilder builders[];
+    private int currentField = -1;
+    
+    public LimitedStoredFieldVisitor(String fields[], int maxLength) {
+      this.fields = fields;
+      this.maxLength = maxLength;
+      builders = new StringBuilder[fields.length];
+      for (int i = 0; i < builders.length; i++) {
+        builders[i] = new StringBuilder();
+      }
+    }
+    
+    @Override
+    public void stringField(FieldInfo fieldInfo, String value) throws IOException {
+      assert currentField >= 0;
+      StringBuilder builder = builders[currentField];
+      if (builder.length() > 0) {
+        builder.append(' '); // for the offset gap, TODO: make this configurable
+      }
+      if (builder.length() + value.length() > maxLength) {
+        builder.append(value, 0, maxLength - builder.length());
+      } else {
+        builder.append(value);
+      }
     }
 
-    /**
-     * For testing purposes only.
-     */
-    public void forceFilterFailures()
-    {
-        bf = BloomFilter.alwaysMatchingBloomFilter();
+    @Override
+    public Status needsField(FieldInfo fieldInfo) throws IOException {
+      currentField = Arrays.binarySearch(fields, fieldInfo.name);
+      if (currentField < 0) {
+        return Status.NO;
+      } else if (builders[currentField].length() > maxLength) {
+        return fields.length == 1 ? Status.STOP : Status.NO;
+      }
+      return Status.YES;
     }
-
-    /**
-     * @return The key cache: for monitoring purposes.
-     */
-    public InstrumentedCache getKeyCache()
-    {
-        return keyCache;
+    
+    String getValue(int i) {
+      return builders[i].toString();
     }
-
-    /**
-     * @return An estimate of the number of keys in this SSTable.
-     */
-    public long estimatedKeys()
-    {
-        return indexSummary.getIndexPositions().size() * IndexSummary.INDEX_INTERVAL;
+    
+    void reset() {
+      currentField = -1;
+      for (int i = 0; i < fields.length; i++) {
+        builders[i].setLength(0);
+      }
     }
-
-    /**
-     * @return Approximately 1/INDEX_INTERVALth of the keys in this SSTable.
-     */
-    public Collection<DecoratedKey> getKeySamples()
-    {
-        return Collections2.transform(indexSummary.getIndexPositions(),
-                                      new Function<IndexSummary.KeyPosition, DecoratedKey>(){
-                                          public DecoratedKey apply(IndexSummary.KeyPosition kp)
-                                          {
-                                              return kp.key;
-                                          }
-                                      });
-    }
-
-    /**
-     * Determine the minimal set of sections that can be extracted from this SSTable to cover the given ranges.
-     * @return A sorted list of (offset,end) pairs that cover the given ranges in the datafile for this SSTable.
-     */
-    public List<Pair<Long,Long>> getPositionsForRanges(Collection<Range> ranges)
-    {
-        // use the index to determine a minimal section for each range
-        List<Pair<Long,Long>> positions = new ArrayList<Pair<Long,Long>>();
-        for (AbstractBounds range : AbstractBounds.normalize(ranges))
-        {
-            long left = getPosition(new DecoratedKey(range.left, null), Operator.GT);
-            if (left == -1)
-                // left is past the end of the file
-                continue;
-            long right = getPosition(new DecoratedKey(range.right, null), Operator.GT);
-            if (right == -1 || Range.isWrapAround(range.left, range.right))
-                // right is past the end of the file, or it wraps
-                right = length();
-            if (left == right)
-                // empty range
-                continue;
-            positions.add(new Pair(Long.valueOf(left), Long.valueOf(right)));
-        }
-        return positions;
-    }
-
-    /**
-     * @param decoratedKey The key to apply as the rhs to the given Operator.
-     * @param op The Operator defining matching keys: the nearest key to the target matching the operator wins.
-     * @return The position in the data file to find the key, or -1 if the key is not present
-     */
-    public long getPosition(DecoratedKey decoratedKey, Operator op)
-    {
-        // first, check bloom filter
-        if (op == Operator.EQ && !bf.isPresent(partitioner.convertToDiskFormat(decoratedKey)))
-            return -1;
-
-        // next, the key cache
-        Pair<Descriptor, DecoratedKey> unifiedKey = new Pair<Descriptor, DecoratedKey>(desc, decoratedKey);
-        if (keyCache != null && keyCache.getCapacity() > 0)
-        {
-            Long cachedPosition = keyCache.get(unifiedKey);
-            if (cachedPosition != null)
-            {
-                return cachedPosition;
-            }
-        }
-
-        // next, see if the sampled index says it's impossible for the key to be present
-        IndexSummary.KeyPosition sampledPosition = getIndexScanPosition(decoratedKey);
-        if (sampledPosition == null)
-        {
-            if (op == Operator.EQ)
-                bloomFilterTracker.addFalsePositive();
-            // we matched the -1th position: if the operator might match forward, return the 0th position
-            return op.apply(1) >= 0 ? 0 : -1;
-        }
-
-        // scan the on-disk index, starting at the nearest sampled position
-        Iterator<FileDataInput> segments = ifile.iterator(sampledPosition.indexPosition, INDEX_FILE_BUFFER_BYTES);
-        while (segments.hasNext())
-        {
-            FileDataInput input = segments.next();
-            try
-            {
-                while (!input.isEOF())
-                {
-                    // read key & data position from index entry
-                    DecoratedKey indexDecoratedKey = partitioner.convertFromDiskFormat(FBUtilities.readShortByteArray(input));
-                    long dataPosition = input.readLong();
-
-                    int comparison = indexDecoratedKey.compareTo(decoratedKey);
-                    int v = op.apply(comparison);
-                    if (v == 0)
-                    {
-                        if (comparison == 0 && keyCache != null && keyCache.getCapacity() > 0)
-                        {
-                            if (op == Operator.EQ)
-                                bloomFilterTracker.addTruePositive();
-                            // store exact match for the key
-                            keyCache.put(unifiedKey, Long.valueOf(dataPosition));
-                        }
-                        return dataPosition;
-                    }
-                    if (v < 0)
-                    {
-                        if (op == Operator.EQ)
-                            bloomFilterTracker.addFalsePositive();
-                        return -1;
-                    }
-                }
-            }
-            catch (IOException e)
-            {
-                throw new IOError(e);
-            }
-            finally
-            {
-                try
-                {
-                    input.close();
-                }
-                catch (IOException e)
-                {
-                    logger.error("error closing file", e);
-                }
-            }
-        }
-
-        if (op == Operator.EQ)
-            bloomFilterTracker.addFalsePositive();
-        return -1;
-    }
-
-    /**
-     * @return The length in bytes of the data file for this SSTable.
-     */
-    public long length()
-    {
-        return dfile.length;
-    }
-
-    public void markCompacted()
-    {
-        if (logger.isDebugEnabled())
-            logger.debug("Marking " + getFilename() + " compacted");
-        try
-        {
-            if (!new File(compactedFilename()).createNewFile())
-                throw new IOException("Unable to create compaction marker");
-        }
-        catch (IOException e)
-        {
-            throw new IOError(e);
-        }
-        phantomReference.deleteOnCleanup();
-    }
-
-    /**
-     * @param bufferSize Buffer size in bytes for this Scanner.
-     * @return A Scanner for seeking over the rows of the SSTable.
-     */
-    public SSTableScanner getScanner(int bufferSize)
-    {
-        return new SSTableScanner(this, bufferSize);
-    }
-
-    /**
-     * @param bufferSize Buffer size in bytes for this Scanner.
-     * @param filter filter to use when reading the columns
-     * @return A Scanner for seeking over the rows of the SSTable.
-     */
-    public SSTableScanner getScanner(int bufferSize, QueryFilter filter)
-    {
-        return new SSTableScanner(this, filter, bufferSize);
-    }
-
-    public FileDataInput getFileDataInput(DecoratedKey decoratedKey, int bufferSize)
-    {
-        long position = getPosition(decoratedKey, Operator.EQ);
-        if (position < 0)
-            return null;
-
-        return dfile.getSegment(position, bufferSize);
-    }
-
-
-    public int compareTo(SSTableReader o)
-    {
-        return desc.generation - o.desc.generation;
-    }
-
-    public AbstractType getColumnComparator()
-    {
-        return DatabaseDescriptor.getComparator(getTableName(), getColumnFamilyName());
-    }
-
-    public ColumnFamily makeColumnFamily()
-    {
-        return ColumnFamily.create(getTableName(), getColumnFamilyName());
-    }
-
-    public ICompactSerializer2<IColumn> getColumnSerializer()
-    {
-        ColumnFamilyType cfType = DatabaseDescriptor.getColumnFamilyType(getTableName(), getColumnFamilyName());
-        ClockType clockType = DatabaseDescriptor.getClockType(getTableName(), getColumnFamilyName());
-        AbstractReconciler reconciler = DatabaseDescriptor.getReconciler(getTableName(), getColumnFamilyName());
-        return cfType == ColumnFamilyType.Standard
-               ? Column.serializer(clockType)
-               : SuperColumn.serializer(getColumnComparator(), clockType, reconciler);
-    }
-
-    /**
-     * Tests if the sstable contains data newer than the given age param (in localhost currentMilli time).
-     * This works in conjunction with maxDataAge which is an upper bound on the create of data in this sstable.
-     * @param age The age to compare the maxDataAre of this sstable. Measured in millisec since epoc on this host
-     * @return True iff this sstable contains data that's newer than the given age parameter.
-     */
-    public boolean newSince(long age)
-    {
-        return maxDataAge > age;
-    }
-
-    public static long readRowSize(DataInput in, Descriptor d) throws IOException
-    {
-        if (d.hasIntRowSize())
-            return in.readInt();
-        return in.readLong();
-    }
-
-    /**
-     * TODO: Move someplace reusable
-     */
-    public abstract static class Operator
-    {
-        public static final Operator EQ = new Equals();
-        public static final Operator GE = new GreaterThanOrEqualTo();
-        public static final Operator GT = new GreaterThan();
-
-        /**
-         * @param comparison The result of a call to compare/compareTo, with the desired field on the rhs.
-         * @return less than 0 if the operator cannot match forward, 0 if it matches, greater than 0 if it might match forward.
-         */
-        public abstract int apply(int comparison);
-
-        final static class Equals extends Operator
-        {
-            public int apply(int comparison) { return -comparison; }
-        }
-
-        final static class GreaterThanOrEqualTo extends Operator
-        {
-            public int apply(int comparison) { return comparison >= 0 ? 0 : -comparison; }
-        }
-
-        final static class GreaterThan extends Operator
-        {
-            public int apply(int comparison) { return comparison > 0 ? 0 : 1; }
-        }
-    }
-
-    public long getBloomFilterFalsePositiveCount()
-    {
-        return bloomFilterTracker.getFalsePositiveCount();
-    }
-
-    public long getRecentBloomFilterFalsePositiveCount()
-    {
-        return bloomFilterTracker.getRecentFalsePositiveCount();
-    }
-
-    public long getBloomFilterTruePositiveCount()
-    {
-        return bloomFilterTracker.getTruePositiveCount();
-    }
-
-    public long getRecentBloomFilterTruePositiveCount()
-    {
-        return bloomFilterTracker.getRecentTruePositiveCount();
-    }
+  }
 }

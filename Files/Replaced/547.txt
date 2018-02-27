@@ -1,6 +1,6 @@
-bytesRef.copyBytes(missingValue);
+lastTerm.copyBytes(term);
 
-package org.apache.lucene.index.values;
+package org.apache.lucene.index.codecs;
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -18,322 +18,361 @@ package org.apache.lucene.index.values;
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.List;
 
+import java.io.IOException;
+
+import org.apache.lucene.index.FieldInfo;
+import org.apache.lucene.index.Fields;
+import org.apache.lucene.index.IndexFileNames;
+import org.apache.lucene.index.MergePolicy.MergeAbortedException;
 import org.apache.lucene.index.MergeState;
-import org.apache.lucene.index.MergeState.IndexReaderAndLiveDocs;
-import org.apache.lucene.index.values.IndexDocValues.SortedSource;
-import org.apache.lucene.index.values.IndexDocValues.Source;
+import org.apache.lucene.index.SegmentReader;
+import org.apache.lucene.store.DataInput;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.util.ArrayUtil;
+import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.PriorityQueue;
-import org.apache.lucene.util.packed.PackedInts;
+import org.apache.lucene.util.IOUtils;
+import org.apache.lucene.util.StringHelper;
 
-/**
- * @lucene.internal
- */
-final class SortedBytesMergeUtils {
+// TODO: make a new 4.0 TV format that encodes better
+//   - use startOffset (not endOffset) as base for delta on
+//     next startOffset because today for syns or ngrams or
+//     WDF or shingles etc. we are encoding negative vints
+//     (= slow, 5 bytes per)
+//   - if doc has no term vectors, write 0 into the tvx
+//     file; saves a seek to tvd only to read a 0 vint (and
+//     saves a byte in tvd)
 
-  private SortedBytesMergeUtils() {
-    // no instance
+public final class DefaultTermVectorsWriter extends TermVectorsWriter {
+  private final Directory directory;
+  private final String segment;
+  private IndexOutput tvx = null, tvd = null, tvf = null;
+
+  public DefaultTermVectorsWriter(Directory directory, String segment, IOContext context) throws IOException {
+    this.directory = directory;
+    this.segment = segment;
+    boolean success = false;
+    try {
+      // Open files for TermVector storage
+      tvx = directory.createOutput(IndexFileNames.segmentFileName(segment, "", DefaultTermVectorsReader.VECTORS_INDEX_EXTENSION), context);
+      tvx.writeInt(DefaultTermVectorsReader.FORMAT_CURRENT);
+      tvd = directory.createOutput(IndexFileNames.segmentFileName(segment, "", DefaultTermVectorsReader.VECTORS_DOCUMENTS_EXTENSION), context);
+      tvd.writeInt(DefaultTermVectorsReader.FORMAT_CURRENT);
+      tvf = directory.createOutput(IndexFileNames.segmentFileName(segment, "", DefaultTermVectorsReader.VECTORS_FIELDS_EXTENSION), context);
+      tvf.writeInt(DefaultTermVectorsReader.FORMAT_CURRENT);
+      success = true;
+    } finally {
+      if (!success) {
+        IOUtils.closeWhileHandlingException(tvx, tvd, tvf);
+      }
+    }
+  }
+ 
+  @Override
+  public void startDocument(int numVectorFields) throws IOException {
+    lastFieldName = null;
+    this.numVectorFields = numVectorFields;
+    tvx.writeLong(tvd.getFilePointer());
+    tvx.writeLong(tvf.getFilePointer());
+    tvd.writeVInt(numVectorFields);
+    fieldCount = 0;
+    fps = ArrayUtil.grow(fps, numVectorFields);
+  }
+  
+  private long fps[] = new long[10]; // pointers to the tvf before writing each field 
+  private int fieldCount = 0;        // number of fields we have written so far for this document
+  private int numVectorFields = 0;   // total number of fields we will write for this document
+  private String lastFieldName;
+
+  @Override
+  public void startField(FieldInfo info, int numTerms, boolean positions, boolean offsets) throws IOException {
+    assert lastFieldName == null || info.name.compareTo(lastFieldName) > 0: "fieldName=" + info.name + " lastFieldName=" + lastFieldName;
+    lastFieldName = info.name;
+    this.positions = positions;
+    this.offsets = offsets;
+    lastTerm.length = 0;
+    fps[fieldCount++] = tvf.getFilePointer();
+    tvd.writeVInt(info.number);
+    tvf.writeVInt(numTerms);
+    byte bits = 0x0;
+    if (positions)
+      bits |= DefaultTermVectorsReader.STORE_POSITIONS_WITH_TERMVECTOR;
+    if (offsets)
+      bits |= DefaultTermVectorsReader.STORE_OFFSET_WITH_TERMVECTOR;
+    tvf.writeByte(bits);
+    
+    assert fieldCount <= numVectorFields;
+    if (fieldCount == numVectorFields) {
+      // last field of the document
+      // this is crazy because the file format is crazy!
+      for (int i = 1; i < fieldCount; i++) {
+        tvd.writeVLong(fps[i] - fps[i-1]);
+      }
+    }
+  }
+  
+  private final BytesRef lastTerm = new BytesRef(10);
+
+  // NOTE: we override addProx, so we don't need to buffer when indexing.
+  // we also don't buffer during bulk merges.
+  private int offsetStartBuffer[] = new int[10];
+  private int offsetEndBuffer[] = new int[10];
+  private int offsetIndex = 0;
+  private int offsetFreq = 0;
+  private boolean positions = false;
+  private boolean offsets = false;
+
+  @Override
+  public void startTerm(BytesRef term, int freq) throws IOException {
+    final int prefix = StringHelper.bytesDifference(lastTerm.bytes, lastTerm.offset, lastTerm.length, 
+                                                    term.bytes, term.offset, term.length);
+    final int suffix = term.length - prefix;
+    tvf.writeVInt(prefix);
+    tvf.writeVInt(suffix);
+    tvf.writeBytes(term.bytes, term.offset + prefix, suffix);
+    tvf.writeVInt(freq);
+    lastTerm.copy(term);
+    lastPosition = lastOffset = 0;
+    
+    if (offsets && positions) {
+      // we might need to buffer if its a non-bulk merge
+      offsetStartBuffer = ArrayUtil.grow(offsetStartBuffer, freq);
+      offsetEndBuffer = ArrayUtil.grow(offsetEndBuffer, freq);
+      offsetIndex = 0;
+      offsetFreq = freq;
+    }
   }
 
-  static MergeContext init(ValueType type, IndexDocValues[] docValues,
-      Comparator<BytesRef> comp, MergeState mergeState) {
-    int size = -1;
-    if (type == ValueType.BYTES_FIXED_SORTED) {
-      for (IndexDocValues indexDocValues : docValues) {
-        if (indexDocValues != null) {
-          size = indexDocValues.getValueSize();
-          break;
+  int lastPosition = 0;
+  int lastOffset = 0;
+
+  @Override
+  public void addProx(int numProx, DataInput positions, DataInput offsets) throws IOException {
+    // TODO: technically we could just copy bytes and not re-encode if we knew the length...
+    if (positions != null) {
+      for (int i = 0; i < numProx; i++) {
+        tvf.writeVInt(positions.readVInt());
+      }
+    }
+    
+    if (offsets != null) {
+      for (int i = 0; i < numProx; i++) {
+        tvf.writeVInt(offsets.readVInt());
+        tvf.writeVInt(offsets.readVInt());
+      }
+    }
+  }
+
+  @Override
+  public void addPosition(int position, int startOffset, int endOffset) throws IOException {
+    if (positions && offsets) {
+      // write position delta
+      tvf.writeVInt(position - lastPosition);
+      lastPosition = position;
+      
+      // buffer offsets
+      offsetStartBuffer[offsetIndex] = startOffset;
+      offsetEndBuffer[offsetIndex] = endOffset;
+      offsetIndex++;
+      
+      // dump buffer if we are done
+      if (offsetIndex == offsetFreq) {
+        for (int i = 0; i < offsetIndex; i++) {
+          tvf.writeVInt(offsetStartBuffer[i] - lastOffset);
+          tvf.writeVInt(offsetEndBuffer[i] - offsetStartBuffer[i]);
+          lastOffset = offsetEndBuffer[i];
         }
       }
-      assert size >= 0;
+    } else if (positions) {
+      // write position delta
+      tvf.writeVInt(position - lastPosition);
+      lastPosition = position;
+    } else if (offsets) {
+      // write offset deltas
+      tvf.writeVInt(startOffset - lastOffset);
+      tvf.writeVInt(endOffset - startOffset);
+      lastOffset = endOffset;
     }
-    return new MergeContext(comp, mergeState, size, type);
   }
 
-  public static final class MergeContext {
-    private final Comparator<BytesRef> comp;
-    private final BytesRef missingValue = new BytesRef();
-    final int sizePerValues; // -1 if var length
-    final ValueType type;
-    final int[] docToEntry;
-    long[] offsets; // if non-null #mergeRecords collects byte offsets here
+  @Override
+  public void abort() {
+    try {
+      close();
+    } catch (IOException ignored) {}
+    
+    try {
+      directory.deleteFile(IndexFileNames.segmentFileName(segment, "", DefaultTermVectorsReader.VECTORS_INDEX_EXTENSION));
+    } catch (IOException ignored) {}
+    
+    try {
+      directory.deleteFile(IndexFileNames.segmentFileName(segment, "", DefaultTermVectorsReader.VECTORS_DOCUMENTS_EXTENSION));
+    } catch (IOException ignored) {}
+    
+    try {
+      directory.deleteFile(IndexFileNames.segmentFileName(segment, "", DefaultTermVectorsReader.VECTORS_FIELDS_EXTENSION));
+    } catch (IOException ignored) {}
+  }
 
-    public MergeContext(Comparator<BytesRef> comp, MergeState mergeState,
-        int size, ValueType type) {
-      assert type == ValueType.BYTES_FIXED_SORTED || type == ValueType.BYTES_VAR_SORTED;
-      this.comp = comp;
-      this.sizePerValues = size;
-      this.type = type;
-      if (size > 0) {
-        missingValue.grow(size);
-        missingValue.length = size;
+  /**
+   * Do a bulk copy of numDocs documents from reader to our
+   * streams.  This is used to expedite merging, if the
+   * field numbers are congruent.
+   */
+  private void addRawDocuments(DefaultTermVectorsReader reader, int[] tvdLengths, int[] tvfLengths, int numDocs) throws IOException {
+    long tvdPosition = tvd.getFilePointer();
+    long tvfPosition = tvf.getFilePointer();
+    long tvdStart = tvdPosition;
+    long tvfStart = tvfPosition;
+    for(int i=0;i<numDocs;i++) {
+      tvx.writeLong(tvdPosition);
+      tvdPosition += tvdLengths[i];
+      tvx.writeLong(tvfPosition);
+      tvfPosition += tvfLengths[i];
+    }
+    tvd.copyBytes(reader.getTvdStream(), tvdPosition-tvdStart);
+    tvf.copyBytes(reader.getTvfStream(), tvfPosition-tvfStart);
+    assert tvd.getFilePointer() == tvdPosition;
+    assert tvf.getFilePointer() == tvfPosition;
+  }
+
+  @Override
+  public final int merge(MergeState mergeState) throws IOException {
+    // Used for bulk-reading raw bytes for term vectors
+    int rawDocLengths[] = new int[MAX_RAW_MERGE_DOCS];
+    int rawDocLengths2[] = new int[MAX_RAW_MERGE_DOCS];
+
+    int idx = 0;
+    int numDocs = 0;
+    for (final MergeState.IndexReaderAndLiveDocs reader : mergeState.readers) {
+      final SegmentReader matchingSegmentReader = mergeState.matchingSegmentReaders[idx++];
+      DefaultTermVectorsReader matchingVectorsReader = null;
+      if (matchingSegmentReader != null) {
+        TermVectorsReader vectorsReader = matchingSegmentReader.getTermVectorsReader();
+
+        if (vectorsReader != null && vectorsReader instanceof DefaultTermVectorsReader) {
+          // If the TV* files are an older format then they cannot read raw docs:
+          if (((DefaultTermVectorsReader)vectorsReader).canReadRawDocs()) {
+            matchingVectorsReader = (DefaultTermVectorsReader) vectorsReader;
+          }
+        }
       }
-      docToEntry = new int[mergeState.mergedDocCount];
-    }
-  }
-
-  static List<SortedSourceSlice> buildSlices(MergeState mergeState,
-      IndexDocValues[] docValues, MergeContext ctx) throws IOException {
-    final List<SortedSourceSlice> slices = new ArrayList<SortedSourceSlice>();
-    for (int i = 0; i < docValues.length; i++) {
-      final SortedSourceSlice nextSlice;
-      final Source directSource;
-      if (docValues[i] != null
-          && (directSource = docValues[i].getDirectSource()) != null) {
-        final SortedSourceSlice slice = new SortedSourceSlice(i, directSource
-            .asSortedSource(), mergeState, ctx.docToEntry);
-        nextSlice = slice;
+      if (reader.liveDocs != null) {
+        numDocs += copyVectorsWithDeletions(mergeState, matchingVectorsReader, reader, rawDocLengths, rawDocLengths2);
       } else {
-        nextSlice = new SortedSourceSlice(i, new MissingValueSource(ctx),
-            mergeState, ctx.docToEntry);
+        numDocs += copyVectorsNoDeletions(mergeState, matchingVectorsReader, reader, rawDocLengths, rawDocLengths2);
       }
-      createOrdMapping(mergeState, nextSlice);
-      slices.add(nextSlice);
     }
-    return Collections.unmodifiableList(slices);
+    finish(numDocs);
+    return numDocs;
   }
 
-  /*
-   * In order to merge we need to map the ords used in each segment to the new
-   * global ords in the new segment. Additionally we need to drop values that
-   * are not referenced anymore due to deleted documents. This method walks all
-   * live documents and fetches their current ordinal. We store this ordinal per
-   * slice and (SortedSourceSlice#ordMapping) and remember the doc to ord
-   * mapping in docIDToRelativeOrd. After the merge SortedSourceSlice#ordMapping
-   * contains the new global ordinals for the relative index.
-   */
-  private static void createOrdMapping(MergeState mergeState,
-      SortedSourceSlice currentSlice) {
-    final int readerIdx = currentSlice.readerIdx;
-    final int[] currentDocMap = mergeState.docMaps[readerIdx];
-    final int docBase = currentSlice.docToOrdStart;
-    assert docBase == mergeState.docBase[readerIdx];
-    if (currentDocMap != null) { // we have deletes
-      for (int i = 0; i < currentDocMap.length; i++) {
-        final int doc = currentDocMap[i];
-        if (doc != -1) { // not deleted
-          final int ord = currentSlice.source.ord(i); // collect ords strictly
-                                                      // increasing
-          currentSlice.docIDToRelativeOrd[docBase + doc] = ord;
-          // use ord + 1 to identify unreferenced values (ie. == 0)
-          currentSlice.ordMapping[ord] = ord + 1;
+  /** Maximum number of contiguous documents to bulk-copy
+      when merging term vectors */
+  private final static int MAX_RAW_MERGE_DOCS = 4192;
+
+  private int copyVectorsWithDeletions(MergeState mergeState,
+                                        final DefaultTermVectorsReader matchingVectorsReader,
+                                        final MergeState.IndexReaderAndLiveDocs reader,
+                                        int rawDocLengths[],
+                                        int rawDocLengths2[])
+          throws IOException, MergeAbortedException {
+    final int maxDoc = reader.reader.maxDoc();
+    final Bits liveDocs = reader.liveDocs;
+    int totalNumDocs = 0;
+    if (matchingVectorsReader != null) {
+      // We can bulk-copy because the fieldInfos are "congruent"
+      for (int docNum = 0; docNum < maxDoc;) {
+        if (!liveDocs.get(docNum)) {
+          // skip deleted docs
+          ++docNum;
+          continue;
         }
+        // We can optimize this case (doing a bulk byte copy) since the field
+        // numbers are identical
+        int start = docNum, numDocs = 0;
+        do {
+          docNum++;
+          numDocs++;
+          if (docNum >= maxDoc) break;
+          if (!liveDocs.get(docNum)) {
+            docNum++;
+            break;
+          }
+        } while(numDocs < MAX_RAW_MERGE_DOCS);
+        
+        matchingVectorsReader.rawDocs(rawDocLengths, rawDocLengths2, start, numDocs);
+        addRawDocuments(matchingVectorsReader, rawDocLengths, rawDocLengths2, numDocs);
+        totalNumDocs += numDocs;
+        mergeState.checkAbort.work(300 * numDocs);
       }
-    } else { // no deletes
-      final IndexReaderAndLiveDocs indexReaderAndLiveDocs = mergeState.readers
-          .get(readerIdx);
-      final int numDocs = indexReaderAndLiveDocs.reader.numDocs();
-      assert indexReaderAndLiveDocs.liveDocs == null;
-      assert currentSlice.docToOrdEnd - currentSlice.docToOrdStart == numDocs;
-      for (int doc = 0; doc < numDocs; doc++) {
-        final int ord = currentSlice.source.ord(doc);
-        currentSlice.docIDToRelativeOrd[docBase + doc] = ord;
-        // use ord + 1 to identify unreferenced values (ie. == 0)
-        currentSlice.ordMapping[ord] = ord + 1;
-      }
-    }
-  }
-
-  static int mergeRecords(MergeContext ctx, IndexOutput datOut,
-      List<SortedSourceSlice> slices) throws IOException {
-    final RecordMerger merger = new RecordMerger(new MergeQueue(slices.size(),
-        ctx.comp), slices.toArray(new SortedSourceSlice[0]));
-    long[] offsets = ctx.offsets;
-    final boolean recordOffsets = offsets != null;
-    long offset = 0;
-    BytesRef currentMergedBytes;
-    merger.pushTop();
-    while (merger.queue.size() > 0) {
-      merger.pullTop();
-      currentMergedBytes = merger.current;
-      assert ctx.sizePerValues == -1 || ctx.sizePerValues == currentMergedBytes.length : "size: "
-          + ctx.sizePerValues + " spare: " + currentMergedBytes.length;
-
-      if (recordOffsets) {
-        offset += currentMergedBytes.length;
-        if (merger.currentOrd >= offsets.length) {
-          offsets = ArrayUtil.grow(offsets, merger.currentOrd + 1);
+    } else {
+      for (int docNum = 0; docNum < maxDoc; docNum++) {
+        if (!liveDocs.get(docNum)) {
+          // skip deleted docs
+          continue;
         }
-        offsets[merger.currentOrd] = offset;
+        
+        // NOTE: it's very important to first assign to vectors then pass it to
+        // termVectorsWriter.addAllDocVectors; see LUCENE-1282
+        Fields vectors = reader.reader.getTermVectors(docNum);
+        addAllDocVectors(vectors, mergeState.fieldInfos);
+        totalNumDocs++;
+        mergeState.checkAbort.work(300);
       }
-      datOut.writeBytes(currentMergedBytes.bytes, currentMergedBytes.offset,
-          currentMergedBytes.length);
-      merger.pushTop();
     }
-    ctx.offsets = offsets;
-    assert offsets == null || offsets[merger.currentOrd - 1] == offset;
-    return merger.currentOrd;
+    return totalNumDocs;
+  }
+  
+  private int copyVectorsNoDeletions(MergeState mergeState,
+                                      final DefaultTermVectorsReader matchingVectorsReader,
+                                      final MergeState.IndexReaderAndLiveDocs reader,
+                                      int rawDocLengths[],
+                                      int rawDocLengths2[])
+          throws IOException, MergeAbortedException {
+    final int maxDoc = reader.reader.maxDoc();
+    if (matchingVectorsReader != null) {
+      // We can bulk-copy because the fieldInfos are "congruent"
+      int docCount = 0;
+      while (docCount < maxDoc) {
+        int len = Math.min(MAX_RAW_MERGE_DOCS, maxDoc - docCount);
+        matchingVectorsReader.rawDocs(rawDocLengths, rawDocLengths2, docCount, len);
+        addRawDocuments(matchingVectorsReader, rawDocLengths, rawDocLengths2, len);
+        docCount += len;
+        mergeState.checkAbort.work(300 * len);
+      }
+    } else {
+      for (int docNum = 0; docNum < maxDoc; docNum++) {
+        // NOTE: it's very important to first assign to vectors then pass it to
+        // termVectorsWriter.addAllDocVectors; see LUCENE-1282
+        Fields vectors = reader.reader.getTermVectors(docNum);
+        addAllDocVectors(vectors, mergeState.fieldInfos);
+        mergeState.checkAbort.work(300);
+      }
+    }
+    return maxDoc;
+  }
+  
+  @Override
+  public void finish(int numDocs) throws IOException {
+    if (4+((long) numDocs)*16 != tvx.getFilePointer())
+      // This is most likely a bug in Sun JRE 1.6.0_04/_05;
+      // we detect that the bug has struck, here, and
+      // throw an exception to prevent the corruption from
+      // entering the index.  See LUCENE-1282 for
+      // details.
+      throw new RuntimeException("mergeVectors produced an invalid result: mergedDocs is " + numDocs + " but tvx size is " + tvx.getFilePointer() + " file=" + tvx.toString() + "; now aborting this merge to prevent index corruption");
   }
 
-  private static final class RecordMerger {
-    private final MergeQueue queue;
-    private final SortedSourceSlice[] top;
-    private int numTop;
-    BytesRef current;
-    int currentOrd = -1;
-
-    RecordMerger(MergeQueue queue, SortedSourceSlice[] top) {
-      super();
-      this.queue = queue;
-      this.top = top;
-      this.numTop = top.length;
-    }
-
-    private void pullTop() {
-      // extract all subs from the queue that have the same
-      // top record
-      assert numTop == 0;
-      assert currentOrd >= 0;
-      while (true) {
-        final SortedSourceSlice popped = top[numTop++] = queue.pop();
-        // use ord + 1 to identify unreferenced values (ie. == 0)
-        popped.ordMapping[popped.relativeOrd] = currentOrd + 1;
-        if (queue.size() == 0
-            || !(queue.top()).current.bytesEquals(top[0].current)) {
-          break;
-        }
-      }
-      current = top[0].current;
-    }
-
-    private void pushTop() throws IOException {
-      // call next() on each top, and put back into queue
-      for (int i = 0; i < numTop; i++) {
-        top[i].current = top[i].next();
-        if (top[i].current != null) {
-          queue.add(top[i]);
-        }
-      }
-      currentOrd++;
-      numTop = 0;
-    }
-  }
-
-  static class SortedSourceSlice {
-    final SortedSource source;
-    final int readerIdx;
-    /* global array indexed by docID containg the relative ord for the doc */
-    final int[] docIDToRelativeOrd;
-    /*
-     * maps relative ords to merged global ords - index is relative ord value
-     * new global ord this map gets updates as we merge ords. later we use the
-     * docIDtoRelativeOrd to get the previous relative ord to get the new ord
-     * from the relative ord map.
-     */
-    final int[] ordMapping;
-
-    /* start index into docIDToRelativeOrd */
-    final int docToOrdStart;
-    /* end index into docIDToRelativeOrd */
-    final int docToOrdEnd;
-    BytesRef current = new BytesRef();
-    /* the currently merged relative ordinal */
-    int relativeOrd = -1;
-
-    SortedSourceSlice(int readerIdx, SortedSource source, MergeState state,
-        int[] docToOrd) {
-      super();
-      this.readerIdx = readerIdx;
-      this.source = source;
-      this.docIDToRelativeOrd = docToOrd;
-      this.ordMapping = new int[source.getValueCount()];
-      this.docToOrdStart = state.docBase[readerIdx];
-      this.docToOrdEnd = this.docToOrdStart + numDocs(state, readerIdx);
-    }
-
-    private static int numDocs(MergeState state, int readerIndex) {
-      if (readerIndex == state.docBase.length - 1) {
-        return state.mergedDocCount - state.docBase[readerIndex];
-      }
-      return state.docBase[readerIndex + 1] - state.docBase[readerIndex];
-    }
-
-    BytesRef next() {
-      for (int i = relativeOrd + 1; i < ordMapping.length; i++) {
-        if (ordMapping[i] != 0) { // skip ords that are not referenced anymore
-          source.getByOrd(i, current);
-          relativeOrd = i;
-          return current;
-        }
-      }
-      return null;
-    }
-
-    void writeOrds(PackedInts.Writer writer) throws IOException {
-      for (int i = docToOrdStart; i < docToOrdEnd; i++) {
-        final int mappedOrd = docIDToRelativeOrd[i];
-        assert mappedOrd < ordMapping.length;
-        assert ordMapping[mappedOrd] > 0 : "illegal mapping ord maps to an unreferenced value";
-        writer.add(ordMapping[mappedOrd] - 1);
-      }
-    }
-  }
-
-  /*
-   * if a segment has no values at all we use this source to fill in the missing
-   * value in the right place (depending on the comparator used)
-   */
-  private static final class MissingValueSource extends SortedSource {
-
-    private BytesRef missingValue;
-
-    public MissingValueSource(MergeContext ctx) {
-      super(ctx.type, ctx.comp);
-      this.missingValue = ctx.missingValue;
-    }
-
-    @Override
-    public int ord(int docID) {
-      return 0;
-    }
-
-    @Override
-    public BytesRef getByOrd(int ord, BytesRef bytesRef) {
-      bytesRef.copy(missingValue);
-      return bytesRef;
-    }
-
-    @Override
-    public PackedInts.Reader getDocToOrd() {
-      return null;
-    }
-
-    @Override
-    public int getValueCount() {
-      return 1;
-    }
-
-  }
-
-  /*
-   * merge queue
-   */
-  private static final class MergeQueue extends
-      PriorityQueue<SortedSourceSlice> {
-    final Comparator<BytesRef> comp;
-
-    public MergeQueue(int maxSize, Comparator<BytesRef> comp) {
-      super(maxSize);
-      this.comp = comp;
-    }
-
-    @Override
-    protected boolean lessThan(SortedSourceSlice a, SortedSourceSlice b) {
-      int cmp = comp.compare(a.current, b.current);
-      if (cmp != 0) {
-        return cmp < 0;
-      } else { // just a tie-breaker
-        return a.docToOrdStart < b.docToOrdStart;
-      }
-    }
-
+  /** Close all streams. */
+  @Override
+  public void close() throws IOException {
+    // make an effort to close all streams we can but remember and re-throw
+    // the first exception encountered in this process
+    IOUtils.close(tvx, tvd, tvf);
+    tvx = tvd = tvf = null;
   }
 }

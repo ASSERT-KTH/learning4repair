@@ -1,13 +1,14 @@
-return o2.compareTo(o1);
+int len = docsGathered > offset ? docsGathered - offset : 0;
 
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+package org.apache.solr.search;
+
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,661 +19,808 @@ return o2.compareTo(o1);
  * limitations under the License.
  */
 
-package org.apache.cassandra.utils;
-
-import java.io.*;
-import java.lang.reflect.Field;
-import java.lang.reflect.InvocationTargetException;
-import java.math.BigInteger;
-import java.net.InetAddress;
-import java.net.URL;
-import java.net.UnknownHostException;
-import java.nio.ByteBuffer;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
-import java.util.*;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
-
-import com.google.common.base.Joiner;
-import com.google.common.collect.AbstractIterator;
+import org.apache.commons.lang.ArrayUtils;
+import org.apache.lucene.document.Fieldable;
+import org.apache.lucene.queryParser.ParseException;
+import org.apache.lucene.search.*;
+import org.apache.lucene.search.grouping.*;
+import org.apache.lucene.util.FixedBitSet;
+import org.apache.lucene.util.OpenBitSet;
+import org.apache.solr.common.SolrException;
+import org.apache.solr.common.util.NamedList;
+import org.apache.solr.common.util.SimpleOrderedMap;
+import org.apache.solr.request.SolrQueryRequest;
+import org.apache.solr.schema.FieldType;
+import org.apache.solr.schema.SchemaField;
+import org.apache.solr.schema.StrFieldSource;
+import org.apache.solr.search.function.OrdFieldSource;
+import org.apache.solr.search.function.ReverseOrdFieldSource;
+import org.apache.solr.search.function.ValueSource;
+import org.apache.solr.search.grouping.collector.FilterCollector;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.cache.IRowCacheProvider;
-import org.apache.cassandra.concurrent.CreationTimeAwareFuture;
-import org.apache.cassandra.config.ConfigurationException;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.db.DecoratedKey;
-import org.apache.cassandra.dht.IPartitioner;
-import org.apache.cassandra.dht.Range;
-import org.apache.cassandra.dht.Token;
-import org.apache.cassandra.io.IVersionedSerializer;
-import org.apache.cassandra.io.util.DataOutputBuffer;
-import org.apache.cassandra.locator.PropertyFileSnitch;
-import org.apache.cassandra.net.IAsyncResult;
-import org.apache.thrift.TBase;
-import org.apache.thrift.TDeserializer;
-import org.apache.thrift.TException;
-import org.apache.thrift.TSerializer;
+import java.io.IOException;
+import java.util.*;
 
-public class FBUtilities
-{
-    private static Logger logger_ = LoggerFactory.getLogger(FBUtilities.class);
+/**
+ * Basic Solr Grouping infrastructure.
+ * Warning NOT thread save!
+ *
+ * @lucene.experimental
+ */
+public class Grouping {
 
-    public static final BigInteger TWO = new BigInteger("2");
+  private final static Logger logger = LoggerFactory.getLogger(Grouping.class);
 
-    private static volatile InetAddress localInetAddress_;
-    private static volatile InetAddress broadcastInetAddress_;
+  private final SolrIndexSearcher searcher;
+  private final SolrIndexSearcher.QueryResult qr;
+  private final SolrIndexSearcher.QueryCommand cmd;
+  private final List<Command> commands = new ArrayList<Command>();
+  private final boolean main;
+  private final boolean cacheSecondPassSearch;
+  private final int maxDocsPercentageToCache;
 
-    private static final ThreadLocal<MessageDigest> localMD5Digest = new ThreadLocal<MessageDigest>()
-    {
-        @Override
-        protected MessageDigest initialValue()
-        {
-            return newMessageDigest("MD5");
-        }
+  private Sort sort;
+  private Sort groupSort;
+  private int limitDefault;
+  private int docsPerGroupDefault;
+  private int groupOffsetDefault;
+  private Format defaultFormat;
+  private TotalCount defaultTotalCount;
 
-        @Override
-        public MessageDigest get()
-        {
-            MessageDigest digest = super.get();
-            digest.reset();
-            return digest;
-        }
-    };
+  private int maxDoc;
+  private boolean needScores;
+  private boolean getDocSet;
+  private boolean getGroupedDocSet;
+  private boolean getDocList; // doclist needed for debugging or highlighting
+  private Query query;
+  private DocSet filter;
+  private Filter luceneFilter;
+  private NamedList grouped = new SimpleOrderedMap();
+  private Set<Integer> idSet = new LinkedHashSet<Integer>();  // used for tracking unique docs when we need a doclist
+  private int maxMatches;  // max number of matches from any grouping command
+  private float maxScore = Float.NEGATIVE_INFINITY;  // max score seen in any doclist
+  private boolean signalCacheWarning = false;
+  private TimeLimitingCollector timeLimitingCollector;
 
-    private static final ThreadLocal<Random> localRandom = new ThreadLocal<Random>()
-    {
-        @Override
-        protected Random initialValue()
-        {
-            return new Random();
-        }
-    };
 
-    public static final int MAX_UNSIGNED_SHORT = 0xFFFF;
+  public DocList mainResult;  // output if one of the grouping commands should be used as the main result.
 
-    public static MessageDigest threadLocalMD5Digest()
-    {
-        return localMD5Digest.get();
+  /**
+   * @param searcher
+   * @param qr
+   * @param cmd
+   * @param cacheSecondPassSearch Whether to cache the documents and scores from the first pass search for the second
+   *                              pass search.
+   * @param maxDocsPercentageToCache The maximum number of documents in a percentage relative from maxdoc
+   *                                 that is allowed in the cache. When this threshold is met,
+   *                                 the cache is not used in the second pass search.
+   */
+  public Grouping(SolrIndexSearcher searcher,
+                  SolrIndexSearcher.QueryResult qr,
+                  SolrIndexSearcher.QueryCommand cmd,
+                  boolean cacheSecondPassSearch,
+                  int maxDocsPercentageToCache,
+                  boolean main) {
+    this.searcher = searcher;
+    this.qr = qr;
+    this.cmd = cmd;
+    this.cacheSecondPassSearch = cacheSecondPassSearch;
+    this.maxDocsPercentageToCache = maxDocsPercentageToCache;
+    this.main = main;
+  }
+
+  public void add(Grouping.Command groupingCommand) {
+    commands.add(groupingCommand);
+  }
+
+  /**
+   * Adds a field command based on the specified field.
+   *
+   * @param field The fieldname to group by.
+   */
+  public void addFieldCommand(String field, SolrQueryRequest request) throws ParseException {
+    SchemaField schemaField = searcher.getSchema().getField(field); // Throws an exception when field doesn't exist. Bad request.
+    FieldType fieldType = schemaField.getType();
+    ValueSource valueSource = fieldType.getValueSource(schemaField, null);
+    if (!(valueSource instanceof OrdFieldSource
+        || valueSource instanceof ReverseOrdFieldSource
+        || valueSource instanceof StrFieldSource)) {
+      throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, "Cannot group on non string like field.");
     }
 
-    public static MessageDigest newMessageDigest(String algorithm)
-    {
-        try
-        {
-            return MessageDigest.getInstance(algorithm);
-        }
-        catch (NoSuchAlgorithmException nsae)
-        {
-            throw new RuntimeException("the requested digest algorithm (" + algorithm + ") is not available", nsae);
-        }
+    Grouping.CommandField gc = new CommandField();
+    gc.groupSort = groupSort;
+    gc.groupBy = field;
+    gc.key = field;
+    gc.numGroups = limitDefault;
+    gc.docsPerGroup = docsPerGroupDefault;
+    gc.groupOffset = groupOffsetDefault;
+    gc.offset = cmd.getOffset();
+    gc.sort = sort;
+    gc.format = defaultFormat;
+    gc.totalCount = defaultTotalCount;
+
+    if (main) {
+      gc.main = true;
+      gc.format = Grouping.Format.simple;
     }
 
-    public static Random threadLocalRandom()
-    {
-        return localRandom.get();
+    if (gc.format == Grouping.Format.simple) {
+      gc.groupOffset = 0;  // doesn't make sense
     }
+    commands.add(gc);
+  }
+
+  public void addQueryCommand(String groupByStr, SolrQueryRequest request) throws ParseException {
+    QParser parser = QParser.getParser(groupByStr, null, request);
+    Query gq = parser.getQuery();
+    Grouping.CommandQuery gc = new CommandQuery();
+    gc.query = gq;
+    gc.groupSort = groupSort;
+    gc.key = groupByStr;
+    gc.numGroups = limitDefault;
+    gc.docsPerGroup = docsPerGroupDefault;
+    gc.groupOffset = groupOffsetDefault;
+
+    // these two params will only be used if this is for the main result set
+    gc.offset = cmd.getOffset();
+    gc.numGroups = limitDefault;
+    gc.format = defaultFormat;
+
+    if (main) {
+      gc.main = true;
+      gc.format = Grouping.Format.simple;
+    }
+    if (gc.format == Grouping.Format.simple) {
+      gc.docsPerGroup = gc.numGroups;  // doesn't make sense to limit to one
+      gc.groupOffset = gc.offset;
+    }
+
+    commands.add(gc);
+  }
+
+  public Grouping setSort(Sort sort) {
+    this.sort = sort;
+    return this;
+  }
+
+  public Grouping setGroupSort(Sort groupSort) {
+    this.groupSort = groupSort;
+    return this;
+  }
+
+  public Grouping setLimitDefault(int limitDefault) {
+    this.limitDefault = limitDefault;
+    return this;
+  }
+
+  public Grouping setDocsPerGroupDefault(int docsPerGroupDefault) {
+    this.docsPerGroupDefault = docsPerGroupDefault;
+    return this;
+  }
+
+  public Grouping setGroupOffsetDefault(int groupOffsetDefault) {
+    this.groupOffsetDefault = groupOffsetDefault;
+    return this;
+  }
+
+  public Grouping setDefaultFormat(Format defaultFormat) {
+    this.defaultFormat = defaultFormat;
+    return this;
+  }
+
+  public Grouping setDefaultTotalCount(TotalCount defaultTotalCount) {
+    this.defaultTotalCount = defaultTotalCount;
+    return this;
+  }
+
+  public Grouping setGetGroupedDocSet(boolean getGroupedDocSet) {
+    this.getGroupedDocSet = getGroupedDocSet;
+    return this;
+  }
+
+  public List<Command> getCommands() {
+    return commands;
+  }
+
+  public void execute() throws IOException {
+    if (commands.isEmpty()) {
+      throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, "Specify at least one field, function or query to group by.");
+    }
+
+    DocListAndSet out = new DocListAndSet();
+    qr.setDocListAndSet(out);
+
+    SolrIndexSearcher.ProcessedFilter pf = searcher.getProcessedFilter(cmd.getFilter(), cmd.getFilterList());
+    final Filter luceneFilter = pf.filter;
+    maxDoc = searcher.maxDoc();
+
+    needScores = (cmd.getFlags() & SolrIndexSearcher.GET_SCORES) != 0;
+    boolean cacheScores = false;
+    // NOTE: Change this when groupSort can be specified per group
+    if (cacheSecondPassSearch && !needScores && !commands.isEmpty()) {
+      if (commands.get(0).groupSort == null) {
+        cacheScores = true;
+      } else {
+        for (SortField field : commands.get(0).groupSort.getSort()) {
+          if (field.getType() == SortField.SCORE) {
+            cacheScores = true;
+            break;
+          }
+        }
+      }
+    } else if (needScores) {
+      cacheScores = needScores;
+    }
+    getDocSet = (cmd.getFlags() & SolrIndexSearcher.GET_DOCSET) != 0;
+    getDocList = (cmd.getFlags() & SolrIndexSearcher.GET_DOCLIST) != 0;
+    query = QueryUtils.makeQueryable(cmd.getQuery());
+
+    for (Command cmd : commands) {
+      cmd.prepare();
+    }
+
+    AbstractAllGroupHeadsCollector<?> allGroupHeadsCollector = null;
+    List<Collector> collectors = new ArrayList<Collector>(commands.size());
+    for (Command cmd : commands) {
+      Collector collector = cmd.createFirstPassCollector();
+      if (collector != null) {
+        collectors.add(collector);
+      }
+      if (getGroupedDocSet && allGroupHeadsCollector == null) {
+        collectors.add(allGroupHeadsCollector = cmd.createAllGroupCollector());
+      }
+    }
+
+    Collector allCollectors = MultiCollector.wrap(collectors.toArray(new Collector[collectors.size()]));
+    DocSetCollector setCollector = null;
+    if (getDocSet && allGroupHeadsCollector == null) {
+      setCollector = new DocSetDelegateCollector(maxDoc >> 6, maxDoc, allCollectors);
+      allCollectors = setCollector;
+    }
+
+    CachingCollector cachedCollector = null;
+    if (cacheSecondPassSearch && allCollectors != null) {
+      int maxDocsToCache = (int) Math.round(maxDoc * (maxDocsPercentageToCache / 100.0d));
+      // Only makes sense to cache if we cache more than zero.
+      // Maybe we should have a minimum and a maximum, that defines the window we would like caching for.
+      if (maxDocsToCache > 0) {
+        allCollectors = cachedCollector = CachingCollector.create(allCollectors, cacheScores, maxDocsToCache);
+      }
+    }
+
+    if (pf.postFilter != null) {
+      pf.postFilter.setLastDelegate(allCollectors);
+      allCollectors = pf.postFilter;
+    }
+
+    if (allCollectors != null) {
+      searchWithTimeLimiter(luceneFilter, allCollectors);
+    }
+
+    if (getGroupedDocSet && allGroupHeadsCollector != null) {
+      FixedBitSet fixedBitSet = allGroupHeadsCollector.retrieveGroupHeads(maxDoc);
+      long[] bits = fixedBitSet.getBits();
+      OpenBitSet openBitSet = new OpenBitSet(bits, bits.length);
+      qr.setDocSet(new BitDocSet(openBitSet));
+    } else if (getDocSet) {
+      qr.setDocSet(setCollector.getDocSet());
+    }
+
+    collectors.clear();
+    for (Command cmd : commands) {
+      Collector collector = cmd.createSecondPassCollector();
+      if (collector != null)
+        collectors.add(collector);
+    }
+
+    if (!collectors.isEmpty()) {
+      Collector secondPhaseCollectors = MultiCollector.wrap(collectors.toArray(new Collector[collectors.size()]));
+      if (collectors.size() > 0) {
+        if (cachedCollector != null) {
+          if (cachedCollector.isCached()) {
+            cachedCollector.replay(secondPhaseCollectors);
+          } else {
+            signalCacheWarning = true;
+            logger.warn(String.format("The grouping cache is active, but not used because it exceeded the max cache limit of %d percent", maxDocsPercentageToCache));
+            logger.warn("Please increase cache size or disable group caching.");
+            searchWithTimeLimiter(luceneFilter, secondPhaseCollectors);
+          }
+        } else {
+          if (pf.postFilter != null) {
+            pf.postFilter.setLastDelegate(secondPhaseCollectors);
+            secondPhaseCollectors = pf.postFilter;
+          }
+          searchWithTimeLimiter(luceneFilter, secondPhaseCollectors);
+        }
+      }
+    }
+
+    for (Command cmd : commands) {
+      cmd.finish();
+    }
+
+    qr.groupedResults = grouped;
+
+    if (getDocList) {
+      int sz = idSet.size();
+      int[] ids = new int[sz];
+      int idx = 0;
+      for (int val : idSet) {
+        ids[idx++] = val;
+      }
+      qr.setDocList(new DocSlice(0, sz, ids, null, maxMatches, maxScore));
+    }
+  }
+
+  /**
+   * Invokes search with the specified filter and collector.  
+   * If a time limit has been specified, wrap the collector in a TimeLimitingCollector
+   */
+  private void searchWithTimeLimiter(final Filter luceneFilter, Collector collector) throws IOException {
+    if (cmd.getTimeAllowed() > 0) {
+      if (timeLimitingCollector == null) {
+        timeLimitingCollector = new TimeLimitingCollector(collector, TimeLimitingCollector.getGlobalCounter(), cmd.getTimeAllowed());
+      } else {
+        /*
+         * This is so the same timer can be used for grouping's multiple phases.   
+         * We don't want to create a new TimeLimitingCollector for each phase because that would 
+         * reset the timer for each phase.  If time runs out during the first phase, the 
+         * second phase should timeout quickly.
+         */
+        timeLimitingCollector.setCollector(collector);
+      }
+      collector = timeLimitingCollector;
+    }
+    try {
+      searcher.search(query, luceneFilter, collector);
+    } catch (TimeLimitingCollector.TimeExceededException x) {
+      logger.warn( "Query: " + query + "; " + x.getMessage() );
+      qr.setPartialResults(true);
+    }
+  }
+
+  /**
+   * Returns offset + len if len equals zero or higher. Otherwise returns max.
+   *
+   * @param offset The offset
+   * @param len The number of documents to return
+   * @param max The number of document to return if len < 0 or if offset + len < 0
+   * @return offset + len if len equals zero or higher. Otherwise returns max
+   */
+  int getMax(int offset, int len, int max) {
+    int v = len < 0 ? max : offset + len;
+    if (v < 0 || v > max) v = max;
+    return v;
+  }
+
+  /**
+   * Returns whether a cache warning should be send to the client.
+   * The value <code>true</code> is returned when the cache is emptied because the caching limits where met, otherwise
+   * <code>false</code> is returned.
+   *
+   * @return whether a cache warning should be send to the client
+   */
+  public boolean isSignalCacheWarning() {
+    return signalCacheWarning;
+  }
+
+  //======================================   Inner classes =============================================================
+
+  public static enum Format {
 
     /**
-     * Parses a string representing either a fraction, absolute value or percentage.
+     * Grouped result. Each group has its own result set.
      */
-    public static double parseDoubleOrPercent(String value)
-    {
-        if (value.endsWith("%"))
-        {
-            return Double.parseDouble(value.substring(0, value.length() - 1)) / 100;
-        }
-        else
-        {
-            return Double.parseDouble(value);
-        }
-    }
+    grouped,
 
     /**
-     * Please use getBroadcastAddress instead. You need this only when you have to listen/connect.
+     * Flat result. All documents of all groups are put in one list.
      */
-    public static InetAddress getLocalAddress()
-    {
-        if (localInetAddress_ == null)
-            try
-            {
-                localInetAddress_ = DatabaseDescriptor.getListenAddress() == null
-                                    ? InetAddress.getLocalHost()
-                                    : DatabaseDescriptor.getListenAddress();
-            }
-            catch (UnknownHostException e)
-            {
-                throw new RuntimeException(e);
-            }
-        return localInetAddress_;
-    }
+    simple
+  }
 
-    public static InetAddress getBroadcastAddress()
-    {
-        if (broadcastInetAddress_ == null)
-            broadcastInetAddress_ = DatabaseDescriptor.getBroadcastAddress() == null
-                                ? getLocalAddress()
-                                : DatabaseDescriptor.getBroadcastAddress();
-        return broadcastInetAddress_;
-    }
-
+  public static enum TotalCount {
     /**
-     * @param fractOrAbs A double that may represent a fraction or absolute value.
-     * @param total If fractionOrAbs is a fraction, the total to take the fraction from
-     * @return An absolute value which may be larger than the total.
+     * Computations should be based on groups.
      */
-    public static long absoluteFromFraction(double fractOrAbs, long total)
-    {
-        if (fractOrAbs < 0)
-            throw new UnsupportedOperationException("unexpected negative value " + fractOrAbs);
-
-        if (0 < fractOrAbs && fractOrAbs <= 1)
-        {
-            // fraction
-            return Math.max(1, (long)(fractOrAbs * total));
-        }
-
-        // absolute
-        assert fractOrAbs >= 1 || fractOrAbs == 0;
-        return (long)fractOrAbs;
-    }
+    grouped,
 
     /**
-     * Given two bit arrays represented as BigIntegers, containing the given
-     * number of significant bits, calculate a midpoint.
+     * Computations should be based on plain documents, so not taking grouping into account.
+     */
+    ungrouped
+  }
+
+  /**
+   * General group command. A group command is responsible for creating the first and second pass collectors.
+   * A group command is also responsible for creating the response structure.
+   * <p/>
+   * Note: Maybe the creating the response structure should be done in something like a ReponseBuilder???
+   * Warning NOT thread save!
+   */
+  public abstract class Command<GROUP_VALUE_TYPE> {
+
+    public String key;       // the name to use for this group in the response
+    public Sort groupSort;   // the sort of the documents *within* a single group.
+    public Sort sort;        // the sort between groups
+    public int docsPerGroup; // how many docs in each group - from "group.limit" param, default=1
+    public int groupOffset;  // the offset within each group (for paging within each group)
+    public int numGroups;    // how many groups - defaults to the "rows" parameter
+    int actualGroupsToFind;  // How many groups should actually be found. Based on groupOffset and numGroups.
+    public int offset;       // offset into the list of groups
+    public Format format;
+    public boolean main;     // use as the main result in simple format (grouped.main=true param)
+    public TotalCount totalCount = TotalCount.ungrouped;
+
+    TopGroups<GROUP_VALUE_TYPE> result;
+
+
+    /**
+     * Prepare this <code>Command</code> for execution.
      *
-     * @param left The left point.
-     * @param right The right point.
-     * @param sigbits The number of bits in the points that are significant.
-     * @return A midpoint that will compare bitwise halfway between the params, and
-     * a boolean representing whether a non-zero lsbit remainder was generated.
+     * @throws IOException If I/O related errors occur
      */
-    public static Pair<BigInteger,Boolean> midpoint(BigInteger left, BigInteger right, int sigbits)
-    {
-        BigInteger midpoint;
-        boolean remainder;
-        if (left.compareTo(right) < 0)
-        {
-            BigInteger sum = left.add(right);
-            remainder = sum.testBit(0);
-            midpoint = sum.shiftRight(1);
-        }
-        else
-        {
-            BigInteger max = TWO.pow(sigbits);
-            // wrapping case
-            BigInteger distance = max.add(right).subtract(left);
-            remainder = distance.testBit(0);
-            midpoint = distance.shiftRight(1).add(left).mod(max);
-        }
-        return new Pair<BigInteger, Boolean>(midpoint, remainder);
-    }
+    protected abstract void prepare() throws IOException;
 
     /**
-     * Copy bytes from int into bytes starting from offset.
-     * @param bytes Target array
-     * @param offset Offset into the array
-     * @param i Value to write
-     */
-    public static void copyIntoBytes(byte[] bytes, int offset, int i)
-    {
-        bytes[offset]   = (byte)( ( i >>> 24 ) & 0xFF );
-        bytes[offset+1] = (byte)( ( i >>> 16 ) & 0xFF );
-        bytes[offset+2] = (byte)( ( i >>> 8  ) & 0xFF );
-        bytes[offset+3] = (byte)(   i          & 0xFF );
-    }
-
-    /**
-     * @param i Write this int to an array
-     * @return 4-byte array containing the int
-     */
-    public static byte[] toByteArray(int i)
-    {
-        byte[] bytes = new byte[4];
-        copyIntoBytes(bytes, 0, i);
-        return bytes;
-    }
-
-    /**
-     * Copy bytes from long into bytes starting from offset.
-     * @param bytes Target array
-     * @param offset Offset into the array
-     * @param l Value to write
-     */
-    public static void copyIntoBytes(byte[] bytes, int offset, long l)
-    {
-        bytes[offset]   = (byte)( ( l >>> 56 ) & 0xFF );
-        bytes[offset+1] = (byte)( ( l >>> 48 ) & 0xFF );
-        bytes[offset+2] = (byte)( ( l >>> 40 ) & 0xFF );
-        bytes[offset+3] = (byte)( ( l >>> 32 ) & 0xFF );
-        bytes[offset+4] = (byte)( ( l >>> 24 ) & 0xFF );
-        bytes[offset+5] = (byte)( ( l >>> 16 ) & 0xFF );
-        bytes[offset+6] = (byte)( ( l >>> 8  ) & 0xFF );
-        bytes[offset+7] = (byte)(   l          & 0xFF );
-    }
-
-    /**
-     * @param l Write this long to an array
-     * @return 8-byte array containing the long
-     */
-    public static byte[] toByteArray(long l)
-    {
-        byte[] bytes = new byte[8];
-        copyIntoBytes(bytes, 0, l);
-        return bytes;
-    }
-
-    /**
-     * Convert the byte array to an int starting from the given offset.
+     * Returns one or more {@link Collector} instances that are needed to perform the first pass search.
+     * If multiple Collectors are returned then these wrapped in a {@link org.apache.lucene.search.MultiCollector}.
      *
-     * @param b The byte array
+     * @return one or more {@link Collector} instances that are need to perform the first pass search
+     * @throws IOException If I/O related errors occur
+     */
+    protected abstract Collector createFirstPassCollector() throws IOException;
+
+    /**
+     * Returns zero or more {@link Collector} instances that are needed to perform the second pass search.
+     * In the case when no {@link Collector} instances are created <code>null</code> is returned.
+     * If multiple Collectors are returned then these wrapped in a {@link org.apache.lucene.search.MultiCollector}.
      *
-     * @return The integer
+     * @return zero or more {@link Collector} instances that are needed to perform the second pass search
+     * @throws IOException If I/O related errors occur
      */
-    public static int byteArrayToInt(byte[] b)
-    {
-        int value = 0;
-
-        for (int i = 0; i < 4; i++)
-        {
-            int shift = (4 - 1 - i) * 8;
-            value += (b[i] & 0x000000FF) << shift;
-        }
-
-        return value;
-    }
-
-    public static int compareUnsigned(byte[] bytes1, byte[] bytes2, int offset1, int offset2, int len1, int len2)
-    {
-        return FastByteComparisons.compareTo(bytes1, offset1, len1, bytes2, offset2, len2);
-    }
-  
-    /**
-     * @return The bitwise XOR of the inputs. The output will be the same length as the
-     * longer input, but if either input is null, the output will be null.
-     */
-    public static byte[] xor(byte[] left, byte[] right)
-    {
-        if (left == null || right == null)
-            return null;
-        if (left.length > right.length)
-        {
-            byte[] swap = left;
-            left = right;
-            right = swap;
-        }
-
-        // left.length is now <= right.length
-        byte[] out = Arrays.copyOf(right, right.length);
-        for (int i = 0; i < left.length; i++)
-        {
-            out[i] = (byte)((left[i] & 0xFF) ^ (right[i] & 0xFF));
-        }
-        return out;
-    }
-
-    public static BigInteger hashToBigInteger(ByteBuffer data)
-    {
-        byte[] result = hash(data);
-        BigInteger hash = new BigInteger(result);
-        return hash.abs();        
-    }
-
-    public static byte[] hash(ByteBuffer... data)
-    {
-        MessageDigest messageDigest = localMD5Digest.get();
-        for(ByteBuffer block : data)
-        {
-            messageDigest.update(block.duplicate());
-        }
-
-        return messageDigest.digest();
-    }
-
-    public static void renameWithConfirm(String tmpFilename, String filename) throws IOException
-    {
-        if (!new File(tmpFilename).renameTo(new File(filename)))
-        {
-            throw new IOException("rename failed of " + filename);
-        }
-    }
-
-    public static void atomicSetMax(AtomicInteger atomic, int i)
-    {
-        while (true)
-        {
-            int j = atomic.get();
-            if (j >= i || atomic.compareAndSet(j, i))
-                break;
-        }
-    }
-
-    public static void atomicSetMax(AtomicLong atomic, long i)
-    {
-        while (true)
-        {
-            long j = atomic.get();
-            if (j >= i || atomic.compareAndSet(j, i))
-                break;
-        }
-    }
-
-    public static void serialize(TSerializer serializer, TBase struct, DataOutput out)
-    throws IOException
-    {
-        assert serializer != null;
-        assert struct != null;
-        assert out != null;
-        byte[] bytes;
-        try
-        {
-            bytes = serializer.serialize(struct);
-        }
-        catch (TException e)
-        {
-            throw new RuntimeException(e);
-        }
-        out.writeInt(bytes.length);
-        out.write(bytes);
-    }
-
-    public static void deserialize(TDeserializer deserializer, TBase struct, DataInput in)
-    throws IOException
-    {
-        assert deserializer != null;
-        assert struct != null;
-        assert in != null;
-        byte[] bytes = new byte[in.readInt()];
-        in.readFully(bytes);
-        try
-        {
-            deserializer.deserialize(struct, bytes);
-        }
-        catch (TException ex)
-        {
-            throw new IOException(ex);
-        }
-    }
-
-    public static void sortSampledKeys(List<DecoratedKey> keys, Range<Token> range)
-    {
-        if (range.left.compareTo(range.right) >= 0)
-        {
-            // range wraps.  have to be careful that we sort in the same order as the range to find the right midpoint.
-            final Token right = range.right;
-            Comparator<DecoratedKey> comparator = new Comparator<DecoratedKey>()
-            {
-                public int compare(DecoratedKey o1, DecoratedKey o2)
-                {
-                    if ((right.compareTo(o1.token) < 0 && right.compareTo(o2.token) < 0)
-                        || (right.compareTo(o1.token) > 0 && right.compareTo(o2.token) > 0))
-                    {
-                        // both tokens are on the same side of the wrap point
-                        return o1.compareTo(o2);
-                    }
-                    return -o1.compareTo(o2);
-                }
-            };
-            Collections.sort(keys, comparator);
-        }
-        else
-        {
-            // unwrapped range (left < right).  standard sort is all we need.
-            Collections.sort(keys);
-        }
-    }
-
-    public static int encodedUTF8Length(String st)
-    {
-        int strlen = st.length();
-        int utflen = 0;
-        for (int i = 0; i < strlen; i++)
-        {
-            int c = st.charAt(i);
-            if ((c >= 0x0001) && (c <= 0x007F))
-                utflen++;
-            else if (c > 0x07FF)
-                utflen += 3;
-            else
-                utflen += 2;
-        }
-        return utflen;
-    }
-
-    public static String resourceToFile(String filename) throws ConfigurationException
-    {
-        ClassLoader loader = PropertyFileSnitch.class.getClassLoader();
-        URL scpurl = loader.getResource(filename);
-        if (scpurl == null)
-            throw new ConfigurationException("unable to locate " + filename);
-
-        return scpurl.getFile();
-    }
-
-    public static String getReleaseVersionString()
-    {
-        try
-        {
-            InputStream in = FBUtilities.class.getClassLoader().getResourceAsStream("org/apache/cassandra/config/version.properties");
-            if (in == null)
-            {
-                return "Unknown";
-            }
-            Properties props = new Properties();
-            props.load(in);
-            return props.getProperty("CassandraVersion");
-        }
-        catch (Exception e)
-        {
-            logger_.warn("Unable to load version.properties", e);
-            return "debug version";
-        }
-    }
-
-    public static long timestampMicros()
-    {
-        // we use microsecond resolution for compatibility with other client libraries, even though
-        // we can't actually get microsecond precision.
-        return System.currentTimeMillis() * 1000;
-    }
-
-    public static void waitOnFutures(Iterable<Future<?>> futures)
-    {
-        for (Future f : futures)
-        {
-            try
-            {
-                f.get();
-            }
-            catch (ExecutionException ee)
-            {
-                throw new RuntimeException(ee);
-            }
-            catch (InterruptedException ie)
-            {
-                throw new AssertionError(ie);
-            }
-        }
-    }
-
-    public static void waitOnFutures(List<IAsyncResult> results, long ms) throws TimeoutException
-    {
-        for (IAsyncResult result : results)
-            result.get(ms, TimeUnit.MILLISECONDS);
-    }
-
-
-    /**
-     * Waits for the futures to complete.
-     * @param timeout the timeout expressed in <code>TimeUnit</code> units
-     * @param timeUnit TimeUnit
-     * @throws TimeoutException if the waiting time exceeds <code>timeout</code>
-     */
-    public static void waitOnFutures(List<CreationTimeAwareFuture<?>> hintFutures, long timeout, TimeUnit timeUnit) throws TimeoutException
-    {
-        for (Future<?> future : hintFutures)
-        {
-            try
-            {
-                future.get(timeout, timeUnit);
-            }
-            catch (InterruptedException ex)
-            {
-                throw new AssertionError(ex);
-            }
-            catch (ExecutionException e)
-            {
-                throw new RuntimeException(e);
-            }
-            catch (TimeoutException e)
-            {
-               throw e;
-            }
-        }
-    }
-
-    public static IPartitioner newPartitioner(String partitionerClassName) throws ConfigurationException
-    {
-        if (!partitionerClassName.contains("."))
-            partitionerClassName = "org.apache.cassandra.dht." + partitionerClassName;
-        return FBUtilities.construct(partitionerClassName, "partitioner");
+    protected Collector createSecondPassCollector() throws IOException {
+      return null;
     }
 
     /**
-     * @return The Class for the given name.
-     * @param classname Fully qualified classname.
-     * @param readable Descriptive noun for the role the class plays.
-     * @throws ConfigurationException If the class cannot be found.
+     * Returns a collector that is able to return the most relevant document of all groups.
+     * Returns <code>null</code> if the command doesn't support this type of collector.
+     *
+     * @return a collector that is able to return the most relevant document of all groups.
+     * @throws IOException If I/O related errors occur
      */
-    public static <T> Class<T> classForName(String classname, String readable) throws ConfigurationException
-    {
-        try
-        {
-            return (Class<T>)Class.forName(classname);
-        }
-        catch (ClassNotFoundException e)
-        {
-            throw new ConfigurationException(String.format("Unable to find %s class '%s'", readable, classname));
-        }
+    public AbstractAllGroupHeadsCollector<?> createAllGroupCollector() throws IOException {
+      return null;
     }
 
     /**
-     * Constructs an instance of the given class, which must have a no-arg constructor.
-     * @param classname Fully qualified classname.
-     * @param readable Descriptive noun for the role the class plays.
-     * @throws ConfigurationException If the class cannot be found.
+     * Performs any necessary post actions to prepare the response.
+     *
+     * @throws IOException If I/O related errors occur
      */
-    public static <T> T construct(String classname, String readable) throws ConfigurationException
-    {
-        Class<T> cls = FBUtilities.classForName(classname, readable);
-        try
-        {
-            return cls.getConstructor().newInstance();
-        }
-        catch (NoSuchMethodException e)
-        {
-            throw new ConfigurationException(String.format("No default constructor for %s class '%s'.", readable, classname));
-        }
-        catch (IllegalAccessException e)
-        {
-            throw new ConfigurationException(String.format("Default constructor for %s class '%s' is inaccessible.", readable, classname));
-        }
-        catch (InstantiationException e)
-        {
-            throw new ConfigurationException(String.format("Cannot use abstract class '%s' as %s.", classname, readable));
-        }
-        catch (InvocationTargetException e)
-        {
-            if (e.getCause() instanceof ConfigurationException)
-                throw (ConfigurationException)e.getCause();
-            throw new ConfigurationException(String.format("Error instantiating %s class '%s'.", readable, classname), e);
-        }
+    protected abstract void finish() throws IOException;
+
+    /**
+     * Returns the number of matches for this <code>Command</code>.
+     *
+     * @return the number of matches for this <code>Command</code>
+     */
+    public abstract int getMatches();
+
+    /**
+     * Returns the number of groups found for this <code>Command</code>.
+     * If the command doesn't support counting the groups <code>null</code> is returned.
+     *
+     * @return the number of groups found for this <code>Command</code>
+     */
+    protected Integer getNumberOfGroups() {
+      return null;
     }
 
-    public static <T extends Comparable> SortedSet<T> singleton(T column)
-    {
-        return new TreeSet<T>(Arrays.asList(column));
+    protected NamedList commonResponse() {
+      NamedList groupResult = new SimpleOrderedMap();
+      grouped.add(key, groupResult);  // grouped={ key={
+
+      int matches = getMatches();
+      groupResult.add("matches", matches);
+      if (totalCount == TotalCount.grouped) {
+        Integer totalNrOfGroups = getNumberOfGroups();
+        groupResult.add("ngroups", totalNrOfGroups == null ? 0 : totalNrOfGroups);
+      }
+      maxMatches = Math.max(maxMatches, matches);
+      return groupResult;
     }
 
-    public static String toString(Map<?,?> map)
-    {
-        Joiner.MapJoiner joiner = Joiner.on(", ").withKeyValueSeparator(":");
-        return joiner.join(map);
+    protected DocList getDocList(GroupDocs groups) {
+      int max = groups.totalHits;
+      int off = groupOffset;
+      int len = docsPerGroup;
+      if (format == Format.simple) {
+        off = offset;
+        len = numGroups;
+      }
+      int docsToCollect = getMax(off, len, max);
+
+      // TODO: implement a DocList impl that doesn't need to start at offset=0
+      int docsCollected = Math.min(docsToCollect, groups.scoreDocs.length);
+
+      int ids[] = new int[docsCollected];
+      float[] scores = needScores ? new float[docsCollected] : null;
+      for (int i = 0; i < ids.length; i++) {
+        ids[i] = groups.scoreDocs[i].doc;
+        if (scores != null)
+          scores[i] = groups.scoreDocs[i].score;
+      }
+
+      float score = groups.maxScore;
+      maxScore = Math.max(maxScore, score);
+      DocSlice docs = new DocSlice(off, Math.max(0, ids.length - off), ids, scores, groups.totalHits, score);
+
+      if (getDocList) {
+        DocIterator iter = docs.iterator();
+        while (iter.hasNext())
+          idSet.add(iter.nextDoc());
+      }
+      return docs;
+    }
+
+    protected void addDocList(NamedList rsp, GroupDocs groups) {
+      rsp.add("doclist", getDocList(groups));
+    }
+
+    // Flatten the groups and get up offset + rows documents
+    protected DocList createSimpleResponse() {
+      GroupDocs[] groups = result != null ? result.groups : new GroupDocs[0];
+
+      List<Integer> ids = new ArrayList<Integer>();
+      List<Float> scores = new ArrayList<Float>();
+      int docsToGather = getMax(offset, numGroups, maxDoc);
+      int docsGathered = 0;
+      float maxScore = Float.NEGATIVE_INFINITY;
+
+      outer:
+      for (GroupDocs group : groups) {
+        if (group.maxScore > maxScore) {
+          maxScore = group.maxScore;
+        }
+
+        for (ScoreDoc scoreDoc : group.scoreDocs) {
+          if (docsGathered >= docsToGather) {
+            break outer;
+          }
+
+          ids.add(scoreDoc.doc);
+          scores.add(scoreDoc.score);
+          docsGathered++;
+        }
+      }
+
+      int len = docsGathered - offset;
+      int[] docs = ArrayUtils.toPrimitive(ids.toArray(new Integer[ids.size()]));
+      float[] docScores = ArrayUtils.toPrimitive(scores.toArray(new Float[scores.size()]));
+      DocSlice docSlice = new DocSlice(offset, len, docs, docScores, getMatches(), maxScore);
+
+      if (getDocList) {
+        for (int i = offset; i < docs.length; i++) {
+          idSet.add(docs[i]);
+        }
+      }
+
+      return docSlice;
+    }
+
+  }
+
+  /**
+   * A group command for grouping on a field.
+   */
+  public class CommandField extends Command<String> {
+
+    public String groupBy;
+    TermFirstPassGroupingCollector firstPass;
+    TermSecondPassGroupingCollector secondPass;
+
+    TermAllGroupsCollector allGroupsCollector;
+
+    // If offset falls outside the number of documents a group can provide use this collector instead of secondPass
+    TotalHitCountCollector fallBackCollector;
+    Collection<SearchGroup<String>> topGroups;
+
+    /**
+     * {@inheritDoc}
+     */
+    protected void prepare() throws IOException {
+      actualGroupsToFind = getMax(offset, numGroups, maxDoc);
     }
 
     /**
-     * Used to get access to protected/private field of the specified class
-     * @param klass - name of the class
-     * @param fieldName - name of the field
-     * @return Field or null on error
+     * {@inheritDoc}
      */
-    public static Field getProtectedField(Class klass, String fieldName)
-    {
-        Field field;
+    protected Collector createFirstPassCollector() throws IOException {
+      // Ok we don't want groups, but do want a total count
+      if (actualGroupsToFind <= 0) {
+        fallBackCollector = new TotalHitCountCollector();
+        return fallBackCollector;
+      }
 
-        try
-        {
-            field = klass.getDeclaredField(fieldName);
-            field.setAccessible(true);
+      sort = sort == null ? Sort.RELEVANCE : sort;
+      firstPass = new TermFirstPassGroupingCollector(groupBy, sort, actualGroupsToFind);
+      return firstPass;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    protected Collector createSecondPassCollector() throws IOException {
+      if (actualGroupsToFind <= 0) {
+        allGroupsCollector = new TermAllGroupsCollector(groupBy);
+        return totalCount == TotalCount.grouped ? allGroupsCollector : null;
+      }
+
+      topGroups = format == Format.grouped ? firstPass.getTopGroups(offset, false) : firstPass.getTopGroups(0, false);
+      if (topGroups == null) {
+        if (totalCount == TotalCount.grouped) {
+          allGroupsCollector = new TermAllGroupsCollector(groupBy);
+          fallBackCollector = new TotalHitCountCollector();
+          return MultiCollector.wrap(allGroupsCollector, fallBackCollector);
+        } else {
+          fallBackCollector = new TotalHitCountCollector();
+          return fallBackCollector;
         }
-        catch (Exception e)
-        {
-            throw new AssertionError(e);
+      }
+
+      int groupedDocsToCollect = getMax(groupOffset, docsPerGroup, maxDoc);
+      groupedDocsToCollect = Math.max(groupedDocsToCollect, 1);
+      secondPass = new TermSecondPassGroupingCollector(
+          groupBy, topGroups, sort, groupSort, groupedDocsToCollect, needScores, needScores, false
+      );
+
+      if (totalCount == TotalCount.grouped) {
+        allGroupsCollector = new TermAllGroupsCollector(groupBy);
+        return MultiCollector.wrap(secondPass, allGroupsCollector);
+      } else {
+        return secondPass;
+      }
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public AbstractAllGroupHeadsCollector<?> createAllGroupCollector() throws IOException {
+      Sort sortWithinGroup = groupSort != null ? groupSort : new Sort();
+      return TermAllGroupHeadsCollector.create(groupBy, sortWithinGroup);
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    protected void finish() throws IOException {
+      result = secondPass != null ? secondPass.getTopGroups(0) : null;
+      if (main) {
+        mainResult = createSimpleResponse();
+        return;
+      }
+
+      NamedList groupResult = commonResponse();
+
+      if (format == Format.simple) {
+        groupResult.add("doclist", createSimpleResponse());
+        return;
+      }
+
+      List groupList = new ArrayList();
+      groupResult.add("groups", groupList);        // grouped={ key={ groups=[
+
+      if (result == null) {
+        return;
+      }
+
+      // handle case of rows=0
+      if (numGroups == 0) return;
+
+      for (GroupDocs<String> group : result.groups) {
+        NamedList nl = new SimpleOrderedMap();
+        groupList.add(nl);                         // grouped={ key={ groups=[ {
+
+
+        // To keep the response format compatable with trunk.
+        // In trunk MutableValue can convert an indexed value to its native type. E.g. string to int
+        // The only option I currently see is the use the FieldType for this
+        if (group.groupValue != null) {
+          SchemaField schemaField = searcher.getSchema().getField(groupBy);
+          FieldType fieldType = schemaField.getType();
+          String readableValue = fieldType.indexedToReadable(group.groupValue);
+          Fieldable field = schemaField.createField(readableValue, 0.0f);
+          nl.add("groupValue", fieldType.toObject(field));
+        } else {
+          nl.add("groupValue", null);
         }
 
-        return field;
+        addDocList(nl, group);
+      }
     }
 
-    public static IRowCacheProvider newCacheProvider(String cache_provider) throws ConfigurationException
-    {
-        if (!cache_provider.contains("."))
-            cache_provider = "org.apache.cassandra.cache." + cache_provider;
-        return FBUtilities.construct(cache_provider, "row cache provider");
+    /**
+     * {@inheritDoc}
+     */
+    public int getMatches() {
+      if (result == null && fallBackCollector == null) {
+        return 0;
+      }
+
+      return result != null ? result.totalHitCount : fallBackCollector.getTotalHits();
     }
 
-    public static <T> CloseableIterator<T> closeableIterator(Iterator<T> iterator)
-    {
-        return new WrappedCloseableIterator<T>(iterator);
+    /**
+     * {@inheritDoc}
+     */
+    protected Integer getNumberOfGroups() {
+      return allGroupsCollector == null ? null : allGroupsCollector.getGroupCount();
+    }
+  }
+
+  /**
+   * A group command for grouping on a query.
+   */
+  //NOTE: doesn't need to be generic. Maybe Command interface --> First / Second pass abstract impl.
+  public class CommandQuery extends Command {
+
+    public Query query;
+    TopDocsCollector topCollector;
+    FilterCollector collector;
+
+    /**
+     * {@inheritDoc}
+     */
+    protected void prepare() throws IOException {
+      actualGroupsToFind = getMax(offset, numGroups, maxDoc);
     }
 
-    private static final class WrappedCloseableIterator<T>
-        extends AbstractIterator<T> implements CloseableIterator<T>
-    {
-        private final Iterator<T> source;
-        public WrappedCloseableIterator(Iterator<T> source)
-        {
-            this.source = source;
-        }
-
-        protected T computeNext()
-        {
-            if (!source.hasNext())
-                return endOfData();
-            return source.next();
-        }
-
-        public void close() {}
+    /**
+     * {@inheritDoc}
+     */
+    protected Collector createFirstPassCollector() throws IOException {
+      DocSet groupFilt = searcher.getDocSet(query);
+      topCollector = newCollector(groupSort, needScores);
+      collector = new FilterCollector(groupFilt, topCollector);
+      return collector;
     }
 
-    public static <T> byte[] serialize(T object, IVersionedSerializer<T> serializer, int version) throws IOException
-    {
-        int size = (int) serializer.serializedSize(object, version);
-        DataOutputBuffer buffer = new DataOutputBuffer(size);
-        serializer.serialize(object, buffer, version);
-        assert buffer.getLength() == size && buffer.getData().length == size
-               : String.format("Final buffer length %s to accomodate data size of %s (predicted %s) for %s",
-                               buffer.getData().length, buffer.getLength(), size, object);
-        return buffer.getData();
+    TopDocsCollector newCollector(Sort sort, boolean needScores) throws IOException {
+      int groupDocsToCollect = getMax(groupOffset, docsPerGroup, maxDoc);
+      if (sort == null || sort == Sort.RELEVANCE) {
+        return TopScoreDocCollector.create(groupDocsToCollect, true);
+      } else {
+        return TopFieldCollector.create(searcher.weightSort(sort), groupDocsToCollect, false, needScores, needScores, true);
+      }
     }
 
-    public static RuntimeException unchecked(Exception e)
-    {
-        return e instanceof RuntimeException ? (RuntimeException) e : new RuntimeException(e);
+    /**
+     * {@inheritDoc}
+     */
+    protected void finish() throws IOException {
+      TopDocsCollector topDocsCollector = (TopDocsCollector) collector.getDelegate();
+      TopDocs topDocs = topDocsCollector.topDocs();
+      GroupDocs<String> groupDocs = new GroupDocs<String>(topDocs.getMaxScore(), topDocs.totalHits, topDocs.scoreDocs, query.toString(), null);
+      if (main) {
+        mainResult = getDocList(groupDocs);
+      } else {
+        NamedList rsp = commonResponse();
+        addDocList(rsp, groupDocs);
+      }
     }
+
+    /**
+     * {@inheritDoc}
+     */
+    public int getMatches() {
+      return collector.getMatches();
+    }
+  }
+
 }

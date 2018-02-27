@@ -21,104 +21,143 @@ if (logger_.isDebugEnabled())
 package org.apache.cassandra.db;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.io.DataInputBuffer;
-import org.apache.cassandra.io.DataOutputBuffer;
-import org.apache.cassandra.net.EndPoint;
-import org.apache.cassandra.net.IVerbHandler;
-import org.apache.cassandra.net.Message;
-import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.io.SSTable;
 import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.utils.LogUtil;
+
 import org.apache.log4j.Logger;
+import org.cliffc.high_scale_lib.NonBlockingHashMap;
 
 /**
  * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
  */
 
-public class ReadVerbHandler implements IVerbHandler
+public class BinaryMemtable
 {
-    protected static class ReadContext
+    private static Logger logger_ = Logger.getLogger( Memtable.class );
+    private int threshold_ = 512*1024*1024;
+    private AtomicInteger currentSize_ = new AtomicInteger(0);
+
+    /* Table and ColumnFamily name are used to determine the ColumnFamilyStore */
+    private String table_;
+    private String cfName_;
+    private boolean isFrozen_ = false;
+    private Map<String, byte[]> columnFamilies_ = new NonBlockingHashMap<String, byte[]>();
+    /* Lock and Condition for notifying new clients about Memtable switches */
+    Lock lock_ = new ReentrantLock();
+    Condition condition_;
+
+    BinaryMemtable(String table, String cfName) throws IOException
     {
-        protected DataInputBuffer bufIn_ = new DataInputBuffer();
-        protected DataOutputBuffer bufOut_ = new DataOutputBuffer();
+        condition_ = lock_.newCondition();
+        table_ = table;
+        cfName_ = cfName;
     }
 
-    private static Logger logger_ = Logger.getLogger( ReadVerbHandler.class );
-    /* We use this so that we can reuse the same row mutation context for the mutation. */
-    private static ThreadLocal<ReadVerbHandler.ReadContext> tls_ = new InheritableThreadLocal<ReadVerbHandler.ReadContext>();
-    
-    protected static ReadVerbHandler.ReadContext getCurrentReadContext()
+    public int getMemtableThreshold()
     {
-        return tls_.get();
-    }
-    
-    protected static void setCurrentReadContext(ReadVerbHandler.ReadContext readContext)
-    {
-        tls_.set(readContext);
+        return currentSize_.get();
     }
 
-    public void doVerb(Message message)
+    void resolveSize(int oldSize, int newSize)
     {
-        byte[] body = message.getMessageBody();
-        /* Obtain a Read Context from TLS */
-        ReadContext readCtx = tls_.get();
-        if ( readCtx == null )
+        currentSize_.addAndGet(newSize - oldSize);
+    }
+
+
+    boolean isThresholdViolated()
+    {
+        if (currentSize_.get() >= threshold_ || columnFamilies_.size() > 50000)
         {
-            readCtx = new ReadContext();
-            tls_.set(readCtx);
+            logger_.debug("CURRENT SIZE:" + currentSize_.get());
+        	return true;
         }
-        readCtx.bufIn_.reset(body, body.length);
+        return false;
+    }
 
-        try
+    String getColumnFamily()
+    {
+    	return cfName_;
+    }
+
+    /*
+     * This version is used by the external clients to put data into
+     * the memtable. This version will respect the threshold and flush
+     * the memtable to disk when the size exceeds the threshold.
+    */
+    void put(String key, byte[] buffer) throws IOException
+    {
+        if (isThresholdViolated() )
         {
-            ReadCommand readCommand = ReadCommand.serializer().deserialize(readCtx.bufIn_);
-            Table table = Table.open(readCommand.table);
-            Row row = null;
-            row = readCommand.getRow(table);
-            ReadResponse readResponse = null;
-            if (readCommand.isDigestQuery())
+            lock_.lock();
+            try
             {
-                readResponse = new ReadResponse(row.digest());
+                ColumnFamilyStore cfStore = Table.open(table_).getColumnFamilyStore(cfName_);
+                if (!isFrozen_)
+                {
+                    isFrozen_ = true;
+                    BinaryMemtableManager.instance().submit(cfStore.getColumnFamilyName(), this);
+                    cfStore.switchBinaryMemtable(key, buffer);
+                }
+                else
+                {
+                    cfStore.applyBinary(key, buffer);
+                }
             }
-            else
+            finally
             {
-                readResponse = new ReadResponse(row);
-            }
-            readResponse.setIsDigestQuery(readCommand.isDigestQuery());
-            /* serialize the ReadResponseMessage. */
-            readCtx.bufOut_.reset();
-
-            ReadResponse.serializer().serialize(readResponse, readCtx.bufOut_);
-
-            byte[] bytes = new byte[readCtx.bufOut_.getLength()];
-            System.arraycopy(readCtx.bufOut_.getData(), 0, bytes, 0, bytes.length);
-
-            Message response = message.getReply(StorageService.getLocalStorageEndPoint(), bytes);
-            logger_.debug("Read key " + readCommand.key + "; sending response to " + message.getMessageId() + "@" + message.getFrom());
-            MessagingService.getMessagingInstance().sendOneWay(response, message.getFrom());
-
-            /* Do read repair if header of the message says so */
-            if (message.getHeader(ReadCommand.DO_REPAIR) != null)
-            {
-                doReadRepair(row, readCommand);
+                lock_.unlock();
             }
         }
-        catch (IOException ex)
+        else
         {
-            throw new RuntimeException(ex);
+            resolve(key, buffer);
         }
     }
-    
-    private void doReadRepair(Row row, ReadCommand readCommand)
+
+    private void resolve(String key, byte[] buffer)
     {
-        List<EndPoint> endpoints = StorageService.instance().getNLiveStorageEndPoint(readCommand.key);
-        /* Remove the local storage endpoint from the list. */ 
-        endpoints.remove( StorageService.getLocalStorageEndPoint() );
-            
-        if (endpoints.size() > 0 && DatabaseDescriptor.getConsistencyCheck())
-            StorageService.instance().doConsistencyCheck(row, endpoints, readCommand);
-    }     
+            columnFamilies_.put(key, buffer);
+            currentSize_.addAndGet(buffer.length + key.length());
+    }
+
+
+    /*
+     * 
+    */
+    void flush() throws IOException
+    {
+        if ( columnFamilies_.size() == 0 )
+            return;
+
+        /*
+         * Use the SSTable to write the contents of the TreeMap
+         * to disk.
+        */
+        ColumnFamilyStore cfStore = Table.open(table_).getColumnFamilyStore(cfName_);
+        List<String> keys = new ArrayList<String>( columnFamilies_.keySet() );
+        SSTable ssTable = new SSTable(cfStore.getTempSSTablePath(), keys.size(), StorageService.getPartitioner());
+        Collections.sort(keys);
+        /* Use this BloomFilter to decide if a key exists in a SSTable */
+        for ( String key : keys )
+        {           
+            byte[] bytes = columnFamilies_.get(key);
+            if ( bytes.length > 0 )
+            {            	
+                /* Now write the key and value to disk */
+                ssTable.append(key, bytes);
+            }
+        }
+        ssTable.close();
+        cfStore.storeLocation(ssTable);
+        columnFamilies_.clear();       
+    }
 }

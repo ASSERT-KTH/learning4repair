@@ -1,803 +1,1054 @@
-if (length > (this.length() - (pos -1))) {
+if (reader.getVersion() == segmentInfos.getVersion()) {
 
-/*
-
-   Derby - Class org.apache.derby.impl.jdbc.EmbedClob
-
-   Licensed to the Apache Software Foundation (ASF) under one or more
-   contributor license agreements.  See the NOTICE file distributed with
-   this work for additional information regarding copyright ownership.
-   The ASF licenses this file to you under the Apache License, Version 2.0
-   (the "License"); you may not use this file except in compliance with
-   the License.  You may obtain a copy of the License at
-
-      http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
-
- */
-
-
-package org.apache.derby.impl.jdbc;
-
-import org.apache.derby.iapi.reference.SQLState;
-import org.apache.derby.iapi.error.StandardException;
-import org.apache.derby.iapi.jdbc.EngineLOB;
-import org.apache.derby.iapi.jdbc.CharacterStreamDescriptor;
-import org.apache.derby.iapi.services.sanity.SanityManager;
-import org.apache.derby.iapi.types.Resetable;
-import org.apache.derby.iapi.types.StringDataValue;
-
-import java.io.Reader;
-import java.io.IOException;
-import java.io.EOFException;
-import java.sql.SQLException;
-import java.sql.Clob;
+package org.apache.lucene.index;
 
 /**
-    Implements java.sql.Clob (see the JDBC 2.0 spec).
-    A clob sits on top of a CHAR, VARCHAR or LONG VARCHAR column.
-    If its data is small (less than 1 page) it is a byte array taken from
-    the SQLChar class. If it is large (more than 1 page) it is a long column
-    in the database. The long column is accessed as a stream, and is implemented
-    in store as an OverflowInputStream. The Resetable interface allows sending
-    messages to that stream to initialize itself (reopen its container and
-    lock the corresponding row) and to reset itself to the beginning.
-    <p>
-    NOTE: In the case that the data is large, it is represented as a stream.
-    This stream can be returned to the user in the getAsciiStream() method.
-    This means that we have limited control over the state of the stream,
-    since the user can read bytes from it at any time.  Thus all methods
-    here reset the stream to the beginning before doing any work.
-    CAVEAT: The methods may not behave correctly if a user sets up
-    multiple threads and sucks data from the stream (returned from
-    getAsciiStream()) at the same time as calling the Clob methods.
-
-  <P><B>Supports</B>
-   <UL>
-   <LI> JSR169 - no subsetting for java.sql.Clob
-   <LI> JDBC 2.0
-   <LI> JDBC 3.0 - no new dependencies on new JDBC 3.0 or JDK 1.4 classes,
-        new update methods can safely be added into implementation.
-   </UL>
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
-final class EmbedClob extends ConnectionChild implements Clob, EngineLOB
-{
 
-    /**
-     * The underlying Clob object, which may change depending on what the user
-     * does with the Clob.
-     */
-    private InternalClob clob;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
-    /** Tells whether the Clob has been freed or not. */
-    private boolean isValid = true;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.IOContext;
+import org.apache.lucene.store.Lock;
+import org.apache.lucene.store.LockObtainFailedException;
+import org.apache.lucene.index.codecs.CodecProvider;
+import org.apache.lucene.index.codecs.PerDocValues;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.MapBackedSet;
 
-    private int locator;
-    
-    /**
-     * Creates an empty Clob object.
-     *
-     * @param con The Connection object associated with this EmbedClob object.
-     * @throws SQLException
-     *
-     */
-    EmbedClob(EmbedConnection con) throws SQLException {
-        super(con);
-        this.clob = new TemporaryClob (this);
-        con.addLOBReference (this);
+/** 
+ * An IndexReader which reads indexes with multiple segments.
+ */
+class DirectoryReader extends IndexReader implements Cloneable {
+  protected Directory directory;
+  protected boolean readOnly;
+  
+  protected CodecProvider codecs;
+
+  IndexWriter writer;
+
+  private IndexDeletionPolicy deletionPolicy;
+  private Lock writeLock;
+  private final SegmentInfos segmentInfos;
+  private boolean stale;
+  private final int termInfosIndexDivisor;
+
+  private boolean rollbackHasChanges;
+
+  private SegmentReader[] subReaders;
+  private ReaderContext topLevelReaderContext;
+  private int[] starts;                           // 1st docno for each segment
+  private int maxDoc = 0;
+  private int numDocs = -1;
+  private boolean hasDeletions = false;
+
+  // Max version in index as of when we opened; this can be
+  // > our current segmentInfos version in case we were
+  // opened on a past IndexCommit:
+  private long maxIndexVersion;
+
+  private final boolean applyAllDeletes;
+
+//  static IndexReader open(final Directory directory, final IndexDeletionPolicy deletionPolicy, final IndexCommit commit, final boolean readOnly,
+//      final int termInfosIndexDivisor) throws CorruptIndexException, IOException {
+//    return open(directory, deletionPolicy, commit, readOnly, termInfosIndexDivisor, null);
+//  }
+  
+  static IndexReader open(final Directory directory, final IndexDeletionPolicy deletionPolicy, final IndexCommit commit, final boolean readOnly,
+                          final int termInfosIndexDivisor, CodecProvider codecs) throws CorruptIndexException, IOException {
+    final CodecProvider codecProvider = codecs == null ? CodecProvider.getDefault()
+        : codecs;
+    return (IndexReader) new SegmentInfos.FindSegmentsFile(directory) {
+      @Override
+      protected Object doBody(String segmentFileName) throws CorruptIndexException, IOException {
+        SegmentInfos infos = new SegmentInfos(codecProvider);
+        infos.read(directory, segmentFileName, codecProvider);
+        return new DirectoryReader(directory, infos, deletionPolicy, readOnly, termInfosIndexDivisor, codecProvider);
+      }
+    }.run(commit);
+  }
+
+  /** Construct reading the named set of readers. */
+//  DirectoryReader(Directory directory, SegmentInfos sis, IndexDeletionPolicy deletionPolicy, boolean readOnly, int termInfosIndexDivisor) throws IOException {
+//    this(directory, sis, deletionPolicy, readOnly, termInfosIndexDivisor, null);
+//  }
+  
+  /** Construct reading the named set of readers. */
+  DirectoryReader(Directory directory, SegmentInfos sis, IndexDeletionPolicy deletionPolicy, boolean readOnly, int termInfosIndexDivisor, CodecProvider codecs) throws IOException {
+    this.directory = directory;
+    this.readOnly = readOnly;
+    this.segmentInfos = sis;
+    this.deletionPolicy = deletionPolicy;
+    this.termInfosIndexDivisor = termInfosIndexDivisor;
+    if (codecs == null) {
+      this.codecs = CodecProvider.getDefault();
+    } else {
+      this.codecs = codecs;
+    }
+    readerFinishedListeners = new MapBackedSet<ReaderFinishedListener>(new ConcurrentHashMap<ReaderFinishedListener,Boolean>());
+    applyAllDeletes = false;
+
+    // To reduce the chance of hitting FileNotFound
+    // (and having to retry), we open segments in
+    // reverse because IndexWriter merges & deletes
+    // the newest segments first.
+
+    SegmentReader[] readers = new SegmentReader[sis.size()];
+    for (int i = sis.size()-1; i >= 0; i--) {
+      boolean success = false;
+      try {
+        readers[i] = SegmentReader.get(readOnly, sis.info(i), termInfosIndexDivisor, IOContext.READ);
+        readers[i].readerFinishedListeners = readerFinishedListeners;
+        success = true;
+      } finally {
+        if (!success) {
+          // Close all readers we had opened:
+          for(i++;i<sis.size();i++) {
+            try {
+              readers[i].close();
+            } catch (Throwable ignore) {
+              // keep going - we want to clean up as much as possible
+            }
+          }
+        }
+      }
     }
 
-    /**
-     * Creates a Clob on top of a data value descriptor.
-     * <p>
-     * This constructor should only be called by {@link EmbedResultSet#getClob}.
-     * The data value descriptor may provide a <code>String</code> or a stream
-     * as the source of the Clob.
-     *
-     * @param dvd string data value descriptor providing the Clob source
-     * @param con associated connection for the Clob
-     * @throws StandardException
-     */
-    protected EmbedClob(EmbedConnection con, StringDataValue dvd)
-        throws StandardException
-    {
-        super(con);
-        // if the underlying column is null, ResultSet.getClob will return null,
-        // never should get this far
-        if (SanityManager.DEBUG)
-            SanityManager.ASSERT(!dvd.isNull(),
-                                 "clob is created on top of a null column");
+    initialize(readers);
+  }
 
-        CharacterStreamDescriptor csd = dvd.getStreamWithDescriptor();
-        // See if a String or a stream will be the source of the Clob.
-        if (csd == null) {
-            try {
-                clob = new TemporaryClob(dvd.getString(),
-                        this);
-            }
-            catch (SQLException sqle) {
-                throw StandardException.newException (sqle.getSQLState(), sqle);
-            }
-            catch (IOException e) {
-                throw StandardException.newException (
-                                        SQLState.SET_STREAM_FAILURE, e);
-            }
+  // Used by near real-time search
+  DirectoryReader(IndexWriter writer, SegmentInfos infos, CodecProvider codecs, boolean applyAllDeletes) throws IOException {
+    this.directory = writer.getDirectory();
+    this.readOnly = true;
+    this.applyAllDeletes = applyAllDeletes;       // saved for reopen
+
+    this.termInfosIndexDivisor = writer.getConfig().getReaderTermsIndexDivisor();
+    if (codecs == null) {
+      this.codecs = CodecProvider.getDefault();
+    } else {
+      this.codecs = codecs;
+    }
+    readerFinishedListeners = writer.getReaderFinishedListeners();
+
+    // IndexWriter synchronizes externally before calling
+    // us, which ensures infos will not change; so there's
+    // no need to process segments in reverse order
+    final int numSegments = infos.size();
+
+    List<SegmentReader> readers = new ArrayList<SegmentReader>();
+    final Directory dir = writer.getDirectory();
+
+    segmentInfos = (SegmentInfos) infos.clone();
+    int infosUpto = 0;
+    for (int i=0;i<numSegments;i++) {
+      boolean success = false;
+      try {
+        final SegmentInfo info = infos.info(i);
+        assert info.dir == dir;
+        final SegmentReader reader = writer.readerPool.getReadOnlyClone(info, IOContext.READ);
+        if (reader.numDocs() > 0 || writer.getKeepFullyDeletedSegments()) {
+          reader.readerFinishedListeners = readerFinishedListeners;
+          readers.add(reader);
+          infosUpto++;
         } else {
-            /*
-             We are expecting this stream to be a FormatIdInputStream with an
-             OverflowInputStream inside. FormatIdInputStream implements
-             Resetable, as does OverflowInputStream. This should be the case
-             when retrieving data from a long column. However, SQLChar, which is
-             the class implementing the getStream() method for dvd.getStream(),
-             does not guarantee this for us. In particular, the logging system
-             (see StoredPage.logColumn) calls setStream with an argument that
-             is sometimes a RememberBytesInputStream on a SQLChar object
-             (e.g. see test repStreaming.sql). However, such a SQLChar
-             object is going to the log buffer, NOT back to the user, so it
-             should not break the ASSERT below.
-             */
-            if (SanityManager.DEBUG)
-                SanityManager.ASSERT(csd.getStream() instanceof Resetable);
-
+          reader.close();
+          segmentInfos.remove(infosUpto);
+        }
+        success = true;
+      } finally {
+        if (!success) {
+          // Close all readers we had opened:
+          for(SegmentReader reader : readers) {
             try {
-                this.clob = new StoreStreamClob(csd, this);
-            } catch (StandardException se) {
-                if (se.getMessageId().equals(SQLState.DATA_CONTAINER_CLOSED)) {
-                    throw StandardException
-                            .newException(SQLState.BLOB_ACCESSED_AFTER_COMMIT);
+              reader.close();
+            } catch (Throwable ignore) {
+              // keep going - we want to clean up as much as possible
+            }
+          }
+        }
+      }
+    }
+
+    this.writer = writer;
+
+    initialize(readers.toArray(new SegmentReader[readers.size()]));
+  }
+
+  /** This constructor is only used for {@link #doOpenIfChanged()} */
+  DirectoryReader(Directory directory, SegmentInfos infos, SegmentReader[] oldReaders,
+                  boolean readOnly, boolean doClone, int termInfosIndexDivisor, CodecProvider codecs,
+                  Collection<ReaderFinishedListener> readerFinishedListeners) throws IOException {
+    this.directory = directory;
+    this.readOnly = readOnly;
+    this.segmentInfos = infos;
+    this.termInfosIndexDivisor = termInfosIndexDivisor;
+    this.readerFinishedListeners = readerFinishedListeners;
+    applyAllDeletes = false;
+
+    if (codecs == null) {
+      this.codecs = CodecProvider.getDefault();
+    } else {
+      this.codecs = codecs;
+    }
+    
+
+    // we put the old SegmentReaders in a map, that allows us
+    // to lookup a reader using its segment name
+    Map<String,Integer> segmentReaders = new HashMap<String,Integer>();
+
+    if (oldReaders != null) {
+      // create a Map SegmentName->SegmentReader
+      for (int i = 0; i < oldReaders.length; i++) {
+        segmentReaders.put(oldReaders[i].getSegmentName(), Integer.valueOf(i));
+      }
+    }
+    
+    SegmentReader[] newReaders = new SegmentReader[infos.size()];
+    
+    // remember which readers are shared between the old and the re-opened
+    // DirectoryReader - we have to incRef those readers
+    boolean[] readerShared = new boolean[infos.size()];
+    
+    for (int i = infos.size() - 1; i>=0; i--) {
+      // find SegmentReader for this segment
+      Integer oldReaderIndex = segmentReaders.get(infos.info(i).name);
+      if (oldReaderIndex == null) {
+        // this is a new segment, no old SegmentReader can be reused
+        newReaders[i] = null;
+      } else {
+        // there is an old reader for this segment - we'll try to reopen it
+        newReaders[i] = oldReaders[oldReaderIndex.intValue()];
+      }
+
+      boolean success = false;
+      try {
+        SegmentReader newReader;
+        if (newReaders[i] == null || infos.info(i).getUseCompoundFile() != newReaders[i].getSegmentInfo().getUseCompoundFile()) {
+
+          // We should never see a totally new segment during cloning
+          assert !doClone;
+
+          // this is a new reader; in case we hit an exception we can close it safely
+          newReader = SegmentReader.get(readOnly, infos.info(i), termInfosIndexDivisor, IOContext.READ);
+          newReader.readerFinishedListeners = readerFinishedListeners;
+          readerShared[i] = false;
+          newReaders[i] = newReader;
+        } else {
+          newReader = newReaders[i].reopenSegment(infos.info(i), doClone, readOnly);
+          if (newReader == null) {
+            // this reader will be shared between the old and the new one,
+            // so we must incRef it
+            readerShared[i] = true;
+            newReaders[i].incRef();
+          } else {
+            assert newReader.readerFinishedListeners == readerFinishedListeners;
+            readerShared[i] = false;
+            // Steal ref returned to us by reopenSegment:
+            newReaders[i] = newReader;
+          }
+        }
+        success = true;
+      } finally {
+        if (!success) {
+          for (i++; i < infos.size(); i++) {
+            if (newReaders[i] != null) {
+              try {
+                if (!readerShared[i]) {
+                  // this is a new subReader that is not used by the old one,
+                  // we can close it
+                  newReaders[i].close();
+                } else {
+                  // this subReader is also used by the old reader, so instead
+                  // closing we must decRef it
+                  newReaders[i].decRef();
                 }
-                throw se;
+              } catch (IOException ignore) {
+                // keep going - we want to clean up as much as possible
+              }
             }
+          }
         }
-        con.addLOBReference (this);
+      }
+    }    
+    
+    // initialize the readers to calculate maxDoc before we try to reuse the old normsCache
+    initialize(newReaders);
+  }
+
+  /** {@inheritDoc} */
+  @Override
+  public String toString() {
+    final StringBuilder buffer = new StringBuilder();
+    if (hasChanges) {
+      buffer.append("*");
+    }
+    buffer.append(getClass().getSimpleName());
+    buffer.append('(');
+    final String segmentsFile = segmentInfos.getCurrentSegmentFileName();
+    if (segmentsFile != null) {
+      buffer.append(segmentsFile).append(":").append(segmentInfos.getVersion());
+    }
+    if (writer != null) {
+      buffer.append(":nrt");
+    }
+    for(int i=0;i<subReaders.length;i++) {
+      buffer.append(' ');
+      buffer.append(subReaders[i]);
+    }
+    buffer.append(')');
+    return buffer.toString();
+  }
+
+  private void initialize(SegmentReader[] subReaders) throws IOException {
+    this.subReaders = subReaders;
+    starts = new int[subReaders.length + 1];    // build starts array
+    final AtomicReaderContext[] subReaderCtx = new AtomicReaderContext[subReaders.length];
+    topLevelReaderContext = new CompositeReaderContext(this, subReaderCtx, subReaderCtx);
+    final List<Fields> subFields = new ArrayList<Fields>();
+    
+    for (int i = 0; i < subReaders.length; i++) {
+      starts[i] = maxDoc;
+      subReaderCtx[i] = new AtomicReaderContext(topLevelReaderContext, subReaders[i], i, maxDoc, i, maxDoc);
+      maxDoc += subReaders[i].maxDoc();      // compute maxDocs
+
+      if (subReaders[i].hasDeletions()) {
+        hasDeletions = true;
+      }
+      
+      final Fields f = subReaders[i].fields();
+      if (f != null) {
+        subFields.add(f);
+      }
+    }
+    starts[subReaders.length] = maxDoc;
+
+    if (!readOnly) {
+      maxIndexVersion = SegmentInfos.readCurrentVersion(directory, codecs);
+    }
+  }
+
+  @Override
+  public Bits getLiveDocs() {
+    throw new UnsupportedOperationException("please use MultiFields.getLiveDocs, or wrap your IndexReader with SlowMultiReaderWrapper, if you really need a top level Bits liveDocs");
+  }
+
+  @Override
+  public final synchronized Object clone() {
+    try {
+      return clone(readOnly); // Preserve current readOnly
+    } catch (Exception ex) {
+      throw new RuntimeException(ex);
+    }
+  }
+
+  @Override
+  public final synchronized IndexReader clone(boolean openReadOnly) throws CorruptIndexException, IOException {
+    // doOpenIfChanged calls ensureOpen
+    DirectoryReader newReader = doOpenIfChanged((SegmentInfos) segmentInfos.clone(), true, openReadOnly);
+
+    if (this != newReader) {
+      newReader.deletionPolicy = deletionPolicy;
+    }
+    newReader.writer = writer;
+    // If we're cloning a non-readOnly reader, move the
+    // writeLock (if there is one) to the new reader:
+    if (!openReadOnly && writeLock != null) {
+      // In near real-time search, reader is always readonly
+      assert writer == null;
+      newReader.writeLock = writeLock;
+      newReader.hasChanges = hasChanges;
+      newReader.hasDeletions = hasDeletions;
+      writeLock = null;
+      hasChanges = false;
+    }
+    assert newReader.readerFinishedListeners != null;
+
+    return newReader;
+  }
+
+  @Override
+  protected final IndexReader doOpenIfChanged() throws CorruptIndexException, IOException {
+    // Preserve current readOnly
+    return doOpenIfChanged(readOnly, null);
+  }
+
+  @Override
+  protected final IndexReader doOpenIfChanged(boolean openReadOnly) throws CorruptIndexException, IOException {
+    return doOpenIfChanged(openReadOnly, null);
+  }
+
+  @Override
+  protected final IndexReader doOpenIfChanged(final IndexCommit commit) throws CorruptIndexException, IOException {
+    return doOpenIfChanged(true, commit);
+  }
+
+  @Override
+  protected final IndexReader doOpenIfChanged(IndexWriter writer, boolean applyAllDeletes) throws CorruptIndexException, IOException {
+    if (writer == this.writer && applyAllDeletes == this.applyAllDeletes) {
+      return doOpenIfChanged();
+    } else {    
+      return super.doOpenIfChanged(writer, applyAllDeletes);
+    }
+  }
+
+  private final IndexReader doOpenFromWriter(boolean openReadOnly, IndexCommit commit) throws CorruptIndexException, IOException {
+    assert readOnly;
+
+    if (!openReadOnly) {
+      throw new IllegalArgumentException("a reader obtained from IndexWriter.getReader() can only be reopened with openReadOnly=true (got false)");
     }
 
-    /**
-     * Returns the number of characters in the <code>CLOB</code> value
-     * designated by this <code>Clob</code> object.
-     *
-     * @return The length of the <code>CLOB</code> in number of characters.
-     * @exception SQLException if obtaining the length fails
-     */
-    public long length() throws SQLException
-    {
-        //call checkValidity to exit by throwing a SQLException if
-        //the Clob object has been freed by calling free() on it
-        checkValidity();
+    if (commit != null) {
+      throw new IllegalArgumentException("a reader obtained from IndexWriter.getReader() cannot currently accept a commit");
+    }
+
+    if (writer.nrtIsCurrent(segmentInfos)) {
+      return null;
+    }
+
+    IndexReader reader = writer.getReader(applyAllDeletes);
+
+    // If in fact no changes took place, return null:
+    if (reader.getVersion() == getVersion()) {
+      reader.decRef();
+      return null;
+    }
+
+    reader.readerFinishedListeners = readerFinishedListeners;
+    return reader;
+  }
+
+  private IndexReader doOpenIfChanged(final boolean openReadOnly, IndexCommit commit) throws CorruptIndexException, IOException {
+    ensureOpen();
+
+    assert commit == null || openReadOnly;
+
+    // If we were obtained by writer.getReader(), re-ask the
+    // writer to get a new reader.
+    if (writer != null) {
+      return doOpenFromWriter(openReadOnly, commit);
+    } else {
+      return doOpenNoWriter(openReadOnly, commit);
+    }
+  }
+
+  private synchronized IndexReader doOpenNoWriter(final boolean openReadOnly, IndexCommit commit) throws CorruptIndexException, IOException {
+
+    if (commit == null) {
+      if (hasChanges) {
+        // We have changes, which means we are not readOnly:
+        assert readOnly == false;
+        // and we hold the write lock:
+        assert writeLock != null;
+        // so no other writer holds the write lock, which
+        // means no changes could have been done to the index:
+        assert isCurrent();
+
+        if (openReadOnly) {
+          return clone(openReadOnly);
+        } else {
+          return null;
+        }
+      } else if (isCurrent()) {
+        if (openReadOnly != readOnly) {
+          // Just fallback to clone
+          return clone(openReadOnly);
+        } else {
+          return null;
+        }
+      }
+    } else {
+      if (directory != commit.getDirectory()) {
+        throw new IOException("the specified commit does not match the specified Directory");
+      }
+      if (segmentInfos != null && commit.getSegmentsFileName().equals(segmentInfos.getCurrentSegmentFileName())) {
+        if (readOnly != openReadOnly) {
+          // Just fallback to clone
+          return clone(openReadOnly);
+        } else {
+          return null;
+        }
+      }
+    }
+
+    return (IndexReader) new SegmentInfos.FindSegmentsFile(directory) {
+      @Override
+      protected Object doBody(String segmentFileName) throws CorruptIndexException, IOException {
+        final SegmentInfos infos = new SegmentInfos(codecs);
+        infos.read(directory, segmentFileName, codecs);
+        return doOpenIfChanged(infos, false, openReadOnly);
+      }
+    }.run(commit);
+  }
+
+  private synchronized DirectoryReader doOpenIfChanged(SegmentInfos infos, boolean doClone, boolean openReadOnly) throws CorruptIndexException, IOException {
+    return new DirectoryReader(directory, infos, subReaders, openReadOnly, doClone, termInfosIndexDivisor, codecs, readerFinishedListeners);
+  }
+
+  /** Version number when this IndexReader was opened. */
+  @Override
+  public long getVersion() {
+    ensureOpen();
+    return segmentInfos.getVersion();
+  }
+
+  @Override
+  public TermFreqVector[] getTermFreqVectors(int n) throws IOException {
+    ensureOpen();
+    int i = readerIndex(n);        // find segment num
+    return subReaders[i].getTermFreqVectors(n - starts[i]); // dispatch to segment
+  }
+
+  @Override
+  public TermFreqVector getTermFreqVector(int n, String field)
+      throws IOException {
+    ensureOpen();
+    int i = readerIndex(n);        // find segment num
+    return subReaders[i].getTermFreqVector(n - starts[i], field);
+  }
+
+
+  @Override
+  public void getTermFreqVector(int docNumber, String field, TermVectorMapper mapper) throws IOException {
+    ensureOpen();
+    int i = readerIndex(docNumber);        // find segment num
+    subReaders[i].getTermFreqVector(docNumber - starts[i], field, mapper);
+  }
+
+  @Override
+  public void getTermFreqVector(int docNumber, TermVectorMapper mapper) throws IOException {
+    ensureOpen();
+    int i = readerIndex(docNumber);        // find segment num
+    subReaders[i].getTermFreqVector(docNumber - starts[i], mapper);
+  }
+
+  /**
+   * Checks is the index is optimized (if it has a single segment and no deletions)
+   * @return <code>true</code> if the index is optimized; <code>false</code> otherwise
+   */
+  @Override
+  public boolean isOptimized() {
+    ensureOpen();
+    return segmentInfos.size() == 1 && !hasDeletions();
+  }
+
+  @Override
+  public int numDocs() {
+    // Don't call ensureOpen() here (it could affect performance)
+
+    // NOTE: multiple threads may wind up init'ing
+    // numDocs... but that's harmless
+    if (numDocs == -1) {        // check cache
+      int n = 0;                // cache miss--recompute
+      for (int i = 0; i < subReaders.length; i++)
+        n += subReaders[i].numDocs();      // sum from readers
+      numDocs = n;
+    }
+    return numDocs;
+  }
+
+  @Override
+  public int maxDoc() {
+    // Don't call ensureOpen() here (it could affect performance)
+    return maxDoc;
+  }
+
+  @Override
+  public void document(int docID, StoredFieldVisitor visitor) throws CorruptIndexException, IOException {
+    ensureOpen();
+    int i = readerIndex(docID);                          // find segment num
+    subReaders[i].document(docID - starts[i], visitor);    // dispatch to segment reader
+  }
+
+  @Override
+  public boolean hasDeletions() {
+    ensureOpen();
+    return hasDeletions;
+  }
+
+  @Override
+  protected void doDelete(int n) throws CorruptIndexException, IOException {
+    numDocs = -1;                             // invalidate cache
+    int i = readerIndex(n);                   // find segment num
+    subReaders[i].deleteDocument(n - starts[i]);      // dispatch to segment reader
+    hasDeletions = true;
+  }
+
+  @Override
+  protected void doUndeleteAll() throws CorruptIndexException, IOException {
+    for (int i = 0; i < subReaders.length; i++)
+      subReaders[i].undeleteAll();
+
+    hasDeletions = false;
+    numDocs = -1;                                 // invalidate cache
+  }
+
+  private int readerIndex(int n) {    // find reader for doc n:
+    return readerIndex(n, this.starts, this.subReaders.length);
+  }
+  
+  final static int readerIndex(int n, int[] starts, int numSubReaders) {    // find reader for doc n:
+    int lo = 0;                                      // search starts array
+    int hi = numSubReaders - 1;                  // for first element less
+
+    while (hi >= lo) {
+      int mid = (lo + hi) >>> 1;
+      int midValue = starts[mid];
+      if (n < midValue)
+        hi = mid - 1;
+      else if (n > midValue)
+        lo = mid + 1;
+      else {                                      // found a match
+        while (mid+1 < numSubReaders && starts[mid+1] == midValue) {
+          mid++;                                  // scan to last match
+        }
+        return mid;
+      }
+    }
+    return hi;
+  }
+
+  @Override
+  public boolean hasNorms(String field) throws IOException {
+    ensureOpen();
+    for (int i = 0; i < subReaders.length; i++) {
+      if (subReaders[i].hasNorms(field)) return true;
+    }
+    return false;
+  }
+
+  @Override
+  public synchronized byte[] norms(String field) throws IOException {
+    ensureOpen();
+    throw new UnsupportedOperationException("please use MultiNorms.norms, or wrap your IndexReader with SlowMultiReaderWrapper, if you really need a top level norms");
+  }
+
+  @Override
+  protected void doSetNorm(int n, String field, byte value)
+    throws CorruptIndexException, IOException {
+    int i = readerIndex(n);                           // find segment num
+    subReaders[i].setNorm(n-starts[i], field, value); // dispatch
+  }
+
+  @Override
+  public int docFreq(Term t) throws IOException {
+    ensureOpen();
+    int total = 0;          // sum freqs in segments
+    for (int i = 0; i < subReaders.length; i++)
+      total += subReaders[i].docFreq(t);
+    return total;
+  }
+
+  @Override
+  public int docFreq(String field, BytesRef term) throws IOException {
+    ensureOpen();
+    int total = 0;          // sum freqs in segments
+    for (int i = 0; i < subReaders.length; i++) {
+      total += subReaders[i].docFreq(field, term);
+    }
+    return total;
+  }
+
+  @Override
+  public Fields fields() throws IOException {
+    throw new UnsupportedOperationException("please use MultiFields.getFields, or wrap your IndexReader with SlowMultiReaderWrapper, if you really need a top level Fields");
+  }
+
+  /**
+   * Tries to acquire the WriteLock on this directory. this method is only valid if this IndexReader is directory
+   * owner.
+   *
+   * @throws StaleReaderException  if the index has changed since this reader was opened
+   * @throws CorruptIndexException if the index is corrupt
+   * @throws org.apache.lucene.store.LockObtainFailedException
+   *                               if another writer has this index open (<code>write.lock</code> could not be
+   *                               obtained)
+   * @throws IOException           if there is a low-level IO error
+   */
+  @Override
+  protected void acquireWriteLock() throws StaleReaderException, CorruptIndexException, LockObtainFailedException, IOException {
+
+    if (readOnly) {
+      // NOTE: we should not reach this code w/ the core
+      // IndexReader classes; however, an external subclass
+      // of IndexReader could reach this.
+      throw new UnsupportedOperationException("This IndexReader cannot make any changes to the index (it was opened with readOnly = true)");
+    }
+
+    if (segmentInfos != null) {
+      ensureOpen();
+      if (stale)
+        throw new StaleReaderException("IndexReader out of date and no longer valid for delete, undelete, or setNorm operations");
+
+      if (writeLock == null) {
+        Lock writeLock = directory.makeLock(IndexWriter.WRITE_LOCK_NAME);
+        if (!writeLock.obtain(IndexWriterConfig.WRITE_LOCK_TIMEOUT)) // obtain write lock
+          throw new LockObtainFailedException("Index locked for write: " + writeLock);
+        this.writeLock = writeLock;
+
+        // we have to check whether index has changed since this reader was opened.
+        // if so, this reader is no longer valid for deletion
+        if (SegmentInfos.readCurrentVersion(directory, codecs) > maxIndexVersion) {
+          stale = true;
+          this.writeLock.release();
+          this.writeLock = null;
+          throw new StaleReaderException("IndexReader out of date and no longer valid for delete, undelete, or setNorm operations");
+        }
+      }
+    }
+  }
+
+  /**
+   * Commit changes resulting from delete, undeleteAll, or setNorm operations
+   * <p/>
+   * If an exception is hit, then either no changes or all changes will have been committed to the index (transactional
+   * semantics).
+   *
+   * @throws IOException if there is a low-level IO error
+   */
+  @Override
+  protected void doCommit(Map<String,String> commitUserData) throws IOException {
+    // poll subreaders for changes
+    for (int i = 0; !hasChanges && i < subReaders.length; i++) {
+      hasChanges |= subReaders[i].hasChanges;
+    }
+    
+    if (hasChanges) {
+      segmentInfos.setUserData(commitUserData);
+      // Default deleter (for backwards compatibility) is
+      // KeepOnlyLastCommitDeleter:
+      IndexFileDeleter deleter = new IndexFileDeleter(directory,
+                                                      deletionPolicy == null ? new KeepOnlyLastCommitDeletionPolicy() : deletionPolicy,
+                                                      segmentInfos, null, codecs, null);
+      segmentInfos.updateGeneration(deleter.getLastSegmentInfos());
+      segmentInfos.changed();
+
+      // Checkpoint the state we are about to change, in
+      // case we have to roll back:
+      startCommit();
+
+      final List<SegmentInfo> rollbackSegments = segmentInfos.createBackupSegmentInfos(false);
+
+      boolean success = false;
+      try {
+        for (int i = 0; i < subReaders.length; i++)
+          subReaders[i].commit();
+
+        // Remove segments that contain only 100% deleted
+        // docs:
+        segmentInfos.pruneDeletedSegments();
+
+        // Sync all files we just wrote
+        directory.sync(segmentInfos.files(directory, false));
+        segmentInfos.commit(directory);
+        success = true;
+      } finally {
+
+        if (!success) {
+
+          // Rollback changes that were made to
+          // SegmentInfos but failed to get [fully]
+          // committed.  This way this reader instance
+          // remains consistent (matched to what's
+          // actually in the index):
+          rollbackCommit();
+
+          // Recompute deletable files & remove them (so
+          // partially written .del files, etc, are
+          // removed):
+          deleter.refresh();
+
+          // Restore all SegmentInfos (in case we pruned some)
+          segmentInfos.rollbackSegmentInfos(rollbackSegments);
+        }
+      }
+
+      // Have the deleter remove any now unreferenced
+      // files due to this commit:
+      deleter.checkpoint(segmentInfos, true);
+      deleter.close();
+
+      maxIndexVersion = segmentInfos.getVersion();
+
+      if (writeLock != null) {
+        writeLock.release();  // release write lock
+        writeLock = null;
+      }
+    }
+    hasChanges = false;
+  }
+
+  void startCommit() {
+    rollbackHasChanges = hasChanges;
+    for (int i = 0; i < subReaders.length; i++) {
+      subReaders[i].startCommit();
+    }
+  }
+
+  void rollbackCommit() {
+    hasChanges = rollbackHasChanges;
+    for (int i = 0; i < subReaders.length; i++) {
+      subReaders[i].rollbackCommit();
+    }
+  }
+
+  @Override
+  public long getUniqueTermCount() throws IOException {
+    throw new UnsupportedOperationException("");
+  }
+
+  @Override
+  public Map<String,String> getCommitUserData() {
+    ensureOpen();
+    return segmentInfos.getUserData();
+  }
+
+  /**
+   * Check whether this IndexReader is still using the current (i.e., most recently committed) version of the index.  If
+   * a writer has committed any changes to the index since this reader was opened, this will return <code>false</code>,
+   * in which case you must open a new IndexReader in order
+   * to see the changes.  Use {@link IndexWriter#commit} to
+   * commit changes to the index.
+   *
+   * @throws CorruptIndexException if the index is corrupt
+   * @throws IOException           if there is a low-level IO error
+   */
+  @Override
+  public boolean isCurrent() throws CorruptIndexException, IOException {
+    ensureOpen();
+    if (writer == null || writer.isClosed()) {
+      // we loaded SegmentInfos from the directory
+      return SegmentInfos.readCurrentVersion(directory, codecs) == segmentInfos.getVersion();
+    } else {
+      return writer.nrtIsCurrent(segmentInfos);
+    }
+  }
+
+  @Override
+  protected synchronized void doClose() throws IOException {
+    IOException ioe = null;
+    for (int i = 0; i < subReaders.length; i++) {
+      // try to close each reader, even if an exception is thrown
+      try {
+        subReaders[i].decRef();
+      } catch (IOException e) {
+        if (ioe == null) ioe = e;
+      }
+    }
+
+    if (writer != null) {
+      // Since we just closed, writer may now be able to
+      // delete unused files:
+      writer.deletePendingFiles();
+    }
+
+    // throw the first exception
+    if (ioe != null) throw ioe;
+  }
+
+  @Override
+  public Collection<String> getFieldNames (IndexReader.FieldOption fieldNames) {
+    ensureOpen();
+    return getFieldNames(fieldNames, this.subReaders);
+  }
+  
+  static Collection<String> getFieldNames (IndexReader.FieldOption fieldNames, IndexReader[] subReaders) {
+    // maintain a unique set of field names
+    Set<String> fieldSet = new HashSet<String>();
+    for (IndexReader reader : subReaders) {
+      Collection<String> names = reader.getFieldNames(fieldNames);
+      fieldSet.addAll(names);
+    }
+    return fieldSet;
+  }
+  
+  @Override
+  public ReaderContext getTopReaderContext() {
+    ensureOpen();
+    return topLevelReaderContext;
+  }
+  
+  @Override
+  public IndexReader[] getSequentialSubReaders() {
+    return subReaders;
+  }
+
+  /** Returns the directory this index resides in. */
+  @Override
+  public Directory directory() {
+    // Don't ensureOpen here -- in certain cases, when a
+    // cloned/reopened reader needs to commit, it may call
+    // this method on the closed original reader
+    return directory;
+  }
+
+  @Override
+  public int getTermInfosIndexDivisor() {
+    ensureOpen();
+    return termInfosIndexDivisor;
+  }
+
+  /**
+   * Expert: return the IndexCommit that this reader has opened.
+   * <p/>
+   * @lucene.experimental
+   */
+  @Override
+  public IndexCommit getIndexCommit() throws IOException {
+    ensureOpen();
+    return new ReaderCommit(segmentInfos, directory);
+  }
+
+  /** @see org.apache.lucene.index.IndexReader#listCommits */
+  public static List<IndexCommit> listCommits(Directory dir) throws IOException {
+    return listCommits(dir, CodecProvider.getDefault());
+  }
+
+  /** @see org.apache.lucene.index.IndexReader#listCommits */
+  public static List<IndexCommit> listCommits(Directory dir, CodecProvider codecs) throws IOException {
+    final String[] files = dir.listAll();
+
+    List<IndexCommit> commits = new ArrayList<IndexCommit>();
+
+    SegmentInfos latest = new SegmentInfos(codecs);
+    latest.read(dir, codecs);
+    final long currentGen = latest.getGeneration();
+
+    commits.add(new ReaderCommit(latest, dir));
+
+    for(int i=0;i<files.length;i++) {
+
+      final String fileName = files[i];
+
+      if (fileName.startsWith(IndexFileNames.SEGMENTS) &&
+          !fileName.equals(IndexFileNames.SEGMENTS_GEN) &&
+          SegmentInfos.generationFromSegmentsFileName(fileName) < currentGen) {
+
+        SegmentInfos sis = new SegmentInfos(codecs);
         try {
-            return this.clob.getCharLength();
-        } catch (IOException e) {
-            throw Util.setStreamFailure(e);
+          // IOException allowed to throw there, in case
+          // segments_N is corrupt
+          sis.read(dir, fileName, codecs);
+        } catch (FileNotFoundException fnfe) {
+          // LUCENE-948: on NFS (and maybe others), if
+          // you have writers switching back and forth
+          // between machines, it's very likely that the
+          // dir listing will be stale and will claim a
+          // file segments_X exists when in fact it
+          // doesn't.  So, we catch this and handle it
+          // as if the file does not exist
+          sis = null;
         }
+
+        if (sis != null)
+          commits.add(new ReaderCommit(sis, dir));
+      }
     }
 
-    /**
-     * Returns a copy of the specified substring in the <code>CLOB</code> value
-     * designated by this <code>Clob</code> object.
-     * <p>
-     * The substring begins at position <code>pos</code> and has up to
-     * * <code>length</code> consecutive characters. The starting position must
-     * be between 1 and the length of the CLOB plus 1. This allows for 
-     * zero-length CLOB values, from which only zero-length substrings can be
-     * returned.
-     * <p>
-     * If a larger length is requested than there are characters available,
-     * characters from the start position to the end of the CLOB are returned.
-     * <p>
-     * <em>NOTE</em>: If the starting position is the length of the CLOB plus 1,
-     * zero characters are returned regardless of the length requested.
-     *
-     * @param pos the first character of the substring to be extracted.
-     *    The first character is at position 1.
-     * @param length the number of consecutive characters to be copied
-     * @return A <code>String</code> that is the specified substring in the
-     *    <code>CLOB</code> value designated by this <code>Clob</code> object
-     * @exception SQLException if there is an error accessing the
-     *    <code>CLOB</code>
-     */
-    public String getSubString(long pos, int length) throws SQLException
-    {
-        //call checkValidity to exit by throwing a SQLException if
-        //the Clob object has been freed by calling free() on it
-        checkValidity();
+    // Ensure that the commit points are sorted in ascending order.
+    Collections.sort(commits);
 
-        if (pos < 1)
-            throw Util.generateCsSQLException(
-                SQLState.BLOB_BAD_POSITION, new Long(pos));
-        if (length < 0)
-            throw Util.generateCsSQLException(
-                SQLState.BLOB_NONPOSITIVE_LENGTH, new Integer(length));
+    return commits;
+  }  
+  
+  private static final class ReaderCommit extends IndexCommit {
+    private String segmentsFileName;
+    Collection<String> files;
+    Directory dir;
+    long generation;
+    long version;
+    final boolean isOptimized;
+    final Map<String,String> userData;
 
-        String result;
-        // An exception will be thrown if the position is larger than the Clob.
-        Reader reader;
-        try {
-            try {
-                reader = this.clob.getInternalReader(pos);
-            } catch (EOFException eofe) {
-                throw Util.generateCsSQLException(
-                        SQLState.BLOB_POSITION_TOO_LARGE, new Long(pos), eofe);
-            }
-            char[] chars = new char[length];
-            int charsRead = 0;
-            // Read all the characters requested, or until EOF is reached.
-            while (charsRead < length) {
-                int read = reader.read(chars, charsRead, length - charsRead);
-                if (read == -1) {
-                    break;
-                }
-                charsRead += read;
-            }
-            reader.close();
-            // If we have an empty Clob or requested length is zero, return "".
-            if (charsRead == 0) {
-                result = "";
-            } else {
-                result = String.copyValueOf(chars, 0, charsRead);
-            }
-        } catch (IOException ioe) {
-            throw Util.setStreamFailure(ioe);
-        }
-        return result;
+    ReaderCommit(SegmentInfos infos, Directory dir) throws IOException {
+      segmentsFileName = infos.getCurrentSegmentFileName();
+      this.dir = dir;
+      userData = infos.getUserData();
+      files = Collections.unmodifiableCollection(infos.files(dir, true));
+      version = infos.getVersion();
+      generation = infos.getGeneration();
+      isOptimized = infos.size() == 1 && !infos.info(0).hasDeletions();
     }
 
-    /**
-     * Gets the <code>Clob</code> contents as a stream of characters.
-     * @return A character stream containing the <code>CLOB</code> data.
-     * @exception SQLException if there is an error accessing the
-     *    <code>CLOB</code>
-     */
-    public java.io.Reader getCharacterStream() throws SQLException
-    {
-        //call checkValidity to exit by throwing a SQLException if
-        //the Clob object has been freed by calling free() on it
-        checkValidity();
-        try {
-            return new ClobUpdatableReader (this);
-        } catch (IOException ioe) {
-            throw Util.setStreamFailure(ioe);
-        }
+    @Override
+    public String toString() {
+      return "DirectoryReader.ReaderCommit(" + segmentsFileName + ")";
     }
 
-    /**
-     * Gets the <code>CLOB</code> value designated by this <code>Clob</code>
-     * object as a stream of Ascii bytes.
-     * @return An Ascii stream containing the <code>CLOB</code> data. Valid
-     *      values in the stream are 0 - 255.
-     * @exception SQLException if there is an error accessing the
-     *    <code>CLOB</code> value
-     */
-    public java.io.InputStream getAsciiStream() throws SQLException
-    {
-        // Validity is checked in getCharacterStream().
-        return new ReaderToAscii(getCharacterStream());
+    @Override
+    public boolean isOptimized() {
+      return isOptimized;
     }
 
-    /**
-     * Determines the character position at which the specified substring
-     * <code>searchStr</code> appears in the <code>CLOB</code> value.
-     * <p>
-     * The search begins at position <code>start</code>. The method uses the
-     * following algorithm for the search:
-     * <p>
-     * If the <code>CLOB</code> value is materialized as a string, use
-     * <code>String.indexOf</code>.
-     * <p>
-     * If the <code>CLOB</code> value is represented as a stream, read a block
-     * of chars from the start position and compare the chars with
-     * <code>searchStr</code>. Then:
-     * <ul> <li>If a matching char is found, increment <code>matchCount</code>.
-     *      <li>If <code>matchCount</code> is equal to the length of
-     *          <code>searchStr</code>, return with the current start position.
-     *      <li>If no match is found, and there is more data, restart search
-     *          (see below).
-     *      <li>If no match is found, return <code>-1</code>.
-     * </ul>
-     * <p>
-     * The position where the stream has a char equal to the first char of
-     * <code>searchStr</code> will be remembered and used as the starting
-     * position for the next search-iteration if the current match fails.
-     * If a non-matching char is found, start a fresh search from the position
-     * remembered. If there is no such position, next search will start at the
-     * current position <code>+1</code>.
-     *
-     * @param searchStr the substring for which to search
-     * @param start the position at which to begin searching; the first position
-     *    is <code>1</code>
-     * @return The position at which the substring appears, <code>-1</code> if
-     *    it does not appear in the <code>CLOB</code> value. The first position
-     *    is <code>1</code>.
-     * @exception SQLException if there is an error accessing the
-     *    <code>CLOB</code> value
-     */
-    public long position(String searchStr, long start)
-        throws SQLException
-    {
-        //call checkValidity to exit by throwing a SQLException if
-        //the Clob object has been freed by calling free() on it
-        checkValidity();
-        if (start < 1)
-            throw Util.generateCsSQLException(
-                            SQLState.BLOB_BAD_POSITION, new Long(start));
-        if (searchStr == null)
-            throw Util.generateCsSQLException(
-                            SQLState.BLOB_NULL_PATTERN_OR_SEARCH_STR);
-        if (searchStr == "")
-            return start; // match DB2's SQL LOCATE function
-
-        boolean pushStack = false;
-        try
-        {
-
-            Object synchronization = getConnectionSynchronization();
-            synchronized (synchronization)
-            {
-                pushStack = !getEmbedConnection().isClosed();
-                if (pushStack)
-                    setupContextStack();
-                int matchCount = 0;
-                long pos = start;
-                long newStart = -1;
-                Reader reader = this.clob.getInternalReader(start);
-                char [] tmpClob = new char [4096];
-                boolean reset;
-                for (;;) {
-                    reset = false;
-                    int readCount = reader.read (tmpClob);
-                    if (readCount == -1)
-                        return -1;
-                    for (int clobOffset = 0;
-                                clobOffset < readCount; clobOffset++) {
-                        if (tmpClob[clobOffset]
-                                        == searchStr.charAt(matchCount)) {
-                            //find the new starting position in
-                            // case this match is unsuccessful
-                            if (matchCount != 0 && newStart == -1
-                                    && tmpClob[clobOffset]
-                                    == searchStr.charAt(0)) {
-                                newStart = pos + clobOffset + 1;
-                            }
-                            matchCount ++;
-                            if (matchCount == searchStr.length()) {
-                                return pos + clobOffset
-                                        - searchStr.length() + 1;
-                            }
-                        }
-                        else {
-                            if (matchCount > 0) {
-                                if (newStart == -1) {
-                                    if (matchCount > 1) {
-                                        //compensate for increment in the "for"
-                                        clobOffset--;
-                                    }
-                                    matchCount = 0;
-                                    continue;
-                                }
-                                matchCount = 0;
-                                if (newStart < pos) {
-                                    pos = newStart;
-                                    reader.close();
-                                    reader = this.clob.getInternalReader(
-                                                                    newStart);
-                                    newStart = -1;
-                                    reset = true;
-                                    break;
-                                }
-                                clobOffset = (int) (newStart - pos) - 1;
-                                newStart = -1;
-                                continue;
-                            }
-                        }
-                    }
-                    if (!reset) {
-                        pos += readCount;
-                    }
-                }
-
-            }
-        } catch (EOFException eofe) {
-            throw Util.generateCsSQLException(
-                                        SQLState.BLOB_POSITION_TOO_LARGE, eofe);
-        } catch (IOException ioe) {
-            throw Util.setStreamFailure(ioe);
-        } finally {
-            if (pushStack) {
-                restoreContextStack();
-            }
-        }
+    @Override
+    public String getSegmentsFileName() {
+      return segmentsFileName;
     }
 
-    /**
-     * Determines the character position at which the specified
-     * <code>Clob</code> object <code>searchstr</code> appears in this
-     * <code>Clob</code> object.  The search begins at position
-     * <code>start</code>.
-     * @param searchClob the <code>Clob</code> object for which to search
-     * @param start the position at which to begin searching; the first
-     *              position is 1
-     * @return the position at which the <code>Clob</code> object appears,
-     * else -1; the first position is 1
-     * @exception SQLException if there is an error accessing the
-     * <code>CLOB</code> value
-     */
-    public long position(Clob searchClob, long start)
-        throws SQLException
-    {
-        //call checkValidity to exit by throwing a SQLException if
-        //the Clob object has been freed by calling free() on it
-        checkValidity();
-        if (start < 1)
-            throw Util.generateCsSQLException(
-                                SQLState.BLOB_BAD_POSITION, new Long(start));
-        if (searchClob == null)
-            throw Util.generateCsSQLException(
-                                SQLState.BLOB_NULL_PATTERN_OR_SEARCH_STR);
-
-        boolean pushStack = false;
-        try
-        {
-            synchronized (getConnectionSynchronization())
-            {
-                char[] subPatternChar = new char[1024];
-
-                boolean seenOneCharacter = false;
-
-restartScan:
-                for (;;) {
-                    long firstPosition = -1;
-                    Reader patternReader = searchClob.getCharacterStream();
-                        for (;;) {
-
-                            int read = patternReader.read(subPatternChar, 0,
-                                                        subPatternChar.length);
-                            if (read == -1) {
-                                //empty pattern
-                                if (!seenOneCharacter)
-                                    // matches DB2 SQL LOCATE function
-                                    return start;
-                                return firstPosition;
-                            }
-                            if (read == 0) {
-                                continue;
-                            }
-                            seenOneCharacter = true;
-
-                            String subPattern =
-                                new String(subPatternChar, 0, read);
-                            long position = position(subPattern, start);
-                            if (position == -1) {
-                                // never seen any match
-                                if (firstPosition == -1)
-                                    return -1;
-
-                                start = firstPosition + 1;
-                                continue restartScan;
-                            }
-
-                            if (firstPosition == -1)
-                                firstPosition = position;
-                            else if (position != start) {
-                                // must match at the first character of segment
-                                start = firstPosition + 1;
-                                continue restartScan;
-                            }
-
-                            // read is the length of the subPattern string
-                            start = position + read;
-                    } // End inner for loop
-            } // End outer for loop
-        } // End synchronized block
-        } catch (IOException ioe) {
-            throw Util.setStreamFailure(ioe);
-        } finally {
-            if (pushStack) {
-                restoreContextStack();
-            }
-        }
+    @Override
+    public Collection<String> getFileNames() {
+      return files;
     }
 
-    /**
-    Following methods are for the new JDBC 3.0 methods in java.sql.Clob
-    (see the JDBC 3.0 spec). We have the JDBC 3.0 methods in Local20
-    package, so we don't have to have a new class in Local30.
-    The new JDBC 3.0 methods don't make use of any new JDBC3.0 classes and
-    so this will work fine in jdbc2.0 configuration.
-    */
-
-    /////////////////////////////////////////////////////////////////////////
-    //
-    //    JDBC 3.0    -    New public methods
-    //
-    /////////////////////////////////////////////////////////////////////////
-
-    /**
-     * JDBC 3.0
-     *
-     * Writes the given Java String to the CLOB value that this Clob object
-     * designates at the position pos.
-     *
-     * @param pos the position at which to start writing to the CLOB value that
-     *      this Clob object represents
-     * @return the number of characters written
-     * @throws SQLException if writing the string fails
-     */
-    public int setString(long pos, String str) throws SQLException {
-            return setString (pos, str, 0, str.length());
+    @Override
+    public Directory getDirectory() {
+      return dir;
     }
 
-    /**
-     * JDBC 3.0
-     *
-     * Writes len characters of str, starting at character offset, to the CLOB
-     * value that this Clob represents.
-     *
-     * @param pos the position at which to start writing to this Clob object
-     * @param str the string to be written to the CLOB value that this Clob
-     *      designates
-     * @param offset the offset into str to start reading the characters to be
-     *      written
-     * @param len the number of characters to be written
-     * @return the number of characters written
-     * @exception SQLException if writing the string fails
-     */
-    public int setString(long pos, String str, int offset, int len)
-            throws SQLException {
-        checkValidity();
-        if (pos < 1)
-            throw Util.generateCsSQLException(
-                SQLState.BLOB_BAD_POSITION, new Long(pos));
-        try {
-            if (!this.clob.isWritable()) {
-                makeWritableClobClone();
-            }
-            // Note that Clob.length() +1 is a valid position for setString.
-            // If the position is larger than this, an EOFException will be
-            // thrown. This is cheaper then getting the length up front.
-            this.clob.insertString(str.substring(offset, (offset + len)),
-                                   pos);
-        } catch (EOFException eofe) {
-            throw Util.generateCsSQLException(
-                        SQLState.BLOB_POSITION_TOO_LARGE,
-                        new Long(pos));
-        } catch (IOException e) {
-            throw Util.setStreamFailure(e);
-        }
-        return str.length();
+    @Override
+    public long getVersion() {
+      return version;
     }
 
-    /**
-     * JDBC 3.0
-     *
-     * Retrieves a stream to be used to write Ascii characters to the CLOB
-     * value that this Clob object represents, starting at position pos.
-     *
-     * @param pos the position at which to start writing to this Clob object
-     * @return the stream to which ASCII encoded characters can be written
-     * @exception SQLException if obtaining the stream fails
-     */
-    public java.io.OutputStream setAsciiStream(long pos) throws SQLException {
-        checkValidity();
-        try {
-            return new ClobAsciiStream (this.clob.getWriter(pos));
-        } catch (IOException e) {
-            throw Util.setStreamFailure(e);
-        }
+    @Override
+    public long getGeneration() {
+      return generation;
     }
 
-    /**
-     * JDBC 3.0
-     *
-     * Retrieves a stream to be used to write a stream of characters to the CLOB
-     * value that this Clob object represents, starting at position pos.
-     *
-     * @param pos the position at which to start writing to this Clob object
-     * @return the stream to which Unicode encoded characters can be written
-     * @exception SQLException if obtaining the stream fails
-     */
-    public java.io.Writer setCharacterStream(long pos) throws SQLException {
-        checkValidity();
-        try {
-            if (!this.clob.isWritable()) {
-                makeWritableClobClone();
-            }
-            return this.clob.getWriter(pos);
-        } catch (IOException ioe) {
-            throw Util.setStreamFailure(ioe);
-        }
+    @Override
+    public boolean isDeleted() {
+      return false;
     }
 
-    /**
-     * JDBC 3.0
-     *
-     * Truncates the CLOB value that this Clob designates to have a length of
-     * len characters
-     *
-     * @param len the length, in characters, to which the CLOB value should be
-     *      truncated
-     * @exception SQLException if truncating the CLOB value fails
-     */
-    public void truncate(long len) throws SQLException
-    {
-        checkValidity();
-        if (len < 1)
-            throw Util.generateCsSQLException(
-                SQLState.BLOB_BAD_POSITION, new Long(len));
-        try {
-            if (!clob.isWritable()) {
-                makeWritableClobClone(len);
-            }
-            else {
-                clob.truncate (len);
-            }
-        }
-        catch (EOFException eofe) {
-            throw Util.generateCsSQLException(
-                        SQLState.BLOB_LENGTH_TOO_LONG,
-                        new Long(len), eofe);
-        } catch (IOException e) {
-            throw Util.setStreamFailure(e);
-        }
+    @Override
+    public Map<String,String> getUserData() {
+      return userData;
     }
 
-    /////////////////////////////////////////////////////////////////////////
-    //
-    //    JDBC 4.0    -    New public methods
-    //
-    /////////////////////////////////////////////////////////////////////////
-    /**
-     * Frees the <code>Clob</code> and releases the resources that it holds.
-     * <p>
-     * The object is invalid once the <code>free</code> method
-     * is called. If <code>free</code> is called multiple times, the
-     * subsequent calls to <code>free</code> are treated as a no-op.
-     *
-     * @throws SQLException if an error occurs releasing the Clobs resources
-     */
-    public void free()
-        throws SQLException {
-        if (this.isValid) {
-            this.isValid = false;
-            // Release and nullify the internal Clob.
-            try {
-                this.clob.release();
-            } catch (IOException e) {
-                throw Util.setStreamFailure(e);
-            } finally {
-                localConn.removeLOBMapping(locator);
-                this.clob = null;
-            }
-        }
+    @Override
+    public void delete() {
+      throw new UnsupportedOperationException("This IndexCommit does not support deletions");
     }
+  }
 
-    /**
-     * Returns a <code>Reader</code> object that contains a partial
-     * <code>Clob</code> value, starting with the character specified by pos,
-     * which is length characters in length.
-     *
-     * @param pos the offset to the first character of the partial value to
-     * be retrieved.  The first character in the Clob is at position 1.
-     * @param length the length in characters of the partial value to be
-     * retrieved.
-     * @return <code>Reader</code> through which the partial <code>Clob</code>
-     * value can be read.
-     * @throws SQLException if pos is less than 1 or if pos is greater than the
-     * number of
-     * characters in the <code>Clob</code> or if pos + length is greater than
-     * the number of
-     * characters in the <code>Clob</code>
-     *
-     * @throws SQLException.
-     */
-    public java.io.Reader getCharacterStream(long pos, long length)
-        throws SQLException {
-        //call checkValidity to exit by throwing a SQLException if
-        //the Clob object has been freed by calling free() on it
-        checkValidity();
-        
-        if (pos <= 0) {
-            throw Util.generateCsSQLException(
-                    SQLState.BLOB_BAD_POSITION,
-                    new Long(pos));
-        }
-        if (length < 0) {
-            throw Util.generateCsSQLException(
-                    SQLState.BLOB_NONPOSITIVE_LENGTH,
-                    new Long(length));
-        }
-        if (length > (this.length() - pos)) {
-            throw Util.generateCsSQLException(
-                    SQLState.POS_AND_LENGTH_GREATER_THAN_LOB,
-                    new Long(pos), new Long(length));
-        }
-        
-        try {
-            return new ClobUpdatableReader(this, pos, length);
-        } catch (IOException ioe) {
-            throw Util.setStreamFailure(ioe);
-        } 
-    }
-
-    /*
-     * Checks if the Clob is valid.
-     * <p>
-     * A Clob is invalidated when {@link #free} is called or if the parent
-     * connection is closed.
-     *
-     * @throws SQLException if the Clob is not valid
-     */
-    private void checkValidity() throws SQLException{
-        localConn.checkIfClosed();        
-        if(!isValid)
-            throw newSQLException(SQLState.LOB_OBJECT_INVALID);
-    }
-
-    /**
-     * Makes a writable clone of the current Clob.
-     * <p>
-     * This is called when we have a {@link StoreStreamClob} and the user calls
-     * a method updating the content of the Clob. A temporary Clob will then be
-     * created to hold the updated content.
-     *
-     * @throws IOException if accessing underlying I/O resources fail
-     * @throws SQLException if accessing underlying resources fail
-     */
-    private void makeWritableClobClone()
-            throws IOException, SQLException {
-        InternalClob toBeAbandoned = this.clob;
-        this.clob = TemporaryClob.cloneClobContent(
-                        getEmbedConnection().getDBName(),
-                        this, toBeAbandoned);
-        toBeAbandoned.release();
-    }
-
-    /**
-     * Makes a writable clone of the current Clob.
-     * <p>
-     * This is called when we have a {@link StoreStreamClob} and the user calls
-     * a method updating the content of the Clob. A temporary Clob will then be
-     * created to hold the updated content.
-     *
-     * @param len number of characters to be cloned (should be smaller
-     *      than clob length)
-     * @throws IOException if accessing underlying I/O resources fail
-     * @throws SQLException if accessing underlying resources fail
-     */
-    private void makeWritableClobClone(long len)
-            throws IOException, SQLException {
-        InternalClob toBeAbandoned = this.clob;
-        this.clob = TemporaryClob.cloneClobContent(
-                        getEmbedConnection().getDBName(),
-                        this, toBeAbandoned, len);
-        toBeAbandoned.release();
-    }
-
-    /**
-     * Returns the current internal Clob representation.
-     * <p>
-     * Care should be taken, as the representation can change when the user
-     * performs operations on the Clob. An example is if the Clob content is
-     * served from a store stream and the user updates the content. The
-     * internal representation will then be changed to a temporary Clob copy
-     * that allows updates.
-     *
-     * @return The current internal Clob representation.
-     */
-    InternalClob getInternalClob() {
-        return this.clob;
-    }
-
-    /**     
-     * @return locator value for this Clob.
-     */
-    public int getLocator() {
-        if (locator == 0) {
-            locator = localConn.addLOBMapping(this);
-        }
-        return locator;
-    }
+  @Override
+  public PerDocValues perDocValues() throws IOException {
+    throw new UnsupportedOperationException("please use MultiPerDocValues#getPerDocs, or wrap your IndexReader with SlowMultiReaderWrapper, if you really need a top level Fields");
+  }
 }

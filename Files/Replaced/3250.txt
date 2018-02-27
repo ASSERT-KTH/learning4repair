@@ -1,7 +1,6 @@
-public AutomatonTermsEnum(TermsEnum tenum, CompiledAutomaton compiled) {
+public final boolean incrementToken() {
 
-package org.apache.lucene.index;
-
+package org.apache.solr.schema;
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
@@ -20,304 +19,237 @@ package org.apache.lucene.index;
  */
 
 import java.io.IOException;
-import java.util.Comparator;
+import java.io.Reader;
+import java.io.StringReader;
+import java.lang.reflect.Constructor;
+import java.util.Iterator;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
 
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.IntsRef;
-import org.apache.lucene.util.StringHelper;
-import org.apache.lucene.util.automaton.ByteRunAutomaton;
-import org.apache.lucene.util.automaton.CompiledAutomaton;
-import org.apache.lucene.util.automaton.Transition;
+import org.apache.lucene.analysis.Analyzer;
+import org.apache.lucene.analysis.Tokenizer;
+import org.apache.lucene.document.Field;
+import org.apache.lucene.index.IndexableField;
+import org.apache.lucene.search.SortField;
+import org.apache.lucene.util.AttributeSource;
+import org.apache.lucene.util.AttributeSource.State;
+import org.apache.solr.analysis.SolrAnalyzer;
+import org.apache.solr.response.TextResponseWriter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
- * A FilteredTermsEnum that enumerates terms based upon what is accepted by a
- * DFA.
- * <p>
- * The algorithm is such:
- * <ol>
- *   <li>As long as matches are successful, keep reading sequentially.
- *   <li>When a match fails, skip to the next string in lexicographic order that
- * does not enter a reject state.
- * </ol>
- * <p>
- * The algorithm does not attempt to actually skip to the next string that is
- * completely accepted. This is not possible when the language accepted by the
- * FSM is not finite (i.e. * operator).
- * </p>
- * @lucene.experimental
+ * Pre-analyzed field type provides a way to index a serialized token stream,
+ * optionally with an independent stored value of a field.
  */
-class AutomatonTermsEnum extends FilteredTermsEnum {
-  // a tableized array-based form of the DFA
-  private final ByteRunAutomaton runAutomaton;
-  // common suffix of the automaton
-  private final BytesRef commonSuffixRef;
-  // true if the automaton accepts a finite language
-  private final boolean finite;
-  // array of sorted transitions for each state, indexed by state number
-  private final Transition[][] allTransitions;
-  // for path tracking: each long records gen when we last
-  // visited the state; we use gens to avoid having to clear
-  private final long[] visited;
-  private long curGen;
-  // the reference used for seeking forwards through the term dictionary
-  private final BytesRef seekBytesRef = new BytesRef(10); 
-  // true if we are enumerating an infinite portion of the DFA.
-  // in this case it is faster to drive the query based on the terms dictionary.
-  // when this is true, linearUpperBound indicate the end of range
-  // of terms where we should simply do sequential reads instead.
-  private boolean linear = false;
-  private final BytesRef linearUpperBound = new BytesRef(10);
-  private final Comparator<BytesRef> termComp;
+public class PreAnalyzedField extends FieldType {
+  private static final Logger LOG = LoggerFactory.getLogger(PreAnalyzedField.class);
 
-  /**
-   * Construct an enumerator based upon an automaton, enumerating the specified
-   * field, working on a supplied TermsEnum
-   * <p>
-   * @lucene.experimental 
-   * <p>
-   * @param compiled CompiledAutomaton
+  /** Init argument name. Value is a fully-qualified class name of the parser
+   * that implements {@link PreAnalyzedParser}.
    */
-  public AutomatonTermsEnum(TermsEnum tenum, CompiledAutomaton compiled) throws IOException {
-    super(tenum);
-    this.finite = compiled.finite;
-    this.runAutomaton = compiled.runAutomaton;
-    assert this.runAutomaton != null;
-    this.commonSuffixRef = compiled.commonSuffixRef;
-    this.allTransitions = compiled.sortedTransitions;
-
-    // used for path tracking, where each bit is a numbered state.
-    visited = new long[runAutomaton.getSize()];
-
-    termComp = getComparator();
-  }
+  public static final String PARSER_IMPL = "parserImpl";
   
-  /**
-   * Returns true if the term matches the automaton. Also stashes away the term
-   * to assist with smart enumeration.
-   */
-  @Override
-  protected AcceptStatus accept(final BytesRef term) {
-    if (commonSuffixRef == null || StringHelper.endsWith(term, commonSuffixRef)) {
-      if (runAutomaton.run(term.bytes, term.offset, term.length))
-        return linear ? AcceptStatus.YES : AcceptStatus.YES_AND_SEEK;
-      else
-        return (linear && termComp.compare(term, linearUpperBound) < 0) ? 
-            AcceptStatus.NO : AcceptStatus.NO_AND_SEEK;
-    } else {
-      return (linear && termComp.compare(term, linearUpperBound) < 0) ? 
-          AcceptStatus.NO : AcceptStatus.NO_AND_SEEK;
-    }
-  }
+  private static final String DEFAULT_IMPL = JsonPreAnalyzedParser.class.getName();
+
+  
+  private PreAnalyzedParser parser;
   
   @Override
-  protected BytesRef nextSeekTerm(final BytesRef term) throws IOException {
-    //System.out.println("ATE.nextSeekTerm term=" + term);
-    if (term == null) {
-      assert seekBytesRef.length == 0;
-      // return the empty term, as its valid
-      if (runAutomaton.isAccept(runAutomaton.getInitialState())) {   
-        return seekBytesRef;
-      }
+  protected void init(IndexSchema schema, Map<String, String> args) {
+    super.init(schema, args);
+    String implName = args.get(PARSER_IMPL);
+    if (implName == null) {
+      parser = new JsonPreAnalyzedParser();
     } else {
-      seekBytesRef.copyBytes(term);
-    }
-
-    // seek to the next possible string;
-    if (nextString()) {
-      return seekBytesRef;  // reposition
-    } else {
-      return null;          // no more possible strings can match
-    }
-  }
-
-  /**
-   * Sets the enum to operate in linear fashion, as we have found
-   * a looping transition at position: we set an upper bound and 
-   * act like a TermRangeQuery for this portion of the term space.
-   */
-  private void setLinear(int position) {
-    assert linear == false;
-    
-    int state = runAutomaton.getInitialState();
-    int maxInterval = 0xff;
-    for (int i = 0; i < position; i++) {
-      state = runAutomaton.step(state, seekBytesRef.bytes[i] & 0xff);
-      assert state >= 0: "state=" + state;
-    }
-    for (int i = 0; i < allTransitions[state].length; i++) {
-      Transition t = allTransitions[state][i];
-      if (t.getMin() <= (seekBytesRef.bytes[position] & 0xff) && 
-          (seekBytesRef.bytes[position] & 0xff) <= t.getMax()) {
-        maxInterval = t.getMax();
-        break;
-      }
-    }
-    // 0xff terms don't get the optimization... not worth the trouble.
-    if (maxInterval != 0xff)
-      maxInterval++;
-    int length = position + 1; /* position + maxTransition */
-    if (linearUpperBound.bytes.length < length)
-      linearUpperBound.bytes = new byte[length];
-    System.arraycopy(seekBytesRef.bytes, 0, linearUpperBound.bytes, 0, position);
-    linearUpperBound.bytes[position] = (byte) maxInterval;
-    linearUpperBound.length = length;
-    
-    linear = true;
-  }
-
-  private final IntsRef savedStates = new IntsRef(10);
-  
-  /**
-   * Increments the byte buffer to the next String in binary order after s that will not put
-   * the machine into a reject state. If such a string does not exist, returns
-   * false.
-   * 
-   * The correctness of this method depends upon the automaton being deterministic,
-   * and having no transitions to dead states.
-   * 
-   * @return true if more possible solutions exist for the DFA
-   */
-  private boolean nextString() {
-    int state;
-    int pos = 0;
-    savedStates.grow(seekBytesRef.length+1);
-    final int[] states = savedStates.ints;
-    states[0] = runAutomaton.getInitialState();
-    
-    while (true) {
-      curGen++;
-      linear = false;
-      // walk the automaton until a character is rejected.
-      for (state = states[pos]; pos < seekBytesRef.length; pos++) {
-        visited[state] = curGen;
-        int nextState = runAutomaton.step(state, seekBytesRef.bytes[pos] & 0xff);
-        if (nextState == -1)
-          break;
-        states[pos+1] = nextState;
-        // we found a loop, record it for faster enumeration
-        if (!finite && !linear && visited[nextState] == curGen) {
-          setLinear(pos);
+      try {
+        Class<?> implClazz = Class.forName(implName);
+        if (!PreAnalyzedParser.class.isAssignableFrom(implClazz)) {
+          throw new Exception("must implement " + PreAnalyzedParser.class.getName());
         }
-        state = nextState;
-      }
-
-      // take the useful portion, and the last non-reject state, and attempt to
-      // append characters that will match.
-      if (nextString(state, pos)) {
-        return true;
-      } else { /* no more solutions exist from this useful portion, backtrack */
-        if ((pos = backtrack(pos)) < 0) /* no more solutions at all */
-          return false;
-        final int newState = runAutomaton.step(states[pos], seekBytesRef.bytes[pos] & 0xff);
-        if (newState >= 0 && runAutomaton.isAccept(newState))
-          /* String is good to go as-is */
-          return true;
-        /* else advance further */
-        // TODO: paranoia? if we backtrack thru an infinite DFA, the loop detection is important!
-        // for now, restart from scratch for all infinite DFAs 
-        if (!finite) pos = 0;
+        Constructor<?> c = implClazz.getConstructor(new Class<?>[0]);
+        parser = (PreAnalyzedParser) c.newInstance(new Object[0]);
+      } catch (Exception e) {
+        LOG.warn("Can't use the configured PreAnalyzedParser class '" + implName + "' (" +
+            e.getMessage() + "), using default " + DEFAULT_IMPL);
+        parser = new JsonPreAnalyzedParser();
       }
     }
   }
+
+  @Override
+  public Analyzer getAnalyzer() {
+    return new SolrAnalyzer() {
+      
+      @Override
+      protected TokenStreamComponents createComponents(String fieldName,
+          Reader reader) {
+        try {
+          return new TokenStreamComponents(new PreAnalyzedTokenizer(reader, parser));
+        } catch (IOException e) {
+          return null;
+        }
+      }
+      
+    };
+  }
+  
+  @Override
+  public Analyzer getQueryAnalyzer() {
+    return getAnalyzer();
+  }
+
+  @Override
+  public IndexableField createField(SchemaField field, Object value,
+          float boost) {
+    IndexableField f = null;
+    try {
+      f = fromString(field, String.valueOf(value), boost);
+    } catch (Exception e) {
+      e.printStackTrace();
+      return null;
+    }
+    return f;
+  }
+
+  @Override
+  public SortField getSortField(SchemaField field, boolean top) {
+    return getStringSort(field, top);
+  }
+
+  @Override
+  public void write(TextResponseWriter writer, String name, IndexableField f)
+          throws IOException {
+    writer.writeStr(name, f.stringValue(), true);
+  }
+  
+  /** Utility method to convert a field to a string that is parse-able by this
+   * class.
+   * @param f field to convert
+   * @return string that is compatible with the serialization format
+   * @throws IOException
+   */
+  public String toFormattedString(Field f) throws IOException {
+    return parser.toFormattedString(f);
+  }
   
   /**
-   * Returns the next String in lexicographic order that will not put
-   * the machine into a reject state. 
-   * 
-   * This method traverses the DFA from the given position in the String,
-   * starting at the given state.
-   * 
-   * If this cannot satisfy the machine, returns false. This method will
-   * walk the minimal path, in lexicographic order, as long as possible.
-   * 
-   * If this method returns false, then there might still be more solutions,
-   * it is necessary to backtrack to find out.
-   * 
-   * @param state current non-reject state
-   * @param position useful portion of the string
-   * @return true if more possible solutions exist for the DFA from this
-   *         position
+   * This is a simple holder of a stored part and the collected states (tokens with attributes).
    */
-  private boolean nextString(int state, int position) {
-    /* 
-     * the next lexicographic character must be greater than the existing
-     * character, if it exists.
+  public static class ParseResult {
+    public String str;
+    public byte[] bin;
+    public List<State> states = new LinkedList<State>();
+  }
+  
+  /**
+   * Parse the input and return the stored part and the tokens with attributes.
+   */
+  public static interface PreAnalyzedParser {
+    /**
+     * Parse input.
+     * @param reader input to read from
+     * @param parent parent who will own the resulting states (tokens with attributes)
+     * @return parse result, with possibly null stored and/or states fields.
+     * @throws IOException if a parsing error or IO error occurs
      */
-    int c = 0;
-    if (position < seekBytesRef.length) {
-      c = seekBytesRef.bytes[position] & 0xff;
-      // if the next byte is 0xff and is not part of the useful portion,
-      // then by definition it puts us in a reject state, and therefore this
-      // path is dead. there cannot be any higher transitions. backtrack.
-      if (c++ == 0xff)
-        return false;
-    }
-
-    seekBytesRef.length = position;
-    visited[state] = curGen;
-
-    Transition transitions[] = allTransitions[state];
-
-    // find the minimal path (lexicographic order) that is >= c
+    public ParseResult parse(Reader reader, AttributeSource parent) throws IOException;
     
-    for (int i = 0; i < transitions.length; i++) {
-      Transition transition = transitions[i];
-      if (transition.getMax() >= c) {
-        int nextChar = Math.max(c, transition.getMin());
-        // append either the next sequential char, or the minimum transition
-        seekBytesRef.grow(seekBytesRef.length + 1);
-        seekBytesRef.length++;
-        seekBytesRef.bytes[seekBytesRef.length - 1] = (byte) nextChar;
-        state = transition.getDest().getNumber();
-        /* 
-         * as long as is possible, continue down the minimal path in
-         * lexicographic order. if a loop or accept state is encountered, stop.
-         */
-        while (visited[state] != curGen && !runAutomaton.isAccept(state)) {
-          visited[state] = curGen;
-          /* 
-           * Note: we work with a DFA with no transitions to dead states.
-           * so the below is ok, if it is not an accept state,
-           * then there MUST be at least one transition.
-           */
-          transition = allTransitions[state][0];
-          state = transition.getDest().getNumber();
-          
-          // append the minimum transition
-          seekBytesRef.grow(seekBytesRef.length + 1);
-          seekBytesRef.length++;
-          seekBytesRef.bytes[seekBytesRef.length - 1] = (byte) transition.getMin();
-          
-          // we found a loop, record it for faster enumeration
-          if (!finite && !linear && visited[state] == curGen) {
-            setLinear(seekBytesRef.length-1);
-          }
-        }
-        return true;
-      }
-    }
-    return false;
+    /**
+     * Format a field so that the resulting String is valid for parsing with {@link #parse(Reader, AttributeSource)}.
+     * @param f field instance
+     * @return formatted string
+     * @throws IOException
+     */
+    public String toFormattedString(Field f) throws IOException;
   }
   
+  
+  public IndexableField fromString(SchemaField field, String val, float boost) throws Exception {
+    if (val == null || val.trim().length() == 0) {
+      return null;
+    }
+    PreAnalyzedTokenizer parse = new PreAnalyzedTokenizer(new StringReader(val), parser);
+    Field f = (Field)super.createField(field, val, boost);
+    if (parse.getStringValue() != null) {
+      f.setStringValue(parse.getStringValue());
+    } else if (parse.getBinaryValue() != null) {
+      f.setBytesValue(parse.getBinaryValue());
+    } else {
+      f.fieldType().setStored(false);
+    }
+    
+    if (parse.hasTokenStream()) {
+      f.fieldType().setIndexed(true);
+      f.fieldType().setTokenized(true);
+      f.setTokenStream(parse);
+    }
+    return f;
+  }
+    
   /**
-   * Attempts to backtrack thru the string after encountering a dead end
-   * at some given position. Returns false if no more possible strings 
-   * can match.
-   * 
-   * @param position current position in the input String
-   * @return position >=0 if more possible solutions exist for the DFA
+   * Token stream that works from a list of saved states.
    */
-  private int backtrack(int position) {
-    while (position-- > 0) {
-      int nextChar = seekBytesRef.bytes[position] & 0xff;
-      // if a character is 0xff its a dead-end too,
-      // because there is no higher character in binary sort order.
-      if (nextChar++ != 0xff) {
-        seekBytesRef.bytes[position] = (byte) nextChar;
-        seekBytesRef.length = position+1;
-        return position;
+  private static class PreAnalyzedTokenizer extends Tokenizer {
+    private final List<AttributeSource.State> cachedStates = new LinkedList<AttributeSource.State>();
+    private Iterator<AttributeSource.State> it = null;
+    private String stringValue = null;
+    private byte[] binaryValue = null;
+    private PreAnalyzedParser parser;
+    
+    public PreAnalyzedTokenizer(Reader reader, PreAnalyzedParser parser) throws IOException {
+      super(reader);
+      this.parser = parser;
+      reset(reader);
+    }
+    
+    public boolean hasTokenStream() {
+      return !cachedStates.isEmpty();
+    }
+    
+    public String getStringValue() {
+      return stringValue;
+    }
+    
+    public byte[] getBinaryValue() {
+      return binaryValue;
+    }
+    
+    public final boolean incrementToken() throws IOException {
+      // lazy init the iterator
+      if (it == null) {
+        it = cachedStates.iterator();
+      }
+    
+      if (!it.hasNext()) {
+        return false;
+      }
+      
+      AttributeSource.State state = (State) it.next();
+      restoreState(state.clone());
+      return true;
+    }
+  
+    public final void reset() {
+      it = cachedStates.iterator();
+    }
+
+    @Override
+    public void reset(Reader input) throws IOException {
+      super.reset(input);
+      cachedStates.clear();
+      stringValue = null;
+      binaryValue = null;
+      ParseResult res = parser.parse(input, this);
+      if (res != null) {
+        stringValue = res.str;
+        binaryValue = res.bin;
+        if (res.states != null) {
+          cachedStates.addAll(res.states);
+        }
       }
     }
-    return -1; /* all solutions exhausted */
   }
+  
 }

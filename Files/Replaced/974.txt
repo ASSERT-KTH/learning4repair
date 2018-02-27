@@ -1,13 +1,14 @@
-CFMetaData metadata = ThriftValidation.validateColumnFamily(keyspace, column_parent.column_family);
+SegmentInfo info = codec.segmentInfoFormat().getSegmentInfoReader().read(directory, segName, IOContext.READ);
+
+package org.apache.lucene.index;
 
 /**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,1168 +19,986 @@ CFMetaData metadata = ThriftValidation.validateColumnFamily(keyspace, column_par
  * limitations under the License.
  */
 
-package org.apache.cassandra.thrift;
-
-import java.io.ByteArrayOutputStream;
+import java.io.FileNotFoundException;
 import java.io.IOException;
-import java.io.UnsupportedEncodingException;
-import java.nio.ByteBuffer;
-import java.nio.charset.CharacterCodingException;
-import java.util.*;
-import java.util.Map.Entry;
-import java.util.concurrent.Callable;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeoutException;
-import java.util.zip.DataFormatException;
-import java.util.zip.Inflater;
+import java.io.PrintStream;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
-import com.google.common.base.Predicates;
-import com.google.common.collect.Maps;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.lucene.codecs.Codec;
+import org.apache.lucene.codecs.LiveDocsFormat;
+import org.apache.lucene.store.ChecksumIndexInput;
+import org.apache.lucene.store.ChecksumIndexOutput;
+import org.apache.lucene.store.DataOutput; // javadocs
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.IOContext;
+import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.store.NoSuchDirectoryException;
+import org.apache.lucene.util.CodecUtil;
+import org.apache.lucene.util.IOUtils;
+import org.apache.lucene.util.StringHelper;
+import org.apache.lucene.util.ThreadInterruptedException;
 
-import org.antlr.runtime.RecognitionException;
-import org.apache.cassandra.auth.Permission;
-import org.apache.cassandra.concurrent.Stage;
-import org.apache.cassandra.concurrent.StageManager;
-import org.apache.cassandra.config.*;
-import org.apache.cassandra.cql.QueryProcessor;
-import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.filter.QueryPath;
-import org.apache.cassandra.db.marshal.MarshalException;
-import org.apache.cassandra.db.migration.*;
-import org.apache.cassandra.db.context.CounterContext;
-import org.apache.cassandra.dht.*;
-import org.apache.cassandra.locator.*;
-import org.apache.cassandra.scheduler.IRequestScheduler;
-import org.apache.cassandra.service.ClientState;
-import org.apache.cassandra.service.StorageProxy;
-import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.FBUtilities;
-import org.apache.thrift.TException;
+/**
+ * A collection of segmentInfo objects with methods for operating on
+ * those segments in relation to the file system.
+ * <p>
+ * The active segments in the index are stored in the segment info file,
+ * <tt>segments_N</tt>. There may be one or more <tt>segments_N</tt> files in the
+ * index; however, the one with the largest generation is the active one (when
+ * older segments_N files are present it's because they temporarily cannot be
+ * deleted, or, a writer is in the process of committing, or a custom 
+ * {@link org.apache.lucene.index.IndexDeletionPolicy IndexDeletionPolicy}
+ * is in use). This file lists each segment by name and has details about the
+ * codec and generation of deletes.
+ * </p>
+ * <p>There is also a file <tt>segments.gen</tt>. This file contains
+ * the current generation (the <tt>_N</tt> in <tt>segments_N</tt>) of the index.
+ * This is used only as a fallback in case the current generation cannot be
+ * accurately determined by directory listing alone (as is the case for some NFS
+ * clients with time-based directory cache expiration). This file simply contains
+ * an {@link DataOutput#writeInt Int32} version header 
+ * ({@link #FORMAT_SEGMENTS_GEN_CURRENT}), followed by the
+ * generation recorded as {@link DataOutput#writeLong Int64}, written twice.</p>
+ * <p>
+ * Files:
+ * <ul>
+ *   <li><tt>segments.gen</tt>: GenHeader, Generation, Generation
+ *   <li><tt>segments_N</tt>: Header, Version, NameCounter, SegCount,
+ *    &lt;SegName, SegCodec, DelGen, DeletionCount&gt;<sup>SegCount</sup>, 
+ *    CommitUserData, Checksum
+ * </ul>
+ * </p>
+ * Data types:
+ * <p>
+ * <ul>
+ *   <li>Header --&gt; {@link CodecUtil#writeHeader CodecHeader}</li>
+ *   <li>GenHeader, NameCounter, SegCount, DeletionCount --&gt; {@link DataOutput#writeInt Int32}</li>
+ *   <li>Generation, Version, DelGen, Checksum --&gt; {@link DataOutput#writeLong Int64}</li>
+ *   <li>SegName, SegCodec --&gt; {@link DataOutput#writeString String}</li>
+ *   <li>CommitUserData --&gt; {@link DataOutput#writeStringStringMap Map&lt;String,String&gt;}</li>
+ * </ul>
+ * </p>
+ * Field Descriptions:
+ * <p>
+ * <ul>
+ *   <li>Version counts how often the index has been changed by adding or deleting
+ *       documents.</li>
+ *   <li>NameCounter is used to generate names for new segment files.</li>
+ *   <li>SegName is the name of the segment, and is used as the file name prefix for
+ *       all of the files that compose the segment's index.</li>
+ *   <li>DelGen is the generation count of the deletes file. If this is -1,
+ *       there are no deletes. Anything above zero means there are deletes 
+ *       stored by {@link LiveDocsFormat}.</li>
+ *   <li>DeletionCount records the number of deleted documents in this segment.</li>
+ *   <li>Checksum contains the CRC32 checksum of all bytes in the segments_N file up
+ *       until the checksum. This is used to verify integrity of the file on opening the
+ *       index.</li>
+ *   <li>SegCodec is the {@link Codec#getName() name} of the Codec that encoded
+ *       this segment.</li>
+ *   <li>CommitUserData stores an optional user-supplied opaque
+ *       Map&lt;String,String&gt; that was passed to {@link IndexWriter#commit(java.util.Map)} 
+ *       or {@link IndexWriter#prepareCommit(java.util.Map)}.</li>
+ * </ul>
+ * </p>
+ * 
+ * @lucene.experimental
+ */
+public final class SegmentInfos implements Cloneable, Iterable<SegmentInfoPerCommit> {
 
-public class CassandraServer implements Cassandra.Iface
-{
-    private static Logger logger = LoggerFactory.getLogger(CassandraServer.class);
+  /**
+   * The file format version for the segments_N codec header
+   */
+  public static final int VERSION_40 = 0;
 
-    private final static List<ColumnOrSuperColumn> EMPTY_COLUMNS = Collections.emptyList();
-    private final static List<Column> EMPTY_SUBCOLUMNS = Collections.emptyList();
-    private final static List<CounterColumn> EMPTY_COUNTER_SUBCOLUMNS = Collections.emptyList();
+  /** Used for the segments.gen file only!
+   * Whenever you add a new format, make it 1 smaller (negative version logic)! */
+  public static final int FORMAT_SEGMENTS_GEN_CURRENT = -2;
 
-    // thread local state containing session information
-    public final ThreadLocal<ClientState> clientState = new ThreadLocal<ClientState>()
-    {
-        @Override
-        public ClientState initialValue()
-        {
-            return new ClientState();
+  public int counter;    // used to name new segments
+  
+  /**
+   * counts how often the index has been changed
+   */
+  public long version;
+
+  private long generation;     // generation of the "segments_N" for the next commit
+  private long lastGeneration; // generation of the "segments_N" file we last successfully read
+                               // or wrote; this is normally the same as generation except if
+                               // there was an IOException that had interrupted a commit
+
+  public Map<String,String> userData = Collections.<String,String>emptyMap();       // Opaque Map<String, String> that user can specify during IndexWriter.commit
+  
+  private List<SegmentInfoPerCommit> segments = new ArrayList<SegmentInfoPerCommit>();
+  
+  /**
+   * If non-null, information about loading segments_N files
+   * will be printed here.  @see #setInfoStream.
+   */
+  private static PrintStream infoStream = null;
+
+  public SegmentInfoPerCommit info(int i) {
+    return segments.get(i);
+  }
+
+  /**
+   * Get the generation of the most recent commit to the
+   * list of index files (N in the segments_N file).
+   *
+   * @param files -- array of file names to check
+   */
+  public static long getLastCommitGeneration(String[] files) {
+    if (files == null) {
+      return -1;
+    }
+    long max = -1;
+    for (String file : files) {
+      if (file.startsWith(IndexFileNames.SEGMENTS) && !file.equals(IndexFileNames.SEGMENTS_GEN)) {
+        long gen = generationFromSegmentsFileName(file);
+        if (gen > max) {
+          max = gen;
         }
-    };
+      }
+    }
+    return max;
+  }
 
-    /*
-     * RequestScheduler to perform the scheduling of incoming requests
-     */
-    private final IRequestScheduler requestScheduler;
+  /**
+   * Get the generation of the most recent commit to the
+   * index in this directory (N in the segments_N file).
+   *
+   * @param directory -- directory to search for the latest segments_N file
+   */
+  public static long getLastCommitGeneration(Directory directory) throws IOException {
+    try {
+      return getLastCommitGeneration(directory.listAll());
+    } catch (NoSuchDirectoryException nsde) {
+      return -1;
+    }
+  }
 
-    public CassandraServer()
-    {
-        requestScheduler = DatabaseDescriptor.getRequestScheduler();
+  /**
+   * Get the filename of the segments_N file for the most
+   * recent commit in the list of index files.
+   *
+   * @param files -- array of file names to check
+   */
+
+  public static String getLastCommitSegmentsFileName(String[] files) throws IOException {
+    return IndexFileNames.fileNameFromGeneration(IndexFileNames.SEGMENTS,
+                                                 "",
+                                                 getLastCommitGeneration(files));
+  }
+
+  /**
+   * Get the filename of the segments_N file for the most
+   * recent commit to the index in this Directory.
+   *
+   * @param directory -- directory to search for the latest segments_N file
+   */
+  public static String getLastCommitSegmentsFileName(Directory directory) throws IOException {
+    return IndexFileNames.fileNameFromGeneration(IndexFileNames.SEGMENTS,
+                                                 "",
+                                                 getLastCommitGeneration(directory));
+  }
+
+  /**
+   * Get the segments_N filename in use by this segment infos.
+   */
+  public String getSegmentsFileName() {
+    return IndexFileNames.fileNameFromGeneration(IndexFileNames.SEGMENTS,
+                                                 "",
+                                                 lastGeneration);
+  }
+  
+  /**
+   * Parse the generation off the segments file name and
+   * return it.
+   */
+  public static long generationFromSegmentsFileName(String fileName) {
+    if (fileName.equals(IndexFileNames.SEGMENTS)) {
+      return 0;
+    } else if (fileName.startsWith(IndexFileNames.SEGMENTS)) {
+      return Long.parseLong(fileName.substring(1+IndexFileNames.SEGMENTS.length()),
+                            Character.MAX_RADIX);
+    } else {
+      throw new IllegalArgumentException("fileName \"" + fileName + "\" is not a segments file");
+    }
+  }
+
+
+  /**
+   * Get the next segments_N filename that will be written.
+   */
+  public String getNextSegmentFileName() {
+    long nextGeneration;
+
+    if (generation == -1) {
+      nextGeneration = 1;
+    } else {
+      nextGeneration = generation+1;
+    }
+    return IndexFileNames.fileNameFromGeneration(IndexFileNames.SEGMENTS,
+                                                 "",
+                                                 nextGeneration);
+  }
+
+  /**
+   * Read a particular segmentFileName.  Note that this may
+   * throw an IOException if a commit is in process.
+   *
+   * @param directory -- directory containing the segments file
+   * @param segmentFileName -- segment file to load
+   * @throws CorruptIndexException if the index is corrupt
+   * @throws IOException if there is a low-level IO error
+   */
+  public final void read(Directory directory, String segmentFileName) throws CorruptIndexException, IOException {
+    boolean success = false;
+
+    // Clear any previous segments:
+    this.clear();
+
+    generation = generationFromSegmentsFileName(segmentFileName);
+
+    lastGeneration = generation;
+
+    ChecksumIndexInput input = new ChecksumIndexInput(directory.openInput(segmentFileName, IOContext.READ));
+    try {
+      // NOTE: as long as we want to throw indexformattooold (vs corruptindexexception), we need
+      // to read the magic ourselves.
+      int magic = input.readInt();
+      if (magic != CodecUtil.CODEC_MAGIC) {
+        throw new IndexFormatTooOldException(input, magic, CodecUtil.CODEC_MAGIC, CodecUtil.CODEC_MAGIC);
+      }
+      // 4.0+
+      CodecUtil.checkHeaderNoMagic(input, "segments", VERSION_40, VERSION_40);
+      version = input.readLong();
+      counter = input.readInt();
+      int numSegments = input.readInt();
+      for(int seg=0;seg<numSegments;seg++) {
+        String segName = input.readString();
+        Codec codec = Codec.forName(input.readString());
+        //System.out.println("SIS.read seg=" + seg + " codec=" + codec);
+        SegmentInfo info = codec.segmentInfoFormat().getSegmentInfosReader().read(directory, segName, IOContext.READ);
+        info.setCodec(codec);
+        long delGen = input.readLong();
+        int delCount = input.readInt();
+        assert delCount <= info.getDocCount();
+        add(new SegmentInfoPerCommit(info, delCount, delGen));
+      }
+      userData = input.readStringStringMap();
+
+      final long checksumNow = input.getChecksum();
+      final long checksumThen = input.readLong();
+      if (checksumNow != checksumThen) {
+        throw new CorruptIndexException("checksum mismatch in segments file (resource: " + input + ")");
+      }
+
+      success = true;
+    } finally {
+      if (!success) {
+        // Clear any segment infos we had loaded so we
+        // have a clean slate on retry:
+        this.clear();
+        IOUtils.closeWhileHandlingException(input);
+      } else {
+        input.close();
+      }
+    }
+  }
+
+  public final void read(Directory directory) throws CorruptIndexException, IOException {
+    generation = lastGeneration = -1;
+
+    new FindSegmentsFile(directory) {
+
+      @Override
+      protected Object doBody(String segmentFileName) throws CorruptIndexException, IOException {
+        read(directory, segmentFileName);
+        return null;
+      }
+    }.run();
+  }
+
+  // Only non-null after prepareCommit has been called and
+  // before finishCommit is called
+  ChecksumIndexOutput pendingSegnOutput;
+
+  private void write(Directory directory) throws IOException {
+
+    String segmentFileName = getNextSegmentFileName();
+    
+    // Always advance the generation on write:
+    if (generation == -1) {
+      generation = 1;
+    } else {
+      generation++;
     }
     
-    public ClientState state()
-    {
-        return clientState.get();
+    ChecksumIndexOutput segnOutput = null;
+    boolean success = false;
+
+    try {
+      segnOutput = new ChecksumIndexOutput(directory.createOutput(segmentFileName, IOContext.DEFAULT));
+      CodecUtil.writeHeader(segnOutput, "segments", VERSION_40);
+      segnOutput.writeLong(version); 
+      segnOutput.writeInt(counter); // write counter
+      segnOutput.writeInt(size()); // write infos
+      for (SegmentInfoPerCommit siPerCommit : this) {
+        SegmentInfo si = siPerCommit.info;
+        segnOutput.writeString(si.name);
+        segnOutput.writeString(si.getCodec().getName());
+        segnOutput.writeLong(siPerCommit.getDelGen());
+        segnOutput.writeInt(siPerCommit.getDelCount());
+        assert si.dir == directory;
+
+        assert siPerCommit.getDelCount() <= si.getDocCount();
+      }
+      segnOutput.writeStringStringMap(userData);
+      pendingSegnOutput = segnOutput;
+      success = true;
+    } finally {
+      if (!success) {
+        // We hit an exception above; try to close the file
+        // but suppress any exception:
+        IOUtils.closeWhileHandlingException(segnOutput);
+
+        try {
+          // Try not to leave a truncated segments_N file in
+          // the index:
+          directory.deleteFile(segmentFileName);
+        } catch (Throwable t) {
+          // Suppress so we keep throwing the original exception
+        }
+      }
+    }
+  }
+
+  /**
+   * Returns a copy of this instance, also copying each
+   * SegmentInfo.
+   */
+  
+  @Override
+  public SegmentInfos clone() {
+    try {
+      final SegmentInfos sis = (SegmentInfos) super.clone();
+      // deep clone, first recreate all collections:
+      sis.segments = new ArrayList<SegmentInfoPerCommit>(size());
+      for(final SegmentInfoPerCommit info : this) {
+        assert info.info.getCodec() != null;
+        // dont directly access segments, use add method!!!
+        sis.add(info.clone());
+      }
+      sis.userData = new HashMap<String,String>(userData);
+      return sis;
+    } catch (CloneNotSupportedException e) {
+      throw new RuntimeException("should not happen", e);
+    }
+  }
+
+  /**
+   * version number when this SegmentInfos was generated.
+   */
+  public long getVersion() {
+    return version;
+  }
+  public long getGeneration() {
+    return generation;
+  }
+  public long getLastGeneration() {
+    return lastGeneration;
+  }
+
+  /** If non-null, information about retries when loading
+   * the segments file will be printed to this.
+   */
+  public static void setInfoStream(PrintStream infoStream) {
+    SegmentInfos.infoStream = infoStream;
+  }
+
+  /* Advanced configuration of retry logic in loading
+     segments_N file */
+  private static int defaultGenLookaheadCount = 10;
+
+  /**
+   * Advanced: set how many times to try incrementing the
+   * gen when loading the segments file.  This only runs if
+   * the primary (listing directory) and secondary (opening
+   * segments.gen file) methods fail to find the segments
+   * file.
+   *
+   * @lucene.experimental
+   */
+  public static void setDefaultGenLookaheadCount(int count) {
+    defaultGenLookaheadCount = count;
+  }
+  /**
+   * @see #setDefaultGenLookaheadCount
+   *
+   * @lucene.experimental
+   */
+  public static int getDefaultGenLookahedCount() {
+    return defaultGenLookaheadCount;
+  }
+
+  /**
+   * @see #setInfoStream
+   */
+  public static PrintStream getInfoStream() {
+    return infoStream;
+  }
+
+  /**
+   * Prints the given message to the infoStream. Note, this method does not
+   * check for null infoStream. It assumes this check has been performed by the
+   * caller, which is recommended to avoid the (usually) expensive message
+   * creation.
+   */
+  private static void message(String message) {
+    infoStream.println("SIS [" + Thread.currentThread().getName() + "]: " + message);
+  }
+
+  /**
+   * Utility class for executing code that needs to do
+   * something with the current segments file.  This is
+   * necessary with lock-less commits because from the time
+   * you locate the current segments file name, until you
+   * actually open it, read its contents, or check modified
+   * time, etc., it could have been deleted due to a writer
+   * commit finishing.
+   */
+  public abstract static class FindSegmentsFile {
+    
+    final Directory directory;
+
+    public FindSegmentsFile(Directory directory) {
+      this.directory = directory;
     }
 
-    protected Map<DecoratedKey, ColumnFamily> readColumnFamily(List<ReadCommand> commands, ConsistencyLevel consistency_level)
-    throws InvalidRequestException, UnavailableException, TimedOutException
-    {
-        // TODO - Support multiple column families per row, right now row only contains 1 column family
-        Map<DecoratedKey, ColumnFamily> columnFamilyKeyMap = new HashMap<DecoratedKey, ColumnFamily>();
-
-        if (consistency_level == ConsistencyLevel.ANY)
-        {
-            throw new InvalidRequestException("Consistency level any may not be applied to read operations");
-        }
-
-        List<Row> rows;
-        try
-        {
-            try
-            {
-                schedule();
-                rows = StorageProxy.read(commands, consistency_level);
-            }
-            finally
-            {
-                release();
-            }
-        }
-        catch (TimeoutException e) 
-        {
-            logger.debug("... timed out");
-        	throw new TimedOutException();
-        }
-        catch (IOException e)
-        {
-            throw new RuntimeException(e);
-        }
-
-        for (Row row: rows)
-        {
-            columnFamilyKeyMap.put(row.key, row.cf);
-        }
-        return columnFamilyKeyMap;
-    }
-
-    public List<Column> thriftifySubColumns(Collection<IColumn> columns)
-    {
-        if (columns == null || columns.isEmpty())
-        {
-            return EMPTY_SUBCOLUMNS;
-        }
-
-        ArrayList<Column> thriftColumns = new ArrayList<Column>(columns.size());
-        for (IColumn column : columns)
-        {
-            if (column.isMarkedForDelete())
-            {
-                continue;
-            }
-            Column thrift_column = new Column(column.name(), column.value(), column.timestamp());
-            if (column instanceof ExpiringColumn)
-            {
-                thrift_column.setTtl(((ExpiringColumn) column).getTimeToLive());
-            }
-            thriftColumns.add(thrift_column);
-        }
-
-        return thriftColumns;
-    }
-
-    public List<CounterColumn> thriftifyCounterSubColumns(Collection<IColumn> columns)
-    {
-        if (columns == null || columns.isEmpty())
-        {
-            return EMPTY_COUNTER_SUBCOLUMNS;
-        }
-
-        ArrayList<CounterColumn> thriftColumns = new ArrayList<CounterColumn>(columns.size());
-        for (IColumn column : columns)
-        {
-            if (column.isMarkedForDelete())
-            {
-                continue;
-            }
-            assert column instanceof org.apache.cassandra.db.CounterColumn;
-            CounterColumn thrift_column = new CounterColumn(column.name(), CounterContext.instance().total(column.value()));
-            thriftColumns.add(thrift_column);
-        }
-
-        return thriftColumns;
-    }
-
-    public List<ColumnOrSuperColumn> thriftifyColumns(Collection<IColumn> columns, boolean reverseOrder)
-    {
-        ArrayList<ColumnOrSuperColumn> thriftColumns = new ArrayList<ColumnOrSuperColumn>(columns.size());
-        for (IColumn column : columns)
-        {
-            if (column.isMarkedForDelete())
-            {
-                continue;
-            }
-            if (column instanceof org.apache.cassandra.db.CounterColumn)
-            {
-                CounterColumn thrift_column = new CounterColumn(column.name(), CounterContext.instance().total(column.value()));
-                thriftColumns.add(new ColumnOrSuperColumn().setCounter_column(thrift_column));
-            }
-            else
-            {
-                Column thrift_column = new Column(column.name(), column.value(), column.timestamp());
-                if (column instanceof ExpiringColumn)
-                {
-                    thrift_column.setTtl(((ExpiringColumn) column).getTimeToLive());
-                }
-                thriftColumns.add(new ColumnOrSuperColumn().setColumn(thrift_column));
-            }
-        }
-
-        // we have to do the reversing here, since internally we pass results around in ColumnFamily
-        // objects, which always sort their columns in the "natural" order
-        // TODO this is inconvenient for direct users of StorageProxy
-        if (reverseOrder)
-            Collections.reverse(thriftColumns);
-        return thriftColumns;
-    }
-
-    private List<ColumnOrSuperColumn> thriftifySuperColumns(Collection<IColumn> columns, boolean reverseOrder, boolean isCounterCF)
-    {
-        if (isCounterCF)
-            return thriftifyCounterSuperColumns(columns, reverseOrder);
-        else
-            return thriftifySuperColumns(columns, reverseOrder);
-    }
-
-    private List<ColumnOrSuperColumn> thriftifySuperColumns(Collection<IColumn> columns, boolean reverseOrder)
-    {
-        ArrayList<ColumnOrSuperColumn> thriftSuperColumns = new ArrayList<ColumnOrSuperColumn>(columns.size());
-        for (IColumn column : columns)
-        {
-            List<Column> subcolumns = thriftifySubColumns(column.getSubColumns());
-            if (subcolumns.isEmpty())
-            {
-                continue;
-            }
-            SuperColumn superColumn = new SuperColumn(column.name(), subcolumns);
-            thriftSuperColumns.add(new ColumnOrSuperColumn().setSuper_column(superColumn));
-        }
-
-        if (reverseOrder)
-            Collections.reverse(thriftSuperColumns);
-
-        return thriftSuperColumns;
-    }
-
-    private List<ColumnOrSuperColumn> thriftifyCounterSuperColumns(Collection<IColumn> columns, boolean reverseOrder)
-    {
-        ArrayList<ColumnOrSuperColumn> thriftSuperColumns = new ArrayList<ColumnOrSuperColumn>(columns.size());
-        for (IColumn column : columns)
-        {
-            List<CounterColumn> subcolumns = thriftifyCounterSubColumns(column.getSubColumns());
-            if (subcolumns.isEmpty())
-            {
-                continue;
-            }
-            CounterSuperColumn superColumn = new CounterSuperColumn(column.name(), subcolumns);
-            thriftSuperColumns.add(new ColumnOrSuperColumn().setCounter_super_column(superColumn));
-        }
-
-        if (reverseOrder)
-            Collections.reverse(thriftSuperColumns);
-
-        return thriftSuperColumns;
-    }
-
-    private Map<ByteBuffer, List<ColumnOrSuperColumn>> getSlice(List<ReadCommand> commands, ConsistencyLevel consistency_level)
-    throws InvalidRequestException, UnavailableException, TimedOutException
-    {
-        Map<DecoratedKey, ColumnFamily> columnFamilies = readColumnFamily(commands, consistency_level);
-        Map<ByteBuffer, List<ColumnOrSuperColumn>> columnFamiliesMap = new HashMap<ByteBuffer, List<ColumnOrSuperColumn>>();
-        for (ReadCommand command: commands)
-        {
-            ColumnFamily cf = columnFamilies.get(StorageService.getPartitioner().decorateKey(command.key));
-            boolean reverseOrder = command instanceof SliceFromReadCommand && ((SliceFromReadCommand)command).reversed;
-            List<ColumnOrSuperColumn> thriftifiedColumns = thriftifyColumnFamily(cf, command.queryPath.superColumnName != null, reverseOrder);
-            columnFamiliesMap.put(command.key, thriftifiedColumns);
-        }
-
-        return columnFamiliesMap;
-    }
-
-    private List<ColumnOrSuperColumn> thriftifyColumnFamily(ColumnFamily cf, boolean subcolumnsOnly, boolean reverseOrder)
-    {
-        if (cf == null || cf.getColumnsMap().size() == 0)
-            return EMPTY_COLUMNS;
-        if (subcolumnsOnly)
-        {
-            IColumn column = cf.getColumnsMap().values().iterator().next();
-            Collection<IColumn> subcolumns = column.getSubColumns();
-            if (subcolumns == null || subcolumns.isEmpty())
-                return EMPTY_COLUMNS;
-            else
-                return thriftifyColumns(subcolumns, reverseOrder);
-        }
-        if (cf.isSuper())
-        {
-            boolean isCounterCF = cf.metadata().getDefaultValidator().isCommutative();
-            return thriftifySuperColumns(cf.getSortedColumns(), reverseOrder, isCounterCF);
-        }
-        else
-        {
-            return thriftifyColumns(cf.getSortedColumns(), reverseOrder);
-        }
-    }
-
-    public List<ColumnOrSuperColumn> get_slice(ByteBuffer key, ColumnParent column_parent, SlicePredicate predicate, ConsistencyLevel consistency_level)
-    throws InvalidRequestException, UnavailableException, TimedOutException
-    {
-        logger.debug("get_slice");
-        
-        state().hasColumnFamilyAccess(column_parent.column_family, Permission.READ);
-        return multigetSliceInternal(state().getKeyspace(), Collections.singletonList(key), column_parent, predicate, consistency_level).get(key);
+    public Object run() throws CorruptIndexException, IOException {
+      return run(null);
     }
     
-    public Map<ByteBuffer, List<ColumnOrSuperColumn>> multiget_slice(List<ByteBuffer> keys, ColumnParent column_parent, SlicePredicate predicate, ConsistencyLevel consistency_level)
-    throws InvalidRequestException, UnavailableException, TimedOutException
-    {
-        logger.debug("multiget_slice");
+    public Object run(IndexCommit commit) throws CorruptIndexException, IOException {
+      if (commit != null) {
+        if (directory != commit.getDirectory())
+          throw new IOException("the specified commit does not match the specified Directory");
+        return doBody(commit.getSegmentsFileName());
+      }
 
-        state().hasColumnFamilyAccess(column_parent.column_family, Permission.READ);
-        return multigetSliceInternal(state().getKeyspace(), keys, column_parent, predicate, consistency_level);
-    }
+      String segmentFileName = null;
+      long lastGen = -1;
+      long gen = 0;
+      int genLookaheadCount = 0;
+      IOException exc = null;
+      int retryCount = 0;
 
-    private Map<ByteBuffer, List<ColumnOrSuperColumn>> multigetSliceInternal(String keyspace, List<ByteBuffer> keys, ColumnParent column_parent, SlicePredicate predicate, ConsistencyLevel consistency_level)
-    throws InvalidRequestException, UnavailableException, TimedOutException
-    {
-        CFMetaData metadata = ThriftValidation.validateColumnFamily(keyspace, column_parent.column_family);
-        ThriftValidation.validateColumnParent(metadata, column_parent);
-        ThriftValidation.validatePredicate(metadata, column_parent, predicate);
+      boolean useFirstMethod = true;
 
-        List<ReadCommand> commands = new ArrayList<ReadCommand>();
-        if (predicate.column_names != null)
-        {
-            for (ByteBuffer key: keys)
-            {
-                ThriftValidation.validateKey(metadata, key);
-                commands.add(new SliceByNamesReadCommand(keyspace, key, column_parent, predicate.column_names));
+      // Loop until we succeed in calling doBody() without
+      // hitting an IOException.  An IOException most likely
+      // means a commit was in process and has finished, in
+      // the time it took us to load the now-old infos files
+      // (and segments files).  It's also possible it's a
+      // true error (corrupt index).  To distinguish these,
+      // on each retry we must see "forward progress" on
+      // which generation we are trying to load.  If we
+      // don't, then the original error is real and we throw
+      // it.
+      
+      // We have three methods for determining the current
+      // generation.  We try the first two in parallel (when
+      // useFirstMethod is true), and fall back to the third
+      // when necessary.
+
+      while(true) {
+
+        if (useFirstMethod) {
+
+          // List the directory and use the highest
+          // segments_N file.  This method works well as long
+          // as there is no stale caching on the directory
+          // contents (NOTE: NFS clients often have such stale
+          // caching):
+          String[] files = null;
+
+          long genA = -1;
+
+          files = directory.listAll();
+          
+          if (files != null) {
+            genA = getLastCommitGeneration(files);
+          }
+          
+          if (infoStream != null) {
+            message("directory listing genA=" + genA);
+          }
+
+          // Also open segments.gen and read its
+          // contents.  Then we take the larger of the two
+          // gens.  This way, if either approach is hitting
+          // a stale cache (NFS) we have a better chance of
+          // getting the right generation.
+          long genB = -1;
+          IndexInput genInput = null;
+          try {
+            genInput = directory.openInput(IndexFileNames.SEGMENTS_GEN, IOContext.READONCE);
+          } catch (FileNotFoundException e) {
+            if (infoStream != null) {
+              message("segments.gen open: FileNotFoundException " + e);
             }
-        }
-        else
-        {
-            SliceRange range = predicate.slice_range;
-            for (ByteBuffer key: keys)
-            {
-                ThriftValidation.validateKey(metadata, key);
-                commands.add(new SliceFromReadCommand(keyspace, key, column_parent, range.start, range.finish, range.reversed, range.count));
+          } catch (IOException e) {
+            if (infoStream != null) {
+              message("segments.gen open: IOException " + e);
             }
-        }
-
-        return getSlice(commands, consistency_level);
-    }
-
-    private ColumnOrSuperColumn internal_get(ByteBuffer key, ColumnPath column_path, ConsistencyLevel consistency_level)
-    throws InvalidRequestException, NotFoundException, UnavailableException, TimedOutException
-    {
-        state().hasColumnFamilyAccess(column_path.column_family, Permission.READ);
-        String keyspace = state().getKeyspace();
-
-        CFMetaData metadata = ThriftValidation.validateColumnFamily(keyspace, column_path.column_family);
-        ThriftValidation.validateColumnPath(metadata, column_path);
-
-        QueryPath path = new QueryPath(column_path.column_family, column_path.column == null ? null : column_path.super_column);
-        List<ByteBuffer> nameAsList = Arrays.asList(column_path.column == null ? column_path.super_column : column_path.column);
-        ThriftValidation.validateKey(metadata, key);
-        ReadCommand command = new SliceByNamesReadCommand(keyspace, key, path, nameAsList);
-
-        Map<DecoratedKey, ColumnFamily> cfamilies = readColumnFamily(Arrays.asList(command), consistency_level);
-
-        ColumnFamily cf = cfamilies.get(StorageService.getPartitioner().decorateKey(command.key));
-
-        if (cf == null)
-            throw new NotFoundException();
-        List<ColumnOrSuperColumn> tcolumns = thriftifyColumnFamily(cf, command.queryPath.superColumnName != null, false);
-        if (tcolumns.isEmpty())
-            throw new NotFoundException();
-        assert tcolumns.size() == 1;
-        return tcolumns.get(0);
-    }
-
-    public ColumnOrSuperColumn get(ByteBuffer key, ColumnPath column_path, ConsistencyLevel consistency_level)
-    throws InvalidRequestException, NotFoundException, UnavailableException, TimedOutException
-    {
-        logger.debug("get");
-
-        return internal_get(key, column_path, consistency_level);
-    }
-
-    public int get_count(ByteBuffer key, ColumnParent column_parent, SlicePredicate predicate, ConsistencyLevel consistency_level)
-    throws InvalidRequestException, UnavailableException, TimedOutException
-    {
-        logger.debug("get_count");
-
-        state().hasColumnFamilyAccess(column_parent.column_family, Permission.READ);
-
-        return get_slice(key, column_parent, predicate, consistency_level).size();
-    }
-
-    public Map<ByteBuffer, Integer> multiget_count(List<ByteBuffer> keys, ColumnParent column_parent, SlicePredicate predicate, ConsistencyLevel consistency_level)
-    throws InvalidRequestException, UnavailableException, TimedOutException
-    {
-        logger.debug("multiget_count");
-
-        state().hasColumnFamilyAccess(column_parent.column_family, Permission.READ);
-        String keyspace = state().getKeyspace();
-
-        Map<ByteBuffer, Integer> counts = new HashMap<ByteBuffer, Integer>();
-        Map<ByteBuffer, List<ColumnOrSuperColumn>> columnFamiliesMap = multigetSliceInternal(keyspace, keys, column_parent, predicate, consistency_level);
-
-        for (Map.Entry<ByteBuffer, List<ColumnOrSuperColumn>> cf : columnFamiliesMap.entrySet()) {
-          counts.put(cf.getKey(), cf.getValue().size());
-        }
-        return counts;
-    }
-
-    private void internal_insert(ByteBuffer key, ColumnParent column_parent, Column column, ConsistencyLevel consistency_level)
-    throws InvalidRequestException, UnavailableException, TimedOutException
-    {
-        state().hasColumnFamilyAccess(column_parent.column_family, Permission.WRITE);
-
-        CFMetaData metadata = ThriftValidation.validateColumnFamily(state().getKeyspace(), column_parent.column_family, false);
-        ThriftValidation.validateColumnNames(metadata, column_parent, Arrays.asList(column.name));
-        ThriftValidation.validateColumnData(metadata, column);
-
-        RowMutation rm = new RowMutation(state().getKeyspace(), key);
-        try
-        {
-            rm.add(new QueryPath(column_parent.column_family, column_parent.super_column, column.name), column.value, column.timestamp, column.ttl);
-        }
-        catch (MarshalException e)
-        {
-            throw new InvalidRequestException(e.getMessage());
-        }
-        doInsert(consistency_level, Arrays.asList(rm));
-    }
-
-    public void insert(ByteBuffer key, ColumnParent column_parent, Column column, ConsistencyLevel consistency_level)
-    throws InvalidRequestException, UnavailableException, TimedOutException
-    {
-        logger.debug("insert");
-
-        internal_insert(key, column_parent, column, consistency_level);
-    }
-
-    private void internal_batch_mutate(Map<ByteBuffer,Map<String,List<Mutation>>> mutation_map, ConsistencyLevel consistency_level)
-    throws InvalidRequestException, UnavailableException, TimedOutException
-    {
-        List<String> cfamsSeen = new ArrayList<String>();
-        List<RowMutation> rowMutations = new ArrayList<RowMutation>();
-        String keyspace = state().getKeyspace();
-
-        for (Map.Entry<ByteBuffer, Map<String, List<Mutation>>> mutationEntry: mutation_map.entrySet())
-        {
-            ByteBuffer key = mutationEntry.getKey();
-
-            Map<String, List<Mutation>> columnFamilyToMutations = mutationEntry.getValue();
-            for (Map.Entry<String, List<Mutation>> columnFamilyMutations : columnFamilyToMutations.entrySet())
-            {
-                String cfName = columnFamilyMutations.getKey();
-
-                // Avoid unneeded authorizations
-                if (!(cfamsSeen.contains(cfName)))
-                {
-                    state().hasColumnFamilyAccess(cfName, Permission.WRITE);
-                    cfamsSeen.add(cfName);
+          }
+  
+          if (genInput != null) {
+            try {
+              int version = genInput.readInt();
+              if (version == FORMAT_SEGMENTS_GEN_CURRENT) {
+                long gen0 = genInput.readLong();
+                long gen1 = genInput.readLong();
+                if (infoStream != null) {
+                  message("fallback check: " + gen0 + "; " + gen1);
                 }
-
-                CFMetaData metadata = ThriftValidation.validateColumnFamily(keyspace, cfName);
-                ThriftValidation.validateKey(metadata, key);
-
-                if (metadata.getDefaultValidator().isCommutative())
-                    ThriftValidation.validateCommutativeForWrite(metadata, consistency_level);
-
-                for (Mutation mutation : columnFamilyMutations.getValue())
-                {
-                    ThriftValidation.validateMutation(metadata, mutation);
+                if (gen0 == gen1) {
+                  // The file is consistent.
+                  genB = gen0;
                 }
+              } else {
+                throw new IndexFormatTooNewException(genInput, version, FORMAT_SEGMENTS_GEN_CURRENT, FORMAT_SEGMENTS_GEN_CURRENT);
+              }
+            } catch (IOException err2) {
+              // rethrow any format exception
+              if (err2 instanceof CorruptIndexException) throw err2;
+            } finally {
+              genInput.close();
             }
-            RowMutation rm = RowMutation.getRowMutationFromMutations(keyspace, key, columnFamilyToMutations);
-            if (!rm.isEmpty())
-                rowMutations.add(rm);
+          }
+
+          if (infoStream != null) {
+            message(IndexFileNames.SEGMENTS_GEN + " check: genB=" + genB);
+          }
+
+          // Pick the larger of the two gen's:
+          gen = Math.max(genA, genB);
+
+          if (gen == -1) {
+            // Neither approach found a generation
+            throw new IndexNotFoundException("no segments* file found in " + directory + ": files: " + Arrays.toString(files));
+          }
         }
 
-        doInsert(consistency_level, rowMutations);
-    }
+        if (useFirstMethod && lastGen == gen && retryCount >= 2) {
+          // Give up on first method -- this is 3rd cycle on
+          // listing directory and checking gen file to
+          // attempt to locate the segments file.
+          useFirstMethod = false;
+        }
 
-    public void batch_mutate(Map<ByteBuffer,Map<String,List<Mutation>>> mutation_map, ConsistencyLevel consistency_level)
-    throws InvalidRequestException, UnavailableException, TimedOutException
-    {
-        logger.debug("batch_mutate");
+        // Second method: since both directory cache and
+        // file contents cache seem to be stale, just
+        // advance the generation.
+        if (!useFirstMethod) {
+          if (genLookaheadCount < defaultGenLookaheadCount) {
+            gen++;
+            genLookaheadCount++;
+            if (infoStream != null) {
+              message("look ahead increment gen to " + gen);
+            }
+          } else {
+            // All attempts have failed -- throw first exc:
+            throw exc;
+          }
+        } else if (lastGen == gen) {
+          // This means we're about to try the same
+          // segments_N last tried.
+          retryCount++;
+        } else {
+          // Segment file has advanced since our last loop
+          // (we made "progress"), so reset retryCount:
+          retryCount = 0;
+        }
 
-        internal_batch_mutate(mutation_map, consistency_level);
-    }
+        lastGen = gen;
 
-    private void internal_remove(ByteBuffer key, ColumnPath column_path, long timestamp, ConsistencyLevel consistency_level, boolean isCommutativeOp)
-    throws InvalidRequestException, UnavailableException, TimedOutException
-    {
-        state().hasColumnFamilyAccess(column_path.column_family, Permission.WRITE);
+        segmentFileName = IndexFileNames.fileNameFromGeneration(IndexFileNames.SEGMENTS,
+                                                                "",
+                                                                gen);
 
-        CFMetaData metadata = ThriftValidation.validateColumnFamily(state().getKeyspace(), column_path.column_family, isCommutativeOp);
-        ThriftValidation.validateKey(metadata, key);
-        ThriftValidation.validateColumnPathOrParent(metadata, column_path);
-        if (isCommutativeOp)
-            ThriftValidation.validateCommutativeForWrite(metadata, consistency_level);
+        try {
+          Object v = doBody(segmentFileName);
+          if (infoStream != null) {
+            message("success on " + segmentFileName);
+          }
+          return v;
+        } catch (IOException err) {
 
-        RowMutation rm = new RowMutation(state().getKeyspace(), key);
-        rm.delete(new QueryPath(column_path), timestamp); 
+          // Save the original root cause:
+          if (exc == null) {
+            exc = err;
+          }
 
-        doInsert(consistency_level, Arrays.asList(rm));
-    }
+          if (infoStream != null) {
+            message("primary Exception on '" + segmentFileName + "': " + err + "'; will retry: retryCount=" + retryCount + "; gen = " + gen);
+          }
 
-    public void remove(ByteBuffer key, ColumnPath column_path, long timestamp, ConsistencyLevel consistency_level)
-    throws InvalidRequestException, UnavailableException, TimedOutException
-    {
-        logger.debug("remove");
+          if (gen > 1 && useFirstMethod && retryCount == 1) {
 
-        internal_remove(key, column_path, timestamp, consistency_level, false);
-    }
+            // This is our second time trying this same segments
+            // file (because retryCount is 1), and, there is
+            // possibly a segments_(N-1) (because gen > 1).
+            // So, check if the segments_(N-1) exists and
+            // try it if so:
+            String prevSegmentFileName = IndexFileNames.fileNameFromGeneration(IndexFileNames.SEGMENTS,
+                                                                               "",
+                                                                               gen-1);
 
-    private void doInsert(ConsistencyLevel consistency_level, List<RowMutation> mutations) throws UnavailableException, TimedOutException
-    {
-        try
-        {
-            schedule();
+            final boolean prevExists;
+            prevExists = directory.fileExists(prevSegmentFileName);
 
-            try
-            {
-                if (!mutations.isEmpty())
-                {
-                    // FIXME: Mighty ugly but we've made sure above this will always work
-                    if (mutations.iterator().next().getColumnFamilies().iterator().next().metadata().getDefaultValidator().isCommutative())
-                    {
-                        List<org.apache.cassandra.db.CounterMutation> cmutations = new ArrayList<org.apache.cassandra.db.CounterMutation>(mutations.size());
-                        for (RowMutation mutation : mutations)
-                        {
-                            cmutations.add(new org.apache.cassandra.db.CounterMutation(mutation, consistency_level));
-                        }
-                        StorageProxy.mutateCounters(cmutations);
-                    }
-                    else
-                    {
-                        StorageProxy.mutate(mutations, consistency_level);
-                    }
+            if (prevExists) {
+              if (infoStream != null) {
+                message("fallback to prior segment file '" + prevSegmentFileName + "'");
+              }
+              try {
+                Object v = doBody(prevSegmentFileName);
+                if (infoStream != null) {
+                  message("success on fallback " + prevSegmentFileName);
                 }
+                return v;
+              } catch (IOException err2) {
+                if (infoStream != null) {
+                  message("secondary Exception on '" + prevSegmentFileName + "': " + err2 + "'; will retry");
+                }
+              }
             }
-            catch (TimeoutException e)
-            {
-                logger.debug("... timed out");
-                throw new TimedOutException();
-            }
+          }
         }
-        finally
-        {
-            release();
-        }
-    }
-
-    public KsDef describe_keyspace(String table) throws NotFoundException, InvalidRequestException
-    {
-        state().hasKeyspaceListAccess(Permission.READ);
-        
-        KSMetaData ksm = DatabaseDescriptor.getTableDefinition(table);
-        if (ksm == null)
-            throw new NotFoundException();
-
-        List<CfDef> cfDefs = new ArrayList<CfDef>();
-        for (CFMetaData cfm : ksm.cfMetaData().values())
-            cfDefs.add(CFMetaData.convertToThrift(cfm));
-        KsDef ksdef = new KsDef(ksm.name, ksm.strategyClass.getName(), cfDefs);
-        ksdef.setStrategy_options(ksm.strategyOptions);
-        return ksdef;
-    }
-
-    public List<KeySlice> get_range_slices(ColumnParent column_parent, SlicePredicate predicate, KeyRange range, ConsistencyLevel consistency_level)
-    throws InvalidRequestException, UnavailableException, TException, TimedOutException
-    {
-        logger.debug("range_slice");
-
-        String keyspace = state().getKeyspace();
-        state().hasColumnFamilyAccess(column_parent.column_family, Permission.READ);
-
-        CFMetaData metadata = ThriftValidation.validateColumnFamily(keyspace, column_parent.column_family, false);
-        ThriftValidation.validateColumnParent(metadata, column_parent);
-        ThriftValidation.validatePredicate(metadata, column_parent, predicate);
-        ThriftValidation.validateKeyRange(range);
-
-        List<Row> rows;
-        try
-        {
-            IPartitioner p = StorageService.getPartitioner();
-            AbstractBounds bounds;
-            if (range.start_key == null)
-            {
-                Token.TokenFactory tokenFactory = p.getTokenFactory();
-                Token left = tokenFactory.fromString(range.start_token);
-                Token right = tokenFactory.fromString(range.end_token);
-                bounds = new Range(left, right);
-            }
-            else
-            {
-                bounds = new Bounds(p.getToken(range.start_key), p.getToken(range.end_key));
-            }
-            try
-            {
-                schedule();
-                rows = StorageProxy.getRangeSlice(new RangeSliceCommand(keyspace, column_parent, predicate, bounds, range.count), consistency_level);
-            }
-            finally
-            {
-                release();
-            }
-            assert rows != null;
-        }
-        catch (TimeoutException e)
-        {
-            logger.debug("... timed out");
-        	throw new TimedOutException();
-        }
-        catch (IOException e)
-        {
-            throw new RuntimeException(e);
-        }
-
-        return thriftifyKeySlices(rows, column_parent, predicate);
-    }
-
-    private List<KeySlice> thriftifyKeySlices(List<Row> rows, ColumnParent column_parent, SlicePredicate predicate)
-    {
-        List<KeySlice> keySlices = new ArrayList<KeySlice>(rows.size());
-        boolean reversed = predicate.slice_range != null && predicate.slice_range.reversed;
-        for (Row row : rows)
-        {
-            List<ColumnOrSuperColumn> thriftifiedColumns = thriftifyColumnFamily(row.cf, column_parent.super_column != null, reversed);
-            keySlices.add(new KeySlice(row.key.key, thriftifiedColumns));
-        }
-
-        return keySlices;
-    }
-
-    public List<KeySlice> get_indexed_slices(ColumnParent column_parent, IndexClause index_clause, SlicePredicate column_predicate, ConsistencyLevel consistency_level) throws InvalidRequestException, UnavailableException, TimedOutException, TException
-    {
-        logger.debug("scan");
-
-        state().hasColumnFamilyAccess(column_parent.column_family, Permission.READ);
-        String keyspace = state().getKeyspace();
-        CFMetaData metadata = ThriftValidation.validateColumnFamily(keyspace, column_parent.column_family, false);
-        ThriftValidation.validateColumnParent(metadata, column_parent);
-        ThriftValidation.validatePredicate(metadata, column_parent, column_predicate);
-        ThriftValidation.validateIndexClauses(metadata, index_clause);
-
-        List<Row> rows;
-        try
-        {
-            rows = StorageProxy.scan(keyspace, column_parent.column_family, index_clause, column_predicate, consistency_level);
-        }
-        catch (IOException e)
-        {
-            throw new RuntimeException(e);
-        }
-        catch (TimeoutException e)
-        {
-            logger.debug("... timed out");
-            throw new TimedOutException();
-        }
-        return thriftifyKeySlices(rows, column_parent, column_predicate);
-    }
-
-    public List<KsDef> describe_keyspaces() throws TException, InvalidRequestException
-    {
-        state().hasKeyspaceListAccess(Permission.READ);
-        
-        Set<String> keyspaces = DatabaseDescriptor.getTables();
-        List<KsDef> ksset = new ArrayList<KsDef>();
-        for (String ks : keyspaces)
-        {
-            try
-            {
-                ksset.add(describe_keyspace(ks));
-            }
-            catch (NotFoundException nfe)
-            {
-                logger.info("Failed to find metadata for keyspace '" + ks + "'. Continuing... ");
-            }
-        }
-        return ksset;
-    }
-
-    public String describe_cluster_name() throws TException
-    {
-        return DatabaseDescriptor.getClusterName();
-    }
-
-    public String describe_version() throws TException
-    {
-        return Constants.VERSION;
-    }
-
-    public List<TokenRange> describe_ring(String keyspace)throws InvalidRequestException
-    {
-        if (keyspace == null || !DatabaseDescriptor.getNonSystemTables().contains(keyspace))
-            throw new InvalidRequestException("There is no ring for the keyspace: " + keyspace);
-        List<TokenRange> ranges = new ArrayList<TokenRange>();
-        Token.TokenFactory tf = StorageService.getPartitioner().getTokenFactory();
-        for (Map.Entry<Range, List<String>> entry : StorageService.instance.getRangeToEndpointMap(keyspace).entrySet())
-        {
-            Range range = entry.getKey();
-            List<String> endpoints = entry.getValue();
-            ranges.add(new TokenRange(tf.toString(range.left), tf.toString(range.right), endpoints));
-        }
-        return ranges;
-    }
-
-    public String describe_partitioner() throws TException
-    {
-        return StorageService.getPartitioner().getClass().getName();
-    }
-
-    public String describe_snitch() throws TException
-    {
-        if (DatabaseDescriptor.getEndpointSnitch() instanceof DynamicEndpointSnitch)
-            return ((DynamicEndpointSnitch)DatabaseDescriptor.getEndpointSnitch()).subsnitch.getClass().getName();
-        return DatabaseDescriptor.getEndpointSnitch().getClass().getName();
-    }
-
-    public List<String> describe_splits(String cfName, String start_token, String end_token, int keys_per_split)
-    throws TException, InvalidRequestException
-    {
-        // TODO: add keyspace authorization call post CASSANDRA-1425
-        Token.TokenFactory tf = StorageService.getPartitioner().getTokenFactory();
-        List<Token> tokens = StorageService.instance.getSplits(state().getKeyspace(), cfName, new Range(tf.fromString(start_token), tf.fromString(end_token)), keys_per_split);
-        List<String> splits = new ArrayList<String>(tokens.size());
-        for (Token token : tokens)
-        {
-            splits.add(tf.toString(token));
-        }
-        return splits;
-    }
-
-    public void login(AuthenticationRequest auth_request) throws AuthenticationException, AuthorizationException, TException
-    {
-         state().login(auth_request.getCredentials());
+      }
     }
 
     /**
-     * Schedule the current thread for access to the required services
+     * Subclass must implement this.  The assumption is an
+     * IOException will be thrown if something goes wrong
+     * during the processing that could have been caused by
+     * a writer committing.
      */
-    private void schedule()
-    {
-        requestScheduler.queue(Thread.currentThread(), state().getSchedulingValue());
+    protected abstract Object doBody(String segmentFileName) throws CorruptIndexException, IOException;
+  }
+
+  // Carry over generation numbers from another SegmentInfos
+  void updateGeneration(SegmentInfos other) {
+    lastGeneration = other.lastGeneration;
+    generation = other.generation;
+  }
+
+  final void rollbackCommit(Directory dir) throws IOException {
+    if (pendingSegnOutput != null) {
+      try {
+        pendingSegnOutput.close();
+      } catch (Throwable t) {
+        // Suppress so we keep throwing the original exception
+        // in our caller
+      }
+
+      // Must carefully compute fileName from "generation"
+      // since lastGeneration isn't incremented:
+      try {
+        final String segmentFileName = IndexFileNames.fileNameFromGeneration(IndexFileNames.SEGMENTS,
+                                                                              "",
+                                                                             generation);
+        dir.deleteFile(segmentFileName);
+      } catch (Throwable t) {
+        // Suppress so we keep throwing the original exception
+        // in our caller
+      }
+      pendingSegnOutput = null;
+    }
+  }
+
+  /** Call this to start a commit.  This writes the new
+   *  segments file, but writes an invalid checksum at the
+   *  end, so that it is not visible to readers.  Once this
+   *  is called you must call {@link #finishCommit} to complete
+   *  the commit or {@link #rollbackCommit} to abort it.
+   *  <p>
+   *  Note: {@link #changed()} should be called prior to this
+   *  method if changes have been made to this {@link SegmentInfos} instance
+   *  </p>  
+   **/
+  final void prepareCommit(Directory dir) throws IOException {
+    if (pendingSegnOutput != null) {
+      throw new IllegalStateException("prepareCommit was already called");
+    }
+    write(dir);
+  }
+
+  /** Returns all file names referenced by SegmentInfo
+   *  instances matching the provided Directory (ie files
+   *  associated with any "external" segments are skipped).
+   *  The returned collection is recomputed on each
+   *  invocation.  */
+  public Collection<String> files(Directory dir, boolean includeSegmentsFile) throws IOException {
+    HashSet<String> files = new HashSet<String>();
+    if (includeSegmentsFile) {
+      final String segmentFileName = getSegmentsFileName();
+      if (segmentFileName != null) {
+        /*
+         * TODO: if lastGen == -1 we get might get null here it seems wrong to
+         * add null to the files set
+         */
+        files.add(segmentFileName);
+      }
+    }
+    final int size = size();
+    for(int i=0;i<size;i++) {
+      final SegmentInfoPerCommit info = info(i);
+      assert info.info.dir == dir;
+      if (info.info.dir == dir) {
+        files.addAll(info.files());
+      }
+    }
+    return files;
+  }
+
+  final void finishCommit(Directory dir) throws IOException {
+    if (pendingSegnOutput == null) {
+      throw new IllegalStateException("prepareCommit was not called");
+    }
+    boolean success = false;
+    try {
+      pendingSegnOutput.finishCommit();
+      success = true;
+    } finally {
+      if (!success) {
+        IOUtils.closeWhileHandlingException(pendingSegnOutput);
+        rollbackCommit(dir);
+      } else {
+        pendingSegnOutput.close();
+        pendingSegnOutput = null;
+      }
     }
 
-    /**
-     * Release count for the used up resources
-     */
-    private void release()
-    {
-        requestScheduler.release();
+    // NOTE: if we crash here, we have left a segments_N
+    // file in the directory in a possibly corrupt state (if
+    // some bytes made it to stable storage and others
+    // didn't).  But, the segments_N file includes checksum
+    // at the end, which should catch this case.  So when a
+    // reader tries to read it, it will throw a
+    // CorruptIndexException, which should cause the retry
+    // logic in SegmentInfos to kick in and load the last
+    // good (previous) segments_N-1 file.
+
+    final String fileName = IndexFileNames.fileNameFromGeneration(IndexFileNames.SEGMENTS, "", generation);
+    success = false;
+    try {
+      dir.sync(Collections.singleton(fileName));
+      success = true;
+    } finally {
+      if (!success) {
+        try {
+          dir.deleteFile(fileName);
+        } catch (Throwable t) {
+          // Suppress so we keep throwing the original exception
+        }
+      }
     }
+
+    lastGeneration = generation;
+
+    try {
+      IndexOutput genOutput = dir.createOutput(IndexFileNames.SEGMENTS_GEN, IOContext.READONCE);
+      try {
+        genOutput.writeInt(FORMAT_SEGMENTS_GEN_CURRENT);
+        genOutput.writeLong(generation);
+        genOutput.writeLong(generation);
+      } finally {
+        genOutput.close();
+        dir.sync(Collections.singleton(IndexFileNames.SEGMENTS_GEN));
+      }
+    } catch (Throwable t) {
+      // It's OK if we fail to write this file since it's
+      // used only as one of the retry fallbacks.
+      try {
+        dir.deleteFile(IndexFileNames.SEGMENTS_GEN);
+      } catch (Throwable t2) {
+        // Ignore; this file is only used in a retry
+        // fallback on init.
+      }
+      if (t instanceof ThreadInterruptedException) {
+        throw (ThreadInterruptedException) t;
+      }
+    }
+  }
+
+  /** Writes & syncs to the Directory dir, taking care to
+   *  remove the segments file on exception
+   *  <p>
+   *  Note: {@link #changed()} should be called prior to this
+   *  method if changes have been made to this {@link SegmentInfos} instance
+   *  </p>  
+   **/
+  final void commit(Directory dir) throws IOException {
+    prepareCommit(dir);
+    finishCommit(dir);
+  }
+
+  public String toString(Directory directory) {
+    StringBuilder buffer = new StringBuilder();
+    buffer.append(getSegmentsFileName()).append(": ");
+    final int count = size();
+    for(int i = 0; i < count; i++) {
+      if (i > 0) {
+        buffer.append(' ');
+      }
+      final SegmentInfoPerCommit info = info(i);
+      buffer.append(info.toString(directory, 0));
+    }
+    return buffer.toString();
+  }
+
+  public Map<String,String> getUserData() {
+    return userData;
+  }
+
+  void setUserData(Map<String,String> data) {
+    if (data == null) {
+      userData = Collections.<String,String>emptyMap();
+    } else {
+      userData = data;
+    }
+  }
+
+  /** Replaces all segments in this instance, but keeps
+   *  generation, version, counter so that future commits
+   *  remain write once.
+   */
+  void replace(SegmentInfos other) {
+    rollbackSegmentInfos(other.asList());
+    lastGeneration = other.lastGeneration;
+  }
+
+  /** Returns sum of all segment's docCounts.  Note that
+   *  this does not include deletions */
+  public int totalDocCount() {
+    int count = 0;
+    for(SegmentInfoPerCommit info : this) {
+      count += info.info.getDocCount();
+    }
+    return count;
+  }
+
+  /** Call this before committing if changes have been made to the
+   *  segments. */
+  public void changed() {
+    version++;
+  }
+  
+  /** applies all changes caused by committing a merge to this SegmentInfos */
+  void applyMergeChanges(MergePolicy.OneMerge merge, boolean dropSegment) {
+    final Set<SegmentInfoPerCommit> mergedAway = new HashSet<SegmentInfoPerCommit>(merge.segments);
+    boolean inserted = false;
+    int newSegIdx = 0;
+    for (int segIdx = 0, cnt = segments.size(); segIdx < cnt; segIdx++) {
+      assert segIdx >= newSegIdx;
+      final SegmentInfoPerCommit info = segments.get(segIdx);
+      if (mergedAway.contains(info)) {
+        if (!inserted && !dropSegment) {
+          segments.set(segIdx, merge.info);
+          inserted = true;
+          newSegIdx++;
+        }
+      } else {
+        segments.set(newSegIdx, info);
+        newSegIdx++;
+      }
+    }
+
+    // the rest of the segments in list are duplicates, so don't remove from map, only list!
+    segments.subList(newSegIdx, segments.size()).clear();
     
-    // helper method to apply migration on the migration stage. typical migration failures will throw an 
-    // InvalidRequestException. atypical failures will throw a RuntimeException.
-    private static void applyMigrationOnStage(final Migration m)
-    {
-        Future f = StageManager.getStage(Stage.MIGRATION).submit(new Callable()
-        {
-            public Object call() throws Exception
-            {
-                m.apply();
-                m.announce();
-                return null;
-            }
-        });
-        try
-        {
-            f.get();
-        }
-        catch (InterruptedException e)
-        {
-            throw new AssertionError(e);
-        }
-        catch (ExecutionException e)
-        {
-            throw new RuntimeException(e);
-        }
+    // Either we found place to insert segment, or, we did
+    // not, but only because all segments we merged becamee
+    // deleted while we are merging, in which case it should
+    // be the case that the new segment is also all deleted,
+    // we insert it at the beginning if it should not be dropped:
+    if (!inserted && !dropSegment) {
+      segments.add(0, merge.info);
     }
+  }
 
-    public synchronized String system_add_column_family(CfDef cf_def)
-    throws InvalidRequestException, SchemaDisagreementException, TException
-    {
-        logger.debug("add_column_family");
-        state().hasColumnFamilyListAccess(Permission.WRITE);
-        ThriftValidation.validateCfDef(cf_def);
-        validateSchemaAgreement();
-
-        try
-        {
-            applyMigrationOnStage(new AddColumnFamily(convertToCFMetaData(cf_def)));
-            return DatabaseDescriptor.getDefsVersion().toString();
-        }
-        catch (ConfigurationException e)
-        {
-            InvalidRequestException ex = new InvalidRequestException(e.getMessage());
-            ex.initCause(e);
-            throw ex;
-        }
-        catch (IOException e)
-        {
-            InvalidRequestException ex = new InvalidRequestException(e.getMessage());
-            ex.initCause(e);
-            throw ex;
-        }
+  List<SegmentInfoPerCommit> createBackupSegmentInfos() {
+    final List<SegmentInfoPerCommit> list = new ArrayList<SegmentInfoPerCommit>(size());
+    for(final SegmentInfoPerCommit info : this) {
+      assert info.info.getCodec() != null;
+      list.add(info.clone());
     }
+    return list;
+  }
+  
+  void rollbackSegmentInfos(List<SegmentInfoPerCommit> infos) {
+    this.clear();
+    this.addAll(infos);
+  }
+  
+  /** Returns an <b>unmodifiable</b> {@link Iterator} of contained segments in order. */
+  // @Override (comment out until Java 6)
+  public Iterator<SegmentInfoPerCommit> iterator() {
+    return asList().iterator();
+  }
+  
+  /** Returns all contained segments as an <b>unmodifiable</b> {@link List} view. */
+  public List<SegmentInfoPerCommit> asList() {
+    return Collections.unmodifiableList(segments);
+  }
+  
+  public int size() {
+    return segments.size();
+  }
 
-    public synchronized String system_drop_column_family(String column_family)
-    throws InvalidRequestException, SchemaDisagreementException, TException
-    {
-        logger.debug("drop_column_family");
-        state().hasColumnFamilyListAccess(Permission.WRITE);
-        validateSchemaAgreement();
-        
-        try
-        {
-            applyMigrationOnStage(new DropColumnFamily(state().getKeyspace(), column_family));
-            return DatabaseDescriptor.getDefsVersion().toString();
-        }
-        catch (ConfigurationException e)
-        {
-            InvalidRequestException ex = new InvalidRequestException(e.getMessage());
-            ex.initCause(e);
-            throw ex;
-        }
-        catch (IOException e)
-        {
-            InvalidRequestException ex = new InvalidRequestException(e.getMessage());
-            ex.initCause(e);
-            throw ex;
-        }
+  public void add(SegmentInfoPerCommit si) {
+    segments.add(si);
+  }
+  
+  public void addAll(Iterable<SegmentInfoPerCommit> sis) {
+    for (final SegmentInfoPerCommit si : sis) {
+      this.add(si);
     }
+  }
+  
+  public void clear() {
+    segments.clear();
+  }
 
-    public synchronized String system_add_keyspace(KsDef ks_def)
-    throws InvalidRequestException, SchemaDisagreementException, TException
-    {
-        logger.debug("add_keyspace");
-        state().hasKeyspaceListAccess(Permission.WRITE);
-        validateSchemaAgreement();
-        
-        // generate a meaningful error if the user setup keyspace and/or column definition incorrectly
-        for (CfDef cf : ks_def.cf_defs) 
-        {
-            if (!cf.getKeyspace().equals(ks_def.getName()))
-            {
-                throw new InvalidRequestException("CsDef (" + cf.getName() +") had a keyspace definition that did not match KsDef");
-            }
-        }
+  /** WARNING: O(N) cost */
+  public void remove(SegmentInfoPerCommit si) {
+    segments.remove(si);
+  }
+  
+  /** WARNING: O(N) cost */
+  void remove(int index) {
+    segments.remove(index);
+  }
 
-        try
-        {
-            Collection<CFMetaData> cfDefs = new ArrayList<CFMetaData>(ks_def.cf_defs.size());
-            for (CfDef cfDef : ks_def.cf_defs)
-            {
-                ThriftValidation.validateCfDef(cfDef);
-                cfDefs.add(convertToCFMetaData(cfDef));
-            }
+  /** WARNING: O(N) cost */
+  boolean contains(SegmentInfoPerCommit si) {
+    return segments.contains(si);
+  }
 
-            // Attempt to instantiate the ARS, which will throw a ConfigException if
-            //  the strategy_options aren't fully formed or if the ARS Classname is invalid.
-            TokenMetadata tmd = StorageService.instance.getTokenMetadata();
-            IEndpointSnitch eps = DatabaseDescriptor.getEndpointSnitch();
-            Class<? extends AbstractReplicationStrategy> cls = AbstractReplicationStrategy.getClass(ks_def.strategy_class);
-            AbstractReplicationStrategy strat = AbstractReplicationStrategy
-                                                    .createReplicationStrategy(ks_def.name,
-                                                                               cls,
-                                                                               tmd,
-                                                                               eps,
-                                                                               ks_def.strategy_options);
-
-            KSMetaData ksm = new KSMetaData(ks_def.name,
-                                            AbstractReplicationStrategy.getClass(ks_def.strategy_class),
-                                            ks_def.strategy_options,
-                                            cfDefs.toArray(new CFMetaData[cfDefs.size()]));
-
-            applyMigrationOnStage(new AddKeyspace(ksm));
-            return DatabaseDescriptor.getDefsVersion().toString();
-        }
-        catch (ConfigurationException e)
-        {
-            InvalidRequestException ex = new InvalidRequestException(e.getMessage());
-            ex.initCause(e);
-            throw ex;
-        }
-        catch (IOException e)
-        {
-            InvalidRequestException ex = new InvalidRequestException(e.getMessage());
-            ex.initCause(e);
-            throw ex;
-        }
-    }
-    
-    public synchronized String system_drop_keyspace(String keyspace)
-    throws InvalidRequestException, SchemaDisagreementException, TException
-    {
-        logger.debug("drop_keyspace");
-        state().hasKeyspaceListAccess(Permission.WRITE);
-        validateSchemaAgreement();
-        
-        try
-        {
-            applyMigrationOnStage(new DropKeyspace(keyspace));
-            return DatabaseDescriptor.getDefsVersion().toString();
-        }
-        catch (ConfigurationException e)
-        {
-            InvalidRequestException ex = new InvalidRequestException(e.getMessage());
-            ex.initCause(e);
-            throw ex;
-        }
-        catch (IOException e)
-        {
-            InvalidRequestException ex = new InvalidRequestException(e.getMessage());
-            ex.initCause(e);
-            throw ex;
-        }
-    }
-
-    /** update an existing keyspace, but do not allow column family modifications. 
-     * @throws SchemaDisagreementException */
-    public synchronized String system_update_keyspace(KsDef ks_def)
-    throws InvalidRequestException, SchemaDisagreementException, TException
-    {
-        logger.debug("update_keyspace");
-        state().hasKeyspaceListAccess(Permission.WRITE);
-        ThriftValidation.validateTable(ks_def.name);
-        if (ks_def.getCf_defs() != null && ks_def.getCf_defs().size() > 0)
-            throw new InvalidRequestException("Keyspace update must not contain any column family definitions.");
-        validateSchemaAgreement();
-
-        try
-        {
-            KSMetaData ksm = new KSMetaData(ks_def.name,
-                                            AbstractReplicationStrategy.getClass(ks_def.strategy_class),
-                                            ks_def.strategy_options);
-            applyMigrationOnStage(new UpdateKeyspace(ksm));
-            return DatabaseDescriptor.getDefsVersion().toString();
-        }
-        catch (ConfigurationException e)
-        {
-            InvalidRequestException ex = new InvalidRequestException(e.getMessage());
-            ex.initCause(e);
-            throw ex;
-        }
-        catch (IOException e)
-        {
-            InvalidRequestException ex = new InvalidRequestException(e.getMessage());
-            ex.initCause(e);
-            throw ex;
-        }
-    }
-
-    public synchronized String system_update_column_family(CfDef cf_def)
-    throws InvalidRequestException, SchemaDisagreementException, TException
-    {
-        logger.debug("update_column_family");
-        state().hasColumnFamilyListAccess(Permission.WRITE);
-        ThriftValidation.validateCfDef(cf_def);
-        if (cf_def.keyspace == null || cf_def.name == null)
-            throw new InvalidRequestException("Keyspace and CF name must be set.");
-        CFMetaData oldCfm = DatabaseDescriptor.getCFMetaData(CFMetaData.getId(cf_def.keyspace, cf_def.name));
-        if (oldCfm == null) 
-            throw new InvalidRequestException("Could not find column family definition to modify.");
-        validateSchemaAgreement();
-
-        try
-        {
-            // ideally, apply() would happen on the stage with the
-            CFMetaData.applyImplicitDefaults(cf_def);
-            UpdateColumnFamily update = new UpdateColumnFamily(CFMetaData.convertToAvro(cf_def));
-            applyMigrationOnStage(update);
-            return DatabaseDescriptor.getDefsVersion().toString();
-        }
-        catch (ConfigurationException e)
-        {
-            InvalidRequestException ex = new InvalidRequestException(e.getMessage());
-            ex.initCause(e);
-            throw ex;
-        }
-        catch (IOException e)
-        {
-            InvalidRequestException ex = new InvalidRequestException(e.getMessage());
-            ex.initCause(e);
-            throw ex;
-        }
-    }
-
-    private void validateSchemaAgreement() throws SchemaDisagreementException
-    {
-        // unreachable hosts don't count towards disagreement
-        Map<String, List<String>> versions = Maps.filterKeys(StorageProxy.describeSchemaVersions(),
-                                                             Predicates.not(Predicates.equalTo(StorageProxy.UNREACHABLE)));
-        if (versions.size() > 1)
-            throw new SchemaDisagreementException();
-    }
-
-    // @see CFMetaData.applyImplicitDefaults().
-    private CFMetaData convertToCFMetaData(CfDef cf_def) throws InvalidRequestException, ConfigurationException
-    {
-        ColumnFamilyType cfType = ColumnFamilyType.create(cf_def.column_type);
-        if (cfType == null)
-        {
-          throw new InvalidRequestException("Invalid column type " + cf_def.column_type);
-        }
-
-        CFMetaData.applyImplicitDefaults(cf_def);
-        CFMetaData.validateMinMaxCompactionThresholds(cf_def);
-        CFMetaData.validateMemtableSettings(cf_def);
-
-        CFMetaData newCFMD = new CFMetaData(cf_def.keyspace,
-                                            cf_def.name,
-                                            cfType,
-                                            DatabaseDescriptor.getComparator(cf_def.comparator_type),
-                                            cf_def.subcomparator_type == null ? null : DatabaseDescriptor.getComparator(cf_def.subcomparator_type));
-
-        if (cf_def.isSetGc_grace_seconds()) { newCFMD.gcGraceSeconds(cf_def.gc_grace_seconds); }
-        if (cf_def.isSetMin_compaction_threshold()) { newCFMD.minCompactionThreshold(cf_def.min_compaction_threshold); }
-        if (cf_def.isSetMax_compaction_threshold()) { newCFMD.maxCompactionThreshold(cf_def.max_compaction_threshold); }
-        if (cf_def.isSetRow_cache_save_period_in_seconds()) { newCFMD.rowCacheSavePeriod(cf_def.row_cache_save_period_in_seconds); }
-        if (cf_def.isSetKey_cache_save_period_in_seconds()) { newCFMD.keyCacheSavePeriod(cf_def.key_cache_save_period_in_seconds); }
-        if (cf_def.isSetMemtable_flush_after_mins()) { newCFMD.memTime(cf_def.memtable_flush_after_mins); }
-        if (cf_def.isSetMemtable_throughput_in_mb()) { newCFMD.memSize(cf_def.memtable_throughput_in_mb); }
-        if (cf_def.isSetMemtable_operations_in_millions()) { newCFMD.memOps(cf_def.memtable_operations_in_millions); }
-        if (cf_def.isSetMerge_shards_chance()) { newCFMD.mergeShardsChance(cf_def.merge_shards_chance); }
-        if (cf_def.isSetRow_cache_provider()) { newCFMD.rowCacheProvider(FBUtilities.newCacheProvider(cf_def.row_cache_provider)); }
-
-        return newCFMD.comment(cf_def.comment)
-                      .rowCacheSize(cf_def.row_cache_size)
-                      .keyCacheSize(cf_def.key_cache_size)
-                      .readRepairChance(cf_def.read_repair_chance)
-                      .replicateOnWrite(cf_def.replicate_on_write)
-                      .defaultValidator(DatabaseDescriptor.getComparator(cf_def.default_validation_class))
-                      .columnMetadata(ColumnDefinition.fromColumnDef(cf_def.column_metadata));
-    }
-
-    public void truncate(String cfname) throws InvalidRequestException, UnavailableException, TException
-    {
-        logger.debug("truncating {} in {}", cfname, state().getKeyspace());
-        state().hasColumnFamilyAccess(cfname, Permission.WRITE);
-        try
-        {
-            schedule();
-            StorageProxy.truncateBlocking(state().getKeyspace(), cfname);
-        }
-        catch (TimeoutException e)
-        {
-            throw (UnavailableException) new UnavailableException().initCause(e);
-        }
-        catch (IOException e)
-        {
-            throw (UnavailableException) new UnavailableException().initCause(e);
-        }
-        finally
-        {
-            release();
-        }
-    }
-
-    public void set_keyspace(String keyspace) throws InvalidRequestException, TException
-    {
-        ThriftValidation.validateTable(keyspace);
-
-        state().setKeyspace(keyspace);
-    }
-
-    public Map<String, List<String>> describe_schema_versions() throws TException, InvalidRequestException
-    {
-        logger.debug("checking schema agreement");      
-        return StorageProxy.describeSchemaVersions();
-    }
-
-    // counter methods
-
-    public void add(ByteBuffer key, ColumnParent column_parent, CounterColumn column, ConsistencyLevel consistency_level)
-            throws InvalidRequestException, UnavailableException, TimedOutException, TException
-    {
-        logger.debug("add");
-
-        state().hasColumnFamilyAccess(column_parent.column_family, Permission.WRITE);
-        String keyspace = state().getKeyspace();
-
-        CFMetaData metadata = ThriftValidation.validateColumnFamily(keyspace, column_parent.column_family, true);
-        ThriftValidation.validateKey(metadata, key);
-        ThriftValidation.validateCommutativeForWrite(metadata, consistency_level);
-        ThriftValidation.validateColumnParent(metadata, column_parent);
-        ThriftValidation.validateColumnNames(metadata, column_parent, Arrays.asList(column.name));
-
-        RowMutation rm = new RowMutation(keyspace, key);
-        try
-        {
-            rm.addCounter(new QueryPath(column_parent.column_family, column_parent.super_column, column.name), column.value);
-        }
-        catch (MarshalException e)
-        {
-            throw new InvalidRequestException(e.getMessage());
-        }
-        doInsert(consistency_level, Arrays.asList(rm));
-    }
-
-    public void remove_counter(ByteBuffer key, ColumnPath path, ConsistencyLevel consistency_level)
-            throws InvalidRequestException, UnavailableException, TimedOutException, TException
-    {
-        if (logger.isDebugEnabled())
-            logger.debug("remove_counter");
-
-        String keyspace = state().getKeyspace();
-
-        internal_remove(key, path, System.currentTimeMillis(), consistency_level, true);
-    }
-
-    public CqlResult execute_cql_query(ByteBuffer query, Compression compression)
-    throws InvalidRequestException, UnavailableException, TimedOutException, SchemaDisagreementException, TException
-    {
-        String queryString = null;
-        
-        // Decompress the query string.
-        try
-        {
-            switch (compression)
-            {
-                case GZIP:
-                    ByteArrayOutputStream byteArray = new ByteArrayOutputStream();
-                    byte[] outBuffer = new byte[1024], inBuffer = new byte[1024];
-                    
-                    Inflater decompressor = new Inflater();
-                    
-                    int lenRead = 0;
-                    while (true)
-                    {
-                        if (decompressor.needsInput())
-                            lenRead = query.remaining() < 1024 ? query.remaining() : 1024;
-                            query.get(inBuffer, 0, lenRead);
-                            decompressor.setInput(inBuffer, 0, lenRead);
-                        
-                        int lenWrite = 0;
-                        while ((lenWrite = decompressor.inflate(outBuffer)) !=0)
-                            byteArray.write(outBuffer, 0, lenWrite);
-                        
-                        if (decompressor.finished())
-                            break;
-                    }
-                    
-                    decompressor.end();
-                    
-                    queryString = new String(byteArray.toByteArray(), 0, byteArray.size(), "UTF-8");
-                    break;
-                case NONE:
-                    try 
-                    {
-                        queryString = ByteBufferUtil.string(query);
-                    }
-                    catch (CharacterCodingException ex) 
-                    {
-                        throw new InvalidRequestException(ex.getMessage());
-                    }
-                    break;
-            }
-        }
-        catch (DataFormatException e)
-        {
-            throw new InvalidRequestException("Error deflating query string.");
-        }
-        catch (UnsupportedEncodingException e)
-        {
-            throw new InvalidRequestException("Unknown query string encoding.");
-        }
-        
-        try
-        {
-            return QueryProcessor.process(queryString, state());
-        }
-        catch (RecognitionException e)
-        {
-            InvalidRequestException ire = new InvalidRequestException("Invalid or malformed CQL query string");
-            ire.initCause(e);
-            throw ire;
-        }
-    }
-
-    // main method moved to CassandraDaemon
+  /** WARNING: O(N) cost */
+  int indexOf(SegmentInfoPerCommit si) {
+    return segments.indexOf(si);
+  }
 }

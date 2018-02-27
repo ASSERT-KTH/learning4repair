@@ -1,6 +1,6 @@
 @Override
 
-package org.apache.lucene.index;
+package org.apache.lucene.codecs.compressing;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -18,142 +18,91 @@ package org.apache.lucene.index;
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-import java.util.ArrayList;
-import java.util.List;
 
-import org.apache.lucene.util.Counter;
-import org.apache.lucene.util.IntBlockPool;
-import org.apache.lucene.util.LuceneTestCase;
-import org.apache.lucene.util.RamUsageEstimator;
+import java.io.IOException;
 
-/**
- * tests basic {@link IntBlockPool} functionality
- */
-public class TestIntBlockPool extends LuceneTestCase {
-  
-  public void testSingleWriterReader() {
-    Counter bytesUsed = Counter.newCounter();
-    IntBlockPool pool = new IntBlockPool(new ByteTrackingAllocator(bytesUsed));
-    
-    for (int j = 0; j < 2; j++) {
-      IntBlockPool.SliceWriter writer = new IntBlockPool.SliceWriter(pool);
-      int start = writer.startNewSlice();
-      int num = atLeast(100);
-      for (int i = 0; i < num; i++) {
-        writer.writeInt(i);
-      }
-      
-      int upto = writer.getCurrentOffset();
-      IntBlockPool.SliceReader reader = new IntBlockPool.SliceReader(pool);
-      reader.reset(start, upto);
-      for (int i = 0; i < num; i++) {
-        assertEquals(i, reader.readInt());
-      }
-      assertTrue(reader.endOfSlice());
-      if (random().nextBoolean()) {
-        pool.reset(true, false);
-        assertEquals(0, bytesUsed.get());
-      } else {
-        pool.reset(true, true);
-        assertEquals(IntBlockPool.INT_BLOCK_SIZE
-            * RamUsageEstimator.NUM_BYTES_INT, bytesUsed.get());
-      }
-    }
-  }
-  
-  public void testMultipleWriterReader() {
-    Counter bytesUsed = Counter.newCounter();
-    IntBlockPool pool = new IntBlockPool(new ByteTrackingAllocator(bytesUsed));
-    for (int j = 0; j < 2; j++) {
-      List<StartEndAndValues> holders = new ArrayList<TestIntBlockPool.StartEndAndValues>();
-      int num = atLeast(4);
-      for (int i = 0; i < num; i++) {
-        holders.add(new StartEndAndValues(random().nextInt(1000)));
-      }
-      IntBlockPool.SliceWriter writer = new IntBlockPool.SliceWriter(pool);
-      IntBlockPool.SliceReader reader = new IntBlockPool.SliceReader(pool);
-      
-      int numValuesToWrite = atLeast(10000);
-      for (int i = 0; i < numValuesToWrite; i++) {
-        StartEndAndValues values = holders
-            .get(random().nextInt(holders.size()));
-        if (values.valueCount == 0) {
-          values.start = writer.startNewSlice();
-        } else {
-          writer.reset(values.end);
+import com.carrotsearch.randomizedtesting.generators.RandomInts;
+
+public abstract class AbstractTestLZ4CompressionMode extends AbstractTestCompressionMode {
+
+  public byte[] test(byte[] decompressed) throws IOException {
+    final byte[] compressed = super.test(decompressed);
+    int off = 0;
+    int decompressedOff = 0;
+    for (;;) {
+      final int token = compressed[off++] & 0xFF;
+      int literalLen = token >>> 4;
+      if (literalLen == 0x0F) {
+        while (compressed[off] == (byte) 0xFF) {
+          literalLen += 0xFF;
+          ++off;
         }
-        writer.writeInt(values.nextValue());
-        values.end = writer.getCurrentOffset();
-        if (random().nextInt(5) == 0) {
-          // pick one and reader the ints
-          assertReader(reader, holders.get(random().nextInt(holders.size())));
+        literalLen += compressed[off++] & 0xFF;
+      }
+      // skip literals
+      off += literalLen;
+      decompressedOff += literalLen;
+
+      // check that the stream ends with literals and that there are at least
+      // 5 of them
+      if (off == compressed.length) {
+        assertEquals(decompressed.length, decompressedOff);
+        assertTrue("lastLiterals=" + literalLen + ", bytes=" + decompressed.length,
+            literalLen >= LZ4.LAST_LITERALS || literalLen == decompressed.length);
+        break;
+      }
+
+      final int matchDec = (compressed[off++] & 0xFF) | ((compressed[off++] & 0xFF) << 8);
+      // check that match dec is not 0
+      assertTrue(matchDec + " " + decompressedOff, matchDec > 0 && matchDec <= decompressedOff);
+
+      int matchLen = token & 0x0F;
+      if (matchLen == 0x0F) {
+        while (compressed[off] == (byte) 0xFF) {
+          matchLen += 0xFF;
+          ++off;
         }
+        matchLen += compressed[off++] & 0xFF;
       }
-      
-      while (!holders.isEmpty()) {
-        StartEndAndValues values = holders.remove(random().nextInt(
-            holders.size()));
-        assertReader(reader, values);
-      }
-      if (random().nextBoolean()) {
-        pool.reset(true, false);
-        assertEquals(0, bytesUsed.get());
-      } else {
-        pool.reset(true, true);
-        assertEquals(IntBlockPool.INT_BLOCK_SIZE
-            * RamUsageEstimator.NUM_BYTES_INT, bytesUsed.get());
-      }
+      matchLen += LZ4.MIN_MATCH;
+
+      // if the match ends prematurely, the next sequence should not have
+      // literals or this means we are wasting space
+      if (decompressedOff + matchLen < decompressed.length - LZ4.LAST_LITERALS) {
+        final boolean moreCommonBytes = decompressed[decompressedOff + matchLen] == decompressed[decompressedOff - matchDec + matchLen];
+        final boolean nextSequenceHasLiterals = ((compressed[off] & 0xFF) >>> 4) != 0;
+        assertTrue(!moreCommonBytes || !nextSequenceHasLiterals);
+      }      
+
+      decompressedOff += matchLen;
     }
+    assertEquals(decompressed.length, decompressedOff);
+    return compressed;
   }
-  
-  private static class ByteTrackingAllocator extends IntBlockPool.Allocator {
-    private final Counter bytesUsed;
-    
-    public ByteTrackingAllocator(Counter bytesUsed) {
-      this(IntBlockPool.INT_BLOCK_SIZE, bytesUsed);
-    }
-    
-    public ByteTrackingAllocator(int blockSize, Counter bytesUsed) {
-      super(blockSize);
-      this.bytesUsed = bytesUsed;
-    }
-    
-    public int[] getIntBlock() {
-      bytesUsed.addAndGet(blockSize * RamUsageEstimator.NUM_BYTES_INT);
-      return new int[blockSize];
-    }
-    
-    @Override
-    public void recycleIntBlocks(int[][] blocks, int start, int end) {
-      bytesUsed
-          .addAndGet(-((end - start) * blockSize * RamUsageEstimator.NUM_BYTES_INT));
-    }
-    
+
+  public void testShortLiteralsAndMatchs() throws IOException {
+    // literals and matchs lengths <= 15
+    final byte[] decompressed = "1234562345673456745678910123".getBytes("UTF-8");
+    test(decompressed);
   }
-  
-  private void assertReader(IntBlockPool.SliceReader reader,
-      StartEndAndValues values) {
-    reader.reset(values.start, values.end);
-    for (int i = 0; i < values.valueCount; i++) {
-      assertEquals(values.valueOffset + i, reader.readInt());
+
+  public void testLongMatchs() throws IOException {
+    // match length >= 20
+    final byte[] decompressed = new byte[RandomInts.randomIntBetween(random(), 300, 1024)];
+    for (int i = 0; i < decompressed.length; ++i) {
+      decompressed[i] = (byte) i;
     }
-    assertTrue(reader.endOfSlice());
+    test(decompressed);
   }
-  
-  private static class StartEndAndValues {
-    int valueOffset;
-    int valueCount;
-    int start;
-    int end;
-    
-    public StartEndAndValues(int valueOffset) {
-      this.valueOffset = valueOffset;
-    }
-    
-    public int nextValue() {
-      return valueOffset + valueCount++;
-    }
-    
+
+  public void testLongLiterals() throws IOException {
+    // long literals (length >= 16) which are not the last literals
+    final byte[] decompressed = randomArray(RandomInts.randomIntBetween(random(), 400, 1024), 256);
+    final int matchRef = random().nextInt(30);
+    final int matchOff = RandomInts.randomIntBetween(random(), decompressed.length - 40, decompressed.length - 20);
+    final int matchLength = RandomInts.randomIntBetween(random(), 4, 10);
+    System.arraycopy(decompressed, matchRef, decompressed, matchOff, matchLength);
+    test(decompressed);
   }
-  
+
 }

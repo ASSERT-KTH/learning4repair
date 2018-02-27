@@ -1,6 +1,6 @@
-public final class KeepOnlyLastCommitDeletionPolicy extends IndexDeletionPolicy {
+state.directory, state.fieldInfos, state.segmentInfo,
 
-package org.apache.lucene.index;
+package org.apache.lucene.codecs.pulsing;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,40 +19,104 @@ package org.apache.lucene.index;
  * limitations under the License.
  */
 
-import java.util.List;
+import java.io.IOException;
 
-/**
- * This {@link IndexDeletionPolicy} implementation that
- * keeps only the most recent commit and immediately removes
- * all prior commits after a new commit is done.  This is
- * the default deletion policy.
- */
+import org.apache.lucene.codecs.BlockTreeTermsReader;
+import org.apache.lucene.codecs.BlockTreeTermsWriter;
+import org.apache.lucene.codecs.FieldsConsumer;
+import org.apache.lucene.codecs.FieldsProducer;
+import org.apache.lucene.codecs.PostingsBaseFormat;
+import org.apache.lucene.codecs.PostingsFormat;
+import org.apache.lucene.codecs.PostingsReaderBase;
+import org.apache.lucene.codecs.PostingsWriterBase;
+import org.apache.lucene.index.SegmentReadState;
+import org.apache.lucene.index.SegmentWriteState;
+import org.apache.lucene.util.IOUtils;
 
-public final class KeepOnlyLastCommitDeletionPolicy implements IndexDeletionPolicy {
+/** This postings format "inlines" the postings for terms that have
+ *  low docFreq.  It wraps another postings format, which is used for
+ *  writing the non-inlined terms.
+ *
+ *  @lucene.experimental */
 
-  /** Sole constructor. */
-  public KeepOnlyLastCommitDeletionPolicy() {
+public abstract class PulsingPostingsFormat extends PostingsFormat {
+
+  private final int freqCutoff;
+  private final int minBlockSize;
+  private final int maxBlockSize;
+  private final PostingsBaseFormat wrappedPostingsBaseFormat;
+  
+  public PulsingPostingsFormat(String name, PostingsBaseFormat wrappedPostingsBaseFormat, int freqCutoff) {
+    this(name, wrappedPostingsBaseFormat, freqCutoff, BlockTreeTermsWriter.DEFAULT_MIN_BLOCK_SIZE, BlockTreeTermsWriter.DEFAULT_MAX_BLOCK_SIZE);
   }
 
-  /**
-   * Deletes all commits except the most recent one.
-   */
-  @Override
-  public void onInit(List<? extends IndexCommit> commits) {
-    // Note that commits.size() should normally be 1:
-    onCommit(commits);
+  /** Terms with freq <= freqCutoff are inlined into terms
+   *  dict. */
+  public PulsingPostingsFormat(String name, PostingsBaseFormat wrappedPostingsBaseFormat, int freqCutoff, int minBlockSize, int maxBlockSize) {
+    super(name);
+    this.freqCutoff = freqCutoff;
+    this.minBlockSize = minBlockSize;
+    assert minBlockSize > 1;
+    this.maxBlockSize = maxBlockSize;
+    this.wrappedPostingsBaseFormat = wrappedPostingsBaseFormat;
   }
 
-  /**
-   * Deletes all commits except the most recent one.
-   */
   @Override
-  public void onCommit(List<? extends IndexCommit> commits) {
-    // Note that commits.size() should normally be 2 (if not
-    // called by onInit above):
-    int size = commits.size();
-    for(int i=0;i<size-1;i++) {
-      commits.get(i).delete();
+  public String toString() {
+    return getName() + "(freqCutoff=" + freqCutoff + " minBlockSize=" + minBlockSize + " maxBlockSize=" + maxBlockSize + ")";
+  }
+
+  @Override
+  public FieldsConsumer fieldsConsumer(SegmentWriteState state) throws IOException {
+    PostingsWriterBase docsWriter = null;
+
+    // Terms that have <= freqCutoff number of docs are
+    // "pulsed" (inlined):
+    PostingsWriterBase pulsingWriter = null;
+
+    // Terms dict
+    boolean success = false;
+    try {
+      docsWriter = wrappedPostingsBaseFormat.postingsWriterBase(state);
+
+      // Terms that have <= freqCutoff number of docs are
+      // "pulsed" (inlined):
+      pulsingWriter = new PulsingPostingsWriter(freqCutoff, docsWriter);
+      FieldsConsumer ret = new BlockTreeTermsWriter(state, pulsingWriter, minBlockSize, maxBlockSize);
+      success = true;
+      return ret;
+    } finally {
+      if (!success) {
+        IOUtils.closeWhileHandlingException(docsWriter, pulsingWriter);
+      }
     }
+  }
+
+  @Override
+  public FieldsProducer fieldsProducer(SegmentReadState state) throws IOException {
+    PostingsReaderBase docsReader = null;
+    PostingsReaderBase pulsingReader = null;
+
+    boolean success = false;
+    try {
+      docsReader = wrappedPostingsBaseFormat.postingsReaderBase(state);
+      pulsingReader = new PulsingPostingsReader(docsReader);
+      FieldsProducer ret = new BlockTreeTermsReader(
+                                                    state.dir, state.fieldInfos, state.segmentInfo,
+                                                    pulsingReader,
+                                                    state.context,
+                                                    state.segmentSuffix,
+                                                    state.termsIndexDivisor);
+      success = true;
+      return ret;
+    } finally {
+      if (!success) {
+        IOUtils.closeWhileHandlingException(docsReader, pulsingReader);
+      }
+    }
+  }
+
+  public int getFreqCutoff() {
+    return freqCutoff;
   }
 }

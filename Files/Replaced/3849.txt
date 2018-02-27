@@ -1,6 +1,8 @@
-: (64 - Long.numberOfLeadingZeros(maxIndexEntry));
+// FIXME: on windows, this often fails! assertEquals(0, dir.listAll().length);
 
-/*
+package org.apache.lucene.index;
+
+/**
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -17,339 +19,1153 @@
  * limitations under the License.
  */
 
-package org.apache.lucene.util.packed;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Random;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.PrintStream;
+import java.io.Reader;
 
-import java.util.Arrays;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.LuceneTestCase;
+import org.apache.lucene.util._TestUtil;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.store.LockObtainFailedException;
+import org.apache.lucene.store.MockDirectoryWrapper;
+import org.apache.lucene.store.MockDirectoryWrapper.Failure;
+import org.apache.lucene.store.RAMDirectory;
+import org.apache.lucene.analysis.Analyzer;
+import org.apache.lucene.analysis.MockAnalyzer;
+import org.apache.lucene.analysis.MockTokenizer;
+import org.apache.lucene.analysis.TokenFilter;
+import org.apache.lucene.analysis.TokenStream;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.Field;
+import org.apache.lucene.index.IndexWriterConfig.OpenMode;
 
-import org.apache.lucene.util.ToStringUtils;
-import org.apache.lucene.util.FixedBitSet; // for javadocs
+public class TestIndexWriterExceptions extends LuceneTestCase {
 
+  private class IndexerThread extends Thread {
 
-/** Encode a non decreasing sequence of non negative whole numbers in the Elias-Fano encoding
- * that was introduced in the 1970's by Peter Elias and Robert Fano.
- * <p>
- * The Elias-Fano encoding is a high bits / low bits representation of
- * a monotonically increasing sequence of <code>numValues > 0</code> natural numbers <code>x[i]</code>
- * <p>
- * <code>0 <= x[0] <= x[1] <= ... <= x[numValues-2] <= x[numValues-1] <= upperBound</code>
- * <p>
- * where <code>upperBound > 0</code> is an upper bound on the last value.
- * <br>
- * The Elias-Fano encoding uses less than half a bit per encoded number more
- * than the smallest representation
- * that can encode any monotone sequence with the same bounds.
- * <p>
- * The lower <code>L</code> bits of each <code>x[i]</code> are stored explicitly and contiguously
- * in the lower-bits array, with <code>L</code> chosen as (<code>log()</code> base 2):
- * <p>
- * <code>L = max(0, floor(log(upperBound/numValues)))</code>
- * <p>
- * The upper bits are stored in the upper-bits array as a sequence of unary-coded gaps (<code>x[-1] = 0</code>):
- * <p>
- * <code>(x[i]/2**L) - (x[i-1]/2**L)</code>
- * <p>
- * The unary code encodes a natural number <code>n</code> by <code>n</code> 0 bits followed by a 1 bit:
- * <code>0...01</code>. <br>
- * In the upper bits the total the number of 1 bits is <code>numValues</code>
- * and the total number of 0 bits is:<p>
- * <code>floor(x[numValues-1]/2**L) <= upperBound/(2**max(0, floor(log(upperBound/numValues)))) <= 2*numValues</code>
- * <p>
- * The Elias-Fano encoding uses at most
- * <p>
- * <code>2 + ceil(log(upperBound/numValues))</code>
- * <p>
- * bits per encoded number. With <code>upperBound</code> in these bounds (<code>p</code> is an integer):
- * <p>
- * <code>2**p < x[numValues-1] <= upperBound <= 2**(p+1)</code>
- * <p>
- * the number of bits per encoded number is minimized.
- * <p>
- * In this implementation the values in the sequence can be given as <code>long</code>,
- * <code>numValues = 0</code> and <code>upperBound = 0</code> are allowed,
- * and each of the upper and lower bit arrays should fit in a <code>long[]</code>.
- * <br>
- * An index of positions of zero's in the upper bits is also built.
- * <p>
- * This implementation is based on this article:
- * <br>
- * Sebastiano Vigna, "Quasi Succinct Indices", June 19, 2012, sections 3, 4 and 9.
- * Retrieved from http://arxiv.org/pdf/1206.4300 .
- *
- * <p>The articles originally describing the Elias-Fano representation are:
- * <br>Peter Elias, "Efficient storage and retrieval by content and address of static files",
- * J. Assoc. Comput. Mach., 21(2):246–260, 1974.
- * <br>Robert M. Fano, "On the number of bits required to implement an associative memory",
- *  Memorandum 61, Computer Structures Group, Project MAC, MIT, Cambridge, Mass., 1971.
- *
- * @lucene.internal
- */
+    IndexWriter writer;
 
-public class EliasFanoEncoder {
-  final long numValues;
-  private final long upperBound;
-  final int numLowBits;
-  final long lowerBitsMask;
-  final long[] upperLongs;
-  final long[] lowerLongs;
-  private static final int LOG2_LONG_SIZE = Long.numberOfTrailingZeros(Long.SIZE);
+    final Random r = new Random(random.nextLong());
+    volatile Throwable failure;
 
-  long numEncoded = 0L;
-  long lastEncoded = 0L;
-
-  /** The default index interval for zero upper bits. */
-  public static final long DEFAULT_INDEX_INTERVAL = 256;
-  final long numIndexEntries;
-  final long indexInterval;
-  final int nIndexEntryBits;
-  /** upperZeroBitPositionIndex[i] (filled using packValue) will contain the bit position
-   *  just after the zero bit ((i+1) * indexInterval) in the upper bits.
-   */
-  final long[] upperZeroBitPositionIndex;
-  long currentEntryIndex; // also indicates how many entries in the index are valid.
-
-
-
-  /**
-   * Construct an Elias-Fano encoder.
-   * After construction, call {@link #encodeNext} <code>numValues</code> times to encode
-   * a non decreasing sequence of non negative numbers.
-   * @param numValues The number of values that is to be encoded.
-   * @param upperBound  At least the highest value that will be encoded.
-   *                For space efficiency this should not exceed the power of two that equals
-   *                or is the first higher than the actual maximum.
-   *                <br>When <code>numValues >= (upperBound/3)</code>
-   *                a {@link FixedBitSet} will take less space.
-   * @param indexInterval The number of high zero bits for which a single index entry is built.
-   *                The index will have at most <code>2 * numValues / indexInterval</code> entries
-   *                and each index entry will use at most <code>ceil(log2(3 * numValues))</code> bits,
-   *                see {@link EliasFanoEncoder}.
-   * @throws IllegalArgumentException when:
-   *         <ul>
-   *         <li><code>numValues</code> is negative, or
-   *         <li><code>numValues</code> is non negative and <code>upperBound</code> is negative, or
-   *         <li>the low bits do not fit in a <code>long[]</code>:
-   *             <code>(L * numValues / 64) > Integer.MAX_VALUE</code>, or
-   *         <li>the high bits do not fit in a <code>long[]</code>:
-   *             <code>(2 * numValues / 64) > Integer.MAX_VALUE</code>, or
-   *         <li><code>indexInterval < 2</code>,
-   *         <li>the index bits do not fit in a <code>long[]</code>:
-   *             <code>(numValues / indexInterval * ceil(2log(3 * numValues)) / 64) > Integer.MAX_VALUE</code>.
-   *         </ul>
-   */
-  public EliasFanoEncoder(long numValues, long upperBound, long indexInterval) {
-    if (numValues < 0L) {
-      throw new IllegalArgumentException("numValues should not be negative: " + numValues);
+    public IndexerThread(int i, IndexWriter writer) {
+      setName("Indexer " + i);
+      this.writer = writer;
     }
-    this.numValues = numValues;
-    if ((numValues > 0L) && (upperBound < 0L)) {
-      throw new IllegalArgumentException("upperBound should not be negative: " + upperBound + " when numValues > 0");
+
+    @Override
+    public void run() {
+
+      final Document doc = new Document();
+
+      doc.add(newField("content1", "aaa bbb ccc ddd", Field.Store.YES, Field.Index.ANALYZED));
+      doc.add(newField("content6", "aaa bbb ccc ddd", Field.Store.NO, Field.Index.ANALYZED, Field.TermVector.WITH_POSITIONS_OFFSETS));
+      doc.add(newField("content2", "aaa bbb ccc ddd", Field.Store.YES, Field.Index.NOT_ANALYZED));
+      doc.add(newField("content3", "aaa bbb ccc ddd", Field.Store.YES, Field.Index.NO));
+
+      doc.add(newField("content4", "aaa bbb ccc ddd", Field.Store.NO, Field.Index.ANALYZED));
+      doc.add(newField("content5", "aaa bbb ccc ddd", Field.Store.NO, Field.Index.NOT_ANALYZED));
+
+      doc.add(newField("content7", "aaa bbb ccc ddd", Field.Store.NO, Field.Index.NOT_ANALYZED, Field.TermVector.WITH_POSITIONS_OFFSETS));
+
+      final Field idField = newField("id", "", Field.Store.YES, Field.Index.NOT_ANALYZED);
+      doc.add(idField);
+
+      final long stopTime = System.currentTimeMillis() + 500;
+
+      do {
+        if (VERBOSE) {
+          System.out.println(Thread.currentThread().getName() + ": TEST: IndexerThread: cycle");
+        }
+        doFail.set(this);
+        final String id = ""+r.nextInt(50);
+        idField.setValue(id);
+        Term idTerm = new Term("id", id);
+        try {
+          writer.updateDocument(idTerm, doc);
+        } catch (RuntimeException re) {
+          if (VERBOSE) {
+            System.out.println(Thread.currentThread().getName() + ": EXC: ");
+            re.printStackTrace(System.out);
+          }
+          try {
+            _TestUtil.checkIndex(writer.getDirectory());
+          } catch (IOException ioe) {
+            System.out.println(Thread.currentThread().getName() + ": unexpected exception1");
+            ioe.printStackTrace(System.out);
+            failure = ioe;
+            break;
+          }
+        } catch (Throwable t) {
+          System.out.println(Thread.currentThread().getName() + ": unexpected exception2");
+          t.printStackTrace(System.out);
+          failure = t;
+          break;
+        }
+
+        doFail.set(null);
+
+        // After a possible exception (above) I should be able
+        // to add a new document without hitting an
+        // exception:
+        try {
+          writer.updateDocument(idTerm, doc);
+        } catch (Throwable t) {
+          System.out.println(Thread.currentThread().getName() + ": unexpected exception3");
+          t.printStackTrace(System.out);
+          failure = t;
+          break;
+        }
+      } while(System.currentTimeMillis() < stopTime);
     }
-    this.upperBound = numValues > 0 ? upperBound : -1L; // if there is no value, -1 is the best upper bound
-    int nLowBits = 0;
-    if (this.numValues > 0) { // nLowBits = max(0; floor(2log(upperBound/numValues)))
-      long lowBitsFac = this.upperBound / this.numValues;
-      if (lowBitsFac > 0) {
-        nLowBits = 63 - Long.numberOfLeadingZeros(lowBitsFac); // see Long.numberOfLeadingZeros javadocs
+  }
+
+  ThreadLocal<Thread> doFail = new ThreadLocal<Thread>();
+
+  private class MockIndexWriter extends IndexWriter {
+    Random r = new Random(random.nextLong());
+
+    public MockIndexWriter(Directory dir, IndexWriterConfig conf) throws IOException {
+      super(dir, conf);
+    }
+
+    @Override
+    boolean testPoint(String name) {
+      if (doFail.get() != null && !name.equals("startDoFlush") && r.nextInt(20) == 17) {
+        if (VERBOSE) {
+          System.out.println(Thread.currentThread().getName() + ": NOW FAIL: " + name);
+          new Throwable().printStackTrace(System.out);
+        }
+        throw new RuntimeException(Thread.currentThread().getName() + ": intentionally failing at " + name);
       }
-    }
-    this.numLowBits = nLowBits;
-    this.lowerBitsMask = Long.MAX_VALUE >>> (Long.SIZE - 1 - this.numLowBits);
-
-    long numLongsForLowBits = numLongsForBits(numValues * numLowBits);
-    if (numLongsForLowBits > Integer.MAX_VALUE) {
-      throw new IllegalArgumentException("numLongsForLowBits too large to index a long array: " + numLongsForLowBits);
-    }
-    this.lowerLongs = new long[(int) numLongsForLowBits];
-
-    long numHighBitsClear = ((this.upperBound > 0) ? this.upperBound : 0) >>> this.numLowBits;
-    assert numHighBitsClear <= (2 * this.numValues);
-    long numHighBitsSet = this.numValues;
-
-    long numLongsForHighBits = numLongsForBits(numHighBitsClear + numHighBitsSet);
-    if (numLongsForHighBits > Integer.MAX_VALUE) {
-      throw new IllegalArgumentException("numLongsForHighBits too large to index a long array: " + numLongsForHighBits);
-    }
-    this.upperLongs = new long[(int) numLongsForHighBits];
-    if (indexInterval < 2) {
-      throw new IllegalArgumentException("indexInterval should at least 2: " + indexInterval);
-    }
-    // For the index:
-    long maxHighValue = upperBound >>> this.numLowBits;
-    long nIndexEntries = maxHighValue / indexInterval; // no zero value index entry
-    this.numIndexEntries = (nIndexEntries >= 0) ? nIndexEntries : 0;
-    long maxIndexEntry = maxHighValue + numValues - 1; // clear upper bits, set upper bits, start at zero
-    this.nIndexEntryBits = (maxIndexEntry <= 0) ? 0
-                          : (64 - Long.numberOfLeadingZeros(maxIndexEntry - 1));
-    long numLongsForIndexBits = numLongsForBits(numIndexEntries * nIndexEntryBits);
-    if (numLongsForIndexBits > Integer.MAX_VALUE) {
-      throw new IllegalArgumentException("numLongsForIndexBits too large to index a long array: " + numLongsForIndexBits);
-    }
-    this.upperZeroBitPositionIndex = new long[(int) numLongsForIndexBits];
-    this.currentEntryIndex = 0;
-    this.indexInterval = indexInterval;
-  }
-
-  /**
-  * Construct an Elias-Fano encoder using {@link #DEFAULT_INDEX_INTERVAL}.
-  */
-  public EliasFanoEncoder(long numValues, long upperBound) {
-    this(numValues, upperBound, DEFAULT_INDEX_INTERVAL);
-  }
-
-  private static long numLongsForBits(long numBits) { // Note: int version in FixedBitSet.bits2words()
-    assert numBits >= 0 : numBits;
-    return (numBits + (Long.SIZE-1)) >>> LOG2_LONG_SIZE;
-  }
-
-  /** Call at most <code>numValues</code> times to encode a non decreasing sequence of non negative numbers.
-   * @param x The next number to be encoded.
-   * @throws IllegalStateException when called more than <code>numValues</code> times.
-   * @throws IllegalArgumentException when:
-   *         <ul>
-   *         <li><code>x</code> is smaller than an earlier encoded value, or
-   *         <li><code>x</code> is larger than <code>upperBound</code>.
-   *         </ul>
-   */
-  public void encodeNext(long x) {
-    if (numEncoded >= numValues) {
-      throw new IllegalStateException("encodeNext called more than " + numValues + " times.");
-    }
-    if (lastEncoded > x) {
-      throw new IllegalArgumentException(x + " smaller than previous " + lastEncoded);
-    }
-    if (x > upperBound) {
-      throw new IllegalArgumentException(x + " larger than upperBound " + upperBound);
-    }
-    long highValue = x >>> numLowBits;
-    encodeUpperBits(highValue);
-    encodeLowerBits(x & lowerBitsMask);
-    lastEncoded = x;
-    // Add index entries:
-    long indexValue = (currentEntryIndex + 1) * indexInterval;
-    while (indexValue <= highValue) { 
-      long afterZeroBitPosition = indexValue + numEncoded;
-      packValue(afterZeroBitPosition, upperZeroBitPositionIndex, nIndexEntryBits, currentEntryIndex);
-      currentEntryIndex += 1;
-      indexValue += indexInterval;
-    }
-    numEncoded++;
-  }
-
-  private void encodeUpperBits(long highValue) {
-    long nextHighBitNum = numEncoded + highValue; // sequence of unary gaps
-    upperLongs[(int)(nextHighBitNum >>> LOG2_LONG_SIZE)] |= (1L << (nextHighBitNum & (Long.SIZE-1)));
-  }
-
-  private void encodeLowerBits(long lowValue) {
-    packValue(lowValue, lowerLongs, numLowBits, numEncoded);
-  }
-
-  private static void packValue(long value, long[] longArray, int numBits, long packIndex) {
-    if (numBits != 0) {
-      long bitPos = numBits * packIndex;
-      int index = (int) (bitPos >>> LOG2_LONG_SIZE);
-      int bitPosAtIndex = (int) (bitPos & (Long.SIZE-1));
-      longArray[index] |= (value << bitPosAtIndex);
-      if ((bitPosAtIndex + numBits) > Long.SIZE) {
-        longArray[index+1] = (value >>> (Long.SIZE - bitPosAtIndex));
-      }
+      return true;
     }
   }
 
-  /** Provide an indication that it is better to use an {@link EliasFanoEncoder} than a {@link FixedBitSet}
-   *  to encode document identifiers.
-   *  This indication is not precise and may change in the future.
-   *  <br>An EliasFanoEncoder is favoured when the size of the encoding by the EliasFanoEncoder
-   *  (including some space for its index) is at most about 5/6 of the size of the FixedBitSet,
-   *  this is the same as comparing estimates of the number of bits accessed by a pair of FixedBitSets and
-   *  by a pair of non indexed EliasFanoDocIdSets when determining the intersections of the pairs.
-   *  <br>A bit set is preferred when <code>upperbound <= 256</code>.
-   *  <br>It is assumed that {@link #DEFAULT_INDEX_INTERVAL} is used.
-   *  @param numValues The number of document identifiers that is to be encoded. Should be non negative.
-   *  @param upperBound The maximum possible value for a document identifier. Should be at least <code>numValues</code>.
-   */
-  public static boolean sufficientlySmallerThanBitSet(long numValues, long upperBound) {
-    /* When (upperBound / 6) == numValues,
-     * the number of bits per entry for the EliasFanoEncoder is 2 + ceil(2log(upperBound/numValues)) == 5.
-     *
-     * For intersecting two bit sets upperBound bits are accessed, roughly half of one, half of the other.
-     * For intersecting two EliasFano sequences without index on the upper bits,
-     * all (2 * 3 * numValues) upper bits are accessed.
-     */
-    return (upperBound > (4 * Long.SIZE)) // prefer a bit set when it takes no more than 4 longs.
-            && (upperBound / 7) > numValues; // 6 + 1 to allow some room for the index.
+  public void testRandomExceptions() throws Throwable {
+    if (VERBOSE) {
+      System.out.println("\nTEST: start testRandomExceptions");
+    }
+    MockDirectoryWrapper dir = newDirectory();
+
+    MockIndexWriter writer  = new MockIndexWriter(dir, newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer())
+        .setRAMBufferSizeMB(0.1).setMergeScheduler(new ConcurrentMergeScheduler()));
+    ((ConcurrentMergeScheduler) writer.getConfig().getMergeScheduler()).setSuppressExceptions();
+    //writer.setMaxBufferedDocs(10);
+    if (VERBOSE) {
+      System.out.println("TEST: initial commit");
+    }
+    writer.commit();
+
+    if (VERBOSE) {
+      writer.setInfoStream(System.out);
+    }
+
+    IndexerThread thread = new IndexerThread(0, writer);
+    thread.run();
+    if (thread.failure != null) {
+      thread.failure.printStackTrace(System.out);
+      fail("thread " + thread.getName() + ": hit unexpected failure");
+    }
+
+    if (VERBOSE) {
+      System.out.println("TEST: commit after thread start");
+    }
+    writer.commit();
+
+    try {
+      writer.close();
+    } catch (Throwable t) {
+      System.out.println("exception during close:");
+      t.printStackTrace(System.out);
+      writer.rollback();
+    }
+
+    // Confirm that when doc hits exception partway through tokenization, it's deleted:
+    IndexReader r2 = IndexReader.open(dir, true);
+    final int count = r2.docFreq(new Term("content4", "aaa"));
+    final int count2 = r2.docFreq(new Term("content4", "ddd"));
+    assertEquals(count, count2);
+    r2.close();
+
+    _TestUtil.checkIndex(dir);
+    dir.close();
   }
 
-  /**
-   * Returns an {@link EliasFanoDecoder} to access the encoded values.
-   * Perform all calls to {@link #encodeNext} before calling {@link #getDecoder}.
-   */
-  public EliasFanoDecoder getDecoder() {
-    // decode as far as currently encoded as determined by numEncoded.
-    return new EliasFanoDecoder(this);
-  }
+  public void testRandomExceptionsThreads() throws Throwable {
+    MockDirectoryWrapper dir = newDirectory();
+    MockIndexWriter writer  = new MockIndexWriter(dir, newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer())
+        .setRAMBufferSizeMB(0.2).setMergeScheduler(new ConcurrentMergeScheduler()));
+    ((ConcurrentMergeScheduler) writer.getConfig().getMergeScheduler()).setSuppressExceptions();
+    //writer.setMaxBufferedDocs(10);
+    writer.commit();
 
-  /** Expert. The low bits. */
-  public long[] getLowerBits() {
-    return lowerLongs;
-  }
+    if (VERBOSE) {
+      writer.setInfoStream(System.out);
+    }
 
-  /** Expert. The high bits. */
-  public long[] getUpperBits() {
-    return upperLongs;
+    final int NUM_THREADS = 4;
+
+    final IndexerThread[] threads = new IndexerThread[NUM_THREADS];
+    for(int i=0;i<NUM_THREADS;i++) {
+      threads[i] = new IndexerThread(i, writer);
+      threads[i].start();
+    }
+
+    for(int i=0;i<NUM_THREADS;i++)
+      threads[i].join();
+
+    for(int i=0;i<NUM_THREADS;i++)
+      if (threads[i].failure != null)
+        fail("thread " + threads[i].getName() + ": hit unexpected failure");
+
+    writer.commit();
+
+    try {
+      writer.close();
+    } catch (Throwable t) {
+      System.out.println("exception during close:");
+      t.printStackTrace(System.out);
+      writer.rollback();
+    }
+
+    // Confirm that when doc hits exception partway through tokenization, it's deleted:
+    IndexReader r2 = IndexReader.open(dir, true);
+    final int count = r2.docFreq(new Term("content4", "aaa"));
+    final int count2 = r2.docFreq(new Term("content4", "ddd"));
+    assertEquals(count, count2);
+    r2.close();
+
+    _TestUtil.checkIndex(dir);
+    dir.close();
   }
   
-  /** Expert. The index bits. */
-  public long[] getIndexBits() {
-    return upperZeroBitPositionIndex;
+  // LUCENE-1198
+  private static final class MockIndexWriter2 extends IndexWriter {
+
+    public MockIndexWriter2(Directory dir, IndexWriterConfig conf) throws IOException {
+      super(dir, conf);
+    }
+
+    boolean doFail;
+
+    @Override
+    boolean testPoint(String name) {
+      if (doFail && name.equals("DocumentsWriter.ThreadState.init start"))
+        throw new RuntimeException("intentionally failing");
+      return true;
+    }
+  }
+  
+  private class CrashingFilter extends TokenFilter {
+    String fieldName;
+    int count;
+
+    public CrashingFilter(String fieldName, TokenStream input) {
+      super(input);
+      this.fieldName = fieldName;
+    }
+
+    @Override
+    public boolean incrementToken() throws IOException {
+      if (this.fieldName.equals("crash") && count++ >= 4)
+        throw new IOException("I'm experiencing problems");
+      return input.incrementToken();
+    }
+
+    @Override
+    public void reset() throws IOException {
+      super.reset();
+      count = 0;
+    }
   }
 
-  @Override
-  public String toString() {
-    StringBuilder s = new StringBuilder("EliasFanoSequence");
-    s.append(" numValues " + numValues);
-    s.append(" numEncoded " + numEncoded);
-    s.append(" upperBound " + upperBound);
-    s.append(" lastEncoded " + lastEncoded);
-    s.append(" numLowBits " + numLowBits);
-    s.append("\nupperLongs[" + upperLongs.length + "]");
-    for (int i = 0; i < upperLongs.length; i++) {
-      s.append(" " + ToStringUtils.longHex(upperLongs[i]));
+  public void testExceptionDocumentsWriterInit() throws IOException {
+    Directory dir = newDirectory();
+    MockIndexWriter2 w = new MockIndexWriter2(dir, newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer()));
+    w.setInfoStream(VERBOSE ? System.out : null);
+    Document doc = new Document();
+    doc.add(newField("field", "a field", Field.Store.YES,
+                      Field.Index.ANALYZED));
+    w.addDocument(doc);
+    w.doFail = true;
+    try {
+      w.addDocument(doc);
+      fail("did not hit exception");
+    } catch (RuntimeException re) {
+      // expected
     }
-    s.append("\nlowerLongs[" + lowerLongs.length + "]");
-    for (int i = 0; i < lowerLongs.length; i++) {
-      s.append(" " + ToStringUtils.longHex(lowerLongs[i]));
-    }
-    s.append("\nindexInterval: " + indexInterval + ", nIndexEntryBits: " + nIndexEntryBits);
-    s.append("\nupperZeroBitPositionIndex[" + upperZeroBitPositionIndex.length + "]");
-    for (int i = 0; i < upperZeroBitPositionIndex.length; i++) { 
-      s.append(" " + ToStringUtils.longHex(upperZeroBitPositionIndex[i]));
-    }
-    return s.toString();
+    w.close();
+    _TestUtil.checkIndex(dir);
+    dir.close();
   }
 
-  @Override
-  public boolean equals(Object other) {
-    if (! (other instanceof EliasFanoEncoder)) {
-      return false;
+  // LUCENE-1208
+  public void testExceptionJustBeforeFlush() throws IOException {
+    Directory dir = newDirectory();
+    MockIndexWriter w = new MockIndexWriter(dir, newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer()).setMaxBufferedDocs(2));
+    w.setInfoStream(VERBOSE ? System.out : null);
+    Document doc = new Document();
+    doc.add(newField("field", "a field", Field.Store.YES,
+                      Field.Index.ANALYZED));
+    w.addDocument(doc);
+
+    Analyzer analyzer = new Analyzer() {
+      @Override
+      public TokenStream tokenStream(String fieldName, Reader reader) {
+        return new CrashingFilter(fieldName, new MockTokenizer(reader, MockTokenizer.WHITESPACE, false));
+      }
+    };
+
+    Document crashDoc = new Document();
+    crashDoc.add(newField("crash", "do it on token 4", Field.Store.YES,
+                           Field.Index.ANALYZED));
+    try {
+      w.addDocument(crashDoc, analyzer);
+      fail("did not hit expected exception");
+    } catch (IOException ioe) {
+      // expected
     }
-    EliasFanoEncoder oefs = (EliasFanoEncoder) other;
-    // no equality needed for upperBound
-    return (this.numValues == oefs.numValues)
-        && (this.numEncoded == oefs.numEncoded)
-        && (this.numLowBits == oefs.numLowBits)
-        && (this.numIndexEntries == oefs.numIndexEntries)
-        && (this.indexInterval == oefs.indexInterval) // no need to check index content
-        && Arrays.equals(this.upperLongs, oefs.upperLongs)
-        && Arrays.equals(this.lowerLongs, oefs.lowerLongs);
+    w.addDocument(doc);
+    w.close();
+    dir.close();
+  }    
+
+  private static final class MockIndexWriter3 extends IndexWriter {
+
+    public MockIndexWriter3(Directory dir, IndexWriterConfig conf) throws IOException {
+      super(dir, conf);
+    }
+
+    boolean doFail;
+    boolean failed;
+
+    @Override
+    boolean testPoint(String name) {
+      if (doFail && name.equals("startMergeInit")) {
+        failed = true;
+        throw new RuntimeException("intentionally failing");
+      }
+      return true;
+    }
+  }
+  
+
+  // LUCENE-1210
+  public void testExceptionOnMergeInit() throws IOException {
+    Directory dir = newDirectory();
+    IndexWriterConfig conf = newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer())
+      .setMaxBufferedDocs(2).setMergeScheduler(new ConcurrentMergeScheduler()).setMergePolicy(newLogMergePolicy());
+    ((LogMergePolicy) conf.getMergePolicy()).setMergeFactor(2);
+    MockIndexWriter3 w = new MockIndexWriter3(dir, conf);
+    w.doFail = true;
+    Document doc = new Document();
+    doc.add(newField("field", "a field", Field.Store.YES,
+                      Field.Index.ANALYZED));
+    for(int i=0;i<10;i++)
+      try {
+        w.addDocument(doc);
+      } catch (RuntimeException re) {
+        break;
+      }
+
+    ((ConcurrentMergeScheduler) w.getConfig().getMergeScheduler()).sync();
+    assertTrue(w.failed);
+    w.close();
+    dir.close();
+  }
+  
+  // LUCENE-1072
+  public void testExceptionFromTokenStream() throws IOException {
+    Directory dir = newDirectory();
+    IndexWriterConfig conf = newIndexWriterConfig( TEST_VERSION_CURRENT, new Analyzer() {
+
+      @Override
+      public TokenStream tokenStream(String fieldName, Reader reader) {
+        return new TokenFilter(new MockTokenizer(reader, MockTokenizer.SIMPLE, true)) {
+          private int count = 0;
+
+          @Override
+          public boolean incrementToken() throws IOException {
+            if (count++ == 5) {
+              throw new IOException();
+            }
+            return input.incrementToken();
+          }
+        };
+      }
+
+    });
+    conf.setMaxBufferedDocs(Math.max(3, conf.getMaxBufferedDocs()));
+
+    IndexWriter writer = new IndexWriter(dir, conf);
+
+    Document doc = new Document();
+    String contents = "aa bb cc dd ee ff gg hh ii jj kk";
+    doc.add(newField("content", contents, Field.Store.NO,
+        Field.Index.ANALYZED));
+    try {
+      writer.addDocument(doc);
+      fail("did not hit expected exception");
+    } catch (Exception e) {
+    }
+
+    // Make sure we can add another normal document
+    doc = new Document();
+    doc.add(newField("content", "aa bb cc dd", Field.Store.NO,
+        Field.Index.ANALYZED));
+    writer.addDocument(doc);
+
+    // Make sure we can add another normal document
+    doc = new Document();
+    doc.add(newField("content", "aa bb cc dd", Field.Store.NO,
+        Field.Index.ANALYZED));
+    writer.addDocument(doc);
+
+    writer.close();
+    IndexReader reader = IndexReader.open(dir, true);
+    final Term t = new Term("content", "aa");
+    assertEquals(3, reader.docFreq(t));
+
+    // Make sure the doc that hit the exception was marked
+    // as deleted:
+    DocsEnum tdocs = MultiFields.getTermDocsEnum(reader,
+                                              MultiFields.getDeletedDocs(reader),
+                                              t.field(),
+                                              new BytesRef(t.text()));
+
+    int count = 0;
+    while(tdocs.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
+      count++;
+    }
+    assertEquals(2, count);
+
+    assertEquals(reader.docFreq(new Term("content", "gg")), 0);
+    reader.close();
+    dir.close();
   }
 
-  @Override
-  public int hashCode() {
-    int h = ((int) (31*(numValues + 7*(numEncoded + 5*(numLowBits + 3*(numIndexEntries + 11*indexInterval))))))
-            ^ Arrays.hashCode(upperLongs)
-            ^ Arrays.hashCode(lowerLongs);
-    return h;
+  private static class FailOnlyOnFlush extends MockDirectoryWrapper.Failure {
+    boolean doFail = false;
+    int count;
+
+    @Override
+    public void setDoFail() {
+      this.doFail = true;
+    }
+    @Override
+    public void clearDoFail() {
+      this.doFail = false;
+    }
+
+    @Override
+    public void eval(MockDirectoryWrapper dir)  throws IOException {
+      if (doFail) {
+        StackTraceElement[] trace = new Exception().getStackTrace();
+        boolean sawAppend = false;
+        boolean sawFlush = false;
+        for (int i = 0; i < trace.length; i++) {
+          if ("org.apache.lucene.index.FreqProxTermsWriter".equals(trace[i].getClassName()) && "appendPostings".equals(trace[i].getMethodName()))
+            sawAppend = true;
+          if ("doFlush".equals(trace[i].getMethodName()))
+            sawFlush = true;
+        }
+
+        if (sawAppend && sawFlush && count++ >= 30) {
+          doFail = false;
+          throw new IOException("now failing during flush");
+        }
+      }
+    }
   }
 
+  // LUCENE-1072: make sure an errant exception on flushing
+  // one segment only takes out those docs in that one flush
+  public void testDocumentsWriterAbort() throws IOException {
+    MockDirectoryWrapper dir = newDirectory();
+    FailOnlyOnFlush failure = new FailOnlyOnFlush();
+    failure.setDoFail();
+    dir.failOn(failure);
+
+    IndexWriter writer = new IndexWriter(dir, newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer()).setMaxBufferedDocs(2));
+    Document doc = new Document();
+    String contents = "aa bb cc dd ee ff gg hh ii jj kk";
+    doc.add(newField("content", contents, Field.Store.NO,
+        Field.Index.ANALYZED));
+    boolean hitError = false;
+    for(int i=0;i<200;i++) {
+      try {
+        writer.addDocument(doc);
+      } catch (IOException ioe) {
+        // only one flush should fail:
+        assertFalse(hitError);
+        hitError = true;
+      }
+    }
+    assertTrue(hitError);
+    writer.close();
+    IndexReader reader = IndexReader.open(dir, true);
+    assertEquals(198, reader.docFreq(new Term("content", "aa")));
+    reader.close();
+    dir.close();
+  }
+
+  public void testDocumentsWriterExceptions() throws IOException {
+    Analyzer analyzer = new Analyzer() {
+      @Override
+      public TokenStream tokenStream(String fieldName, Reader reader) {
+        return new CrashingFilter(fieldName, new MockTokenizer(reader, MockTokenizer.WHITESPACE, false));
+      }
+    };
+
+    for(int i=0;i<2;i++) {
+      if (VERBOSE) {
+        System.out.println("TEST: cycle i=" + i);
+      }
+      MockDirectoryWrapper dir = newDirectory();
+      IndexWriter writer = new IndexWriter(dir, newIndexWriterConfig( TEST_VERSION_CURRENT, analyzer).setMergePolicy(newLogMergePolicy()));
+      writer.setInfoStream(VERBOSE ? System.out : null);
+
+      // don't allow a sudden merge to clean up the deleted
+      // doc below:
+      LogMergePolicy lmp = (LogMergePolicy) writer.getConfig().getMergePolicy();
+      lmp.setMergeFactor(Math.max(lmp.getMergeFactor(), 5));
+
+      Document doc = new Document();
+      doc.add(newField("contents", "here are some contents", Field.Store.YES,
+                        Field.Index.ANALYZED, Field.TermVector.WITH_POSITIONS_OFFSETS));
+      writer.addDocument(doc);
+      writer.addDocument(doc);
+      doc.add(newField("crash", "this should crash after 4 terms", Field.Store.YES,
+                        Field.Index.ANALYZED, Field.TermVector.WITH_POSITIONS_OFFSETS));
+      doc.add(newField("other", "this will not get indexed", Field.Store.YES,
+                        Field.Index.ANALYZED, Field.TermVector.WITH_POSITIONS_OFFSETS));
+      try {
+        writer.addDocument(doc);
+        fail("did not hit expected exception");
+      } catch (IOException ioe) {
+        if (VERBOSE) {
+          System.out.println("TEST: hit expected exception");
+          ioe.printStackTrace(System.out);
+        }
+      }
+
+      if (0 == i) {
+        doc = new Document();
+        doc.add(newField("contents", "here are some contents", Field.Store.YES,
+                          Field.Index.ANALYZED, Field.TermVector.WITH_POSITIONS_OFFSETS));
+        writer.addDocument(doc);
+        writer.addDocument(doc);
+      }
+      writer.close();
+
+      if (VERBOSE) {
+        System.out.println("TEST: open reader");
+      }
+      IndexReader reader = IndexReader.open(dir, true);
+      if (i == 0) { 
+        int expected = 5;
+        assertEquals(expected, reader.docFreq(new Term("contents", "here")));
+        assertEquals(expected, reader.maxDoc());
+        int numDel = 0;
+        final Bits delDocs = MultiFields.getDeletedDocs(reader);
+        assertNotNull(delDocs);
+        for(int j=0;j<reader.maxDoc();j++) {
+          if (delDocs.get(j))
+            numDel++;
+          else {
+            reader.document(j);
+            reader.getTermFreqVectors(j);
+          }
+        }
+        assertEquals(1, numDel);
+      }
+      reader.close();
+
+      writer = new IndexWriter(dir, newIndexWriterConfig( TEST_VERSION_CURRENT,
+          analyzer).setMaxBufferedDocs(10));
+      doc = new Document();
+      doc.add(newField("contents", "here are some contents", Field.Store.YES,
+                        Field.Index.ANALYZED, Field.TermVector.WITH_POSITIONS_OFFSETS));
+      for(int j=0;j<17;j++)
+        writer.addDocument(doc);
+      writer.optimize();
+      writer.close();
+
+      reader = IndexReader.open(dir, true);
+      int expected = 19+(1-i)*2;
+      assertEquals(expected, reader.docFreq(new Term("contents", "here")));
+      assertEquals(expected, reader.maxDoc());
+      int numDel = 0;
+      assertNull(MultiFields.getDeletedDocs(reader));
+      for(int j=0;j<reader.maxDoc();j++) {
+        reader.document(j);
+        reader.getTermFreqVectors(j);
+      }
+      reader.close();
+      assertEquals(0, numDel);
+
+      dir.close();
+    }
+  }
+
+  public void testDocumentsWriterExceptionThreads() throws Exception {
+    Analyzer analyzer = new Analyzer() {
+      @Override
+      public TokenStream tokenStream(String fieldName, Reader reader) {
+        return new CrashingFilter(fieldName, new MockTokenizer(reader, MockTokenizer.WHITESPACE, false));
+      }
+    };
+
+    final int NUM_THREAD = 3;
+    final int NUM_ITER = 100;
+
+    for(int i=0;i<2;i++) {
+      MockDirectoryWrapper dir = newDirectory();
+
+      {
+        final  IndexWriter writer = new IndexWriter(
+            dir,
+            newIndexWriterConfig(TEST_VERSION_CURRENT, analyzer).
+                setMaxBufferedDocs(-1).
+                setMergePolicy(newLogMergePolicy(10))
+        );
+        final int finalI = i;
+
+        Thread[] threads = new Thread[NUM_THREAD];
+        for(int t=0;t<NUM_THREAD;t++) {
+          threads[t] = new Thread() {
+              @Override
+              public void run() {
+                try {
+                  for(int iter=0;iter<NUM_ITER;iter++) {
+                    Document doc = new Document();
+                    doc.add(newField("contents", "here are some contents", Field.Store.YES,
+                                      Field.Index.ANALYZED, Field.TermVector.WITH_POSITIONS_OFFSETS));
+                    writer.addDocument(doc);
+                    writer.addDocument(doc);
+                    doc.add(newField("crash", "this should crash after 4 terms", Field.Store.YES,
+                                      Field.Index.ANALYZED, Field.TermVector.WITH_POSITIONS_OFFSETS));
+                    doc.add(newField("other", "this will not get indexed", Field.Store.YES,
+                                      Field.Index.ANALYZED, Field.TermVector.WITH_POSITIONS_OFFSETS));
+                    try {
+                      writer.addDocument(doc);
+                      fail("did not hit expected exception");
+                    } catch (IOException ioe) {
+                    }
+
+                    if (0 == finalI) {
+                      doc = new Document();
+                      doc.add(newField("contents", "here are some contents", Field.Store.YES,
+                                        Field.Index.ANALYZED, Field.TermVector.WITH_POSITIONS_OFFSETS));
+                      writer.addDocument(doc);
+                      writer.addDocument(doc);
+                    }
+                  }
+                } catch (Throwable t) {
+                  synchronized(this) {
+                    System.out.println(Thread.currentThread().getName() + ": ERROR: hit unexpected exception");
+                    t.printStackTrace(System.out);
+                  }
+                  fail();
+                }
+              }
+            };
+          threads[t].start();
+        }
+
+        for(int t=0;t<NUM_THREAD;t++)
+          threads[t].join();
+            
+        writer.close();
+      }
+
+      IndexReader reader = IndexReader.open(dir, true);
+      int expected = (3+(1-i)*2)*NUM_THREAD*NUM_ITER;
+      assertEquals("i=" + i, expected, reader.docFreq(new Term("contents", "here")));
+      assertEquals(expected, reader.maxDoc());
+      int numDel = 0;
+      final Bits delDocs = MultiFields.getDeletedDocs(reader);
+      assertNotNull(delDocs);
+      for(int j=0;j<reader.maxDoc();j++) {
+        if (delDocs.get(j))
+          numDel++;
+        else {
+          reader.document(j);
+          reader.getTermFreqVectors(j);
+        }
+      }
+      reader.close();
+
+      assertEquals(NUM_THREAD*NUM_ITER, numDel);
+
+      IndexWriter writer = new IndexWriter(dir, newIndexWriterConfig(
+          TEST_VERSION_CURRENT, analyzer).setMaxBufferedDocs(10));
+      Document doc = new Document();
+      doc.add(newField("contents", "here are some contents", Field.Store.YES,
+                        Field.Index.ANALYZED, Field.TermVector.WITH_POSITIONS_OFFSETS));
+      for(int j=0;j<17;j++)
+        writer.addDocument(doc);
+      writer.optimize();
+      writer.close();
+
+      reader = IndexReader.open(dir, true);
+      expected += 17-NUM_THREAD*NUM_ITER;
+      assertEquals(expected, reader.docFreq(new Term("contents", "here")));
+      assertEquals(expected, reader.maxDoc());
+      assertNull(MultiFields.getDeletedDocs(reader));
+      for(int j=0;j<reader.maxDoc();j++) {
+        reader.document(j);
+        reader.getTermFreqVectors(j);
+      }
+      reader.close();
+
+      dir.close();
+    }
+  }
+  
+  // Throws IOException during MockDirectoryWrapper.sync
+  private static class FailOnlyInSync extends MockDirectoryWrapper.Failure {
+    boolean didFail;
+    @Override
+    public void eval(MockDirectoryWrapper dir)  throws IOException {
+      if (doFail) {
+        StackTraceElement[] trace = new Exception().getStackTrace();
+        for (int i = 0; i < trace.length; i++) {
+          if (doFail && "org.apache.lucene.store.MockDirectoryWrapper".equals(trace[i].getClassName()) && "sync".equals(trace[i].getMethodName())) {
+            didFail = true;
+            throw new IOException("now failing on purpose during sync");
+          }
+        }
+      }
+    }
+  }
+  
+  // TODO: these are also in TestIndexWriter... add a simple doc-writing method
+  // like this to LuceneTestCase?
+  private void addDoc(IndexWriter writer) throws IOException
+  {
+      Document doc = new Document();
+      doc.add(newField("content", "aaa", Field.Store.NO, Field.Index.ANALYZED));
+      writer.addDocument(doc);
+  }
+  
+  // LUCENE-1044: test exception during sync
+  public void testExceptionDuringSync() throws IOException {
+    MockDirectoryWrapper dir = newDirectory();
+    FailOnlyInSync failure = new FailOnlyInSync();
+    dir.failOn(failure);
+
+    IndexWriter writer = new IndexWriter(
+        dir,
+        newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer()).
+            setMaxBufferedDocs(2).
+            setMergeScheduler(new ConcurrentMergeScheduler()).
+            setMergePolicy(newLogMergePolicy(5))
+    );
+    failure.setDoFail();
+
+    for (int i = 0; i < 23; i++) {
+      addDoc(writer);
+      if ((i-1)%2 == 0) {
+        try {
+          writer.commit();
+        } catch (IOException ioe) {
+          // expected
+        }
+      }
+    }
+    ((ConcurrentMergeScheduler) writer.getConfig().getMergeScheduler()).sync();
+    assertTrue(failure.didFail);
+    failure.clearDoFail();
+    writer.close();
+
+    IndexReader reader = IndexReader.open(dir, true);
+    assertEquals(23, reader.numDocs());
+    reader.close();
+    dir.close();
+  }
+  
+  private static class FailOnlyInCommit extends MockDirectoryWrapper.Failure {
+
+    boolean failOnCommit, failOnDeleteFile;
+    private final boolean dontFailDuringGlobalFieldMap;
+    private static final String PREPARE_STAGE = "prepareCommit";
+    private static final String FINISH_STAGE = "finishCommit";
+    private final String stage;
+    
+    public FailOnlyInCommit(boolean dontFailDuringGlobalFieldMap, String stage) {
+      this.dontFailDuringGlobalFieldMap = dontFailDuringGlobalFieldMap;
+      this.stage = stage;
+    }
+
+    @Override
+    public void eval(MockDirectoryWrapper dir)  throws IOException {
+      StackTraceElement[] trace = new Exception().getStackTrace();
+      boolean isCommit = false;
+      boolean isDelete = false;
+      boolean isInGlobalFieldMap = false;
+      for (int i = 0; i < trace.length; i++) {
+        if ("org.apache.lucene.index.SegmentInfos".equals(trace[i].getClassName()) && stage.equals(trace[i].getMethodName()))
+          isCommit = true;
+        if ("org.apache.lucene.store.MockDirectoryWrapper".equals(trace[i].getClassName()) && "deleteFile".equals(trace[i].getMethodName()))
+          isDelete = true;
+        if ("org.apache.lucene.index.SegmentInfos".equals(trace[i].getClassName()) && "writeGlobalFieldMap".equals(trace[i].getMethodName()))
+          isInGlobalFieldMap = true;
+          
+      }
+      if (isInGlobalFieldMap && dontFailDuringGlobalFieldMap) {
+        isCommit = false;
+      }
+      if (isCommit) {
+        if (!isDelete) {
+          failOnCommit = true;
+          throw new RuntimeException("now fail first");
+        } else {
+          failOnDeleteFile = true;
+          throw new IOException("now fail during delete");
+        }
+      }
+    }
+  }
+  
+  public void testExceptionsDuringCommit() throws Throwable {
+    FailOnlyInCommit[] failures = new FailOnlyInCommit[] {
+        // LUCENE-1214
+        new FailOnlyInCommit(false, FailOnlyInCommit.PREPARE_STAGE), // fail during global field map is written
+        new FailOnlyInCommit(true, FailOnlyInCommit.PREPARE_STAGE), // fail after global field map is written
+        new FailOnlyInCommit(false, FailOnlyInCommit.FINISH_STAGE)  // fail while running finishCommit    
+    };
+    
+    for (FailOnlyInCommit failure : failures) {
+      MockDirectoryWrapper dir = newDirectory();
+      IndexWriter w = new IndexWriter(dir, newIndexWriterConfig(
+          TEST_VERSION_CURRENT, new MockAnalyzer()));
+      Document doc = new Document();
+      doc.add(newField("field", "a field", Field.Store.YES,
+          Field.Index.ANALYZED));
+      w.addDocument(doc);
+      dir.failOn(failure);
+      try {
+        w.close();
+        fail();
+      } catch (IOException ioe) {
+        fail("expected only RuntimeException");
+      } catch (RuntimeException re) {
+        // Expected
+      }
+      assertTrue(dir.fileExists("1.fnx"));
+      assertTrue(failure.failOnCommit && failure.failOnDeleteFile);
+      w.rollback();
+      assertFalse(dir.fileExists("1.fnx"));
+      assertEquals(0, dir.listAll().length);
+      dir.close();
+    }
+  }
+  
+  public void testOptimizeExceptions() throws IOException {
+    Directory startDir = newDirectory();
+    IndexWriterConfig conf = newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer()).setMaxBufferedDocs(2).setMergePolicy(newLogMergePolicy());
+    ((LogMergePolicy) conf.getMergePolicy()).setMergeFactor(100);
+    IndexWriter w = new IndexWriter(startDir, conf);
+    for(int i=0;i<27;i++)
+      addDoc(w);
+    w.close();
+
+    for(int i=0;i<200;i++) {
+      if (VERBOSE) {
+        System.out.println("TEST: iter " + i);
+      }
+      MockDirectoryWrapper dir = new MockDirectoryWrapper(random, new RAMDirectory(startDir));
+      conf = newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer()).setMergeScheduler(new ConcurrentMergeScheduler());
+      ((ConcurrentMergeScheduler) conf.getMergeScheduler()).setSuppressExceptions();
+      w = new IndexWriter(dir, conf);
+      w.setInfoStream(VERBOSE ? System.out : null);
+      dir.setRandomIOExceptionRate(0.5);
+      try {
+        w.optimize();
+      } catch (IOException ioe) {
+        if (ioe.getCause() == null)
+          fail("optimize threw IOException without root cause");
+      }
+      dir.setRandomIOExceptionRate(0);
+      w.close();
+      dir.close();
+    }
+    startDir.close();
+  }
+  
+  // LUCENE-1429
+  public void testOutOfMemoryErrorCausesCloseToFail() throws Exception {
+
+    final List<Throwable> thrown = new ArrayList<Throwable>();
+    final Directory dir = newDirectory();
+    final IndexWriter writer = new IndexWriter(dir,
+        newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer())) {
+        @Override
+        public void message(final String message) {
+          if (message.startsWith("now flush at close") && 0 == thrown.size()) {
+            thrown.add(null);
+            throw new OutOfMemoryError("fake OOME at " + message);
+          }
+        }
+      };
+
+    // need to set an info stream so message is called
+    writer.setInfoStream(new PrintStream(new ByteArrayOutputStream()));
+    try {
+      writer.close();
+      fail("OutOfMemoryError expected");
+    }
+    catch (final OutOfMemoryError expected) {}
+
+    // throws IllegalStateEx w/o bug fix
+    writer.close();
+    dir.close();
+  }
+  
+  // LUCENE-1347
+  private static final class MockIndexWriter4 extends IndexWriter {
+
+    public MockIndexWriter4(Directory dir, IndexWriterConfig conf) throws IOException {
+      super(dir, conf);
+    }
+
+    boolean doFail;
+
+    @Override
+    boolean testPoint(String name) {
+      if (doFail && name.equals("rollback before checkpoint"))
+        throw new RuntimeException("intentionally failing");
+      return true;
+    }
+  }
+  
+  // LUCENE-1347
+  public void testRollbackExceptionHang() throws Throwable {
+    Directory dir = newDirectory();
+    MockIndexWriter4 w = new MockIndexWriter4(dir, newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer()));
+
+    addDoc(w);
+    w.doFail = true;
+    try {
+      w.rollback();
+      fail("did not hit intentional RuntimeException");
+    } catch (RuntimeException re) {
+      // expected
+    }
+    
+    w.doFail = false;
+    w.rollback();
+    dir.close();
+  }
+  
+  // LUCENE-1044: Simulate checksum error in segments_N
+  public void testSegmentsChecksumError() throws IOException {
+    Directory dir = newDirectory();
+
+    IndexWriter writer = null;
+
+    writer = new IndexWriter(dir, newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer()));
+
+    // add 100 documents
+    for (int i = 0; i < 100; i++) {
+      addDoc(writer);
+    }
+
+    // close
+    writer.close();
+
+    long gen = SegmentInfos.getCurrentSegmentGeneration(dir);
+    assertTrue("segment generation should be > 0 but got " + gen, gen > 0);
+
+    final String segmentsFileName = SegmentInfos.getCurrentSegmentFileName(dir);
+    IndexInput in = dir.openInput(segmentsFileName);
+    IndexOutput out = dir.createOutput(IndexFileNames.fileNameFromGeneration(IndexFileNames.SEGMENTS, "", 1+gen));
+    out.copyBytes(in, in.length()-1);
+    byte b = in.readByte();
+    out.writeByte((byte) (1+b));
+    out.close();
+    in.close();
+
+    IndexReader reader = null;
+    try {
+      reader = IndexReader.open(dir, true);
+    } catch (IOException e) {
+      e.printStackTrace(System.out);
+      fail("segmentInfos failed to retry fallback to correct segments_N file");
+    }
+    reader.close();
+    dir.close();
+  }
+  
+  // Simulate a corrupt index by removing last byte of
+  // latest segments file and make sure we get an
+  // IOException trying to open the index:
+  public void testSimulatedCorruptIndex1() throws IOException {
+      MockDirectoryWrapper dir = newDirectory();
+      dir.setCheckIndexOnClose(false); // we are corrupting it!
+
+      IndexWriter writer = null;
+
+      writer  = new IndexWriter(dir, newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer()));
+
+      // add 100 documents
+      for (int i = 0; i < 100; i++) {
+          addDoc(writer);
+      }
+
+      // close
+      writer.close();
+
+      long gen = SegmentInfos.getCurrentSegmentGeneration(dir);
+      assertTrue("segment generation should be > 0 but got " + gen, gen > 0);
+
+      String fileNameIn = SegmentInfos.getCurrentSegmentFileName(dir);
+      String fileNameOut = IndexFileNames.fileNameFromGeneration(IndexFileNames.SEGMENTS,
+                                                                 "",
+                                                                 1+gen);
+      IndexInput in = dir.openInput(fileNameIn);
+      IndexOutput out = dir.createOutput(fileNameOut);
+      long length = in.length();
+      for(int i=0;i<length-1;i++) {
+        out.writeByte(in.readByte());
+      }
+      in.close();
+      out.close();
+      dir.deleteFile(fileNameIn);
+
+      IndexReader reader = null;
+      try {
+        reader = IndexReader.open(dir, true);
+        fail("reader did not hit IOException on opening a corrupt index");
+      } catch (Exception e) {
+      }
+      if (reader != null) {
+        reader.close();
+      }
+      dir.close();
+  }
+  
+  // Simulate a corrupt index by removing one of the cfs
+  // files and make sure we get an IOException trying to
+  // open the index:
+  public void testSimulatedCorruptIndex2() throws IOException {
+      MockDirectoryWrapper dir = newDirectory();
+      dir.setCheckIndexOnClose(false); // we are corrupting it!
+      IndexWriter writer = null;
+
+      writer  = new IndexWriter(
+          dir,
+          newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer()).
+              setMergePolicy(newLogMergePolicy(true))
+      );
+      ((LogMergePolicy) writer.getConfig().getMergePolicy()).setNoCFSRatio(1.0);
+
+      // add 100 documents
+      for (int i = 0; i < 100; i++) {
+          addDoc(writer);
+      }
+
+      // close
+      writer.close();
+
+      long gen = SegmentInfos.getCurrentSegmentGeneration(dir);
+      assertTrue("segment generation should be > 0 but got " + gen, gen > 0);
+
+      String[] files = dir.listAll();
+      boolean corrupted = false;
+      for(int i=0;i<files.length;i++) {
+        if (files[i].endsWith(".cfs")) {
+          dir.deleteFile(files[i]);
+          corrupted = true;
+          break;
+        }
+      }
+      assertTrue("failed to find cfs file to remove", corrupted);
+
+      IndexReader reader = null;
+      try {
+        reader = IndexReader.open(dir, true);
+        fail("reader did not hit IOException on opening a corrupt index");
+      } catch (Exception e) {
+      }
+      if (reader != null) {
+        reader.close();
+      }
+      dir.close();
+  }
+  
+  // Simulate a writer that crashed while writing segments
+  // file: make sure we can still open the index (ie,
+  // gracefully fallback to the previous segments file),
+  // and that we can add to the index:
+  public void testSimulatedCrashedWriter() throws IOException {
+      MockDirectoryWrapper dir = newDirectory();
+      dir.setPreventDoubleWrite(false);
+
+      IndexWriter writer = null;
+
+      writer  = new IndexWriter(dir, newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer()));
+
+      // add 100 documents
+      for (int i = 0; i < 100; i++) {
+          addDoc(writer);
+      }
+
+      // close
+      writer.close();
+
+      long gen = SegmentInfos.getCurrentSegmentGeneration(dir);
+      assertTrue("segment generation should be > 0 but got " + gen, gen > 0);
+
+      // Make the next segments file, with last byte
+      // missing, to simulate a writer that crashed while
+      // writing segments file:
+      String fileNameIn = SegmentInfos.getCurrentSegmentFileName(dir);
+      String fileNameOut = IndexFileNames.fileNameFromGeneration(IndexFileNames.SEGMENTS,
+                                                                 "",
+                                                                 1+gen);
+      IndexInput in = dir.openInput(fileNameIn);
+      IndexOutput out = dir.createOutput(fileNameOut);
+      long length = in.length();
+      for(int i=0;i<length-1;i++) {
+        out.writeByte(in.readByte());
+      }
+      in.close();
+      out.close();
+
+      IndexReader reader = null;
+      try {
+        reader = IndexReader.open(dir, true);
+      } catch (Exception e) {
+        fail("reader failed to open on a crashed index");
+      }
+      reader.close();
+
+      try {
+        writer  = new IndexWriter(dir, newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer()).setOpenMode(OpenMode.CREATE));
+      } catch (Exception e) {
+        e.printStackTrace(System.out);
+        fail("writer failed to open on a crashed index");
+      }
+
+      // add 100 documents
+      for (int i = 0; i < 100; i++) {
+          addDoc(writer);
+      }
+
+      // close
+      writer.close();
+      dir.close();
+  }
 }

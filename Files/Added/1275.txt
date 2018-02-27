@@ -1,6 +1,6 @@
 @Override
 
-package org.apache.solr.core;
+package org.apache.solr.common.cloud;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,88 +19,185 @@ package org.apache.solr.core;
  * limitations under the License.
  */
 
-import java.io.Closeable;
-import java.io.IOException;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeoutException;
 
-import org.apache.lucene.store.Directory;
-import org.apache.solr.core.CachingDirectoryFactory.CloseListener;
-import org.apache.solr.util.plugin.NamedListInitializedPlugin;
+import org.apache.solr.common.SolrException;
+import org.apache.zookeeper.WatchedEvent;
+import org.apache.zookeeper.Watcher;
+import org.apache.zookeeper.Watcher.Event.KeeperState;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-/**
- * Provides access to a Directory implementation. You must release every
- * Directory that you get.
- */
-public abstract class DirectoryFactory implements NamedListInitializedPlugin,
-    Closeable {
+class ConnectionManager implements Watcher {
+  protected static final Logger log = LoggerFactory
+      .getLogger(ConnectionManager.class);
+
+  private final String name;
+  private CountDownLatch clientConnected;
+  private KeeperState state;
+  private boolean connected;
+
+  private final ZkClientConnectionStrategy connectionStrategy;
   
-  /**
-   * Indicates a Directory will no longer be used, and when it's ref count
-   * hits 0, it can be closed. On shutdown all directories will be closed
-   * whether this has been called or not. This is simply to allow early cleanup.
-   * 
-   * @throws IOException If there is a low-level I/O error.
-   */
-  public abstract void doneWithDirectory(Directory directory) throws IOException;
+  private Object connectionUpdateLock = new Object();
+
+  private String zkServerAddress;
+
+  private int zkClientTimeout;
+
+  private SolrZkClient client;
+
+  private OnReconnect onReconnect;
+
+  private volatile boolean isClosed = false;
+
+  public ConnectionManager(String name, SolrZkClient client, String zkServerAddress, int zkClientTimeout, ZkClientConnectionStrategy strat, OnReconnect onConnect) {
+    this.name = name;
+    this.client = client;
+    this.connectionStrategy = strat;
+    this.zkServerAddress = zkServerAddress;
+    this.zkClientTimeout = zkClientTimeout;
+    this.onReconnect = onConnect;
+    reset();
+  }
+
+  private synchronized void reset() {
+    clientConnected = new CountDownLatch(1);
+    state = KeeperState.Disconnected;
+    connected = false;
+  }
+
+  public synchronized void process(WatchedEvent event) {
+    if (log.isInfoEnabled()) {
+      log.info("Watcher " + this + " name:" + name + " got event " + event
+          + " path:" + event.getPath() + " type:" + event.getType());
+    }
+    
+    if (isClosed) {
+      log.info("Client->ZooKeeper status change trigger but we are already closed");
+      return;
+    }
+
+    state = event.getState();
+    if (state == KeeperState.SyncConnected) {
+      connected = true;
+      clientConnected.countDown();
+      connectionStrategy.connected();
+    } else if (state == KeeperState.Expired) {
+      connected = false;
+      log.info("Our previous ZooKeeper session was expired. Attempting to reconnect to recover relationship with ZooKeeper...");
+      
+      try {
+        connectionStrategy.reconnect(zkServerAddress, zkClientTimeout, this,
+            new ZkClientConnectionStrategy.ZkUpdate() {
+              @Override
+              public void update(SolrZooKeeper keeper) {
+                // if keeper does not replace oldKeeper we must be sure to close it
+                synchronized (connectionUpdateLock) {
+                  try {
+                    waitForConnected(SolrZkClient.DEFAULT_CLIENT_CONNECT_TIMEOUT);
+                  } catch (Exception e1) {
+                    closeKeeper(keeper);
+                    throw new RuntimeException(e1);
+                  }
+                  log.info("Connection with ZooKeeper reestablished.");
+                  try {
+                    client.updateKeeper(keeper);
+                  } catch (InterruptedException e) {
+                    closeKeeper(keeper);
+                    Thread.currentThread().interrupt();
+                    // we must have been asked to stop
+                    throw new RuntimeException(e);
+                  } catch(Throwable t) {
+                    closeKeeper(keeper);
+                    throw new RuntimeException(t);
+                  }
+      
+                  if (onReconnect != null) {
+                    onReconnect.command();
+                  }
+                  synchronized (ConnectionManager.this) {
+                    ConnectionManager.this.connected = true;
+                  }
+                }
+                
+              }
+
+            });
+      } catch (Exception e) {
+        SolrException.log(log, "", e);
+      }
+      log.info("Connected:" + connected);
+    } else if (state == KeeperState.Disconnected) {
+      log.info("zkClient has disconnected");
+      connected = false;
+      connectionStrategy.disconnected();
+    } else {
+      connected = false;
+    }
+    notifyAll();
+  }
+
+  public synchronized boolean isConnected() {
+    return !isClosed && connected;
+  }
   
-  /**
-   * Adds a close listener for a Directory.
-   */
-  public abstract void addCloseListener(Directory dir, CloseListener closeListener);
-  
-  /**
-   * Close the this and all of the Directories it contains.
-   * 
-   * @throws IOException If there is a low-level I/O error.
-   */
-  public abstract void close() throws IOException;
-  
-  /**
-   * Creates a new Directory for a given path.
-   * 
-   * @throws IOException If there is a low-level I/O error.
-   */
-  protected abstract Directory create(String path) throws IOException;
-  
-  /**
-   * Returns true if a Directory exists for a given path.
-   * 
-   */
-  public abstract boolean exists(String path);
-  
-  /**
-   * Returns the Directory for a given path, using the specified rawLockType.
-   * Will return the same Directory instance for the same path.
-   * 
-   * @throws IOException If there is a low-level I/O error.
-   */
-  public abstract Directory get(String path, String rawLockType)
-      throws IOException;
-  
-  /**
-   * Returns the Directory for a given path, using the specified rawLockType.
-   * Will return the same Directory instance for the same path unless forceNew,
-   * in which case a new Directory is returned. There is no need to call
-   * {@link #doneWithDirectory(Directory)} in this case - the old Directory
-   * will be closed when it's ref count hits 0.
-   * 
-   * @throws IOException If there is a low-level I/O error.
-   */
-  public abstract Directory get(String path, String rawLockType,
-      boolean forceNew) throws IOException;
-  
-  /**
-   * Increment the number of references to the given Directory. You must call
-   * release for every call to this method.
-   * 
-   */
-  public abstract void incRef(Directory directory);
-  
-  /**
-   * Releases the Directory so that it may be closed when it is no longer
-   * referenced.
-   * 
-   * @throws IOException If there is a low-level I/O error.
-   */
-  public abstract void release(Directory directory) throws IOException;
-  
+  // we use a volatile rather than sync
+  // to avoid deadlock on shutdown
+  public void close() {
+    this.isClosed = true;
+  }
+
+  public synchronized KeeperState state() {
+    return state;
+  }
+
+  public synchronized void waitForConnected(long waitForConnection)
+      throws TimeoutException {
+    log.info("Waiting for client to connect to ZooKeeper");
+    long expire = System.currentTimeMillis() + waitForConnection;
+    long left = 1;
+    while (!connected && left > 0) {
+      if (isClosed) {
+        break;
+      }
+      try {
+        wait(500);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new RuntimeException(e);
+      }
+      left = expire - System.currentTimeMillis();
+    }
+    if (!connected) {
+      throw new TimeoutException("Could not connect to ZooKeeper " + zkServerAddress + " within " + waitForConnection + " ms");
+    }
+    log.info("Client is connected to ZooKeeper");
+  }
+
+  public synchronized void waitForDisconnected(long timeout)
+      throws InterruptedException, TimeoutException {
+    long expire = System.currentTimeMillis() + timeout;
+    long left = timeout;
+    while (connected && left > 0) {
+      wait(left);
+      left = expire - System.currentTimeMillis();
+    }
+    if (connected) {
+      throw new TimeoutException("Did not disconnect");
+    }
+  }
+
+  private void closeKeeper(SolrZooKeeper keeper) {
+    try {
+      keeper.close();
+    } catch (InterruptedException e) {
+      // Restore the interrupted status
+      Thread.currentThread().interrupt();
+      log.error("", e);
+      throw new ZooKeeperException(SolrException.ErrorCode.SERVER_ERROR,
+          "", e);
+    }
+  }
 }

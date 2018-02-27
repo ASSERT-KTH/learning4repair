@@ -1,8 +1,8 @@
-if (builder.length() > 0 && builder.length() < maxLength) {
++ ManagementFactory.getRuntimeMXBean().getName().replaceAll("[^a-zA-Z0-9]+","") + "-"
 
-package org.apache.lucene.search.postingshighlight;
+package org.apache.lucene.store;
 
-/*
+/**
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -19,688 +19,358 @@ package org.apache.lucene.search.postingshighlight;
  * limitations under the License.
  */
 
+import java.lang.management.ManagementFactory;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.io.File;
+import java.io.RandomAccessFile;
 import java.io.IOException;
-import java.text.BreakIterator;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Locale;
-import java.util.Map;
-import java.util.PriorityQueue;
-import java.util.SortedSet;
-import java.util.TreeSet;
-
-import org.apache.lucene.index.AtomicReader;
-import org.apache.lucene.index.AtomicReaderContext;
-import org.apache.lucene.index.DocsAndPositionsEnum;
-import org.apache.lucene.index.FieldInfo;
-import org.apache.lucene.index.FieldInfo.IndexOptions;
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.IndexReaderContext;
-import org.apache.lucene.index.MultiReader;
-import org.apache.lucene.index.ReaderUtil;
-import org.apache.lucene.index.StoredFieldVisitor;
-import org.apache.lucene.index.Term;
-import org.apache.lucene.index.Terms;
-import org.apache.lucene.index.TermsEnum;
-import org.apache.lucene.search.IndexSearcher;
-import org.apache.lucene.search.Query;
-import org.apache.lucene.search.ScoreDoc;
-import org.apache.lucene.search.TopDocs;
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.InPlaceMergeSorter;
-import org.apache.lucene.util.UnicodeUtil;
+import java.util.HashSet;
+import java.util.Random;
 
 /**
- * Simple highlighter that does not analyze fields nor use
- * term vectors. Instead it requires 
- * {@link IndexOptions#DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS}.
- * <p>
- * PostingsHighlighter treats the single original document as the whole corpus, and then scores individual
- * passages as if they were documents in this corpus. It uses a {@link BreakIterator} to find 
- * passages in the text; by default it breaks using {@link BreakIterator#getSentenceInstance(Locale) 
- * getSentenceInstance(Locale.ROOT)}. It then iterates in parallel (merge sorting by offset) through 
- * the positions of all terms from the query, coalescing those hits that occur in a single passage 
- * into a {@link Passage}, and then scores each Passage using a separate {@link PassageScorer}. 
- * Passages are finally formatted into highlighted snippets with a {@link PassageFormatter}.
- * <p>
- * <b>WARNING</b>: The code is very new and probably still has some exciting bugs!
- * <p>
- * Example usage:
- * <pre class="prettyprint">
- *   // configure field with offsets at index time
- *   FieldType offsetsType = new FieldType(TextField.TYPE_STORED);
- *   offsetsType.setIndexOptions(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS);
- *   Field body = new Field("body", "foobar", offsetsType);
+ * <p>Implements {@link LockFactory} using native OS file
+ * locks.  Note that because this LockFactory relies on
+ * java.nio.* APIs for locking, any problems with those APIs
+ * will cause locking to fail.  Specifically, on certain NFS
+ * environments the java.nio.* locks will fail (the lock can
+ * incorrectly be double acquired) whereas {@link
+ * SimpleFSLockFactory} worked perfectly in those same
+ * environments.  For NFS based access to an index, it's
+ * recommended that you try {@link SimpleFSLockFactory}
+ * first and work around the one limitation that a lock file
+ * could be left when the JVM exits abnormally.</p>
  *
- *   // retrieve highlights at query time 
- *   PostingsHighlighter highlighter = new PostingsHighlighter();
- *   Query query = new TermQuery(new Term("body", "highlighting"));
- *   TopDocs topDocs = searcher.search(query, n);
- *   String highlights[] = highlighter.highlight("body", query, searcher, topDocs);
- * </pre>
- * <p>
- * This is thread-safe, and can be used across different readers.
- * @lucene.experimental
+ * <p>The primary benefit of {@link NativeFSLockFactory} is
+ * that lock files will be properly removed (by the OS) if
+ * the JVM has an abnormal exit.</p>
+ * 
+ * <p>Note that, unlike {@link SimpleFSLockFactory}, the existence of
+ * leftover lock files in the filesystem on exiting the JVM
+ * is fine because the OS will free the locks held against
+ * these files even though the files still remain.</p>
+ *
+ * <p>If you suspect that this or any other LockFactory is
+ * not working properly in your environment, you can easily
+ * test it by using {@link VerifyingLockFactory}, {@link
+ * LockVerifyServer} and {@link LockStressTest}.</p>
+ *
+ * @see LockFactory
  */
-public class PostingsHighlighter {
-  
-  // TODO: maybe allow re-analysis for tiny fields? currently we require offsets,
-  // but if the analyzer is really fast and the field is tiny, this might really be
-  // unnecessary.
-  
-  /** for rewriting: we don't want slow processing from MTQs */
-  private static final IndexReader EMPTY_INDEXREADER = new MultiReader();
-  
-  /** Default maximum content size to process. Typically snippets
-   *  closer to the beginning of the document better summarize its content */
-  public static final int DEFAULT_MAX_LENGTH = 10000;
+
+public class NativeFSLockFactory extends FSLockFactory {
+
+  private volatile boolean tested = false;
+
+  // Simple test to verify locking system is "working".  On
+  // NFS, if it's misconfigured, you can hit long (35
+  // second) timeouts which cause Lock.obtain to take far
+  // too long (it assumes the obtain() call takes zero
+  // time). 
+  private synchronized void acquireTestLock() {
+    if (tested) return;
+    tested = true;
     
-  private final int maxLength;
+    // Ensure that lockDir exists and is a directory.
+    if (!lockDir.exists()) {
+      if (!lockDir.mkdirs())
+        throw new RuntimeException("Cannot create directory: " +
+                              lockDir.getAbsolutePath());
+    } else if (!lockDir.isDirectory()) {
+      throw new RuntimeException("Found regular file where directory expected: " + 
+                            lockDir.getAbsolutePath());
+    }
 
-  /** Set the first time {@link #getFormatter} is called,
-   *  and then reused. */
-  private PassageFormatter defaultFormatter;
+    // add the RuntimeMXBean's name to the lock file, to reduce the chance for
+    // name collisions when this code is invoked by multiple JVMs (such as in
+    // our tests). On most systems, the name includes the process Id.
+    // Also, remove any non-alphanumeric characters, so that the lock file will
+    // be created for sure on all systems.
+    String randomLockName = "lucene-"
+        + ManagementFactory.getRuntimeMXBean().getName().replaceAll("[^a..zA..Z0..9]+","") + "-"
+        + Long.toString(new Random().nextInt(), Character.MAX_RADIX)
+        + "-test.lock";
+    
+    Lock l = makeLock(randomLockName);
+    try {
+      l.obtain();
+      l.release();
+      // If the test lock failed to delete after all the attempts, attempt a
+      // delete when the JVM exits.
+      File lockFile = new File(lockDir, randomLockName);
+      if (lockFile.exists()) {
+        lockFile.deleteOnExit();
+      }
+    } catch (IOException e) {
+      RuntimeException e2 = new RuntimeException("Failed to acquire random test lock; please verify filesystem for lock directory '" + lockDir + "' supports locking");
+      e2.initCause(e);
+      throw e2;
+    }    
+  }
 
-  /** Set the first time {@link #getScorer} is called,
-   *  and then reused. */
-  private PassageScorer defaultScorer;
-  
   /**
-   * Creates a new highlighter with default parameters.
+   * Create a NativeFSLockFactory instance, with null (unset)
+   * lock directory. When you pass this factory to a {@link FSDirectory}
+   * subclass, the lock directory is automatically set to the
+   * directory itsself. Be sure to create one instance for each directory
+   * your create!
    */
-  public PostingsHighlighter() {
-    this(DEFAULT_MAX_LENGTH);
+  public NativeFSLockFactory() throws IOException {
+    this((File) null);
   }
-  
+
   /**
-   * Creates a new highlighter, specifying maximum content length.
-   * @param maxLength maximum content size to process.
-   * @throws IllegalArgumentException if <code>maxLength</code> is negative or <code>Integer.MAX_VALUE</code>
+   * Create a NativeFSLockFactory instance, storing lock
+   * files into the specified lockDirName:
+   *
+   * @param lockDirName where lock files are created.
    */
-  public PostingsHighlighter(int maxLength) {
-    if (maxLength < 0 || maxLength == Integer.MAX_VALUE) {
-      // two reasons: no overflow problems in BreakIterator.preceding(offset+1),
-      // our sentinel in the offsets queue uses this value to terminate.
-      throw new IllegalArgumentException("maxLength must be < Integer.MAX_VALUE");
-    }
-    this.maxLength = maxLength;
-  }
-  
-  /** Returns the {@link BreakIterator} to use for
-   *  dividing text into passages.  This returns 
-   *  {@link BreakIterator#getSentenceInstance(Locale)} by default;
-   *  subclasses can override to customize. */
-  protected BreakIterator getBreakIterator(String field) {
-    return BreakIterator.getSentenceInstance(Locale.ROOT);
-  }
-
-  /** Returns the {@link PassageFormatter} to use for
-   *  formatting passages into highlighted snippets.  This
-   *  returns a new {@code PassageFormatter} by default;
-   *  subclasses can override to customize. */
-  protected PassageFormatter getFormatter(String field) {
-    if (defaultFormatter == null) {
-      defaultFormatter = new DefaultPassageFormatter();
-    }
-    return defaultFormatter;
-  }
-
-  /** Returns the {@link PassageScorer} to use for
-   *  ranking passages.  This
-   *  returns a new {@code PassageScorer} by default;
-   *  subclasses can override to customize. */
-  protected PassageScorer getScorer(String field) {
-    if (defaultScorer == null) {
-      defaultScorer = new PassageScorer();
-    }
-    return defaultScorer;
+  public NativeFSLockFactory(String lockDirName) throws IOException {
+    this(new File(lockDirName));
   }
 
   /**
-   * Highlights the top passages from a single field.
+   * Create a NativeFSLockFactory instance, storing lock
+   * files into the specified lockDir:
    * 
-   * @param field field name to highlight. 
-   *        Must have a stored string value and also be indexed with offsets.
-   * @param query query to highlight.
-   * @param searcher searcher that was previously used to execute the query.
-   * @param topDocs TopDocs containing the summary result documents to highlight.
-   * @return Array of formatted snippets corresponding to the documents in <code>topDocs</code>. 
-   *         If no highlights were found for a document, the
-   *         first sentence for the field will be returned.
-   * @throws IOException if an I/O error occurred during processing
-   * @throws IllegalArgumentException if <code>field</code> was indexed without 
-   *         {@link IndexOptions#DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS}
+   * @param lockDir where lock files are created.
    */
-  public String[] highlight(String field, Query query, IndexSearcher searcher, TopDocs topDocs) throws IOException {
-    return highlight(field, query, searcher, topDocs, 1);
+  public NativeFSLockFactory(File lockDir) throws IOException {
+    setLockDir(lockDir);
   }
-  
-  /**
-   * Highlights the top-N passages from a single field.
+
+  @Override
+  public synchronized Lock makeLock(String lockName) {
+    acquireTestLock();
+    if (lockPrefix != null)
+      lockName = lockPrefix + "-" + lockName;
+    return new NativeFSLock(lockDir, lockName);
+  }
+
+  @Override
+  public void clearLock(String lockName) throws IOException {
+    // Note that this isn't strictly required anymore
+    // because the existence of these files does not mean
+    // they are locked, but, still do this in case people
+    // really want to see the files go away:
+    if (lockDir.exists()) {
+      if (lockPrefix != null) {
+        lockName = lockPrefix + "-" + lockName;
+      }
+      File lockFile = new File(lockDir, lockName);
+      if (lockFile.exists() && !lockFile.delete()) {
+        throw new IOException("Cannot delete " + lockFile);
+      }
+    }
+  }
+}
+
+class NativeFSLock extends Lock {
+
+  private RandomAccessFile f;
+  private FileChannel channel;
+  private FileLock lock;
+  private File path;
+  private File lockDir;
+
+  /*
+   * The javadocs for FileChannel state that you should have
+   * a single instance of a FileChannel (per JVM) for all
+   * locking against a given file (locks are tracked per 
+   * FileChannel instance in Java 1.4/1.5). Even using the same 
+   * FileChannel instance is not completely thread-safe with Java 
+   * 1.4/1.5 though. To work around this, we have a single (static) 
+   * HashSet that contains the file paths of all currently 
+   * locked locks.  This protects against possible cases 
+   * where different Directory instances in one JVM (each 
+   * with their own NativeFSLockFactory instance) have set 
+   * the same lock dir and lock prefix. However, this will not 
+   * work when LockFactorys are created by different 
+   * classloaders (eg multiple webapps). 
    * 
-   * @param field field name to highlight. 
-   *        Must have a stored string value and also be indexed with offsets.
-   * @param query query to highlight.
-   * @param searcher searcher that was previously used to execute the query.
-   * @param topDocs TopDocs containing the summary result documents to highlight.
-   * @param maxPassages The maximum number of top-N ranked passages used to 
-   *        form the highlighted snippets.
-   * @return Array of formatted snippets corresponding to the documents in <code>topDocs</code>. 
-   *         If no highlights were found for a document, the
-   *         first {@code maxPassages} sentences from the
-   *         field will be returned.
-   * @throws IOException if an I/O error occurred during processing
-   * @throws IllegalArgumentException if <code>field</code> was indexed without 
-   *         {@link IndexOptions#DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS}
+   * TODO: Java 1.6 tracks system wide locks in a thread safe manner 
+   * (same FileChannel instance or not), so we may want to 
+   * change this when Lucene moves to Java 1.6.
    */
-  public String[] highlight(String field, Query query, IndexSearcher searcher, TopDocs topDocs, int maxPassages) throws IOException {
-    Map<String,String[]> res = highlightFields(new String[] { field }, query, searcher, topDocs, new int[] { maxPassages });
-    return res.get(field);
-  }
-  
-  /**
-   * Highlights the top passages from multiple fields.
-   * <p>
-   * Conceptually, this behaves as a more efficient form of:
-   * <pre class="prettyprint">
-   * Map m = new HashMap();
-   * for (String field : fields) {
-   *   m.put(field, highlight(field, query, searcher, topDocs));
-   * }
-   * return m;
-   * </pre>
-   * 
-   * @param fields field names to highlight. 
-   *        Must have a stored string value and also be indexed with offsets.
-   * @param query query to highlight.
-   * @param searcher searcher that was previously used to execute the query.
-   * @param topDocs TopDocs containing the summary result documents to highlight.
-   * @return Map keyed on field name, containing the array of formatted snippets 
-   *         corresponding to the documents in <code>topDocs</code>. 
-   *         If no highlights were found for a document, the
-   *         first sentence from the field will be returned.
-   * @throws IOException if an I/O error occurred during processing
-   * @throws IllegalArgumentException if <code>field</code> was indexed without 
-   *         {@link IndexOptions#DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS}
-   */
-  public Map<String,String[]> highlightFields(String fields[], Query query, IndexSearcher searcher, TopDocs topDocs) throws IOException {
-    int maxPassages[] = new int[fields.length];
-    Arrays.fill(maxPassages, 1);
-    return highlightFields(fields, query, searcher, topDocs, maxPassages);
-  }
-  
-  /**
-   * Highlights the top-N passages from multiple fields.
-   * <p>
-   * Conceptually, this behaves as a more efficient form of:
-   * <pre class="prettyprint">
-   * Map m = new HashMap();
-   * for (String field : fields) {
-   *   m.put(field, highlight(field, query, searcher, topDocs, maxPassages));
-   * }
-   * return m;
-   * </pre>
-   * 
-   * @param fields field names to highlight. 
-   *        Must have a stored string value and also be indexed with offsets.
-   * @param query query to highlight.
-   * @param searcher searcher that was previously used to execute the query.
-   * @param topDocs TopDocs containing the summary result documents to highlight.
-   * @param maxPassages The maximum number of top-N ranked passages per-field used to 
-   *        form the highlighted snippets.
-   * @return Map keyed on field name, containing the array of formatted snippets 
-   *         corresponding to the documents in <code>topDocs</code>. 
-   *         If no highlights were found for a document, the
-   *         first {@code maxPassages} sentences from the
-   *         field will be returned.
-   * @throws IOException if an I/O error occurred during processing
-   * @throws IllegalArgumentException if <code>field</code> was indexed without 
-   *         {@link IndexOptions#DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS}
-   */
-  public Map<String,String[]> highlightFields(String fields[], Query query, IndexSearcher searcher, TopDocs topDocs, int maxPassages[]) throws IOException {
-    final ScoreDoc scoreDocs[] = topDocs.scoreDocs;
-    int docids[] = new int[scoreDocs.length];
-    for (int i = 0; i < docids.length; i++) {
-      docids[i] = scoreDocs[i].doc;
-    }
+  private static HashSet<String> LOCK_HELD = new HashSet<String>();
 
-    return highlightFields(fields, query, searcher, docids, maxPassages);
-  }
-    
-  /**
-   * Highlights the top-N passages from multiple fields,
-   * for the provided int[] docids.
-   * 
-   * @param fieldsIn field names to highlight. 
-   *        Must have a stored string value and also be indexed with offsets.
-   * @param query query to highlight.
-   * @param searcher searcher that was previously used to execute the query.
-   * @param docidsIn containing the document IDs to highlight.
-   * @param maxPassagesIn The maximum number of top-N ranked passages per-field used to 
-   *        form the highlighted snippets.
-   * @return Map keyed on field name, containing the array of formatted snippets 
-   *         corresponding to the documents in <code>topDocs</code>. 
-   *         If no highlights were found for a document, the
-   *         first {@code maxPassages} from the field will
-   *         be returned.
-   * @throws IOException if an I/O error occurred during processing
-   * @throws IllegalArgumentException if <code>field</code> was indexed without 
-   *         {@link IndexOptions#DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS}
-   */
-  public Map<String,String[]> highlightFields(String fieldsIn[], Query query, IndexSearcher searcher, int[] docidsIn, int maxPassagesIn[]) throws IOException {
-    if (fieldsIn.length < 1) {
-      throw new IllegalArgumentException("fieldsIn must not be empty");
-    }
-    if (fieldsIn.length != maxPassagesIn.length) {
-      throw new IllegalArgumentException("invalid number of maxPassagesIn");
-    }
-    final IndexReader reader = searcher.getIndexReader();
-    query = rewrite(query);
-    SortedSet<Term> queryTerms = new TreeSet<Term>();
-    query.extractTerms(queryTerms);
-
-    IndexReaderContext readerContext = reader.getContext();
-    List<AtomicReaderContext> leaves = readerContext.leaves();
-
-    // Make our own copies because we sort in-place:
-    int[] docids = new int[docidsIn.length];
-    System.arraycopy(docidsIn, 0, docids, 0, docidsIn.length);
-    final String fields[] = new String[fieldsIn.length];
-    System.arraycopy(fieldsIn, 0, fields, 0, fieldsIn.length);
-    final int maxPassages[] = new int[maxPassagesIn.length];
-    System.arraycopy(maxPassagesIn, 0, maxPassages, 0, maxPassagesIn.length);
-
-    // sort for sequential io
-    Arrays.sort(docids);
-    new InPlaceMergeSorter() {
-
-      @Override
-      protected void swap(int i, int j) {
-        String tmp = fields[i];
-        fields[i] = fields[j];
-        fields[j] = tmp;
-        int tmp2 = maxPassages[i];
-        maxPassages[i] = maxPassages[j];
-        maxPassages[j] = tmp2;
-      }
-
-      @Override
-      protected int compare(int i, int j) {
-        return fields[i].compareTo(fields[j]);
-      }
-      
-    }.sort(0, fields.length);
-    
-    // pull stored data:
-    String[][] contents = loadFieldValues(searcher, fields, docids, maxLength);
-    
-    Map<String,String[]> highlights = new HashMap<String,String[]>();
-    for (int i = 0; i < fields.length; i++) {
-      String field = fields[i];
-      int numPassages = maxPassages[i];
-      Term floor = new Term(field, "");
-      Term ceiling = new Term(field, UnicodeUtil.BIG_TERM);
-      SortedSet<Term> fieldTerms = queryTerms.subSet(floor, ceiling);
-      // TODO: should we have some reasonable defaults for term pruning? (e.g. stopwords)
-
-      // Strip off the redundant field:
-      BytesRef terms[] = new BytesRef[fieldTerms.size()];
-      int termUpto = 0;
-      for(Term term : fieldTerms) {
-        terms[termUpto++] = term.bytes();
-      }
-      Map<Integer,String> fieldHighlights = highlightField(field, contents[i], getBreakIterator(field), terms, docids, leaves, numPassages);
-        
-      String[] result = new String[docids.length];
-      for (int j = 0; j < docidsIn.length; j++) {
-        result[j] = fieldHighlights.get(docidsIn[j]);
-      }
-      highlights.put(field, result);
-    }
-    return highlights;
+  public NativeFSLock(File lockDir, String lockFileName) {
+    this.lockDir = lockDir;
+    path = new File(lockDir, lockFileName);
   }
 
-  /** Loads the String values for each field X docID to be
-   *  highlighted.  By default this loads from stored
-   *  fields, but a subclass can change the source.  This
-   *  method should allocate the String[fields.length][docids.length]
-   *  and fill all values.  The returned Strings must be
-   *  identical to what was indexed. */
-  protected String[][] loadFieldValues(IndexSearcher searcher, String[] fields, int[] docids, int maxLength) throws IOException {
-    String contents[][] = new String[fields.length][docids.length];
-    LimitedStoredFieldVisitor visitor = new LimitedStoredFieldVisitor(fields, maxLength);
-    for (int i = 0; i < docids.length; i++) {
-      searcher.doc(docids[i], visitor);
-      for (int j = 0; j < fields.length; j++) {
-        contents[j][i] = visitor.getValue(j).toString();
-      }
-      visitor.reset();
-    }
-    return contents;
+  private synchronized boolean lockExists() {
+    return lock != null;
   }
-    
-  private Map<Integer,String> highlightField(String field, String contents[], BreakIterator bi, BytesRef terms[], int[] docids, List<AtomicReaderContext> leaves, int maxPassages) throws IOException {  
-    Map<Integer,String> highlights = new HashMap<Integer,String>();
-    
-    // reuse in the real sense... for docs in same segment we just advance our old enum
-    DocsAndPositionsEnum postings[] = null;
-    TermsEnum termsEnum = null;
-    int lastLeaf = -1;
 
-    PassageFormatter fieldFormatter = getFormatter(field);
-    if (fieldFormatter == null) {
-      throw new NullPointerException("PassageFormatter cannot be null");
+  @Override
+  public synchronized boolean obtain() throws IOException {
+
+    if (lockExists()) {
+      // Our instance is already locked:
+      return false;
     }
 
-    for (int i = 0; i < docids.length; i++) {
-      String content = contents[i];
-      if (content.length() == 0) {
-        continue; // nothing to do
-      }
-      bi.setText(content);
-      int doc = docids[i];
-      int leaf = ReaderUtil.subIndex(doc, leaves);
-      AtomicReaderContext subContext = leaves.get(leaf);
-      AtomicReader r = subContext.reader();
-      Terms t = r.terms(field);
-      if (t == null) {
-        continue; // nothing to do
-      }
-      if (leaf != lastLeaf) {
-        termsEnum = t.iterator(null);
-        postings = new DocsAndPositionsEnum[terms.length];
-      }
-      Passage passages[] = highlightDoc(field, terms, content.length(), bi, doc - subContext.docBase, termsEnum, postings, maxPassages);
-      if (passages.length == 0) {
-        passages = getEmptyHighlight(field, bi, maxPassages);
-      }
-      if (passages.length > 0) {
-        // otherwise a null snippet (eg if field is missing
-        // entirely from the doc)
-        highlights.put(doc, fieldFormatter.format(passages, content));
-      }
-      lastLeaf = leaf;
+    // Ensure that lockDir exists and is a directory.
+    if (!lockDir.exists()) {
+      if (!lockDir.mkdirs())
+        throw new IOException("Cannot create directory: " +
+                              lockDir.getAbsolutePath());
+    } else if (!lockDir.isDirectory()) {
+      throw new IOException("Found regular file where directory expected: " + 
+                            lockDir.getAbsolutePath());
     }
-    
-    return highlights;
-  }
-  
-  // algorithm: treat sentence snippets as miniature documents
-  // we can intersect these with the postings lists via BreakIterator.preceding(offset),s
-  // score each sentence as norm(sentenceStartOffset) * sum(weight * tf(freq))
-  private Passage[] highlightDoc(String field, BytesRef terms[], int contentLength, BreakIterator bi, int doc, 
-      TermsEnum termsEnum, DocsAndPositionsEnum[] postings, int n) throws IOException {
-    PassageScorer scorer = getScorer(field);
-    if (scorer == null) {
-      throw new NullPointerException("PassageScorer cannot be null");
-    }
-    PriorityQueue<OffsetsEnum> pq = new PriorityQueue<OffsetsEnum>();
-    float weights[] = new float[terms.length];
-    // initialize postings
-    for (int i = 0; i < terms.length; i++) {
-      DocsAndPositionsEnum de = postings[i];
-      int pDoc;
-      if (de == EMPTY) {
-        continue;
-      } else if (de == null) {
-        postings[i] = EMPTY; // initially
-        if (!termsEnum.seekExact(terms[i], true)) {
-          continue; // term not found
-        }
-        de = postings[i] = termsEnum.docsAndPositions(null, null, DocsAndPositionsEnum.FLAG_OFFSETS);
-        if (de == null) {
-          // no positions available
-          throw new IllegalArgumentException("field '" + field + "' was indexed without offsets, cannot highlight");
-        }
-        pDoc = de.advance(doc);
-      } else {
-        pDoc = de.docID();
-        if (pDoc < doc) {
-          pDoc = de.advance(doc);
-        }
-      }
 
-      if (doc == pDoc) {
-        weights[i] = scorer.weight(contentLength, de.freq());
-        de.nextPosition();
-        pq.add(new OffsetsEnum(de, i));
-      }
-    }
-    
-    pq.add(new OffsetsEnum(EMPTY, Integer.MAX_VALUE)); // a sentinel for termination
-    
-    PriorityQueue<Passage> passageQueue = new PriorityQueue<Passage>(n, new Comparator<Passage>() {
-      @Override
-      public int compare(Passage left, Passage right) {
-        if (left.score < right.score) {
-          return -1;
-        } else if (left.score > right.score) {
-          return 1;
+    String canonicalPath = path.getCanonicalPath();
+
+    boolean markedHeld = false;
+
+    try {
+
+      // Make sure nobody else in-process has this lock held
+      // already, and, mark it held if not:
+
+      synchronized(LOCK_HELD) {
+        if (LOCK_HELD.contains(canonicalPath)) {
+          // Someone else in this JVM already has the lock:
+          return false;
         } else {
-          return left.startOffset - right.startOffset;
+          // This "reserves" the fact that we are the one
+          // thread trying to obtain this lock, so we own
+          // the only instance of a channel against this
+          // file:
+          LOCK_HELD.add(canonicalPath);
+          markedHeld = true;
         }
       }
-    });
-    Passage current = new Passage();
-    
-    OffsetsEnum off;
-    while ((off = pq.poll()) != null) {
-      final DocsAndPositionsEnum dp = off.dp;
-      int start = dp.startOffset();
-      if (start == -1) {
-        throw new IllegalArgumentException("field '" + field + "' was indexed without offsets, cannot highlight");
-      }
-      int end = dp.endOffset();
-      if (start >= current.endOffset) {
-        if (current.startOffset >= 0) {
-          // finalize current
-          current.score *= scorer.norm(current.startOffset);
-          // new sentence: first add 'current' to queue 
-          if (passageQueue.size() == n && current.score < passageQueue.peek().score) {
-            current.reset(); // can't compete, just reset it
-          } else {
-            passageQueue.offer(current);
-            if (passageQueue.size() > n) {
-              current = passageQueue.poll();
-              current.reset();
-            } else {
-              current = new Passage();
-            }
-          }
-        }
-        // if we exceed limit, we are done
-        if (start >= contentLength) {
-          Passage passages[] = new Passage[passageQueue.size()];
-          passageQueue.toArray(passages);
-          for (Passage p : passages) {
-            p.sort();
-          }
-          // sort in ascending order
-          Arrays.sort(passages, new Comparator<Passage>() {
-            @Override
-            public int compare(Passage left, Passage right) {
-              return left.startOffset - right.startOffset;
-            }
-          });
-          return passages;
-        }
-        // advance breakiterator
-        assert BreakIterator.DONE < 0;
-        current.startOffset = Math.max(bi.preceding(start+1), 0);
-        current.endOffset = Math.min(bi.next(), contentLength);
-      }
-      int tf = 0;
-      while (true) {
-        tf++;
-        current.addMatch(start, end, terms[off.id]);
-        if (off.pos == dp.freq()) {
-          break; // removed from pq
-        } else {
-          off.pos++;
-          dp.nextPosition();
-          start = dp.startOffset();
-          end = dp.endOffset();
-        }
-        if (start >= current.endOffset) {
-          pq.offer(off);
-          break;
-        }
-      }
-      current.score += weights[off.id] * scorer.tf(tf, current.endOffset - current.startOffset);
-    }
 
-    // Dead code but compiler disagrees:
-    assert false;
-    return null;
-  }
-
-  /** Called to summarize a document when no hits were
-   *  found.  By default this just returns the first
-   *  {@code maxPassages} sentences; subclasses can override
-   *  to customize. */
-  protected Passage[] getEmptyHighlight(String fieldName, BreakIterator bi, int maxPassages) {
-    // BreakIterator should be un-next'd:
-    List<Passage> passages = new ArrayList<Passage>();
-    int pos = bi.current();
-    assert pos == 0;
-    while (passages.size() < maxPassages) {
-      int next = bi.next();
-      if (next == BreakIterator.DONE) {
-        break;
-      }
-      Passage passage = new Passage();
-      passage.score = Float.NaN;
-      passage.startOffset = pos;
-      passage.endOffset = next;
-      passages.add(passage);
-      pos = next;
-    }
-
-    return passages.toArray(new Passage[passages.size()]);
-  }
-  
-  private static class OffsetsEnum implements Comparable<OffsetsEnum> {
-    DocsAndPositionsEnum dp;
-    int pos;
-    int id;
-    
-    OffsetsEnum(DocsAndPositionsEnum dp, int id) throws IOException {
-      this.dp = dp;
-      this.id = id;
-      this.pos = 1;
-    }
-
-    @Override
-    public int compareTo(OffsetsEnum other) {
       try {
-        int off = dp.startOffset();
-        int otherOff = other.dp.startOffset();
-        if (off == otherOff) {
-          return id - other.id;
-        } else {
-          return Long.signum(((long)off) - otherOff);
-        }
+        f = new RandomAccessFile(path, "rw");
       } catch (IOException e) {
-        throw new RuntimeException(e);
+        // On Windows, we can get intermittent "Access
+        // Denied" here.  So, we treat this as failure to
+        // acquire the lock, but, store the reason in case
+        // there is in fact a real error case.
+        failureReason = e;
+        f = null;
+      }
+
+      if (f != null) {
+        try {
+          channel = f.getChannel();
+          try {
+            lock = channel.tryLock();
+          } catch (IOException e) {
+            // At least on OS X, we will sometimes get an
+            // intermittent "Permission Denied" IOException,
+            // which seems to simply mean "you failed to get
+            // the lock".  But other IOExceptions could be
+            // "permanent" (eg, locking is not supported via
+            // the filesystem).  So, we record the failure
+            // reason here; the timeout obtain (usually the
+            // one calling us) will use this as "root cause"
+            // if it fails to get the lock.
+            failureReason = e;
+          } finally {
+            if (lock == null) {
+              try {
+                channel.close();
+              } finally {
+                channel = null;
+              }
+            }
+          }
+        } finally {
+          if (channel == null) {
+            try {
+              f.close();
+            } finally {
+              f = null;
+            }
+          }
+        }
+      }
+
+    } finally {
+      if (markedHeld && !lockExists()) {
+        synchronized(LOCK_HELD) {
+          if (LOCK_HELD.contains(canonicalPath)) {
+            LOCK_HELD.remove(canonicalPath);
+          }
+        }
+      }
+    }
+    return lockExists();
+  }
+
+  @Override
+  public synchronized void release() throws IOException {
+    if (lockExists()) {
+      try {
+        lock.release();
+      } finally {
+        lock = null;
+        try {
+          channel.close();
+        } finally {
+          channel = null;
+          try {
+            f.close();
+          } finally {
+            f = null;
+            synchronized(LOCK_HELD) {
+              LOCK_HELD.remove(path.getCanonicalPath());
+            }
+          }
+        }
+      }
+      // LUCENE-2421: we don't care anymore if the file cannot be deleted
+      // because it's held up by another process (e.g. AntiVirus). NativeFSLock
+      // does not depend on the existence/absence of the lock file
+      path.delete();
+    } else {
+      // if we don't hold the lock, and somebody still called release(), for
+      // example as a result of calling IndexWriter.unlock(), we should attempt
+      // to obtain the lock and release it. If the obtain fails, it means the
+      // lock cannot be released, and we should throw a proper exception rather
+      // than silently failing/not doing anything.
+      boolean obtained = false;
+      try {
+        if (!(obtained = obtain())) {
+          throw new LockReleaseFailedException(
+              "Cannot forcefully unlock a NativeFSLock which is held by another indexer component: "
+                  + path);
+        }
+      } finally {
+        if (obtained) {
+          release();
+        }
       }
     }
   }
-  
-  private static final DocsAndPositionsEnum EMPTY = new DocsAndPositionsEnum() {
 
-    @Override
-    public int nextPosition() throws IOException { return 0; }
-
-    @Override
-    public int startOffset() throws IOException { return Integer.MAX_VALUE; }
-
-    @Override
-    public int endOffset() throws IOException { return Integer.MAX_VALUE; }
-
-    @Override
-    public BytesRef getPayload() throws IOException { return null; }
-
-    @Override
-    public int freq() throws IOException { return 0; }
-
-    @Override
-    public int docID() { return NO_MORE_DOCS; }
-
-    @Override
-    public int nextDoc() throws IOException { return NO_MORE_DOCS; }
-
-    @Override
-    public int advance(int target) throws IOException { return NO_MORE_DOCS; }
+  @Override
+  public synchronized boolean isLocked() {
+    // The test for is isLocked is not directly possible with native file locks:
     
-    @Override
-    public long cost() { return 0; }
-  };
-  
-  /** 
-   * we rewrite against an empty indexreader: as we don't want things like
-   * rangeQueries that don't summarize the document
-   */
-  private static Query rewrite(Query original) throws IOException {
-    Query query = original;
-    for (Query rewrittenQuery = query.rewrite(EMPTY_INDEXREADER); rewrittenQuery != query;
-         rewrittenQuery = query.rewrite(EMPTY_INDEXREADER)) {
-      query = rewrittenQuery;
-    }
-    return query;
+    // First a shortcut, if a lock reference in this instance is available
+    if (lockExists()) return true;
+    
+    // Look if lock file is present; if not, there can definitely be no lock!
+    if (!path.exists()) return false;
+    
+    // Try to obtain and release (if was locked) the lock
+    try {
+      boolean obtained = obtain();
+      if (obtained) release();
+      return !obtained;
+    } catch (IOException ioe) {
+      return false;
+    }    
   }
-  
-  private static class LimitedStoredFieldVisitor extends StoredFieldVisitor {
-    private final String fields[];
-    private final int maxLength;
-    private final StringBuilder builders[];
-    private int currentField = -1;
-    
-    public LimitedStoredFieldVisitor(String fields[], int maxLength) {
-      this.fields = fields;
-      this.maxLength = maxLength;
-      builders = new StringBuilder[fields.length];
-      for (int i = 0; i < builders.length; i++) {
-        builders[i] = new StringBuilder();
-      }
-    }
-    
-    @Override
-    public void stringField(FieldInfo fieldInfo, String value) throws IOException {
-      assert currentField >= 0;
-      StringBuilder builder = builders[currentField];
-      if (builder.length() > 0) {
-        builder.append(' '); // for the offset gap, TODO: make this configurable
-      }
-      if (builder.length() + value.length() > maxLength) {
-        builder.append(value, 0, maxLength - builder.length());
-      } else {
-        builder.append(value);
-      }
-    }
 
-    @Override
-    public Status needsField(FieldInfo fieldInfo) throws IOException {
-      currentField = Arrays.binarySearch(fields, fieldInfo.name);
-      if (currentField < 0) {
-        return Status.NO;
-      } else if (builders[currentField].length() > maxLength) {
-        return fields.length == 1 ? Status.STOP : Status.NO;
-      }
-      return Status.YES;
-    }
-    
-    String getValue(int i) {
-      return builders[i].toString();
-    }
-    
-    void reset() {
-      currentField = -1;
-      for (int i = 0; i < fields.length; i++) {
-        builders[i].setLength(0);
-      }
-    }
+  @Override
+  public String toString() {
+    return "NativeFSLock@" + path;
   }
 }

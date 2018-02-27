@@ -1,4 +1,4 @@
-int bufferSize = (int) Math.min(Math.max(file.length(), 1), 32 * 1024 * 1024);
+EndPointState epState = Gossiper.instance.getEndpointStateForEndpoint(ep);
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one
@@ -18,487 +18,264 @@ int bufferSize = (int) Math.min(Math.max(file.length(), 1), 32 * 1024 * 1024);
  * limitations under the License.
  */
 
-package org.apache.cassandra.db.commitlog;
+package org.apache.cassandra.gms;
 
-import java.io.*;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.IOError;
+import java.lang.management.ManagementFactory;
 import java.util.*;
-import java.util.concurrent.Callable;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Future;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.zip.CRC32;
-import java.util.zip.Checksum;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+import javax.management.MBeanServer;
+import javax.management.ObjectName;
 
 import org.apache.commons.lang.StringUtils;
+
+import java.net.InetAddress;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.BoundedStatsDeque;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.concurrent.Stage;
-import org.apache.cassandra.concurrent.StageManager;
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.Config;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.db.ColumnFamily;
-import org.apache.cassandra.db.RowMutation;
-import org.apache.cassandra.db.Table;
-import org.apache.cassandra.db.UnserializableColumnFamilyException;
-import org.apache.cassandra.io.DeletionService;
-import org.apache.cassandra.io.util.BufferedRandomAccessFile;
-import org.apache.cassandra.io.util.FileUtils;
-import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.FBUtilities;
-import org.apache.cassandra.utils.WrappedRunnable;
-
-/*
- * Commit Log tracks every write operation into the system. The aim
- * of the commit log is to be able to successfully recover data that was
- * not stored to disk via the Memtable. Every Commit Log maintains a
- * header represented by the abstraction CommitLogHeader. The header
- * contains a bit array and an array of longs and both the arrays are
- * of size, #column families for the Table, the Commit Log represents.
- *
- * Whenever a ColumnFamily is written to, for the first time its bit flag
- * is set to one in the CommitLogHeader. When it is flushed to disk by the
- * Memtable its corresponding bit in the header is set to zero. This helps
- * track which CommitLogs can be thrown away as a result of Memtable flushes.
- * Additionally, when a ColumnFamily is flushed and written to disk, its
- * entry in the array of longs is updated with the offset in the Commit Log
- * file where it was written. This helps speed up recovery since we can seek
- * to these offsets and start processing the commit log.
- *
- * Every Commit Log is rolled over everytime it reaches its threshold in size;
- * the new log inherits the "dirty" bits from the old.
- *
- * Over time there could be a number of commit logs that would be generated.
- * To allow cleaning up non-active commit logs, whenever we flush a column family and update its bit flag in
- * the active CL, we take the dirty bit array and bitwise & it with the headers of the older logs.
- * If the result is 0, then it is safe to remove the older file.  (Since the new CL
- * inherited the old's dirty bitflags, getting a zero for any given bit in the anding
- * means that either the CF was clean in the old CL or it has been flushed since the
- * switch in the new.)
+/**
+ * This FailureDetector is an implementation of the paper titled
+ * "The Phi Accrual Failure Detector" by Hayashibara. 
+ * Check the paper and the <i>IFailureDetector</i> interface for details.
  */
-public class CommitLog
+public class FailureDetector implements IFailureDetector, FailureDetectorMBean
 {
-    private static final int MAX_OUTSTANDING_REPLAY_COUNT = 1024;
+    public static final IFailureDetector instance = new FailureDetector();
+    private static Logger logger_ = LoggerFactory.getLogger(FailureDetector.class);
+    private static final int sampleSize_ = 1000;
+    private static final int phiConvictThreshold_ = 8;
+    /* The Failure Detector has to have been up for at least 1 min. */
+    private static final long uptimeThreshold_ = 60000;
+    /* The time when the module was instantiated. */
+    private static long creationTime_;
     
-    static final Logger logger = LoggerFactory.getLogger(CommitLog.class);
-
-    public static final CommitLog instance = new CommitLog();
-
-    private final Deque<CommitLogSegment> segments = new ArrayDeque<CommitLogSegment>();
-
-    private final ICommitLogExecutorService executor;
+    private Map<InetAddress, ArrivalWindow> arrivalSamples_ = new Hashtable<InetAddress, ArrivalWindow>();
+    private List<IFailureDetectionEventListener> fdEvntListeners_ = new ArrayList<IFailureDetectionEventListener>();
     
-    private volatile int segmentSize = 128*1024*1024; // roll after log gets this big
-
+    public FailureDetector()
+    {
+        creationTime_ = System.currentTimeMillis();
+        // Register this instance with JMX
+        try
+        {
+            MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+            mbs.registerMBean(this, new ObjectName("org.apache.cassandra.gms:type=FailureDetector"));
+        }
+        catch (Exception e)
+        {
+            throw new RuntimeException(e);
+        }
+    }
+    
     /**
-     * param @ table - name of table for which we are maintaining
-     *                 this commit log.
-     * param @ recoverymode - is commit log being instantiated in
-     *                        in recovery mode.
-    */
-    private CommitLog()
+     * Dump the inter arrival times for examination if necessary.
+     */
+    public void dumpInterArrivalTimes()
     {
         try
         {
-            DatabaseDescriptor.createAllDirectories();
-            segmentSize = DatabaseDescriptor.getCommitLogSegmentSize();
+            FileOutputStream fos = new FileOutputStream("/var/tmp/output-" + System.currentTimeMillis() + ".dat", true);
+            fos.write(toString().getBytes());
+            fos.close();
         }
         catch (IOException e)
         {
             throw new IOError(e);
         }
-
-        // all old segments are recovered and deleted before CommitLog is instantiated.
-        // All we need to do is create a new one.
-        segments.add(new CommitLogSegment());
-
-        executor = DatabaseDescriptor.getCommitLogSync() == Config.CommitLogSync.batch
-                 ? new BatchCommitLogExecutorService()
-                 : new PeriodicCommitLogExecutorService(this);
     }
-
-    public void resetUnsafe()
+    
+    /**
+     * We dump the arrival window for any endpoint only if the 
+     * local Failure Detector module has been up for more than a 
+     * minute.
+     * 
+     * @param ep for which the arrival window needs to be dumped.
+     */
+    private void dumpInterArrivalTimes(InetAddress ep)
     {
-        segments.clear();
-        segments.add(new CommitLogSegment());
-    }
-
-    private boolean manages(String name)
-    {
-        for (CommitLogSegment segment : segments)
+        long now = System.currentTimeMillis();
+        if ( (now - FailureDetector.creationTime_) <= FailureDetector.uptimeThreshold_ )
+            return;
+        try
         {
-            if (segment.getPath().endsWith(name))
-                return true;
+            FileOutputStream fos = new FileOutputStream("/var/tmp/output-" + System.currentTimeMillis() + "-" + ep + ".dat", true);
+            ArrivalWindow hWnd = arrivalSamples_.get(ep);
+            fos.write(hWnd.toString().getBytes());
+            fos.close();
         }
-        return false;
+        catch (IOException e)
+        {
+            throw new IOError(e);
+        }
     }
-
-    public static void recover() throws IOException
+    
+    public boolean isAlive(InetAddress ep)
     {
-        String directory = DatabaseDescriptor.getCommitLogLocation();
-        File[] files = new File(directory).listFiles(new FilenameFilter()
+       /* If the endpoint in question is the local endpoint return true. */
+        InetAddress localHost = FBUtilities.getLocalAddress();
+        if (localHost.equals(ep))
+            return true;
+
+    	/* Incoming port is assumed to be the Storage port. We need to change it to the control port */
+        EndPointState epState = Gossiper.instance.getEndPointStateForEndPoint(ep);
+        return epState.isAlive();
+    }
+    
+    public void report(InetAddress ep)
+    {
+        if (logger_.isTraceEnabled())
+            logger_.trace("reporting {}", ep);
+        long now = System.currentTimeMillis();
+        ArrivalWindow heartbeatWindow = arrivalSamples_.get(ep);
+        if ( heartbeatWindow == null )
         {
-            public boolean accept(File dir, String name)
-            {
-                // we used to try to avoid instantiating commitlog (thus creating an empty segment ready for writes)
-                // until after recover was finished.  this turns out to be fragile; it is less error-prone to go
-                // ahead and allow writes before recover(), and just skip active segments when we do.
-                return CommitLogSegment.possibleCommitLogFile(name) && !instance.manages(name);
-            }
-        });
-        if (files.length == 0)
-        {
-            logger.info("No commitlog files found; skipping replay");
+            heartbeatWindow = new ArrivalWindow(sampleSize_);
+            arrivalSamples_.put(ep, heartbeatWindow);
+        }
+        heartbeatWindow.add(now);
+    }
+    
+    public void interpret(InetAddress ep)
+    {
+        ArrivalWindow hbWnd = arrivalSamples_.get(ep);
+        if ( hbWnd == null )
+        {            
             return;
         }
-
-        Arrays.sort(files, new FileUtils.FileComparator());
-        logger.info("Replaying " + StringUtils.join(files, ", "));
-        recover(files);
-        for (File f : files)
-        {
-            FileUtils.delete(CommitLogHeader.getHeaderPathFromSegmentPath(f.getAbsolutePath())); // may not actually exist
-            if (!f.delete())
-                logger.error("Unable to remove " + f + "; you should remove it manually or next restart will replay it again (harmless, but time-consuming)");
-        }
-        logger.info("Log replay complete");
-    }
-
-    public static void recover(File[] clogs) throws IOException
-    {
-        Set<Table> tablesRecovered = new HashSet<Table>();
-        List<Future<?>> futures = new ArrayList<Future<?>>();
-        byte[] bytes = new byte[4096];
-        Map<Integer, AtomicInteger> invalidMutations = new HashMap<Integer, AtomicInteger>();
-
-        for (File file : clogs)
-        {
-            int bufferSize = (int)Math.min(file.length(), 32 * 1024 * 1024);
-            BufferedRandomAccessFile reader = new BufferedRandomAccessFile(new File(file.getAbsolutePath()), "r", bufferSize, true);
-
-            try
-            {
-                CommitLogHeader clHeader = null;
-                int replayPosition = 0;
-                String headerPath = CommitLogHeader.getHeaderPathFromSegmentPath(file.getAbsolutePath());
-                try
-                {
-                    clHeader = CommitLogHeader.readCommitLogHeader(headerPath);
-                    replayPosition = clHeader.getReplayPosition();
-                }
-                catch (IOException ioe)
-                {
-                    logger.info(headerPath + " incomplete, missing or corrupt.  Everything is ok, don't panic.  CommitLog will be replayed from the beginning");
-                    logger.debug("exception was", ioe);
-                }
-                if (replayPosition < 0)
-                {
-                    logger.debug("skipping replay of fully-flushed {}", file);
-                    continue;
-                }
-                reader.seek(replayPosition);
-
-                if (logger.isDebugEnabled())
-                    logger.debug("Replaying " + file + " starting at " + reader.getFilePointer());
-
-                /* read the logs populate RowMutation and apply */
-                while (!reader.isEOF())
-                {
-                    if (logger.isDebugEnabled())
-                        logger.debug("Reading mutation at " + reader.getFilePointer());
-
-                    long claimedCRC32;
-                    Checksum checksum = new CRC32();
-                    int serializedSize;
-                    try
-                    {
-                        // any of the reads may hit EOF
-                        serializedSize = reader.readInt();
-                        // RowMutation must be at LEAST 10 bytes:
-                        // 3 each for a non-empty Table and Key (including the 2-byte length from
-                        // writeUTF/writeWithShortLength) and 4 bytes for column count.
-                        // This prevents CRC by being fooled by special-case garbage in the file; see CASSANDRA-2128
-                        if (serializedSize < 10)
-                            break;
-                        long claimedSizeChecksum = reader.readLong();
-                        checksum.update(serializedSize);
-                        if (checksum.getValue() != claimedSizeChecksum)
-                            break; // entry wasn't synced correctly/fully.  that's ok.
-
-                        if (serializedSize > bytes.length)
-                            bytes = new byte[(int) (1.2 * serializedSize)];
-                        reader.readFully(bytes, 0, serializedSize);
-                        claimedCRC32 = reader.readLong();
-                    }
-                    catch(EOFException eof)
-                    {
-                        break; // last CL entry didn't get completely written.  that's ok.
-                    }
-
-                    checksum.update(bytes, 0, serializedSize);
-                    if (claimedCRC32 != checksum.getValue())
-                    {
-                        // this entry must not have been fsynced.  probably the rest is bad too,
-                        // but just in case there is no harm in trying them (since we still read on an entry boundary)
-                        continue;
-                    }
-
-                    /* deserialize the commit log entry */
-                    ByteArrayInputStream bufIn = new ByteArrayInputStream(bytes, 0, serializedSize);
-                    RowMutation rm = null;
-                    try
-                    {
-                        rm = RowMutation.serializer().deserialize(new DataInputStream(bufIn));
-                    }
-                    catch (UnserializableColumnFamilyException ex)
-                    {
-                        AtomicInteger i = invalidMutations.get(ex.cfId);
-                        if (i == null)
-                        {
-                            i = new AtomicInteger(1);
-                            invalidMutations.put(ex.cfId, i);
-                        }
-                        else
-                            i.incrementAndGet();
-                        continue;
-                    }
-                    
-                    if (logger.isDebugEnabled())
-                        logger.debug(String.format("replaying mutation for %s.%s: %s",
-                                                    rm.getTable(),
-                                                    ByteBufferUtil.bytesToHex(rm.key()),
-                                                    "{" + StringUtils.join(rm.getColumnFamilies(), ", ") + "}"));
-                    final Table table = Table.open(rm.getTable());
-                    tablesRecovered.add(table);
-                    final Collection<ColumnFamily> columnFamilies = new ArrayList<ColumnFamily>(rm.getColumnFamilies());
-                    final long entryLocation = reader.getFilePointer();
-                    final CommitLogHeader finalHeader = clHeader;
-                    final RowMutation frm = rm;
-                    Runnable runnable = new WrappedRunnable()
-                    {
-                        public void runMayThrow() throws IOException
-                        {
-                            RowMutation newRm = new RowMutation(frm.getTable(), frm.key());
-
-                            // Rebuild the row mutation, omitting column families that a) have already been flushed,
-                            // b) are part of a cf that was dropped. Keep in mind that the cf.name() is suspect. do every
-                            // thing based on the cfid instead.
-                            for (ColumnFamily columnFamily : columnFamilies)
-                            {
-                                if (CFMetaData.getCF(columnFamily.id()) == null)
-                                    // null means the cf has been dropped
-                                    continue;
-
-                                if (finalHeader == null || (finalHeader.isDirty(columnFamily.id()) && entryLocation > finalHeader.getPosition(columnFamily.id())))
-                                    newRm.add(columnFamily);
-                            }
-                            if (!newRm.isEmpty())
-                            {
-                                Table.open(newRm.getTable()).apply(newRm, null, false);
-                            }
-                        }
-                    };
-                    futures.add(StageManager.getStage(Stage.MUTATION).submit(runnable));
-                    if (futures.size() > MAX_OUTSTANDING_REPLAY_COUNT)
-                    {
-                        FBUtilities.waitOnFutures(futures);
-                        futures.clear();
-                    }
-                }
-            }
-            finally
-            {
-                FileUtils.closeQuietly(reader);
-                logger.info("Finished reading " + file);
-            }
-        }
+        long now = System.currentTimeMillis();
+        double phi = hbWnd.phi(now);
+        if (logger_.isTraceEnabled())
+            logger_.trace("PHI for " + ep + " : " + phi);
         
-        for (Map.Entry<Integer, AtomicInteger> entry : invalidMutations.entrySet())
-            logger.info(String.format("Skipped %d mutations from unknown (probably removed) CF with id %d", entry.getValue().intValue(), entry.getKey()));
-
-        // wait for all the writes to finish on the mutation stage
-        FBUtilities.waitOnFutures(futures);
-        logger.debug("Finished waiting on mutations from recovery");
-
-        // flush replayed tables
-        futures.clear();
-        for (Table table : tablesRecovered)
-            futures.addAll(table.flush());
-        FBUtilities.waitOnFutures(futures);
+        if ( phi > phiConvictThreshold_ )
+        {     
+            for ( IFailureDetectionEventListener listener : fdEvntListeners_ )
+            {
+                listener.convict(ep);
+            }
+        }        
     }
 
-    private CommitLogSegment currentSegment()
+    public void remove(InetAddress ep)
     {
-        return segments.getLast();
+        arrivalSamples_.remove(ep);
     }
     
-    public CommitLogSegment.CommitLogContext getContext()
+    public void registerFailureDetectionEventListener(IFailureDetectionEventListener listener)
     {
-        Callable<CommitLogSegment.CommitLogContext> task = new Callable<CommitLogSegment.CommitLogContext>()
-        {
-            public CommitLogSegment.CommitLogContext call() throws Exception
-            {
-                return currentSegment().getContext();
-            }
-        };
-        try
-        {
-            return executor.submit(task).get();
-        }
-        catch (InterruptedException e)
-        {
-            throw new RuntimeException(e);
-        }
-        catch (ExecutionException e)
-        {
-            throw new RuntimeException(e);
-        }
-    }
-
-    /*
-     * Adds the specified row to the commit log. This method will reset the
-     * file offset to what it is before the start of the operation in case
-     * of any problems. This way we can assume that the subsequent commit log
-     * entry will override the garbage left over by the previous write.
-    */
-    public void add(RowMutation rowMutation, Object serializedRow) throws IOException
-    {
-        executor.add(new LogRecordAdder(rowMutation, serializedRow));
-    }
-
-    /*
-     * This is called on Memtable flush to add to the commit log
-     * a token indicating that this column family has been flushed.
-     * The bit flag associated with this column family is set in the
-     * header and this is used to decide if the log file can be deleted.
-    */
-    public void discardCompletedSegments(final Integer cfId, final CommitLogSegment.CommitLogContext context) throws IOException
-    {
-        Callable task = new Callable()
-        {
-            public Object call() throws IOException
-            {
-                discardCompletedSegmentsInternal(context, cfId);
-                return null;
-            }
-        };
-        try
-        {
-            executor.submit(task).get();
-        }
-        catch (InterruptedException e)
-        {
-            throw new RuntimeException(e);
-        }
-        catch (ExecutionException e)
-        {
-            throw new RuntimeException(e);
-        }
-    }
-
-    /**
-     * Delete log segments whose contents have been turned into SSTables. NOT threadsafe.
-     *
-     * param @ context The commitLog context .
-     * param @ id id of the columnFamily being flushed to disk.
-     *
-    */
-    private void discardCompletedSegmentsInternal(CommitLogSegment.CommitLogContext context, Integer id) throws IOException
-    {
-        if (logger.isDebugEnabled())
-            logger.debug("discard completed log segments for " + context + ", column family " + id + ".");
-
-        /*
-         * Loop through all the commit log files in the history. Now process
-         * all files that are older than the one in the context. For each of
-         * these files the header needs to modified by resetting the dirty
-         * bit corresponding to the flushed CF.
-        */
-        Iterator<CommitLogSegment> iter = segments.iterator();
-        while (iter.hasNext())
-        {
-            CommitLogSegment segment = iter.next();
-            CommitLogHeader header = segment.getHeader();
-            if (segment.equals(context.getSegment()))
-            {
-                // we can't just mark the segment where the flush happened clean,
-                // since there may have been writes to it between when the flush
-                // started and when it finished. so mark the flush position as
-                // the replay point for this CF, instead.
-                if (logger.isDebugEnabled())
-                    logger.debug("Marking replay position " + context.position + " on commit log " + segment);
-                header.turnOn(id, context.position);
-                segment.writeHeader();
-                break;
-            }
-
-            header.turnOff(id);
-            if (header.isSafeToDelete() && iter.hasNext())
-            {
-                logger.info("Discarding obsolete commit log:" + segment);
-                segment.close();
-                DeletionService.executeDelete(segment.getHeaderPath());
-                DeletionService.executeDelete(segment.getPath());
-                // usually this will be the first (remaining) segment, but not always, if segment A contains
-                // writes to a CF that is unflushed but is followed by segment B whose CFs are all flushed.
-                iter.remove();
-            }
-            else
-            {
-                if (logger.isDebugEnabled())
-                    logger.debug("Not safe to delete commit log " + segment + "; dirty is " + header.dirtyString());
-                segment.writeHeader();
-            }
-        }
+        fdEvntListeners_.add(listener);
     }
     
-    void sync() throws IOException
+    public void unregisterFailureDetectionEventListener(IFailureDetectionEventListener listener)
     {
-        currentSegment().sync();
+        fdEvntListeners_.remove(listener);
     }
-
-    // TODO this should be a Runnable since it doesn't actually return anything, but it's difficult to do that
-    // without breaking the fragile CheaterFutureTask in BatchCLES.
-    class LogRecordAdder implements Callable, Runnable
+    
+    public String toString()
     {
-        final RowMutation rowMutation;
-        final Object serializedRow;
-
-        LogRecordAdder(RowMutation rm, Object serializedRow)
+        StringBuilder sb = new StringBuilder();
+        Set<InetAddress> eps = arrivalSamples_.keySet();
+        
+        sb.append("-----------------------------------------------------------------------");
+        for ( InetAddress ep : eps )
         {
-            this.rowMutation = rm;
-            this.serializedRow = serializedRow;
+            ArrivalWindow hWnd = arrivalSamples_.get(ep);
+            sb.append(ep + " : ");
+            sb.append(hWnd.toString());
+            sb.append( System.getProperty("line.separator") );
         }
-
-        public void run()
-        {
-            try
-            {
-                currentSegment().write(rowMutation, serializedRow);
-                // roll log if necessary
-                if (currentSegment().length() >= segmentSize)
-                {
-                    sync();
-                    segments.add(new CommitLogSegment());
-                }
-            }
-            catch (IOException e)
-            {
-                throw new IOError(e);
-            }
-        }
-
-        public Object call() throws Exception
-        {
-            run();
-            return null;
-        }
+        sb.append("-----------------------------------------------------------------------");
+        return sb.toString();
     }
+    
+    public static void main(String[] args) throws Throwable
+    {           
+    }
+}
 
-    public void shutdownBlocking() throws InterruptedException
+class ArrivalWindow
+{
+    private static Logger logger_ = LoggerFactory.getLogger(ArrivalWindow.class);
+    private double tLast_ = 0L;
+    private BoundedStatsDeque arrivalIntervals_;
+
+    ArrivalWindow(int size)
     {
-        executor.shutdown();
-        executor.awaitTermination();
+        arrivalIntervals_ = new BoundedStatsDeque(size);
+    }
+    
+    synchronized void add(double value)
+    {
+        double interArrivalTime;
+        if ( tLast_ > 0L )
+        {                        
+            interArrivalTime = (value - tLast_);            
+        }
+        else
+        {
+            interArrivalTime = Gossiper.intervalInMillis_ / 2;
+        }
+        tLast_ = value;            
+        arrivalIntervals_.add(interArrivalTime);        
+    }
+    
+    synchronized double sum()
+    {
+        return arrivalIntervals_.sum();
+    }
+    
+    synchronized double sumOfDeviations()
+    {
+        return arrivalIntervals_.sumOfDeviations();
+    }
+    
+    synchronized double mean()
+    {
+        return arrivalIntervals_.mean();
+    }
+    
+    synchronized double variance()
+    {
+        return arrivalIntervals_.variance();
+    }
+    
+    double stdev()
+    {
+        return arrivalIntervals_.stdev();
+    }
+    
+    void clear()
+    {
+        arrivalIntervals_.clear();
+    }
+    
+    double p(double t)
+    {
+        double mean = mean();
+        double exponent = (-1)*(t)/mean;
+        return 1 - ( 1 - Math.pow(Math.E, exponent) );
+    }
+    
+    double phi(long tnow)
+    {            
+        int size = arrivalIntervals_.size();
+        double log = 0d;
+        if ( size > 0 )
+        {
+            double t = tnow - tLast_;                
+            double probability = p(t);       
+            log = (-1) * Math.log10( probability );                                 
+        }
+        return log;           
+    } 
+    
+    public String toString()
+    {
+        return StringUtils.join(arrivalIntervals_.iterator(), " ");
     }
 }

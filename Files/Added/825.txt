@@ -1,6 +1,6 @@
-ords[bottomSlot] = bottomOrd;
+result.newSegments.changed();
 
-package org.apache.lucene.search;
+package org.apache.lucene.index;
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,1227 +19,1018 @@ package org.apache.lucene.search;
  * limitations under the License.
  */
 
-import java.io.IOException;
-import java.text.Collator;
-import java.util.Locale;
-
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.search.FieldCache.DocTermsIndex;
-import org.apache.lucene.search.FieldCache.DocTerms;
-import org.apache.lucene.search.cache.ByteValuesCreator;
-import org.apache.lucene.search.cache.CachedArray;
-import org.apache.lucene.search.cache.CachedArrayCreator;
-import org.apache.lucene.search.cache.DoubleValuesCreator;
-import org.apache.lucene.search.cache.FloatValuesCreator;
-import org.apache.lucene.search.cache.IntValuesCreator;
-import org.apache.lucene.search.cache.LongValuesCreator;
-import org.apache.lucene.search.cache.ShortValuesCreator;
-import org.apache.lucene.search.cache.CachedArray.ByteValues;
-import org.apache.lucene.search.cache.CachedArray.DoubleValues;
-import org.apache.lucene.search.cache.CachedArray.FloatValues;
-import org.apache.lucene.search.cache.CachedArray.IntValues;
-import org.apache.lucene.search.cache.CachedArray.LongValues;
-import org.apache.lucene.search.cache.CachedArray.ShortValues;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.TermQuery;
+import org.apache.lucene.store.FSDirectory;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.document.AbstractField;  // for javadocs
+import org.apache.lucene.document.Document;
+import org.apache.lucene.index.codecs.CodecProvider;
+import org.apache.lucene.index.codecs.DefaultSegmentInfosWriter;
+import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.packed.Direct8;
-import org.apache.lucene.util.packed.Direct16;
-import org.apache.lucene.util.packed.Direct32;
-import org.apache.lucene.util.packed.PackedInts;
+
+import java.text.NumberFormat;
+import java.io.PrintStream;
+import java.io.IOException;
+import java.io.File;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.List;
+import java.util.ArrayList;
+import java.util.Map;
 
 /**
- * Expert: a FieldComparator compares hits so as to determine their
- * sort order when collecting the top results with {@link
- * TopFieldCollector}.  The concrete public FieldComparator
- * classes here correspond to the SortField types.
+ * Basic tool and API to check the health of an index and
+ * write a new segments file that removes reference to
+ * problematic segments.
+ * 
+ * <p>As this tool checks every byte in the index, on a large
+ * index it can take quite a long time to run.
  *
- * <p>This API is designed to achieve high performance
- * sorting, by exposing a tight interaction with {@link
- * FieldValueHitQueue} as it visits hits.  Whenever a hit is
- * competitive, it's enrolled into a virtual slot, which is
- * an int ranging from 0 to numHits-1.  The {@link
- * FieldComparator} is made aware of segment transitions
- * during searching in case any internal state it's tracking
- * needs to be recomputed during these transitions.</p>
- *
- * <p>A comparator must define these functions:</p>
- *
- * <ul>
- *
- *  <li> {@link #compare} Compare a hit at 'slot a'
- *       with hit 'slot b'.
- *
- *  <li> {@link #setBottom} This method is called by
- *       {@link FieldValueHitQueue} to notify the
- *       FieldComparator of the current weakest ("bottom")
- *       slot.  Note that this slot may not hold the weakest
- *       value according to your comparator, in cases where
- *       your comparator is not the primary one (ie, is only
- *       used to break ties from the comparators before it).
- *
- *  <li> {@link #compareBottom} Compare a new hit (docID)
- *       against the "weakest" (bottom) entry in the queue.
- *
- *  <li> {@link #copy} Installs a new hit into the
- *       priority queue.  The {@link FieldValueHitQueue}
- *       calls this method when a new hit is competitive.
- *
- *  <li> {@link #setNextReader} Invoked
- *       when the search is switching to the next segment.
- *       You may need to update internal state of the
- *       comparator, for example retrieving new values from
- *       the {@link FieldCache}.
- *
- *  <li> {@link #value} Return the sort value stored in
- *       the specified slot.  This is only called at the end
- *       of the search, in order to populate {@link
- *       FieldDoc#fields} when returning the top results.
- * </ul>
- *
- * @lucene.experimental
+ * @lucene.experimental Please make a complete backup of your
+ * index before using this to fix your index!
  */
-public abstract class FieldComparator {
+public class CheckIndex {
+
+  private PrintStream infoStream;
+  private Directory dir;
 
   /**
-   * Compare hit at slot1 with hit at slot2.
-   * 
-   * @param slot1 first slot to compare
-   * @param slot2 second slot to compare
-   * @return any N < 0 if slot2's value is sorted after
-   * slot1, any N > 0 if the slot2's value is sorted before
-   * slot1 and 0 if they are equal
-   */
-  public abstract int compare(int slot1, int slot2);
-
-  /**
-   * Set the bottom slot, ie the "weakest" (sorted last)
-   * entry in the queue.  When {@link #compareBottom} is
-   * called, you should compare against this slot.  This
-   * will always be called before {@link #compareBottom}.
-   * 
-   * @param slot the currently weakest (sorted last) slot in the queue
-   */
-  public abstract void setBottom(final int slot);
-
-  /**
-   * Compare the bottom of the queue with doc.  This will
-   * only invoked after setBottom has been called.  This
-   * should return the same result as {@link
-   * #compare(int,int)}} as if bottom were slot1 and the new
-   * document were slot 2.
-   *    
-   * <p>For a search that hits many results, this method
-   * will be the hotspot (invoked by far the most
-   * frequently).</p>
-   * 
-   * @param doc that was hit
-   * @return any N < 0 if the doc's value is sorted after
-   * the bottom entry (not competitive), any N > 0 if the
-   * doc's value is sorted before the bottom entry and 0 if
-   * they are equal.
-   */
-  public abstract int compareBottom(int doc) throws IOException;
-
-  /**
-   * This method is called when a new hit is competitive.
-   * You should copy any state associated with this document
-   * that will be required for future comparisons, into the
-   * specified slot.
-   * 
-   * @param slot which slot to copy the hit to
-   * @param doc docID relative to current reader
-   */
-  public abstract void copy(int slot, int doc) throws IOException;
-
-  /**
-   * Set a new Reader. All subsequent docIDs are relative to
-   * the current reader (you must add docBase if you need to
-   * map it to a top-level docID).
-   * 
-   * @param reader current reader
-   * @param docBase docBase of this reader 
-   * @return the comparator to use for this segment; most
-   *   comparators can just return "this" to reuse the same
-   *   comparator across segments
-   * @throws IOException
-   * @throws IOException
-   */
-  public abstract FieldComparator setNextReader(IndexReader reader, int docBase) throws IOException;
-
-  /** Sets the Scorer to use in case a document's score is
-   *  needed.
-   * 
-   * @param scorer Scorer instance that you should use to
-   * obtain the current hit's score, if necessary. */
-  public void setScorer(Scorer scorer) {
-    // Empty implementation since most comparators don't need the score. This
-    // can be overridden by those that need it.
-  }
-  
-  /**
-   * Return the actual value in the slot.
+   * Returned from {@link #checkIndex()} detailing the health and status of the index.
    *
-   * @param slot the value
-   * @return value in this slot upgraded to Comparable
-   */
-  public abstract Comparable<?> value(int slot);
+   * @lucene.experimental
+   **/
 
-    
+  public static class Status {
 
-  public static abstract class NumericComparator<T extends CachedArray> extends FieldComparator {
-    protected final CachedArrayCreator<T> creator;
-    protected T cached;
-    protected final boolean checkMissing;
-    
-    public NumericComparator( CachedArrayCreator<T> c, boolean checkMissing ) {
-      this.creator = c;
-      this.checkMissing = checkMissing;
-    }
-  }
+    /** True if no problems were found with the index. */
+    public boolean clean;
 
-  /** Parses field's values as byte (using {@link
-   *  FieldCache#getBytes} and sorts by ascending value */
-  public static final class ByteComparator extends NumericComparator<ByteValues> {
-    private final byte[] values;
-    private final byte missingValue;
-    private byte bottom;
+    /** True if we were unable to locate and load the segments_N file. */
+    public boolean missingSegments;
 
-    ByteComparator(int numHits, ByteValuesCreator creator, Byte missingValue ) {
-      super( creator, missingValue!=null );
-      values = new byte[numHits];
-      this.missingValue = checkMissing
-         ? missingValue.byteValue() : 0;
-    }
+    /** True if we were unable to open the segments_N file. */
+    public boolean cantOpenSegments;
 
-    @Override
-    public int compare(int slot1, int slot2) {
-      return values[slot1] - values[slot2];
-    }
+    /** True if we were unable to read the version number from segments_N file. */
+    public boolean missingSegmentVersion;
 
-    @Override
-    public int compareBottom(int doc) {
-      final byte v2 = (checkMissing && !cached.valid.get(doc)) 
-        ? missingValue : cached.values[doc];
-      return bottom - v2;
-    }
+    /** Name of latest segments_N file in the index. */
+    public String segmentsFileName;
 
-    @Override
-    public void copy(int slot, int doc) {
-      values[slot] = ( checkMissing && cached.valid != null && !cached.valid.get(doc) )
-        ? missingValue : cached.values[doc];
-    }
+    /** Number of segments in the index. */
+    public int numSegments;
 
-    @Override
-    public FieldComparator setNextReader(IndexReader reader, int docBase) throws IOException {
-      cached = FieldCache.DEFAULT.getBytes(reader, creator.field, creator );
-      return this;
-    }
-    
-    @Override
-    public void setBottom(final int bottom) {
-      this.bottom = values[bottom];
-    }
+    /** String description of the version of the index. */
+    public String segmentFormat;
 
-    @Override
-    public Comparable<?> value(int slot) {
-      return Byte.valueOf(values[slot]);
-    }
-  }
-
+    /** Empty unless you passed specific segments list to check as optional 3rd argument.
+     *  @see CheckIndex#checkIndex(List) */
+    public List<String> segmentsChecked = new ArrayList<String>();
   
-  /** Parses field's values as double (using {@link
-   *  FieldCache#getDoubles} and sorts by ascending value */
-  public static final class DoubleComparator extends NumericComparator<DoubleValues> {
-    private final double[] values;
-    private final double missingValue;
-    private double bottom;
+    /** True if the index was created with a newer version of Lucene than the CheckIndex tool. */
+    public boolean toolOutOfDate;
 
+    /** List of {@link SegmentInfoStatus} instances, detailing status of each segment. */
+    public List<SegmentInfoStatus> segmentInfos = new ArrayList<SegmentInfoStatus>();
+  
+    /** Directory index is in. */
+    public Directory dir;
 
-    DoubleComparator(int numHits, DoubleValuesCreator creator, Double missingValue ) {
-      super( creator, missingValue != null );
-      values = new double[numHits];
-      this.missingValue = checkMissing
-        ? missingValue.doubleValue() : 0;
-    }
+    /** 
+     * SegmentInfos instance containing only segments that
+     * had no problems (this is used with the {@link CheckIndex#fixIndex} 
+     * method to repair the index. 
+     */
+    SegmentInfos newSegments;
 
-    @Override
-    public int compare(int slot1, int slot2) {
-      final double v1 = values[slot1];
-      final double v2 = values[slot2];
-      if (v1 > v2) {
-        return 1;
-      } else if (v1 < v2) {
-        return -1;
-      } else {
-        return 0;
-      }
-    }
+    /** How many documents will be lost to bad segments. */
+    public int totLoseDocCount;
 
-    @Override
-    public int compareBottom(int doc) {
-      final double v2 = (checkMissing && !cached.valid.get(doc)) 
-        ? missingValue : cached.values[doc];
-      
-      if (bottom > v2) {
-        return 1;
-      } else if (bottom < v2) {
-        return -1;
-      } else {
-        return 0;
-      }
-    }
+    /** How many bad segments were found. */
+    public int numBadSegments;
 
-    @Override
-    public void copy(int slot, int doc) {
-      values[slot] = ( checkMissing && cached.valid != null && !cached.valid.get(doc) )
-        ? missingValue : cached.values[doc];
-    }
+    /** True if we checked only specific segments ({@link
+     * #checkIndex(List)}) was called with non-null
+     * argument). */
+    public boolean partial;
 
-    @Override
-    public FieldComparator setNextReader(IndexReader reader, int docBase) throws IOException {
-      cached = FieldCache.DEFAULT.getDoubles(reader, creator.field, creator );
-      return this;
-    }
+    /** Holds the userData of the last commit in the index */
+    public Map<String, String> userData;
+
+    /** Holds the status of each segment in the index.
+     *  See {@link #segmentInfos}.
+     *
+     * <p><b>WARNING</b>: this API is new and experimental and is
+     * subject to suddenly change in the next release.
+     */
+    public static class SegmentInfoStatus {
+      /** Name of the segment. */
+      public String name;
+
+      /** CodecInfo used to read this segment. */
+      public SegmentCodecs codec;
+
+      /** Document count (does not take deletions into account). */
+      public int docCount;
+
+      /** True if segment is compound file format. */
+      public boolean compound;
+
+      /** Number of files referenced by this segment. */
+      public int numFiles;
+
+      /** Net size (MB) of the files referenced by this
+       *  segment. */
+      public double sizeMB;
+
+      /** Doc store offset, if this segment shares the doc
+       *  store files (stored fields and term vectors) with
+       *  other segments.  This is -1 if it does not share. */
+      public int docStoreOffset = -1;
     
-    @Override
-    public void setBottom(final int bottom) {
-      this.bottom = values[bottom];
+      /** String of the shared doc store segment, or null if
+       *  this segment does not share the doc store files. */
+      public String docStoreSegment;
+
+      /** True if the shared doc store files are compound file
+       *  format. */
+      public boolean docStoreCompoundFile;
+
+      /** True if this segment has pending deletions. */
+      public boolean hasDeletions;
+
+      /** Name of the current deletions file name. */
+      public String deletionsFileName;
+    
+      /** Number of deleted documents. */
+      public int numDeleted;
+
+      /** True if we were able to open a SegmentReader on this
+       *  segment. */
+      public boolean openReaderPassed;
+
+      /** Number of fields in this segment. */
+      int numFields;
+
+      /** True if at least one of the fields in this segment
+       *  does not omitTermFreqAndPositions.
+       *  @see AbstractField#setOmitTermFreqAndPositions */
+      public boolean hasProx;
+
+      /** Map that includes certain
+       *  debugging details that IndexWriter records into
+       *  each segment it creates */
+      public Map<String,String> diagnostics;
+
+      /** Status for testing of field norms (null if field norms could not be tested). */
+      public FieldNormStatus fieldNormStatus;
+
+      /** Status for testing of indexed terms (null if indexed terms could not be tested). */
+      public TermIndexStatus termIndexStatus;
+
+      /** Status for testing of stored fields (null if stored fields could not be tested). */
+      public StoredFieldStatus storedFieldStatus;
+
+      /** Status for testing of term vectors (null if term vectors could not be tested). */
+      public TermVectorStatus termVectorStatus;
     }
 
-    @Override
-    public Comparable<?> value(int slot) {
-      return Double.valueOf(values[slot]);
+    /**
+     * Status from testing field norms.
+     */
+    public static final class FieldNormStatus {
+      /** Number of fields successfully tested */
+      public long totFields = 0L;
+
+      /** Exception thrown during term index test (null on success) */
+      public Throwable error = null;
+    }
+
+    /**
+     * Status from testing term index.
+     */
+    public static final class TermIndexStatus {
+      /** Total term count */
+      public long termCount = 0L;
+
+      /** Total frequency across all terms. */
+      public long totFreq = 0L;
+      
+      /** Total number of positions. */
+      public long totPos = 0L;
+
+      /** Exception thrown during term index test (null on success) */
+      public Throwable error = null;
+    }
+
+    /**
+     * Status from testing stored fields.
+     */
+    public static final class StoredFieldStatus {
+      
+      /** Number of documents tested. */
+      public int docCount = 0;
+      
+      /** Total number of stored fields tested. */
+      public long totFields = 0;
+      
+      /** Exception thrown during stored fields test (null on success) */
+      public Throwable error = null;
+    }
+
+    /**
+     * Status from testing stored fields.
+     */
+    public static final class TermVectorStatus {
+      
+      /** Number of documents tested. */
+      public int docCount = 0;
+      
+      /** Total number of term vectors tested. */
+      public long totVectors = 0;
+      
+      /** Exception thrown during term vector test (null on success) */
+      public Throwable error = null;
     }
   }
 
-  /** Parses field's values as float (using {@link
-   *  FieldCache#getFloats} and sorts by ascending value */
-  public static final class FloatComparator extends NumericComparator<FloatValues> {
-    private final float[] values;
-    private final float missingValue;
-    private float bottom;
-
-    FloatComparator(int numHits, FloatValuesCreator creator, Float missingValue ) {
-      super( creator, missingValue != null );
-      values = new float[numHits];
-      this.missingValue = checkMissing
-        ? missingValue.floatValue() : 0;
-    }
-    
-    @Override
-    public int compare(int slot1, int slot2) {
-      // TODO: are there sneaky non-branch ways to compute
-      // sign of float?
-      final float v1 = values[slot1];
-      final float v2 = values[slot2];
-      if (v1 > v2) {
-        return 1;
-      } else if (v1 < v2) {
-        return -1;
-      } else {
-        return 0;
-      }
-    }
-
-    @Override
-    public int compareBottom(int doc) {
-      // TODO: are there sneaky non-branch ways to compute sign of float?
-      final float v2 = (checkMissing && !cached.valid.get(doc)) 
-        ? missingValue : cached.values[doc];
-      
-      if (bottom > v2) {
-        return 1;
-      } else if (bottom < v2) {
-        return -1;
-      } else {
-        return 0;
-      }
-    }
-
-    @Override
-    public void copy(int slot, int doc) {
-      values[slot] = ( checkMissing && cached.valid != null && !cached.valid.get(doc) )
-        ? missingValue : cached.values[doc];
-    }
-
-    @Override
-    public FieldComparator setNextReader(IndexReader reader, int docBase) throws IOException {
-      cached = FieldCache.DEFAULT.getFloats(reader, creator.field, creator );
-      return this;
-    }
-    
-    @Override
-    public void setBottom(final int bottom) {
-      this.bottom = values[bottom];
-    }
-
-    @Override
-    public Comparable<?> value(int slot) {
-      return Float.valueOf(values[slot]);
-    }
+  /** Create a new CheckIndex on the directory. */
+  public CheckIndex(Directory dir) {
+    this.dir = dir;
+    infoStream = null;
   }
 
-  /** Parses field's values as int (using {@link
-   *  FieldCache#getInts} and sorts by ascending value */
-  public static final class IntComparator extends NumericComparator<IntValues> {
-    private final int[] values;
-    private int bottom;                           // Value of bottom of queue
-    final int missingValue;
-    
-    IntComparator(int numHits, IntValuesCreator creator, Integer missingValue ) {
-      super( creator, missingValue != null );
-      values = new int[numHits];
-      this.missingValue = checkMissing
-        ? missingValue.intValue() : 0;
+  /** Set infoStream where messages should go.  If null, no
+   *  messages are printed */
+  public void setInfoStream(PrintStream out) {
+    infoStream = out;
+  }
+
+  private void msg(String msg) {
+    if (infoStream != null)
+      infoStream.println(msg);
+  }
+
+  /** Returns a {@link Status} instance detailing
+   *  the state of the index.
+   *
+   *  <p>As this method checks every byte in the index, on a large
+   *  index it can take quite a long time to run.
+   *
+   *  <p><b>WARNING</b>: make sure
+   *  you only call this when the index is not opened by any
+   *  writer. */
+  public Status checkIndex() throws IOException {
+    return checkIndex(null);
+  }
+
+  public Status checkIndex(List<String> onlySegments) throws IOException {
+    return checkIndex(onlySegments, CodecProvider.getDefault());
+  }
+  
+  /** Returns a {@link Status} instance detailing
+   *  the state of the index.
+   * 
+   *  @param onlySegments list of specific segment names to check
+   *
+   *  <p>As this method checks every byte in the specified
+   *  segments, on a large index it can take quite a long
+   *  time to run.
+   *
+   *  <p><b>WARNING</b>: make sure
+   *  you only call this when the index is not opened by any
+   *  writer. */
+  public Status checkIndex(List<String> onlySegments, CodecProvider codecs) throws IOException {
+    NumberFormat nf = NumberFormat.getInstance();
+    SegmentInfos sis = new SegmentInfos(codecs);
+    Status result = new Status();
+    result.dir = dir;
+    try {
+      sis.read(dir, codecs);
+    } catch (Throwable t) {
+      msg("ERROR: could not read any segments file in directory");
+      result.missingSegments = true;
+      if (infoStream != null)
+        t.printStackTrace(infoStream);
+      return result;
     }
+
+    final int numSegments = sis.size();
+    final String segmentsFileName = sis.getCurrentSegmentFileName();
+    IndexInput input = null;
+    try {
+      input = dir.openInput(segmentsFileName);
+    } catch (Throwable t) {
+      msg("ERROR: could not open segments file in directory");
+      if (infoStream != null)
+        t.printStackTrace(infoStream);
+      result.cantOpenSegments = true;
+      return result;
+    }
+    int format = 0;
+    try {
+      format = input.readInt();
+    } catch (Throwable t) {
+      msg("ERROR: could not read segment file version in directory");
+      if (infoStream != null)
+        t.printStackTrace(infoStream);
+      result.missingSegmentVersion = true;
+      return result;
+    } finally {
+      if (input != null)
+        input.close();
+    }
+
+    String sFormat = "";
+    boolean skip = false;
+
+    if (format == DefaultSegmentInfosWriter.FORMAT_DIAGNOSTICS) {
+      sFormat = "FORMAT_DIAGNOSTICS [Lucene 2.9]";
+    } else if (format == DefaultSegmentInfosWriter.FORMAT_4_0) {
+      sFormat = "FORMAT_4_0 [Lucene 4.0]";
+    } else if (format < DefaultSegmentInfosWriter.FORMAT_CURRENT) {
+      sFormat = "int=" + format + " [newer version of Lucene than this tool supports]";
+      skip = true;
+    } else if (format > DefaultSegmentInfosWriter.FORMAT_MINIMUM) {
+      sFormat = "int=" + format + " [older version of Lucene than this tool supports]";
+      skip = true;
+    }
+
+    result.segmentsFileName = segmentsFileName;
+    result.numSegments = numSegments;
+    result.segmentFormat = sFormat;
+    result.userData = sis.getUserData();
+    String userDataString;
+    if (sis.getUserData().size() > 0) {
+      userDataString = " userData=" + sis.getUserData();
+    } else {
+      userDataString = "";
+    }
+
+    msg("Segments file=" + segmentsFileName + " numSegments=" + numSegments + " version=" + sFormat + userDataString);
+
+    if (onlySegments != null) {
+      result.partial = true;
+      if (infoStream != null)
+        infoStream.print("\nChecking only these segments:");
+      for (String s : onlySegments) {
+        if (infoStream != null)
+          infoStream.print(" " + s);
+      }
+      result.segmentsChecked.addAll(onlySegments);
+      msg(":");
+    }
+
+    if (skip) {
+      msg("\nERROR: this index appears to be created by a newer version of Lucene than this tool was compiled on; please re-compile this tool on the matching version of Lucene; exiting");
+      result.toolOutOfDate = true;
+      return result;
+    }
+
+
+    result.newSegments = (SegmentInfos) sis.clone();
+    result.newSegments.clear();
+
+    for(int i=0;i<numSegments;i++) {
+      final SegmentInfo info = sis.info(i);
+      if (onlySegments != null && !onlySegments.contains(info.name))
+        continue;
+      Status.SegmentInfoStatus segInfoStat = new Status.SegmentInfoStatus();
+      result.segmentInfos.add(segInfoStat);
+      msg("  " + (1+i) + " of " + numSegments + ": name=" + info.name + " docCount=" + info.docCount);
+      segInfoStat.name = info.name;
+      segInfoStat.docCount = info.docCount;
+
+      int toLoseDocCount = info.docCount;
+
+      SegmentReader reader = null;
+
+      try {
+        final SegmentCodecs codec = info.getSegmentCodecs();
+        msg("    codec=" + codec);
+        segInfoStat.codec = codec;
+        msg("    compound=" + info.getUseCompoundFile());
+        segInfoStat.compound = info.getUseCompoundFile();
+        msg("    hasProx=" + info.getHasProx());
+        segInfoStat.hasProx = info.getHasProx();
+        msg("    numFiles=" + info.files().size());
+        segInfoStat.numFiles = info.files().size();
+        msg("    size (MB)=" + nf.format(info.sizeInBytes()/(1024.*1024.)));
+        segInfoStat.sizeMB = info.sizeInBytes()/(1024.*1024.);
+        Map<String,String> diagnostics = info.getDiagnostics();
+        segInfoStat.diagnostics = diagnostics;
+        if (diagnostics.size() > 0) {
+          msg("    diagnostics = " + diagnostics);
+        }
+
+        final int docStoreOffset = info.getDocStoreOffset();
+        if (docStoreOffset != -1) {
+          msg("    docStoreOffset=" + docStoreOffset);
+          segInfoStat.docStoreOffset = docStoreOffset;
+          msg("    docStoreSegment=" + info.getDocStoreSegment());
+          segInfoStat.docStoreSegment = info.getDocStoreSegment();
+          msg("    docStoreIsCompoundFile=" + info.getDocStoreIsCompoundFile());
+          segInfoStat.docStoreCompoundFile = info.getDocStoreIsCompoundFile();
+        }
+
+        final String delFileName = info.getDelFileName();
+        if (delFileName == null){
+          msg("    no deletions");
+          segInfoStat.hasDeletions = false;
+        }
+        else{
+          msg("    has deletions [delFileName=" + delFileName + "]");
+          segInfoStat.hasDeletions = true;
+          segInfoStat.deletionsFileName = delFileName;
+        }
+        if (infoStream != null)
+          infoStream.print("    test: open reader.........");
+        reader = SegmentReader.get(true, info, IndexReader.DEFAULT_TERMS_INDEX_DIVISOR);
+
+        segInfoStat.openReaderPassed = true;
+
+        final int numDocs = reader.numDocs();
+        toLoseDocCount = numDocs;
+        if (reader.hasDeletions()) {
+          if (reader.deletedDocs.count() != info.getDelCount()) {
+            throw new RuntimeException("delete count mismatch: info=" + info.getDelCount() + " vs deletedDocs.count()=" + reader.deletedDocs.count());
+          }
+          if (reader.deletedDocs.count() > reader.maxDoc()) {
+            throw new RuntimeException("too many deleted docs: maxDoc()=" + reader.maxDoc() + " vs deletedDocs.count()=" + reader.deletedDocs.count());
+          }
+          if (info.docCount - numDocs != info.getDelCount()){
+            throw new RuntimeException("delete count mismatch: info=" + info.getDelCount() + " vs reader=" + (info.docCount - numDocs));
+          }
+          segInfoStat.numDeleted = info.docCount - numDocs;
+          msg("OK [" + (segInfoStat.numDeleted) + " deleted docs]");
+        } else {
+          if (info.getDelCount() != 0) {
+            throw new RuntimeException("delete count mismatch: info=" + info.getDelCount() + " vs reader=" + (info.docCount - numDocs));
+          }
+          msg("OK");
+        }
+        if (reader.maxDoc() != info.docCount)
+          throw new RuntimeException("SegmentReader.maxDoc() " + reader.maxDoc() + " != SegmentInfos.docCount " + info.docCount);
+
+        // Test getFieldNames()
+        if (infoStream != null) {
+          infoStream.print("    test: fields..............");
+        }         
+        Collection<String> fieldNames = reader.getFieldNames(IndexReader.FieldOption.ALL);
+        msg("OK [" + fieldNames.size() + " fields]");
+        segInfoStat.numFields = fieldNames.size();
         
-    @Override
-    public int compare(int slot1, int slot2) {
-      // TODO: there are sneaky non-branch ways to compute
-      // -1/+1/0 sign
-      // Cannot return values[slot1] - values[slot2] because that
-      // may overflow
-      final int v1 = values[slot1];
-      final int v2 = values[slot2];
-      if (v1 > v2) {
-        return 1;
-      } else if (v1 < v2) {
-        return -1;
-      } else {
-        return 0;
+        // Test Field Norms
+        segInfoStat.fieldNormStatus = testFieldNorms(fieldNames, reader);
+
+        // Test the Term Index
+        segInfoStat.termIndexStatus = testTermIndex(reader);
+
+        // Test Stored Fields
+        segInfoStat.storedFieldStatus = testStoredFields(info, reader, nf);
+
+        // Test Term Vectors
+        segInfoStat.termVectorStatus = testTermVectors(info, reader, nf);
+
+        // Rethrow the first exception we encountered
+        //  This will cause stats for failed segments to be incremented properly
+        if (segInfoStat.fieldNormStatus.error != null) {
+          throw new RuntimeException("Field Norm test failed");
+        } else if (segInfoStat.termIndexStatus.error != null) {
+          throw new RuntimeException("Term Index test failed");
+        } else if (segInfoStat.storedFieldStatus.error != null) {
+          throw new RuntimeException("Stored Field test failed");
+        } else if (segInfoStat.termVectorStatus.error != null) {
+          throw new RuntimeException("Term Vector test failed");
+        }
+
+        msg("");
+
+      } catch (Throwable t) {
+        msg("FAILED");
+        String comment;
+        comment = "fixIndex() would remove reference to this segment";
+        msg("    WARNING: " + comment + "; full exception:");
+        if (infoStream != null)
+          t.printStackTrace(infoStream);
+        msg("");
+        result.totLoseDocCount += toLoseDocCount;
+        result.numBadSegments++;
+        continue;
+      } finally {
+        if (reader != null)
+          reader.close();
       }
+
+      // Keeper
+      result.newSegments.add((SegmentInfo) info.clone());
     }
 
-    @Override
-    public int compareBottom(int doc) {
-      // TODO: there are sneaky non-branch ways to compute
-      // -1/+1/0 sign
-      // Cannot return bottom - values[slot2] because that
-      // may overflow
-      final int v2 = (checkMissing && !cached.valid.get(doc)) 
-        ? missingValue : cached.values[doc];
-      
-      if (bottom > v2) {
-        return 1;
-      } else if (bottom < v2) {
-        return -1;
-      } else {
-        return 0;
-      }
-    }
+    if (0 == result.numBadSegments) {
+      result.clean = true;
+      msg("No problems were detected with this index.\n");
+    } else
+      msg("WARNING: " + result.numBadSegments + " broken segments (containing " + result.totLoseDocCount + " documents) detected");
 
-    @Override
-    public void copy(int slot, int doc) {
-      values[slot] = ( checkMissing && cached.valid != null && !cached.valid.get(doc) )
-        ? missingValue : cached.values[doc];
-    }
-
-    @Override
-    public FieldComparator setNextReader(IndexReader reader, int docBase) throws IOException {
-      cached = FieldCache.DEFAULT.getInts(reader, creator.field, creator);  
-      return this;
-    }
-    
-    @Override
-    public void setBottom(final int bottom) {
-      this.bottom = values[bottom];
-    }
-
-    @Override
-    public Comparable<?> value(int slot) {
-      return Integer.valueOf(values[slot]);
-    }
+    return result;
   }
 
-  /** Parses field's values as long (using {@link
-   *  FieldCache#getLongs} and sorts by ascending value */
-  public static final class LongComparator extends NumericComparator<LongValues> {
-    private final long[] values;
-    private long bottom;
-    private final long missingValue;
+  /**
+   * Test field norms.
+   */
+  private Status.FieldNormStatus testFieldNorms(Collection<String> fieldNames, SegmentReader reader) {
+    final Status.FieldNormStatus status = new Status.FieldNormStatus();
 
-    LongComparator(int numHits, LongValuesCreator creator, Long missingValue ) {
-      super( creator, missingValue != null );
-      values = new long[numHits];
-      this.missingValue = checkMissing
-        ? missingValue.longValue() : 0;
-    }
-    
-    @Override
-    public int compare(int slot1, int slot2) {
-      // TODO: there are sneaky non-branch ways to compute
-      // -1/+1/0 sign
-      final long v1 = values[slot1];
-      final long v2 = values[slot2];
-      if (v1 > v2) {
-        return 1;
-      } else if (v1 < v2) {
-        return -1;
-      } else {
-        return 0;
+    try {
+      // Test Field Norms
+      if (infoStream != null) {
+        infoStream.print("    test: field norms.........");
+      }
+      final byte[] b = new byte[reader.maxDoc()];
+      for (final String fieldName : fieldNames) {
+        if (reader.hasNorms(fieldName)) {
+          reader.norms(fieldName, b, 0);
+          ++status.totFields;
+        }
+      }
+
+      msg("OK [" + status.totFields + " fields]");
+    } catch (Throwable e) {
+      msg("ERROR [" + String.valueOf(e.getMessage()) + "]");
+      status.error = e;
+      if (infoStream != null) {
+        e.printStackTrace(infoStream);
       }
     }
 
-    @Override
-    public int compareBottom(int doc) {
-      // TODO: there are sneaky non-branch ways to compute
-      // -1/+1/0 sign
-      final long v2 = (checkMissing && !cached.valid.get(doc)) 
-        ? missingValue : cached.values[doc];
-      
-      if (bottom > v2) {
-        return 1;
-      } else if (bottom < v2) {
-        return -1;
-      } else {
-        return 0;
-      }
-    }
-
-    @Override
-    public void copy(int slot, int doc) {
-      values[slot] = ( checkMissing && cached.valid != null && !cached.valid.get(doc) )
-        ? missingValue : cached.values[doc];
-    }
-
-    @Override
-    public FieldComparator setNextReader(IndexReader reader, int docBase) throws IOException {
-      cached = FieldCache.DEFAULT.getLongs(reader, creator.field, creator);
-      return this;
-    }
-    
-    @Override
-    public void setBottom(final int bottom) {
-      this.bottom = values[bottom];
-    }
-
-    @Override
-    public Comparable<?> value(int slot) {
-      return Long.valueOf(values[slot]);
-    }
+    return status;
   }
 
-  /** Sorts by descending relevance.  NOTE: if you are
-   *  sorting only by descending relevance and then
-   *  secondarily by ascending docID, performance is faster
-   *  using {@link TopScoreDocCollector} directly (which {@link
-   *  IndexSearcher#search} uses when no {@link Sort} is
-   *  specified). */
-  public static final class RelevanceComparator extends FieldComparator {
-    private final float[] scores;
-    private float bottom;
-    private Scorer scorer;
-    
-    RelevanceComparator(int numHits) {
-      scores = new float[numHits];
-    }
+  /**
+   * Test the term index.
+   */
+  private Status.TermIndexStatus testTermIndex(SegmentReader reader) {
+    final Status.TermIndexStatus status = new Status.TermIndexStatus();
 
-    @Override
-    public int compare(int slot1, int slot2) {
-      final float score1 = scores[slot1];
-      final float score2 = scores[slot2];
-      return score1 > score2 ? -1 : (score1 < score2 ? 1 : 0);
-    }
+    final int maxDoc = reader.maxDoc();
+    final Bits delDocs = reader.getDeletedDocs();
 
-    @Override
-    public int compareBottom(int doc) throws IOException {
-      float score = scorer.score();
-      return bottom > score ? -1 : (bottom < score ? 1 : 0);
-    }
+    final IndexSearcher is = new IndexSearcher(reader);
 
-    @Override
-    public void copy(int slot, int doc) throws IOException {
-      scores[slot] = scorer.score();
-    }
+    try {
 
-    @Override
-    public FieldComparator setNextReader(IndexReader reader, int docBase) {
-      return this;
-    }
-    
-    @Override
-    public void setBottom(final int bottom) {
-      this.bottom = scores[bottom];
-    }
+      if (infoStream != null) {
+        infoStream.print("    test: terms, freq, prox...");
+      }
 
-    @Override
-    public void setScorer(Scorer scorer) {
-      // wrap with a ScoreCachingWrappingScorer so that successive calls to
-      // score() will not incur score computation over and over again.
-      this.scorer = new ScoreCachingWrappingScorer(scorer);
-    }
-    
-    @Override
-    public Comparable<?> value(int slot) {
-      return Float.valueOf(scores[slot]);
-    }
-  }
+      final Fields fields = reader.fields();
+      if (fields == null) {
+        msg("OK [no fields/terms]");
+        return status;
+      }
+     
+      DocsEnum docs = null;
+      DocsAndPositionsEnum postings = null;
 
-  /** Parses field's values as short (using {@link
-   *  FieldCache#getShorts} and sorts by ascending value */
-  public static final class ShortComparator extends NumericComparator<ShortValues> {
-    private final short[] values;
-    private short bottom;
-    private final short missingValue;
-    
-    ShortComparator(int numHits, ShortValuesCreator creator, Short missingValue ) {
-      super( creator, missingValue != null );
-      values = new short[numHits];
-      this.missingValue = checkMissing
-        ? missingValue.shortValue() : 0;
-    }
-
-    @Override
-    public int compare(int slot1, int slot2) {
-      return values[slot1] - values[slot2];
-    }
-
-    @Override
-    public int compareBottom(int doc) {
-      final short v2 = (checkMissing && !cached.valid.get(doc)) 
-        ? missingValue : cached.values[doc];
-      
-      return bottom - v2;
-    }
-
-    @Override
-    public void copy(int slot, int doc) {
-      values[slot] = ( checkMissing && cached.valid != null && !cached.valid.get(doc) )
-        ? missingValue : cached.values[doc];
-    }
-
-    @Override
-    public FieldComparator setNextReader(IndexReader reader, int docBase) throws IOException {
-      cached = FieldCache.DEFAULT.getShorts(reader, creator.field, creator );
-      return this;
-    }
-    
-    @Override
-    public void setBottom(final int bottom) {
-      this.bottom = values[bottom];
-    }
-
-    @Override
-    public Comparable<?> value(int slot) {
-      return Short.valueOf(values[slot]);
-    }
-  }
-
-
-  /** Sorts by ascending docID */
-  public static final class DocComparator extends FieldComparator {
-    private final int[] docIDs;
-    private int docBase;
-    private int bottom;
-
-    DocComparator(int numHits) {
-      docIDs = new int[numHits];
-    }
-
-    @Override
-    public int compare(int slot1, int slot2) {
-      // No overflow risk because docIDs are non-negative
-      return docIDs[slot1] - docIDs[slot2];
-    }
-
-    @Override
-    public int compareBottom(int doc) {
-      // No overflow risk because docIDs are non-negative
-      return bottom - (docBase + doc);
-    }
-
-    @Override
-    public void copy(int slot, int doc) {
-      docIDs[slot] = docBase + doc;
-    }
-
-    @Override
-    public FieldComparator setNextReader(IndexReader reader, int docBase) {
-      // TODO: can we "map" our docIDs to the current
-      // reader? saves having to then subtract on every
-      // compare call
-      this.docBase = docBase;
-      return this;
-    }
-    
-    @Override
-    public void setBottom(final int bottom) {
-      this.bottom = docIDs[bottom];
-    }
-
-    @Override
-    public Comparable<?> value(int slot) {
-      return Integer.valueOf(docIDs[slot]);
-    }
-  }
-  
-  
-  /** Sorts by a field's value using the Collator for a
-   *  given Locale.
-   *
-   * <p><b>WARNING</b>: this is likely very slow; you'll
-   * get much better performance using the
-   * CollationKeyAnalyzer or ICUCollationKeyAnalyzer. */
-  public static final class StringComparatorLocale extends FieldComparator {
-
-    private final String[] values;
-    private DocTerms currentDocTerms;
-    private final String field;
-    final Collator collator;
-    private String bottom;
-    private final BytesRef tempBR = new BytesRef();
-
-    StringComparatorLocale(int numHits, String field, Locale locale) {
-      values = new String[numHits];
-      this.field = field;
-      collator = Collator.getInstance(locale);
-    }
-
-    @Override
-    public int compare(int slot1, int slot2) {
-      final String val1 = values[slot1];
-      final String val2 = values[slot2];
-      if (val1 == null) {
-        if (val2 == null) {
-          return 0;
+      final FieldsEnum fieldsEnum = fields.iterator();
+      while(true) {
+        final String field = fieldsEnum.next();
+        if (field == null) {
+          break;
         }
-        return -1;
-      } else if (val2 == null) {
-        return 1;
-      }
-      return collator.compare(val1, val2);
-    }
+        
+        final TermsEnum terms = fieldsEnum.terms();
+        assert terms != null;
+        boolean hasOrd = true;
+        final long termCountStart = status.termCount;
 
-    @Override
-    public int compareBottom(int doc) {
-      final String val2 = currentDocTerms.getTerm(doc, tempBR).utf8ToString();
-      if (bottom == null) {
-        if (val2 == null) {
-          return 0;
-        }
-        return -1;
-      } else if (val2 == null) {
-        return 1;
-      }
-      return collator.compare(bottom, val2);
-    }
+        BytesRef lastTerm = null;
 
-    @Override
-    public void copy(int slot, int doc) {
-      final BytesRef br = currentDocTerms.getTerm(doc, tempBR);
-      if (br == null) {
-        values[slot] = null;
-      } else {
-        values[slot] = br.utf8ToString();
-      }
-    }
+        Comparator<BytesRef> termComp = terms.getComparator();
 
-    @Override
-    public FieldComparator setNextReader(IndexReader reader, int docBase) throws IOException {
-      currentDocTerms = FieldCache.DEFAULT.getTerms(reader, field);
-      return this;
-    }
-    
-    @Override
-    public void setBottom(final int bottom) {
-      this.bottom = values[bottom];
-    }
+        while(true) {
 
-    @Override
-    public Comparable<?> value(int slot) {
-      final String s = values[slot];
-      return s == null ? null : new BytesRef(values[slot]);
-    }
-  }
-
-  /** Sorts by field's natural Term sort order, using
-   *  ordinals.  This is functionally equivalent to {@link
-   *  TermValComparator}, but it first resolves the string
-   *  to their relative ordinal positions (using the index
-   *  returned by {@link FieldCache#getTermsIndex}), and
-   *  does most comparisons using the ordinals.  For medium
-   *  to large results, this comparator will be much faster
-   *  than {@link TermValComparator}.  For very small
-   *  result sets it may be slower. */
-  public static final class TermOrdValComparator extends FieldComparator {
-
-    private final int[] ords;
-    private final BytesRef[] values;
-    private final int[] readerGen;
-
-    private int currentReaderGen = -1;
-    private DocTermsIndex termsIndex;
-    private final String field;
-
-    private int bottomSlot = -1;
-    private int bottomOrd;
-    private boolean bottomSameReader;
-    private BytesRef bottomValue;
-    private final BytesRef tempBR = new BytesRef();
-
-    public TermOrdValComparator(int numHits, String field, int sortPos, boolean reversed) {
-      ords = new int[numHits];
-      values = new BytesRef[numHits];
-      readerGen = new int[numHits];
-      this.field = field;
-    }
-
-    @Override
-    public int compare(int slot1, int slot2) {
-      if (readerGen[slot1] == readerGen[slot2]) {
-        return ords[slot1] - ords[slot2];
-      }
-
-      final BytesRef val1 = values[slot1];
-      final BytesRef val2 = values[slot2];
-      if (val1 == null) {
-        if (val2 == null) {
-          return 0;
-        }
-        return -1;
-      } else if (val2 == null) {
-        return 1;
-      }
-      return val1.compareTo(val2);
-    }
-
-    @Override
-    public int compareBottom(int doc) {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public void copy(int slot, int doc) {
-      throw new UnsupportedOperationException();
-    }
-
-    // Base class for specialized (per bit width of the
-    // ords) per-segment comparator.  NOTE: this is messy;
-    // we do this only because hotspot can't reliably inline
-    // the underlying array access when looking up doc->ord
-    private abstract class PerSegmentComparator extends FieldComparator {
-      
-      @Override
-      public FieldComparator setNextReader(IndexReader reader, int docBase) throws IOException {
-        return TermOrdValComparator.this.setNextReader(reader, docBase);
-      }
-
-      @Override
-      public int compare(int slot1, int slot2) {
-        return TermOrdValComparator.this.compare(slot1, slot2);
-      }
-
-      @Override
-      public void setBottom(final int bottom) {
-        TermOrdValComparator.this.setBottom(bottom);
-      }
-
-      @Override
-      public Comparable<?> value(int slot) {
-        return TermOrdValComparator.this.value(slot);
-      }
-    }
-
-    // Used per-segment when bit width of doc->ord is 8:
-    private final class ByteOrdComparator extends PerSegmentComparator {
-      private final byte[] readerOrds;
-      private final DocTermsIndex termsIndex;
-      private final int docBase;
-
-      public ByteOrdComparator(byte[] readerOrds, DocTermsIndex termsIndex, int docBase) {
-        this.readerOrds = readerOrds;
-        this.termsIndex = termsIndex;
-        this.docBase = docBase;
-      }
-
-      @Override
-      public int compareBottom(int doc) {
-        assert bottomSlot != -1;
-        if (bottomSameReader) {
-          // ord is precisely comparable, even in the equal case
-          return bottomOrd - (readerOrds[doc]&0xFF);
-        } else {
-          // ord is only approx comparable: if they are not
-          // equal, we can use that; if they are equal, we
-          // must fallback to compare by value
-          final int order = readerOrds[doc]&0xFF;
-          final int cmp = bottomOrd - order;
-          if (cmp != 0) {
-            return cmp;
+          final BytesRef term = terms.next();
+          if (term == null) {
+            break;
           }
 
-          if (bottomValue == null) {
-            if (order == 0) {
-              // unset
-              return 0;
-            }
-            // bottom wins
-            return -1;
-          } else if (order == 0) {
-            // doc wins
-            return 1;
-          }
-          termsIndex.lookup(order, tempBR);
-          return bottomValue.compareTo(tempBR);
-        }
-      }
-
-      @Override
-      public void copy(int slot, int doc) {
-        final int ord = readerOrds[doc]&0xFF;
-        ords[slot] = ord;
-        if (ord == 0) {
-          values[slot] = null;
-        } else {
-          assert ord > 0;
-          if (values[slot] == null) {
-            values[slot] = new BytesRef();
-          }
-          termsIndex.lookup(ord, values[slot]);
-        }
-        readerGen[slot] = currentReaderGen;
-      }
-    }
-
-    // Used per-segment when bit width of doc->ord is 16:
-    private final class ShortOrdComparator extends PerSegmentComparator {
-      private final short[] readerOrds;
-      private final DocTermsIndex termsIndex;
-      private final int docBase;
-
-      public ShortOrdComparator(short[] readerOrds, DocTermsIndex termsIndex, int docBase) {
-        this.readerOrds = readerOrds;
-        this.termsIndex = termsIndex;
-        this.docBase = docBase;
-      }
-
-      @Override
-      public int compareBottom(int doc) {
-        assert bottomSlot != -1;
-        if (bottomSameReader) {
-          // ord is precisely comparable, even in the equal case
-          return bottomOrd - (readerOrds[doc]&0xFFFF);
-        } else {
-          // ord is only approx comparable: if they are not
-          // equal, we can use that; if they are equal, we
-          // must fallback to compare by value
-          final int order = readerOrds[doc]&0xFFFF;
-          final int cmp = bottomOrd - order;
-          if (cmp != 0) {
-            return cmp;
-          }
-
-          if (bottomValue == null) {
-            if (order == 0) {
-              // unset
-              return 0;
-            }
-            // bottom wins
-            return -1;
-          } else if (order == 0) {
-            // doc wins
-            return 1;
-          }
-          termsIndex.lookup(order, tempBR);
-          return bottomValue.compareTo(tempBR);
-        }
-      }
-
-      @Override
-      public void copy(int slot, int doc) {
-        final int ord = readerOrds[doc]&0xFFFF;
-        ords[slot] = ord;
-        if (ord == 0) {
-          values[slot] = null;
-        } else {
-          assert ord > 0;
-          if (values[slot] == null) {
-            values[slot] = new BytesRef();
-          }
-          termsIndex.lookup(ord, values[slot]);
-        }
-        readerGen[slot] = currentReaderGen;
-      }
-    }
-
-    // Used per-segment when bit width of doc->ord is 32:
-    private final class IntOrdComparator extends PerSegmentComparator {
-      private final int[] readerOrds;
-      private final DocTermsIndex termsIndex;
-      private final int docBase;
-
-      public IntOrdComparator(int[] readerOrds, DocTermsIndex termsIndex, int docBase) {
-        this.readerOrds = readerOrds;
-        this.termsIndex = termsIndex;
-        this.docBase = docBase;
-      }
-
-      @Override
-      public int compareBottom(int doc) {
-        assert bottomSlot != -1;
-        if (bottomSameReader) {
-          // ord is precisely comparable, even in the equal case
-          return bottomOrd - readerOrds[doc];
-        } else {
-          // ord is only approx comparable: if they are not
-          // equal, we can use that; if they are equal, we
-          // must fallback to compare by value
-          final int order = readerOrds[doc];
-          final int cmp = bottomOrd - order;
-          if (cmp != 0) {
-            return cmp;
-          }
-
-          if (bottomValue == null) {
-            if (order == 0) {
-              // unset
-              return 0;
-            }
-            // bottom wins
-            return -1;
-          } else if (order == 0) {
-            // doc wins
-            return 1;
-          }
-          termsIndex.lookup(order, tempBR);
-          return bottomValue.compareTo(tempBR);
-        }
-      }
-
-      @Override
-      public void copy(int slot, int doc) {
-        final int ord = readerOrds[doc];
-        ords[slot] = ord;
-        if (ord == 0) {
-          values[slot] = null;
-        } else {
-          assert ord > 0;
-          if (values[slot] == null) {
-            values[slot] = new BytesRef();
-          }
-          termsIndex.lookup(ord, values[slot]);
-        }
-        readerGen[slot] = currentReaderGen;
-      }
-    }
-
-    // Used per-segment when bit width is not a native array
-    // size (8, 16, 32):
-    private final class AnyOrdComparator extends PerSegmentComparator {
-      private final PackedInts.Reader readerOrds;
-      private final DocTermsIndex termsIndex;
-      private final int docBase;
-
-      public AnyOrdComparator(PackedInts.Reader readerOrds, DocTermsIndex termsIndex, int docBase) {
-        this.readerOrds = readerOrds;
-        this.termsIndex = termsIndex;
-        this.docBase = docBase;
-      }
-
-      @Override
-      public int compareBottom(int doc) {
-        assert bottomSlot != -1;
-        if (bottomSameReader) {
-          // ord is precisely comparable, even in the equal case
-          return bottomOrd - (int) readerOrds.get(doc);
-        } else {
-          // ord is only approx comparable: if they are not
-          // equal, we can use that; if they are equal, we
-          // must fallback to compare by value
-          final int order = (int) readerOrds.get(doc);
-          final int cmp = bottomOrd - order;
-          if (cmp != 0) {
-            return cmp;
-          }
-
-          if (bottomValue == null) {
-            if (order == 0) {
-              // unset
-              return 0;
-            }
-            // bottom wins
-            return -1;
-          } else if (order == 0) {
-            // doc wins
-            return 1;
-          }
-          termsIndex.lookup(order, tempBR);
-          return bottomValue.compareTo(tempBR);
-        }
-      }
-
-      @Override
-      public void copy(int slot, int doc) {
-        final int ord = (int) readerOrds.get(doc);
-        ords[slot] = ord;
-        if (ord == 0) {
-          values[slot] = null;
-        } else {
-          assert ord > 0;
-          if (values[slot] == null) {
-            values[slot] = new BytesRef();
-          }
-          termsIndex.lookup(ord, values[slot]);
-        }
-        readerGen[slot] = currentReaderGen;
-      }
-    }
-
-    @Override
-    public FieldComparator setNextReader(IndexReader reader, int docBase) throws IOException {
-      termsIndex = FieldCache.DEFAULT.getTermsIndex(reader, field);
-      final PackedInts.Reader docToOrd = termsIndex.getDocToOrd();
-      FieldComparator perSegComp;
-      if (docToOrd instanceof Direct8) {
-        perSegComp = new ByteOrdComparator(((Direct8) docToOrd).getArray(), termsIndex, docBase);
-      } else if (docToOrd instanceof Direct16) {
-        perSegComp = new ShortOrdComparator(((Direct16) docToOrd).getArray(), termsIndex, docBase);
-      } else if (docToOrd instanceof Direct32) {
-        perSegComp = new IntOrdComparator(((Direct32) docToOrd).getArray(), termsIndex, docBase);
-      } else {
-        perSegComp = new AnyOrdComparator(docToOrd, termsIndex, docBase);
-      }
-
-      currentReaderGen++;
-      if (bottomSlot != -1) {
-        perSegComp.setBottom(bottomSlot);
-      }
-
-      return perSegComp;
-    }
-    
-    @Override
-    public void setBottom(final int bottom) {
-      bottomSlot = bottom;
-
-      bottomValue = values[bottomSlot];
-      if (currentReaderGen == readerGen[bottomSlot]) {
-        bottomOrd = ords[bottomSlot];
-        bottomSameReader = true;
-      } else {
-        if (bottomValue == null) {
-          // 0 ord is null for all segments
-          assert ords[bottomSlot] == 0;
-          bottomOrd = 0;
-          bottomSameReader = true;
-          readerGen[bottomSlot] = currentReaderGen;
-        } else {
-          final int index = binarySearch(tempBR, termsIndex, bottomValue);
-          if (index < 0) {
-            bottomOrd = -index - 2;
-            bottomSameReader = false;
+          // make sure terms arrive in order according to
+          // the comp
+          if (lastTerm == null) {
+            lastTerm = new BytesRef(term);
           } else {
-            bottomOrd = index;
-            // exact value match
-            bottomSameReader = true;
+            if (termComp.compare(lastTerm, term) >= 0) {
+              throw new RuntimeException("terms out of order: lastTerm=" + lastTerm + " term=" + term);
+            }
+            lastTerm.copy(term);
+          }
+
+          final int docFreq = terms.docFreq();
+          status.totFreq += docFreq;
+
+          docs = terms.docs(delDocs, docs);
+          postings = terms.docsAndPositions(delDocs, postings);
+
+          if (hasOrd) {
+            long ord = -1;
+            try {
+              ord = terms.ord();
+            } catch (UnsupportedOperationException uoe) {
+              hasOrd = false;
+            }
+
+            if (hasOrd) {
+              final long ordExpected = status.termCount - termCountStart;
+              if (ord != ordExpected) {
+                throw new RuntimeException("ord mismatch: TermsEnum has ord=" + ord + " vs actual=" + ordExpected);
+              }
+            }
+          }
+
+          status.termCount++;
+
+          final DocsEnum docs2;
+          if (postings != null) {
+            docs2 = postings;
+          } else {
+            docs2 = docs;
+          }
+
+          int lastDoc = -1;
+          while(true) {
+            final int doc = docs2.nextDoc();
+            if (doc == DocIdSetIterator.NO_MORE_DOCS) {
+              break;
+            }
+            final int freq = docs2.freq();
+            status.totPos += freq;
+
+            if (doc <= lastDoc) {
+              throw new RuntimeException("term " + term + ": doc " + doc + " <= lastDoc " + lastDoc);
+            }
+            if (doc >= maxDoc) {
+              throw new RuntimeException("term " + term + ": doc " + doc + " >= maxDoc " + maxDoc);
+            }
+
+            lastDoc = doc;
+            if (freq <= 0) {
+              throw new RuntimeException("term " + term + ": doc " + doc + ": freq " + freq + " is out of bounds");
+            }
+            
+            int lastPos = -1;
+            if (postings != null) {
+              for(int j=0;j<freq;j++) {
+                final int pos = postings.nextPosition();
+                if (pos < -1) {
+                  throw new RuntimeException("term " + term + ": doc " + doc + ": pos " + pos + " is out of bounds");
+                }
+                if (pos < lastPos) {
+                  throw new RuntimeException("term " + term + ": doc " + doc + ": pos " + pos + " < lastPos " + lastPos);
+                }
+                lastPos = pos;
+                if (postings.hasPayload()) {
+                  postings.getPayload();
+                }
+              }
+            }
+          }
+
+          // Now count how many deleted docs occurred in
+          // this term:
+
+          if (reader.hasDeletions()) {
+            final DocsEnum docsNoDel = terms.docs(null, docs);
+            int count = 0;
+            while(docsNoDel.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
+              count++;
+            }
+            if (count != docFreq) {
+              throw new RuntimeException("term " + term + " docFreq=" + docFreq + " != tot docs w/o deletions " + count);
+            }
+          }
+        }
+
+        // Test seek to last term:
+        if (lastTerm != null) {
+          if (terms.seek(lastTerm) != TermsEnum.SeekStatus.FOUND) {
+            throw new RuntimeException("seek to last term " + lastTerm + " failed");
+          }
+
+          is.search(new TermQuery(new Term(field, lastTerm)), 1);
+        }
+
+        // Test seeking by ord
+        if (hasOrd && status.termCount-termCountStart > 0) {
+          long termCount;
+          try {
+            termCount = fields.terms(field).getUniqueTermCount();
+          } catch (UnsupportedOperationException uoe) {
+            termCount = -1;
+          }
+
+          if (termCount != -1 && termCount != status.termCount - termCountStart) {
+            throw new RuntimeException("termCount mismatch " + termCount + " vs " + (status.termCount - termCountStart));
+          }
+
+          int seekCount = (int) Math.min(10000L, termCount);
+          if (seekCount > 0) {
+            BytesRef[] seekTerms = new BytesRef[seekCount];
+            
+            // Seek by ord
+            for(int i=seekCount-1;i>=0;i--) {
+              long ord = i*(termCount/seekCount);
+              terms.seek(ord);
+              seekTerms[i] = new BytesRef(terms.term());
+            }
+
+            // Seek by term
+            long totDocCount = 0;
+            for(int i=seekCount-1;i>=0;i--) {
+              if (terms.seek(seekTerms[i]) != TermsEnum.SeekStatus.FOUND) {
+                throw new RuntimeException("seek to existing term " + seekTerms[i] + " failed");
+              }
+              
+              docs = terms.docs(delDocs, docs);
+              if (docs == null) {
+                throw new RuntimeException("null DocsEnum from to existing term " + seekTerms[i]);
+              }
+
+              while(docs.nextDoc() != DocsEnum.NO_MORE_DOCS) {
+                totDocCount++;
+              }
+            }
+
+            // TermQuery
+            long totDocCount2 = 0;
+            for(int i=0;i<seekCount;i++) {
+              totDocCount2 += is.search(new TermQuery(new Term(field, seekTerms[i])), 1).totalHits;
+            }
+
+            if (totDocCount != totDocCount2) {
+              throw new RuntimeException("search to seek terms produced wrong number of hits: " + totDocCount + " vs " + totDocCount2);
+            }
           }
         }
       }
-      if (bottomSameReader) {
-        readerGen[bottomSlot] = currentReaderGen;
+
+      msg("OK [" + status.termCount + " terms; " + status.totFreq + " terms/docs pairs; " + status.totPos + " tokens]");
+
+    } catch (Throwable e) {
+      msg("ERROR [" + String.valueOf(e.getMessage()) + "]");
+      status.error = e;
+      if (infoStream != null) {
+        e.printStackTrace(infoStream);
       }
     }
 
-    @Override
-    public Comparable<?> value(int slot) {
-      return values[slot];
+    return status;
+  }
+  
+  /**
+   * Test stored fields for a segment.
+   */
+  private Status.StoredFieldStatus testStoredFields(SegmentInfo info, SegmentReader reader, NumberFormat format) {
+    final Status.StoredFieldStatus status = new Status.StoredFieldStatus();
+
+    try {
+      if (infoStream != null) {
+        infoStream.print("    test: stored fields.......");
+      }
+
+      // Scan stored fields for all documents
+      final Bits delDocs = reader.getDeletedDocs();
+      for (int j = 0; j < info.docCount; ++j) {
+        if (delDocs == null || !delDocs.get(j)) {
+          status.docCount++;
+          Document doc = reader.document(j);
+          status.totFields += doc.getFields().size();
+        }
+      }      
+
+      // Validate docCount
+      if (status.docCount != reader.numDocs()) {
+        throw new RuntimeException("docCount=" + status.docCount + " but saw " + status.docCount + " undeleted docs");
+      }
+
+      msg("OK [" + status.totFields + " total field count; avg " + 
+          format.format((((float) status.totFields)/status.docCount)) + " fields per doc]");      
+    } catch (Throwable e) {
+      msg("ERROR [" + String.valueOf(e.getMessage()) + "]");
+      status.error = e;
+      if (infoStream != null) {
+        e.printStackTrace(infoStream);
+      }
     }
+
+    return status;
   }
 
-  /** Sorts by field's natural Term sort order.  All
-   *  comparisons are done using BytesRef.compareTo, which is
-   *  slow for medium to large result sets but possibly
-   *  very fast for very small results sets. */
-  public static final class TermValComparator extends FieldComparator {
+  /**
+   * Test term vectors for a segment.
+   */
+  private Status.TermVectorStatus testTermVectors(SegmentInfo info, SegmentReader reader, NumberFormat format) {
+    final Status.TermVectorStatus status = new Status.TermVectorStatus();
+    
+    try {
+      if (infoStream != null) {
+        infoStream.print("    test: term vectors........");
+      }
 
-    private BytesRef[] values;
-    private DocTerms docTerms;
-    private final String field;
-    private BytesRef bottom;
-    private final BytesRef tempBR = new BytesRef();
-
-    TermValComparator(int numHits, String field) {
-      values = new BytesRef[numHits];
-      this.field = field;
-    }
-
-    @Override
-    public int compare(int slot1, int slot2) {
-      final BytesRef val1 = values[slot1];
-      final BytesRef val2 = values[slot2];
-      if (val1 == null) {
-        if (val2 == null) {
-          return 0;
+      final Bits delDocs = reader.getDeletedDocs();
+      for (int j = 0; j < info.docCount; ++j) {
+        if (delDocs == null || !delDocs.get(j)) {
+          status.docCount++;
+          TermFreqVector[] tfv = reader.getTermFreqVectors(j);
+          if (tfv != null) {
+            status.totVectors += tfv.length;
+          }
         }
-        return -1;
-      } else if (val2 == null) {
-        return 1;
       }
-
-      return val1.compareTo(val2);
-    }
-
-    @Override
-    public int compareBottom(int doc) {
-      BytesRef val2 = docTerms.getTerm(doc, tempBR);
-      if (bottom == null) {
-        if (val2 == null) {
-          return 0;
-        }
-        return -1;
-      } else if (val2 == null) {
-        return 1;
+      
+      msg("OK [" + status.totVectors + " total vector count; avg " + 
+          format.format((((float) status.totVectors) / status.docCount)) + " term/freq vector fields per doc]");
+    } catch (Throwable e) {
+      msg("ERROR [" + String.valueOf(e.getMessage()) + "]");
+      status.error = e;
+      if (infoStream != null) {
+        e.printStackTrace(infoStream);
       }
-      return bottom.compareTo(val2);
-    }
-
-    @Override
-    public void copy(int slot, int doc) {
-      if (values[slot] == null) {
-        values[slot] = new BytesRef();
-      }
-      docTerms.getTerm(doc, values[slot]);
-    }
-
-    @Override
-    public FieldComparator setNextReader(IndexReader reader, int docBase) throws IOException {
-      docTerms = FieldCache.DEFAULT.getTerms(reader, field);
-      return this;
     }
     
-    @Override
-    public void setBottom(final int bottom) {
-      this.bottom = values[bottom];
-    }
-
-    @Override
-    public Comparable<?> value(int slot) {
-      return values[slot];
-    }
+    return status;
   }
 
-  final protected static int binarySearch(BytesRef br, DocTermsIndex a, BytesRef key) {
-    return binarySearch(br, a, key, 1, a.numOrd()-1);
+  /** Repairs the index using previously returned result
+   *  from {@link #checkIndex}.  Note that this does not
+   *  remove any of the unreferenced files after it's done;
+   *  you must separately open an {@link IndexWriter}, which
+   *  deletes unreferenced files when it's created.
+   *
+   * <p><b>WARNING</b>: this writes a
+   *  new segments file into the index, effectively removing
+   *  all documents in broken segments from the index.
+   *  BE CAREFUL.
+   *
+   * <p><b>WARNING</b>: Make sure you only call this when the
+   *  index is not opened  by any writer. */
+  public void fixIndex(Status result) throws IOException {
+    if (result.partial)
+      throw new IllegalArgumentException("can only fix an index that was fully checked (this status checked a subset of segments)");
+    result.newSegments.commit(result.dir);
   }
 
-  final protected static int binarySearch(BytesRef br, DocTermsIndex a, BytesRef key, int low, int high) {
+  private static boolean assertsOn;
 
-    while (low <= high) {
-      int mid = (low + high) >>> 1;
-      BytesRef midVal = a.lookup(mid, br);
-      int cmp;
-      if (midVal != null) {
-        cmp = midVal.compareTo(key);
+  private static boolean testAsserts() {
+    assertsOn = true;
+    return true;
+  }
+
+  private static boolean assertsOn() {
+    assert testAsserts();
+    return assertsOn;
+  }
+
+  /** Command-line interface to check and fix an index.
+
+    <p>
+    Run it like this:
+    <pre>
+    java -ea:org.apache.lucene... org.apache.lucene.index.CheckIndex pathToIndex [-fix] [-segment X] [-segment Y]
+    </pre>
+    <ul>
+    <li><code>-fix</code>: actually write a new segments_N file, removing any problematic segments
+
+    <li><code>-segment X</code>: only check the specified
+    segment(s).  This can be specified multiple times,
+    to check more than one segment, eg <code>-segment _2
+    -segment _a</code>.  You can't use this with the -fix
+    option.
+    </ul>
+
+    <p><b>WARNING</b>: <code>-fix</code> should only be used on an emergency basis as it will cause
+                       documents (perhaps many) to be permanently removed from the index.  Always make
+                       a backup copy of your index before running this!  Do not run this tool on an index
+                       that is actively being written to.  You have been warned!
+
+    <p>                Run without -fix, this tool will open the index, report version information
+                       and report any exceptions it hits and what action it would take if -fix were
+                       specified.  With -fix, this tool will remove any segments that have issues and
+                       write a new segments_N file.  This means all documents contained in the affected
+                       segments will be removed.
+
+    <p>
+                       This tool exits with exit code 1 if the index cannot be opened or has any
+                       corruption, else 0.
+   */
+  public static void main(String[] args) throws IOException, InterruptedException {
+
+    boolean doFix = false;
+    List<String> onlySegments = new ArrayList<String>();
+    String indexPath = null;
+    int i = 0;
+    while(i < args.length) {
+      if (args[i].equals("-fix")) {
+        doFix = true;
+        i++;
+      } else if (args[i].equals("-segment")) {
+        if (i == args.length-1) {
+          System.out.println("ERROR: missing name for -segment option");
+          System.exit(1);
+        }
+        onlySegments.add(args[i+1]);
+        i += 2;
       } else {
-        cmp = -1;
+        if (indexPath != null) {
+          System.out.println("ERROR: unexpected extra argument '" + args[i] + "'");
+          System.exit(1);
+        }
+        indexPath = args[i];
+        i++;
       }
-
-      if (cmp < 0)
-        low = mid + 1;
-      else if (cmp > 0)
-        high = mid - 1;
-      else
-        return mid;
     }
-    return -(low + 1);
+
+    if (indexPath == null) {
+      System.out.println("\nERROR: index path not specified");
+      System.out.println("\nUsage: java org.apache.lucene.index.CheckIndex pathToIndex [-fix] [-segment X] [-segment Y]\n" +
+                         "\n" +
+                         "  -fix: actually write a new segments_N file, removing any problematic segments\n" +
+                         "  -segment X: only check the specified segments.  This can be specified multiple\n" + 
+                         "              times, to check more than one segment, eg '-segment _2 -segment _a'.\n" +
+                         "              You can't use this with the -fix option\n" +
+                         "\n" + 
+                         "**WARNING**: -fix should only be used on an emergency basis as it will cause\n" +
+                         "documents (perhaps many) to be permanently removed from the index.  Always make\n" +
+                         "a backup copy of your index before running this!  Do not run this tool on an index\n" +
+                         "that is actively being written to.  You have been warned!\n" +
+                         "\n" +
+                         "Run without -fix, this tool will open the index, report version information\n" +
+                         "and report any exceptions it hits and what action it would take if -fix were\n" +
+                         "specified.  With -fix, this tool will remove any segments that have issues and\n" + 
+                         "write a new segments_N file.  This means all documents contained in the affected\n" +
+                         "segments will be removed.\n" +
+                         "\n" +
+                         "This tool exits with exit code 1 if the index cannot be opened or has any\n" +
+                         "corruption, else 0.\n");
+      System.exit(1);
+    }
+
+    if (!assertsOn())
+      System.out.println("\nNOTE: testing will be more thorough if you run java with '-ea:org.apache.lucene...', so assertions are enabled");
+
+    if (onlySegments.size() == 0)
+      onlySegments = null;
+    else if (doFix) {
+      System.out.println("ERROR: cannot specify both -fix and -segment");
+      System.exit(1);
+    }
+
+    System.out.println("\nOpening index @ " + indexPath + "\n");
+    Directory dir = null;
+    try {
+      dir = FSDirectory.open(new File(indexPath));
+    } catch (Throwable t) {
+      System.out.println("ERROR: could not open directory \"" + indexPath + "\"; exiting");
+      t.printStackTrace(System.out);
+      System.exit(1);
+    }
+
+    CheckIndex checker = new CheckIndex(dir);
+    checker.setInfoStream(System.out);
+
+    Status result = checker.checkIndex(onlySegments);
+    if (result.missingSegments) {
+      System.exit(1);
+    }
+
+    if (!result.clean) {
+      if (!doFix) {
+        System.out.println("WARNING: would write new segments file, and " + result.totLoseDocCount + " documents would be lost, if -fix were specified\n");
+      } else {
+        System.out.println("WARNING: " + result.totLoseDocCount + " documents will be lost\n");
+        System.out.println("NOTE: will write new segments file in 5 seconds; this will remove " + result.totLoseDocCount + " docs from the index. THIS IS YOUR LAST CHANCE TO CTRL+C!");
+        for(int s=0;s<5;s++) {
+          Thread.sleep(1000);
+          System.out.println("  " + (5-s) + "...");
+        }
+        System.out.println("Writing...");
+        checker.fixIndex(result);
+        System.out.println("OK");
+        System.out.println("Wrote new segments file \"" + result.newSegments.getCurrentSegmentFileName() + "\"");
+      }
+    }
+    System.out.println("");
+
+    final int exitCode;
+    if (result.clean == true)
+      exitCode = 0;
+    else
+      exitCode = 1;
+    System.exit(exitCode);
   }
 }

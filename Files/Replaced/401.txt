@@ -1,6 +1,4 @@
-URI resolveRelativeURI(String baseURI, String systemId) throws URISyntaxException {
-
-package org.apache.solr.util;
+public HttpRequestContentStream( HttpServletRequest req ) {
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,160 +17,398 @@ package org.apache.solr.util;
  * limitations under the License.
  */
 
+package org.apache.solr.servlet;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.UnsupportedEncodingException;
+import java.net.URL;
+import java.net.URLDecoder;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.lucene.analysis.util.ResourceLoader;
+import javax.servlet.http.HttpServletRequest;
 
-import org.xml.sax.InputSource;
-import org.xml.sax.EntityResolver;
-import org.xml.sax.ext.EntityResolver2;
-import java.io.File;
-import java.io.IOException;
-import java.net.URI;
-import java.net.URISyntaxException;
-import javax.xml.transform.Source;
-import javax.xml.transform.TransformerException;
-import javax.xml.transform.URIResolver;
-import javax.xml.transform.sax.SAXSource;
-import javax.xml.stream.XMLResolver;
-import javax.xml.stream.XMLStreamException;
+import org.apache.commons.fileupload.FileItem;
+import org.apache.commons.fileupload.disk.DiskFileItemFactory;
+import org.apache.commons.fileupload.servlet.ServletFileUpload;
+import org.apache.solr.common.SolrException;
+import org.apache.solr.common.params.CommonParams;
+import org.apache.solr.common.params.MultiMapSolrParams;
+import org.apache.solr.common.params.SolrParams;
+import org.apache.solr.common.util.ContentStream;
+import org.apache.solr.common.util.ContentStreamBase;
+import org.apache.solr.core.Config;
+import org.apache.solr.core.SolrCore;
+import org.apache.solr.request.ServletSolrParams;
+import org.apache.solr.request.SolrQueryRequest;
+import org.apache.solr.request.SolrQueryRequestBase;
+
+
+public class SolrRequestParsers 
+{
+  final Logger log = LoggerFactory.getLogger(SolrRequestParsers.class);
+  
+  // Should these constants be in a more public place?
+  public static final String MULTIPART = "multipart";
+  public static final String RAW = "raw";
+  public static final String SIMPLE = "simple";
+  public static final String STANDARD = "standard";
+  
+  private HashMap<String, SolrRequestParser> parsers;
+  private boolean enableRemoteStreams = false;
+  private boolean handleSelect = true;
+  private StandardRequestParser standard;
+  
+  /**
+   * Pass in an xml configuration.  A null configuration will enable
+   * everythign with maximum values.
+   */
+  public SolrRequestParsers( Config globalConfig )
+  {
+    long uploadLimitKB = 1048;  // 2MB default
+    if( globalConfig == null ) {
+      uploadLimitKB = Long.MAX_VALUE; 
+      enableRemoteStreams = true;
+      handleSelect = true;
+    }
+    else {
+      uploadLimitKB = globalConfig.getInt( 
+          "requestDispatcher/requestParsers/@multipartUploadLimitInKB", (int)uploadLimitKB );
+      
+      enableRemoteStreams = globalConfig.getBool( 
+          "requestDispatcher/requestParsers/@enableRemoteStreaming", false ); 
+  
+      // Let this filter take care of /select?xxx format
+      handleSelect = globalConfig.getBool( 
+          "requestDispatcher/@handleSelect", handleSelect ); 
+    }
+       
+    MultipartRequestParser multi = new MultipartRequestParser( uploadLimitKB );
+    RawRequestParser raw = new RawRequestParser();
+    standard = new StandardRequestParser( multi, raw );
+    
+    // I don't see a need to have this publicly configured just yet
+    // adding it is trivial
+    parsers = new HashMap<String, SolrRequestParser>();
+    parsers.put( MULTIPART, multi );
+    parsers.put( RAW, raw );
+    parsers.put( SIMPLE, new SimpleRequestParser() );
+    parsers.put( STANDARD, standard );
+    parsers.put( "", standard );
+  }
+  
+  public SolrQueryRequest parse( SolrCore core, String path, HttpServletRequest req ) throws Exception
+  {
+    SolrRequestParser parser = standard;
+    
+    // TODO -- in the future, we could pick a different parser based on the request
+    
+    // Pick the parser from the request...
+    ArrayList<ContentStream> streams = new ArrayList<ContentStream>(1);
+    SolrParams params = parser.parseParamsAndFillStreams( req, streams );
+    SolrQueryRequest sreq = buildRequestFrom( core, params, streams );
+
+    // Handlers and login will want to know the path. If it contains a ':'
+    // the handler could use it for RESTful URLs
+    sreq.getContext().put( "path", path );
+    return sreq;
+  }
+  
+  public SolrQueryRequest buildRequestFrom( SolrCore core, SolrParams params, Collection<ContentStream> streams ) throws Exception
+  {
+    // The content type will be applied to all streaming content
+    String contentType = params.get( CommonParams.STREAM_CONTENTTYPE );
+      
+    // Handle anything with a remoteURL
+    String[] strs = params.getParams( CommonParams.STREAM_URL );
+    if( strs != null ) {
+      if( !enableRemoteStreams ) {
+        throw new SolrException( SolrException.ErrorCode.BAD_REQUEST, "Remote Streaming is disabled." );
+      }
+      for( final String url : strs ) {
+        ContentStreamBase stream = new ContentStreamBase.URLStream( new URL(url) );
+        if( contentType != null ) {
+          stream.setContentType( contentType );
+        }
+        streams.add( stream );
+      }
+    }
+    
+    // Handle streaming files
+    strs = params.getParams( CommonParams.STREAM_FILE );
+    if( strs != null ) {
+      if( !enableRemoteStreams ) {
+        throw new SolrException( SolrException.ErrorCode.BAD_REQUEST, "Remote Streaming is disabled." );
+      }
+      for( final String file : strs ) {
+        ContentStreamBase stream = new ContentStreamBase.FileStream( new File(file) );
+        if( contentType != null ) {
+          stream.setContentType( contentType );
+        }
+        streams.add( stream );
+      }
+    }
+    
+    // Check for streams in the request parameters
+    strs = params.getParams( CommonParams.STREAM_BODY );
+    if( strs != null ) {
+      for( final String body : strs ) {
+        ContentStreamBase stream = new ContentStreamBase.StringStream( body );
+        if( contentType != null ) {
+          stream.setContentType( contentType );
+        }
+        streams.add( stream );
+      }
+    }
+    
+    SolrQueryRequestBase q = new SolrQueryRequestBase( core, params ) { };
+    if( streams != null && streams.size() > 0 ) {
+      q.setContentStreams( streams );
+    }
+    return q;
+  }
+  
+
+  /**
+   * Given a standard query string map it into solr params
+   */
+  public static MultiMapSolrParams parseQueryString(String queryString) 
+  {
+    Map<String,String[]> map = new HashMap<String, String[]>();
+    if( queryString != null && queryString.length() > 0 ) {
+      try {
+        for( String kv : queryString.split( "&" ) ) {
+          int idx = kv.indexOf( '=' );
+          if( idx > 0 ) {
+            String name = URLDecoder.decode( kv.substring( 0, idx ), "UTF-8");
+            String value = URLDecoder.decode( kv.substring( idx+1 ), "UTF-8");
+            MultiMapSolrParams.addParam( name, value, map );
+          }
+          else {
+            String name = URLDecoder.decode( kv, "UTF-8" );
+            MultiMapSolrParams.addParam( name, "", map );
+          }
+        }
+      }
+      catch( UnsupportedEncodingException uex ) {
+        throw new SolrException( SolrException.ErrorCode.SERVER_ERROR, uex );
+      }
+    }
+    return new MultiMapSolrParams( map );
+  }
+
+  public boolean isHandleSelect() {
+    return handleSelect;
+  }
+
+  public void setHandleSelect(boolean handleSelect) {
+    this.handleSelect = handleSelect;
+  }
+}
+
+//-----------------------------------------------------------------
+//-----------------------------------------------------------------
+
+// I guess we don't really even need the interface, but i'll keep it here just for kicks
+interface SolrRequestParser 
+{
+  public SolrParams parseParamsAndFillStreams(
+    final HttpServletRequest req, ArrayList<ContentStream> streams ) throws Exception;
+}
+
+
+//-----------------------------------------------------------------
+//-----------------------------------------------------------------
 
 /**
- * This is a helper class to support resolving of XIncludes or other hrefs
- * inside XML files on top of a {@link ResourceLoader}. Just plug this class
- * on top of a {@link ResourceLoader} and pass it as {@link EntityResolver} to SAX parsers
- * or via wrapper methods as {@link URIResolver} to XSL transformers or {@link XMLResolver} to STAX parsers.
- * The resolver handles special SystemIds with an URI scheme of {@code solrres:} that point
- * to resources. To produce such systemIds when you initially call the parser, use
- * {@link #createSystemIdFromResourceName} which produces a SystemId that can
- * be included along the InputStream coming from {@link ResourceLoader#openResource}.
- * <p>In general create the {@link InputSource} to be passed to the parser like:</p>
- * <pre class="prettyprint">
- *  InputSource is = new InputSource(loader.openSchema(name));
- *  is.setSystemId(SystemIdResolver.createSystemIdFromResourceName(name));
- *  final DocumentBuilder db = DocumentBuilderFactory.newInstance().newDocumentBuilder();
- *  db.setEntityResolver(new SystemIdResolver(loader));
- *  Document doc = db.parse(is);
- * </pre>
+ * The simple parser just uses the params directly
  */
-public final class SystemIdResolver implements EntityResolver, EntityResolver2 {
-  private static final Logger log = LoggerFactory.getLogger(SystemIdResolver.class);
-
-  public static final String RESOURCE_LOADER_URI_SCHEME = "solrres";
-  public static final String RESOURCE_LOADER_AUTHORITY_ABSOLUTE = "@";
-
-  private final ResourceLoader loader;
-
-  public SystemIdResolver(ResourceLoader loader) {
-    this.loader = loader;
+class SimpleRequestParser implements SolrRequestParser
+{
+  public SolrParams parseParamsAndFillStreams( 
+      final HttpServletRequest req, ArrayList<ContentStream> streams ) throws Exception
+  {
+    return new ServletSolrParams(req);
   }
-  
-  public EntityResolver asEntityResolver() {
-    return this;
-  }
-  
-  public URIResolver asURIResolver() {
-    return new URIResolver() {
-      public Source resolve(String href, String base) throws TransformerException {
-        try {
-          final InputSource src = SystemIdResolver.this.resolveEntity(null, null, base, href);
-          return (src == null) ? null : new SAXSource(src);
-        } catch (IOException ioe) {
-          throw new TransformerException("Cannot resolve entity", ioe);
-        }
-      }
-    };
-  }
-  
-  public XMLResolver asXMLResolver() {
-    return new XMLResolver() {
-      public Object resolveEntity(String publicId, String systemId, String baseURI, String namespace) throws XMLStreamException {
-        try {
-          final InputSource src = SystemIdResolver.this.resolveEntity(null, publicId, baseURI, systemId);
-          return (src == null) ? null : src.getByteStream();
-        } catch (IOException ioe) {
-          throw new XMLStreamException("Cannot resolve entity", ioe);
-        }
-      }
-    };
-  }
-  
-  URI resolveRelativeURI(String baseURI, String systemId) throws IOException,URISyntaxException {
-    URI uri;
-    
-    // special case for backwards compatibility: if relative systemId starts with "/" (we convert that to an absolute solrres:-URI)
-    if (systemId.startsWith("/")) {
-      uri = new URI(RESOURCE_LOADER_URI_SCHEME, RESOURCE_LOADER_AUTHORITY_ABSOLUTE, "/", null, null).resolve(systemId);
-    } else {
-      // simply parse as URI
-      uri = new URI(systemId);
-    }
-    
-    // do relative resolving
-    if (baseURI != null ) {
-      uri = new URI(baseURI).resolve(uri);
-    }
-    
-    return uri;
-  }
-  
-  // *** EntityResolver(2) methods:
-  
-  public InputSource getExternalSubset(String name, String baseURI) {
-    return null;
-  }
-  
-  public InputSource resolveEntity(String name, String publicId, String baseURI, String systemId) throws IOException {
-    if (systemId == null)
-      return null;
-    try {
-      final URI uri = resolveRelativeURI(baseURI, systemId);
-      
-      // check schema and resolve with ResourceLoader
-      if (RESOURCE_LOADER_URI_SCHEME.equals(uri.getScheme())) {
-        String path = uri.getPath(), authority = uri.getAuthority();
-        if (!RESOURCE_LOADER_AUTHORITY_ABSOLUTE.equals(authority)) {
-          path = path.substring(1);
-        }
-        try {
-          final InputSource is = new InputSource(loader.openResource(path));
-          is.setSystemId(uri.toASCIIString());
-          is.setPublicId(publicId);
-          return is;
-        } catch (RuntimeException re) {
-          // unfortunately XInclude fallback only works with IOException, but openResource() never throws that one
-          throw (IOException) (new IOException(re.getMessage()).initCause(re));
-        }
-      } else {
-        // resolve all other URIs using the standard resolver
-        return null;
-      }
-    } catch (URISyntaxException use) {
-      log.warn("An URI systax problem occurred during resolving SystemId, falling back to default resolver", use);
-      return null;
-    }
-  }
-
-  public InputSource resolveEntity(String publicId, String systemId) throws IOException {
-    return resolveEntity(null, publicId, null, systemId);
-  }
-  
-  public static String createSystemIdFromResourceName(String name) {
-    name = name.replace(File.separatorChar, '/');
-    final String authority;
-    if (name.startsWith("/")) {
-      // a hack to preserve absolute filenames and keep them absolute after resolving, we set the URI's authority to "@" on absolute filenames:
-      authority = RESOURCE_LOADER_AUTHORITY_ABSOLUTE;
-    } else {
-      authority = null;
-      name = "/" + name;
-    }
-    try {
-      return new URI(RESOURCE_LOADER_URI_SCHEME, authority, name, null, null).toASCIIString();
-    } catch (URISyntaxException use) {
-      throw new IllegalArgumentException("Invalid syntax of Solr Resource URI", use);
-    }
-  }
-
 }
+
+/**
+ * Wrap an HttpServletRequest as a ContentStream
+ */
+class HttpRequestContentStream extends ContentStreamBase
+{
+  private final HttpServletRequest req;
+  
+  public HttpRequestContentStream( HttpServletRequest req ) throws IOException {
+    this.req = req;
+    
+    contentType = req.getContentType();
+    // name = ???
+    // sourceInfo = ???
+    
+    String v = req.getHeader( "Content-Length" );
+    if( v != null ) {
+      size = Long.valueOf( v );
+    }
+  }
+
+  public InputStream getStream() throws IOException {
+    return req.getInputStream();
+  }
+}
+
+
+/**
+ * Wrap a FileItem as a ContentStream
+ */
+class FileItemContentStream extends ContentStreamBase
+{
+  private final FileItem item;
+  
+  public FileItemContentStream( FileItem f )
+  {
+    item = f;
+    contentType = item.getContentType();
+    name = item.getName();
+    sourceInfo = item.getFieldName();
+    size = item.getSize();
+  }
+    
+  public InputStream getStream() throws IOException {
+    return item.getInputStream();
+  }
+}
+
+/**
+ * The raw parser just uses the params directly
+ */
+class RawRequestParser implements SolrRequestParser
+{
+  public SolrParams parseParamsAndFillStreams( 
+      final HttpServletRequest req, ArrayList<ContentStream> streams ) throws Exception
+  {
+    // The javadocs for HttpServletRequest are clear that req.getReader() should take
+    // care of any character encoding issues.  BUT, there are problems while running on
+    // some servlet containers: including Tomcat 5 and resin.
+    //
+    // Rather than return req.getReader(), this uses the default ContentStreamBase method
+    // that checks for charset definitions in the ContentType.
+    
+    streams.add( new HttpRequestContentStream( req ) );
+    return SolrRequestParsers.parseQueryString( req.getQueryString() );
+  }
+}
+
+
+
+/**
+ * Extract Multipart streams
+ */
+class MultipartRequestParser implements SolrRequestParser
+{
+  private long uploadLimitKB;
+  
+  public MultipartRequestParser( long limit )
+  {
+    uploadLimitKB = limit;
+  }
+  
+  public SolrParams parseParamsAndFillStreams( 
+      final HttpServletRequest req, ArrayList<ContentStream> streams ) throws Exception
+  {
+    if( !ServletFileUpload.isMultipartContent(req) ) {
+      throw new SolrException( SolrException.ErrorCode.BAD_REQUEST, "Not multipart content! "+req.getContentType() );
+    }
+    
+    MultiMapSolrParams params = SolrRequestParsers.parseQueryString( req.getQueryString() );
+    
+    // Create a factory for disk-based file items
+    DiskFileItemFactory factory = new DiskFileItemFactory();
+
+    // Set factory constraints
+    // TODO - configure factory.setSizeThreshold(yourMaxMemorySize);
+    // TODO - configure factory.setRepository(yourTempDirectory);
+
+    // Create a new file upload handler
+    ServletFileUpload upload = new ServletFileUpload(factory);
+    upload.setSizeMax( uploadLimitKB*1024 );
+
+    // Parse the request
+    List items = upload.parseRequest(req);
+    Iterator iter = items.iterator();
+    while (iter.hasNext()) {
+        FileItem item = (FileItem) iter.next();
+
+        // If its a form field, put it in our parameter map
+        if (item.isFormField()) {
+          MultiMapSolrParams.addParam( 
+            item.getFieldName(), 
+            item.getString(), params.getMap() );
+        }
+        // Add the stream
+        else { 
+          streams.add( new FileItemContentStream( item ) );
+        }
+    }
+    return params;
+  }
+}
+
+
+/**
+ * The default Logic
+ */
+class StandardRequestParser implements SolrRequestParser
+{
+  MultipartRequestParser multipart;
+  RawRequestParser raw;
+  
+  StandardRequestParser( MultipartRequestParser multi, RawRequestParser raw ) 
+  {
+    this.multipart = multi;
+    this.raw = raw;
+  }
+  
+  public SolrParams parseParamsAndFillStreams( 
+      final HttpServletRequest req, ArrayList<ContentStream> streams ) throws Exception
+  {
+    String method = req.getMethod().toUpperCase(Locale.ENGLISH);
+    if( "GET".equals( method ) || "HEAD".equals( method )) {
+      return new ServletSolrParams(req);
+    }
+    if( "POST".equals( method ) ) {
+      String contentType = req.getContentType();
+      if( contentType != null ) {
+        int idx = contentType.indexOf( ';' );
+        if( idx > 0 ) { // remove the charset definition "; charset=utf-8"
+          contentType = contentType.substring( 0, idx );
+        }
+        if( "application/x-www-form-urlencoded".equals( contentType.toLowerCase(Locale.ENGLISH) ) ) {
+          return new ServletSolrParams(req); // just get the params from parameterMap
+        }
+        if( ServletFileUpload.isMultipartContent(req) ) {
+          return multipart.parseParamsAndFillStreams(req, streams);
+        }
+      }
+      return raw.parseParamsAndFillStreams(req, streams);
+    }
+    throw new SolrException( SolrException.ErrorCode.BAD_REQUEST, "Unsupported method: "+method );
+  }
+}
+
+
+
+
+
+
+
+

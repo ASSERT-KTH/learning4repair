@@ -1,389 +1,205 @@
-package org.apache.lucene.store;
-
 /**
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ * 
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
  */
 
+package org.apache.cassandra.io.sstable;
+
 import java.io.File;
+import java.io.IOError;
 import java.io.IOException;
 import java.util.Collections;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.Map;
+import java.util.List;
+import java.util.Arrays;
 
-import org.apache.lucene.analysis.WhitespaceAnalyzer;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.Field;
-import org.apache.lucene.index.IndexWriter;
-import org.apache.lucene.index.Term;
-import org.apache.lucene.search.IndexSearcher;
-import org.apache.lucene.search.Query;
-import org.apache.lucene.search.ScoreDoc;
-import org.apache.lucene.search.TermQuery;
-import org.apache.lucene.util.LuceneTestCase;
-import org.apache.lucene.util._TestUtil;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-public class TestLockFactory extends LuceneTestCase {
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.db.StatisticsTable;
+import org.apache.cassandra.utils.EstimatedHistogram;
 
-    // Verify: we can provide our own LockFactory implementation, the right
-    // methods are called at the right time, locks are created, etc.
+/**
+ * This class is built on top of the SequenceFile. It stores
+ * data on disk in sorted fashion. However the sorting is upto
+ * the application. This class expects keys to be handed to it
+ * in sorted order.
+ *
+ * A separate index file is maintained as well, containing the
+ * SSTable keys and the offset into the SSTable at which they are found.
+ * Every 1/indexInterval key is read into memory when the SSTable is opened.
+ *
+ * Finally, a bloom filter file is also kept for the keys in each SSTable.
+ */
+public abstract class SSTable
+{
+    static final Logger logger = LoggerFactory.getLogger(SSTable.class);
 
-    public void testCustomLockFactory() throws IOException {
-        Directory dir = new RAMDirectory();
-        MockLockFactory lf = new MockLockFactory();
-        dir.setLockFactory(lf);
+    public static final String COMPONENT_DATA = "Data.db";
+    public static final String COMPONENT_INDEX = "Index.db";
+    public static final String COMPONENT_FILTER = "Filter.db";
 
-        // Lock prefix should have been set:
-        assertTrue("lock prefix was not set by the RAMDirectory", lf.lockPrefixSet);
+    public static final String COMPONENT_COMPACTED = "Compacted";
 
-        IndexWriter writer = new IndexWriter(dir, new WhitespaceAnalyzer(), true,
-                                             IndexWriter.MaxFieldLength.LIMITED);
+    protected final Descriptor desc;
+    protected final CFMetaData metadata;
+    protected final IPartitioner partitioner;
 
-        // add 100 documents (so that commit lock is used)
-        for (int i = 0; i < 100; i++) {
-            addDoc(writer);
-        }
+    public static final String TEMPFILE_MARKER = "tmp";
 
-        // Both write lock and commit lock should have been created:
-        assertEquals("# of unique locks created (after instantiating IndexWriter)",
-                     1, lf.locksCreated.size());
-        assertTrue("# calls to makeLock is 0 (after instantiating IndexWriter)",
-                   lf.makeLockCount >= 1);
-        
-        for(Iterator e = lf.locksCreated.keySet().iterator(); e.hasNext();) {
-            String lockName = (String) e.next();
-            MockLockFactory.MockLock lock = (MockLockFactory.MockLock) lf.locksCreated.get(lockName);
-            assertTrue("# calls to Lock.obtain is 0 (after instantiating IndexWriter)",
-                       lock.lockAttempts > 0);
-        }
-        
-        writer.close();
+    public static List<String> components = Collections.unmodifiableList(Arrays.asList(COMPONENT_FILTER, COMPONENT_INDEX, COMPONENT_DATA));
+    protected EstimatedHistogram estimatedRowSize = new EstimatedHistogram(130);
+    protected EstimatedHistogram estimatedColumnCount = new EstimatedHistogram(112);
+
+    protected SSTable(String filename, CFMetaData metadata, IPartitioner partitioner)
+    {
+        this(Descriptor.fromFilename(filename), metadata, partitioner);
     }
 
-    // Verify: we can use the NoLockFactory with RAMDirectory w/ no
-    // exceptions raised:
-    // Verify: NoLockFactory allows two IndexWriters
-    public void testRAMDirectoryNoLocking() throws IOException {
-        Directory dir = new RAMDirectory();
-        dir.setLockFactory(NoLockFactory.getNoLockFactory());
-
-        assertTrue("RAMDirectory.setLockFactory did not take",
-                   NoLockFactory.class.isInstance(dir.getLockFactory()));
-
-        IndexWriter writer = new IndexWriter(dir, new WhitespaceAnalyzer(), true,
-                                             IndexWriter.MaxFieldLength.LIMITED);
-        writer.commit(); // required so the second open succeed
-        
-        // Create a 2nd IndexWriter.  This is normally not allowed but it should run through since we're not
-        // using any locks:
-        IndexWriter writer2 = null;
-        try {
-            writer2 = new IndexWriter(dir, new WhitespaceAnalyzer(), false,
-                                      IndexWriter.MaxFieldLength.LIMITED);
-        } catch (Exception e) {
-            e.printStackTrace(System.out);
-            fail("Should not have hit an IOException with no locking");
-        }
-
-        writer.close();
-        if (writer2 != null) {
-            writer2.close();
-        }
+    protected SSTable(Descriptor desc, CFMetaData metadata, IPartitioner partitioner)
+    {
+        this.desc = desc;
+        this.metadata = metadata;
+        this.partitioner = partitioner;
     }
 
-    // Verify: SingleInstanceLockFactory is the default lock for RAMDirectory
-    // Verify: RAMDirectory does basic locking correctly (can't create two IndexWriters)
-    public void testDefaultRAMDirectory() throws IOException {
-        Directory dir = new RAMDirectory();
-
-        assertTrue("RAMDirectory did not use correct LockFactory: got " + dir.getLockFactory(),
-                   SingleInstanceLockFactory.class.isInstance(dir.getLockFactory()));
-
-        IndexWriter writer = new IndexWriter(dir, new WhitespaceAnalyzer(), true,
-                                             IndexWriter.MaxFieldLength.LIMITED);
-
-        // Create a 2nd IndexWriter.  This should fail:
-        IndexWriter writer2 = null;
-        try {
-            writer2 = new IndexWriter(dir, new WhitespaceAnalyzer(), false,
-                                      IndexWriter.MaxFieldLength.LIMITED);
-            fail("Should have hit an IOException with two IndexWriters on default SingleInstanceLockFactory");
-        } catch (IOException e) {
-        }
-
-        writer.close();
-        if (writer2 != null) {
-            writer2.close();
-        }
-    }
-    
-    public void testSimpleFSLockFactory() throws IOException {
-      // test string file instantiation
-      new SimpleFSLockFactory("test");
+    public EstimatedHistogram getEstimatedRowSize()
+    {
+        return estimatedRowSize;
     }
 
-    // Verify: do stress test, by opening IndexReaders and
-    // IndexWriters over & over in 2 threads and making sure
-    // no unexpected exceptions are raised:
-    public void testStressLocks() throws Exception {
-      _testStressLocks(null, _TestUtil.getTempDir("index.TestLockFactory6"));
+    public EstimatedHistogram getEstimatedColumnCount()
+    {
+        return estimatedColumnCount;
     }
 
-    // Verify: do stress test, by opening IndexReaders and
-    // IndexWriters over & over in 2 threads and making sure
-    // no unexpected exceptions are raised, but use
-    // NativeFSLockFactory:
-    public void testStressLocksNativeFSLockFactory() throws Exception {
-      File dir = _TestUtil.getTempDir("index.TestLockFactory7");
-      _testStressLocks(new NativeFSLockFactory(dir), dir);
+    public IPartitioner getPartitioner()
+    {
+        return partitioner;
     }
 
-    public void _testStressLocks(LockFactory lockFactory, File indexDir) throws Exception {
-        FSDirectory fs1 = FSDirectory.open(indexDir, lockFactory);
-
-        // First create a 1 doc index:
-        IndexWriter w = new IndexWriter(fs1, new WhitespaceAnalyzer(), true,
-                                        IndexWriter.MaxFieldLength.LIMITED);
-        addDoc(w);
-        w.close();
-
-        WriterThread writer = new WriterThread(100, fs1);
-        SearcherThread searcher = new SearcherThread(100, fs1);
-        writer.start();
-        searcher.start();
-
-        while(writer.isAlive() || searcher.isAlive()) {
-          Thread.sleep(1000);
-        }
-
-        assertTrue("IndexWriter hit unexpected exceptions", !writer.hitException);
-        assertTrue("IndexSearcher hit unexpected exceptions", !searcher.hitException);
-
-        // Cleanup
-        _TestUtil.rmDir(indexDir);
+    public Descriptor getDescriptor()
+    {
+        return desc;
     }
 
-    // Verify: NativeFSLockFactory works correctly
-    public void testNativeFSLockFactory() throws IOException {
-
-      NativeFSLockFactory f = new NativeFSLockFactory(System.getProperty("tempDir"));
-
-      f.setLockPrefix("test");
-      Lock l = f.makeLock("commit");
-      Lock l2 = f.makeLock("commit");
-
-      assertTrue("failed to obtain lock", l.obtain());
-      assertTrue("succeeded in obtaining lock twice", !l2.obtain());
-      l.release();
-
-      assertTrue("failed to obtain 2nd lock after first one was freed", l2.obtain());
-      l2.release();
-
-      // Make sure we can obtain first one again, test isLocked():
-      assertTrue("failed to obtain lock", l.obtain());
-      assertTrue(l.isLocked());
-      assertTrue(l2.isLocked());
-      l.release();
-      assertFalse(l.isLocked());
-      assertFalse(l2.isLocked());
+    public static String indexFilename(String dataFile)
+    {
+        return Descriptor.fromFilename(dataFile).filenameFor(COMPONENT_INDEX);
     }
 
-    // Verify: NativeFSLockFactory assigns null as lockPrefix if the lockDir is inside directory
-    public void testNativeFSLockFactoryPrefix() throws IOException {
-
-      File fdir1 = _TestUtil.getTempDir("TestLockFactory.8");
-      File fdir2 = _TestUtil.getTempDir("TestLockFactory.8.Lockdir");
-      Directory dir1 = FSDirectory.open(fdir1, new NativeFSLockFactory(fdir1));
-      // same directory, but locks are stored somewhere else. The prefix of the lock factory should != null
-      Directory dir2 = FSDirectory.open(fdir1, new NativeFSLockFactory(fdir2));
-
-      String prefix1 = dir1.getLockFactory().getLockPrefix();
-      assertNull("Lock prefix for lockDir same as directory should be null", prefix1);
-      
-      String prefix2 = dir2.getLockFactory().getLockPrefix();
-      assertNotNull("Lock prefix for lockDir outside of directory should be not null", prefix2);
-
-      _TestUtil.rmDir(fdir1);
-      _TestUtil.rmDir(fdir2);
+    public String indexFilename()
+    {
+        return desc.filenameFor(COMPONENT_INDEX);
     }
 
-    // Verify: default LockFactory has no prefix (ie
-    // write.lock is stored in index):
-    public void testDefaultFSLockFactoryPrefix() throws IOException {
-
-      // Make sure we get null prefix:
-      File dirName = _TestUtil.getTempDir("TestLockFactory.10");
-      Directory dir = FSDirectory.open(dirName);
-
-      String prefix = dir.getLockFactory().getLockPrefix();
-
-      assertTrue("Default lock prefix should be null", null == prefix);
-
-      _TestUtil.rmDir(dirName);
+    protected static String compactedFilename(String dataFile)
+    {
+        return Descriptor.fromFilename(dataFile).filenameFor(COMPONENT_COMPACTED);
     }
 
-    private class WriterThread extends Thread { 
-        private Directory dir;
-        private int numIteration;
-        public boolean hitException = false;
-        public WriterThread(int numIteration, Directory dir) {
-            this.numIteration = numIteration;
-            this.dir = dir;
-        }
-        @Override
-        public void run() {
-            WhitespaceAnalyzer analyzer = new WhitespaceAnalyzer();
-            IndexWriter writer = null;
-            for(int i=0;i<this.numIteration;i++) {
-                try {
-                    writer = new IndexWriter(dir, analyzer, false,
-                                             IndexWriter.MaxFieldLength.LIMITED);
-                } catch (IOException e) {
-                    if (e.toString().indexOf(" timed out:") == -1) {
-                        hitException = true;
-                        System.out.println("Stress Test Index Writer: creation hit unexpected IOException: " + e.toString());
-                        e.printStackTrace(System.out);
-                    } else {
-                        // lock obtain timed out
-                        // NOTE: we should at some point
-                        // consider this a failure?  The lock
-                        // obtains, across IndexReader &
-                        // IndexWriters should be "fair" (ie
-                        // FIFO).
-                    }
-                } catch (Exception e) {
-                    hitException = true;
-                    System.out.println("Stress Test Index Writer: creation hit unexpected exception: " + e.toString());
-                    e.printStackTrace(System.out);
-                    break;
-                }
-                if (writer != null) {
-                    try {
-                        addDoc(writer);
-                    } catch (IOException e) {
-                        hitException = true;
-                        System.out.println("Stress Test Index Writer: addDoc hit unexpected exception: " + e.toString());
-                        e.printStackTrace(System.out);
-                        break;
-                    }
-                    try {
-                        writer.close();
-                    } catch (IOException e) {
-                        hitException = true;
-                        System.out.println("Stress Test Index Writer: close hit unexpected exception: " + e.toString());
-                        e.printStackTrace(System.out);
-                        break;
-                    }
-                    writer = null;
-                }
+    /**
+     * We use a ReferenceQueue to manage deleting files that have been compacted
+     * and for which no more SSTable references exist.  But this is not guaranteed
+     * to run for each such file because of the semantics of the JVM gc.  So,
+     * we write a marker to `compactedFilename` when a file is compacted;
+     * if such a marker exists on startup, the file should be removed.
+     *
+     * @return true if the file was deleted
+     */
+    public static boolean deleteIfCompacted(String dataFilename)
+    {
+        if (new File(compactedFilename(dataFilename)).exists())
+        {
+            try
+            {
+                FileUtils.deleteWithConfirm(new File(dataFilename));
+                FileUtils.deleteWithConfirm(new File(SSTable.indexFilename(dataFilename)));
+                FileUtils.deleteWithConfirm(new File(SSTable.filterFilename(dataFilename)));
+                FileUtils.deleteWithConfirm(new File(SSTable.compactedFilename(dataFilename)));
+                StatisticsTable.deleteSSTableStatistics(dataFilename);
             }
+            catch (IOException e)
+            {
+                throw new IOError(e);
+            }
+            logger.info("Deleted " + dataFilename);
+            return true;
         }
+        return false;
     }
 
-    private class SearcherThread extends Thread { 
-        private Directory dir;
-        private int numIteration;
-        public boolean hitException = false;
-        public SearcherThread(int numIteration, Directory dir) {
-            this.numIteration = numIteration;
-            this.dir = dir;
-        }
-        @Override
-        public void run() {
-            IndexSearcher searcher = null;
-            Query query = new TermQuery(new Term("content", "aaa"));
-            for(int i=0;i<this.numIteration;i++) {
-                try{
-                    searcher = new IndexSearcher(dir, false);
-                } catch (Exception e) {
-                    hitException = true;
-                    System.out.println("Stress Test Index Searcher: create hit unexpected exception: " + e.toString());
-                    e.printStackTrace(System.out);
-                    break;
-                }
-                if (searcher != null) {
-                    ScoreDoc[] hits = null;
-                    try {
-                        hits = searcher.search(query, null, 1000).scoreDocs;
-                    } catch (IOException e) {
-                        hitException = true;
-                        System.out.println("Stress Test Index Searcher: search hit unexpected exception: " + e.toString());
-                        e.printStackTrace(System.out);
-                        break;
-                    }
-                    // System.out.println(hits.length() + " total results");
-                    try {
-                        searcher.close();
-                    } catch (IOException e) {
-                        hitException = true;
-                        System.out.println("Stress Test Index Searcher: close hit unexpected exception: " + e.toString());
-                        e.printStackTrace(System.out);
-                        break;
-                    }
-                    searcher = null;
-                }
-            }
-        }
+    protected String compactedFilename()
+    {
+        return desc.filenameFor(COMPONENT_COMPACTED);
     }
 
-    public class MockLockFactory extends LockFactory {
-
-        public boolean lockPrefixSet;
-        public Map locksCreated = Collections.synchronizedMap(new HashMap());
-        public int makeLockCount = 0;
-
-        @Override
-        public void setLockPrefix(String lockPrefix) {    
-            super.setLockPrefix(lockPrefix);
-            lockPrefixSet = true;
-        }
-
-        @Override
-        synchronized public Lock makeLock(String lockName) {
-            Lock lock = new MockLock();
-            locksCreated.put(lockName, lock);
-            makeLockCount++;
-            return lock;
-        }
-
-        @Override
-        public void clearLock(String specificLockName) {}
-
-        public class MockLock extends Lock {
-            public int lockAttempts;
-
-            @Override
-            public boolean obtain() {
-                lockAttempts++;
-                return true;
-            }
-            @Override
-            public void release() {
-                // do nothing
-            }
-            @Override
-            public boolean isLocked() {
-                return false;
-            }
-        }
+    protected static String filterFilename(String dataFile)
+    {
+        return Descriptor.fromFilename(dataFile).filenameFor(COMPONENT_FILTER);
     }
 
-    private void addDoc(IndexWriter writer) throws IOException {
-        Document doc = new Document();
-        doc.add(new Field("content", "aaa", Field.Store.NO, Field.Index.ANALYZED));
-        writer.addDocument(doc);
+    public String filterFilename()
+    {
+        return desc.filenameFor(COMPONENT_FILTER);
+    }
+
+    public String getFilename()
+    {
+        return desc.filenameFor(COMPONENT_DATA);
+    }
+
+    public String getColumnFamilyName()
+    {
+        return desc.cfname;
+    }
+
+    public String getTableName()
+    {
+        return desc.ksname;
+    }
+
+    public static long getTotalBytes(Iterable<SSTableReader> sstables)
+    {
+        long sum = 0;
+        for (SSTableReader sstable : sstables)
+        {
+            sum += sstable.length();
+        }
+        return sum;
+    }
+
+    public long bytesOnDisk()
+    {
+        long bytes = 0;
+        for (String cname : components)
+        {
+            bytes += new File(desc.filenameFor(cname)).length();
+        }
+        return bytes;
+    }
+
+    @Override
+    public String toString()
+    {
+        return getClass().getName() + "(" +
+               "path='" + getFilename() + '\'' +
+               ')';
     }
 }

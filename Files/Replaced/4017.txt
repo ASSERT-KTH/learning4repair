@@ -1,6 +1,11 @@
-if (!core.isReloaded() && !core.getDirectoryFactory().isPersistent()) {
+posincAtt = addAttribute(PositionIncrementAttribute.class);
 
 /*
+ * Created on 28-Oct-2004
+ */
+package org.apache.lucene.search.highlight;
+
+/**
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -17,175 +22,277 @@ if (!core.isReloaded() && !core.getDirectoryFactory().isPersistent()) {
  * limitations under the License.
  */
 
-package org.apache.solr.update;
-
-
 import java.io.IOException;
-import java.util.Vector;
+import java.io.StringReader;
+import java.util.ArrayList;
+import java.util.Comparator;
 
-import org.apache.commons.io.FileUtils;
-import org.apache.solr.core.PluginInfo;
-import org.apache.solr.core.SolrCore;
-import org.apache.solr.core.SolrEventListener;
-import org.apache.solr.core.SolrInfoMBean;
-import org.apache.solr.schema.FieldType;
-import org.apache.solr.schema.IndexSchema;
-import org.apache.solr.schema.SchemaField;
-import org.apache.solr.util.plugin.SolrCoreAware;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.lucene.analysis.Analyzer;
+import org.apache.lucene.analysis.Token;
+import org.apache.lucene.analysis.TokenStream;
+import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
+import org.apache.lucene.analysis.tokenattributes.OffsetAttribute;
+import org.apache.lucene.analysis.tokenattributes.PositionIncrementAttribute;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.TermFreqVector;
+import org.apache.lucene.index.TermPositionVector;
+import org.apache.lucene.index.TermVectorOffsetInfo;
+import org.apache.lucene.util.ArrayUtil;
+import org.apache.lucene.util.BytesRef;
 
 /**
- * <code>UpdateHandler</code> handles requests to change the index
- * (adds, deletes, commits, optimizes, etc).
- *
- *
- * @since solr 0.9
+ * Hides implementation issues associated with obtaining a TokenStream for use
+ * with the higlighter - can obtain from TermFreqVectors with offsets and
+ * (optionally) positions or from Analyzer class reparsing the stored content.
  */
+public class TokenSources {
+  /**
+   * A convenience method that tries to first get a TermPositionVector for the
+   * specified docId, then, falls back to using the passed in
+   * {@link org.apache.lucene.document.Document} to retrieve the TokenStream.
+   * This is useful when you already have the document, but would prefer to use
+   * the vector first.
+   * 
+   * @param reader The {@link org.apache.lucene.index.IndexReader} to use to try
+   *        and get the vector from
+   * @param docId The docId to retrieve.
+   * @param field The field to retrieve on the document
+   * @param doc The document to fall back on
+   * @param analyzer The analyzer to use for creating the TokenStream if the
+   *        vector doesn't exist
+   * @return The {@link org.apache.lucene.analysis.TokenStream} for the
+   *         {@link org.apache.lucene.document.Fieldable} on the
+   *         {@link org.apache.lucene.document.Document}
+   * @throws IOException if there was an error loading
+   */
+  public static TokenStream getAnyTokenStream(IndexReader reader, int docId,
+      String field, Document doc, Analyzer analyzer) throws IOException {
+    TokenStream ts = null;
 
-public abstract class UpdateHandler implements SolrInfoMBean {
-  protected final static Logger log = LoggerFactory.getLogger(UpdateHandler.class);
-
-  protected final SolrCore core;
-  protected final IndexSchema schema;
-
-  protected final SchemaField idField;
-  protected final FieldType idFieldType;
-
-  protected Vector<SolrEventListener> commitCallbacks = new Vector<SolrEventListener>();
-  protected Vector<SolrEventListener> softCommitCallbacks = new Vector<SolrEventListener>();
-  protected Vector<SolrEventListener> optimizeCallbacks = new Vector<SolrEventListener>();
-
-  protected volatile UpdateLog ulog;
-
-  private void parseEventListeners() {
-    final Class<SolrEventListener> clazz = SolrEventListener.class;
-    final String label = "Event Listener";
-    for (PluginInfo info : core.getSolrConfig().getPluginInfos(SolrEventListener.class.getName())) {
-      String event = info.attributes.get("event");
-      if ("postCommit".equals(event)) {
-        SolrEventListener obj = core.createInitInstance(info,clazz,label,null);
-        commitCallbacks.add(obj);
-        log.info("added SolrEventListener for postCommit: " + obj);
-      } else if ("postOptimize".equals(event)) {
-        SolrEventListener obj = core.createInitInstance(info,clazz,label,null);
-        optimizeCallbacks.add(obj);
-        log.info("added SolrEventListener for postOptimize: " + obj);
+    TermFreqVector tfv = reader.getTermFreqVector(docId, field);
+    if (tfv != null) {
+      if (tfv instanceof TermPositionVector) {
+        ts = getTokenStream((TermPositionVector) tfv);
       }
     }
+    // No token info stored so fall back to analyzing raw content
+    if (ts == null) {
+      ts = getTokenStream(doc, field, analyzer);
+    }
+    return ts;
   }
 
+  /**
+   * A convenience method that tries a number of approaches to getting a token
+   * stream. The cost of finding there are no termVectors in the index is
+   * minimal (1000 invocations still registers 0 ms). So this "lazy" (flexible?)
+   * approach to coding is probably acceptable
+   * 
+   * @param reader
+   * @param docId
+   * @param field
+   * @param analyzer
+   * @return null if field not stored correctly
+   * @throws IOException
+   */
+  public static TokenStream getAnyTokenStream(IndexReader reader, int docId,
+      String field, Analyzer analyzer) throws IOException {
+    TokenStream ts = null;
 
-  private void initLog() {
-    PluginInfo ulogPluginInfo = core.getSolrConfig().getPluginInfo(UpdateLog.class.getName());
-    if (ulogPluginInfo != null && ulogPluginInfo.isEnabled()) {
-      ulog = new UpdateLog();
-      ulog.init(ulogPluginInfo);
-      // ulog = core.createInitInstance(ulogPluginInfo, UpdateLog.class, "update log", "solr.NullUpdateLog");
-      ulog.init(this, core);
-    }
-  }
-
-  // not thread safe - for startup
-  protected void clearLog() throws IOException {
-    if (ulog != null) {
-      ulog.close(false);
-      FileUtils.deleteDirectory(ulog.getLogDir());
-      initLog();
-    }
-  }
-
-  protected void callPostCommitCallbacks() {
-    for (SolrEventListener listener : commitCallbacks) {
-      listener.postCommit();
-    }
-  }
-
-  protected void callPostSoftCommitCallbacks() {
-    for (SolrEventListener listener : softCommitCallbacks) {
-      listener.postSoftCommit();
-    }
-  }  
-  
-  protected void callPostOptimizeCallbacks() {
-    for (SolrEventListener listener : optimizeCallbacks) {
-      listener.postCommit();
-    }
-  }
-
-  public UpdateHandler(SolrCore core)  {
-    this.core=core;
-    schema = core.getSchema();
-    idField = schema.getUniqueKeyField();
-    idFieldType = idField!=null ? idField.getType() : null;
-    parseEventListeners();
-    initLog();
-    if (!core.getDirectoryFactory().isPersistent()) {
-      try {
-        clearLog();
-      } catch (IOException e) {
-        throw new RuntimeException(e);
+    TermFreqVector tfv = reader.getTermFreqVector(docId, field);
+    if (tfv != null) {
+      if (tfv instanceof TermPositionVector) {
+        ts = getTokenStream((TermPositionVector) tfv);
       }
     }
+    // No token info stored so fall back to analyzing raw content
+    if (ts == null) {
+      ts = getTokenStream(reader, docId, field, analyzer);
+    }
+    return ts;
+  }
+
+  public static TokenStream getTokenStream(TermPositionVector tpv) {
+    // assumes the worst and makes no assumptions about token position
+    // sequences.
+    return getTokenStream(tpv, false);
   }
 
   /**
-   * Called when the Writer should be opened again - eg when replication replaces
-   * all of the index files.
+   * Low level api. Returns a token stream or null if no offset info available
+   * in index. This can be used to feed the highlighter with a pre-parsed token
+   * stream
    * 
-   * @param rollback IndexWriter if true else close
-   * @param forceNewDir Force a new Directory instance
+   * In my tests the speeds to recreate 1000 token streams using this method
+   * are: - with TermVector offset only data stored - 420 milliseconds - with
+   * TermVector offset AND position data stored - 271 milliseconds (nb timings
+   * for TermVector with position data are based on a tokenizer with contiguous
+   * positions - no overlaps or gaps) The cost of not using TermPositionVector
+   * to store pre-parsed content and using an analyzer to re-parse the original
+   * content: - reanalyzing the original content - 980 milliseconds
    * 
-   * @throws IOException If there is a low-level I/O error.
+   * The re-analyze timings will typically vary depending on - 1) The complexity
+   * of the analyzer code (timings above were using a
+   * stemmer/lowercaser/stopword combo) 2) The number of other fields (Lucene
+   * reads ALL fields off the disk when accessing just one document field - can
+   * cost dear!) 3) Use of compression on field storage - could be faster due to
+   * compression (less disk IO) or slower (more CPU burn) depending on the
+   * content.
+   * 
+   * @param tpv
+   * @param tokenPositionsGuaranteedContiguous true if the token position
+   *        numbers have no overlaps or gaps. If looking to eek out the last
+   *        drops of performance, set to true. If in doubt, set to false.
    */
-  public abstract void newIndexWriter(boolean rollback, boolean forceNewDir) throws IOException;
+  public static TokenStream getTokenStream(TermPositionVector tpv,
+      boolean tokenPositionsGuaranteedContiguous) {
+    if (!tokenPositionsGuaranteedContiguous && tpv.getTermPositions(0) != null) {
+      return new TokenStreamFromTermPositionVector(tpv);
+    }
 
-  public abstract SolrCoreState getSolrCoreState();
+    // an object used to iterate across an array of tokens
+    final class StoredTokenStream extends TokenStream {
+      Token tokens[];
 
-  public abstract int addDoc(AddUpdateCommand cmd) throws IOException;
-  public abstract void delete(DeleteUpdateCommand cmd) throws IOException;
-  public abstract void deleteByQuery(DeleteUpdateCommand cmd) throws IOException;
-  public abstract int mergeIndexes(MergeIndexesCommand cmd) throws IOException;
-  public abstract void commit(CommitUpdateCommand cmd) throws IOException;
-  public abstract void rollback(RollbackUpdateCommand cmd) throws IOException;
-  public abstract void close() throws IOException;
-  public abstract UpdateLog getUpdateLog();
+      int currentToken = 0;
 
-  /**
-   * NOTE: this function is not thread safe.  However, it is safe to call within the
-   * <code>inform( SolrCore core )</code> function for <code>SolrCoreAware</code> classes.
-   * Outside <code>inform</code>, this could potentially throw a ConcurrentModificationException
-   *
-   * @see SolrCoreAware
-   */
-  public void registerCommitCallback( SolrEventListener listener )
-  {
-    commitCallbacks.add( listener );
+      CharTermAttribute termAtt;
+
+      OffsetAttribute offsetAtt;
+
+      PositionIncrementAttribute posincAtt;
+
+      StoredTokenStream(Token tokens[]) {
+        this.tokens = tokens;
+        termAtt = addAttribute(CharTermAttribute.class);
+        offsetAtt = addAttribute(OffsetAttribute.class);
+        posincAtt = (PositionIncrementAttribute) addAttribute(PositionIncrementAttribute.class);
+      }
+
+      @Override
+      public boolean incrementToken() throws IOException {
+        if (currentToken >= tokens.length) {
+          return false;
+        }
+        Token token = tokens[currentToken++];
+        clearAttributes();
+        termAtt.setEmpty().append(token);
+        offsetAtt.setOffset(token.startOffset(), token.endOffset());
+        posincAtt
+            .setPositionIncrement(currentToken <= 1
+                || tokens[currentToken - 1].startOffset() > tokens[currentToken - 2]
+                    .startOffset() ? 1 : 0);
+        return true;
+      }
+    }
+    // code to reconstruct the original sequence of Tokens
+    BytesRef[] terms = tpv.getTerms();
+    int[] freq = tpv.getTermFrequencies();
+    int totalTokens = 0;
+    for (int t = 0; t < freq.length; t++) {
+      totalTokens += freq[t];
+    }
+    Token tokensInOriginalOrder[] = new Token[totalTokens];
+    ArrayList<Token> unsortedTokens = null;
+    for (int t = 0; t < freq.length; t++) {
+      TermVectorOffsetInfo[] offsets = tpv.getOffsets(t);
+      if (offsets == null) {
+        throw new IllegalArgumentException(
+            "Required TermVector Offset information was not found");
+      }
+
+      int[] pos = null;
+      if (tokenPositionsGuaranteedContiguous) {
+        // try get the token position info to speed up assembly of tokens into
+        // sorted sequence
+        pos = tpv.getTermPositions(t);
+      }
+      if (pos == null) {
+        // tokens NOT stored with positions or not guaranteed contiguous - must
+        // add to list and sort later
+        if (unsortedTokens == null) {
+          unsortedTokens = new ArrayList<Token>();
+        }
+        for (int tp = 0; tp < offsets.length; tp++) {
+          Token token = new Token(terms[t].utf8ToString(),
+              offsets[tp].getStartOffset(), offsets[tp].getEndOffset());
+          unsortedTokens.add(token);
+        }
+      } else {
+        // We have positions stored and a guarantee that the token position
+        // information is contiguous
+
+        // This may be fast BUT wont work if Tokenizers used which create >1
+        // token in same position or
+        // creates jumps in position numbers - this code would fail under those
+        // circumstances
+
+        // tokens stored with positions - can use this to index straight into
+        // sorted array
+        for (int tp = 0; tp < pos.length; tp++) {
+          Token token = new Token(terms[t].utf8ToString(),
+              offsets[tp].getStartOffset(), offsets[tp].getEndOffset());
+          tokensInOriginalOrder[pos[tp]] = token;
+        }
+      }
+    }
+    // If the field has been stored without position data we must perform a sort
+    if (unsortedTokens != null) {
+      tokensInOriginalOrder = unsortedTokens.toArray(new Token[unsortedTokens
+          .size()]);
+      ArrayUtil.mergeSort(tokensInOriginalOrder, new Comparator<Token>() {
+        public int compare(Token t1, Token t2) {
+          if (t1.startOffset() == t2.startOffset()) return t1.endOffset()
+              - t2.endOffset();
+          else return t1.startOffset() - t2.startOffset();
+        }
+      });
+    }
+    return new StoredTokenStream(tokensInOriginalOrder);
   }
-  
-  /**
-   * NOTE: this function is not thread safe.  However, it is safe to call within the
-   * <code>inform( SolrCore core )</code> function for <code>SolrCoreAware</code> classes.
-   * Outside <code>inform</code>, this could potentially throw a ConcurrentModificationException
-   *
-   * @see SolrCoreAware
-   */
-  public void registerSoftCommitCallback( SolrEventListener listener )
-  {
-    softCommitCallbacks.add( listener );
+
+  public static TokenStream getTokenStream(IndexReader reader, int docId,
+      String field) throws IOException {
+    TermFreqVector tfv = reader.getTermFreqVector(docId, field);
+    if (tfv == null) {
+      throw new IllegalArgumentException(field + " in doc #" + docId
+          + "does not have any term position data stored");
+    }
+    if (tfv instanceof TermPositionVector) {
+      TermPositionVector tpv = (TermPositionVector) reader.getTermFreqVector(
+          docId, field);
+      return getTokenStream(tpv);
+    }
+    throw new IllegalArgumentException(field + " in doc #" + docId
+        + "does not have any term position data stored");
   }
 
-  /**
-   * NOTE: this function is not thread safe.  However, it is safe to call within the
-   * <code>inform( SolrCore core )</code> function for <code>SolrCoreAware</code> classes.
-   * Outside <code>inform</code>, this could potentially throw a ConcurrentModificationException
-   *
-   * @see SolrCoreAware
-   */
-  public void registerOptimizeCallback( SolrEventListener listener )
-  {
-    optimizeCallbacks.add( listener );
+  // convenience method
+  public static TokenStream getTokenStream(IndexReader reader, int docId,
+      String field, Analyzer analyzer) throws IOException {
+    Document doc = reader.document(docId);
+    return getTokenStream(doc, field, analyzer);
   }
 
-  public abstract void split(SplitIndexCommand cmd) throws IOException;
+  public static TokenStream getTokenStream(Document doc, String field,
+      Analyzer analyzer) {
+    String contents = doc.get(field);
+    if (contents == null) {
+      throw new IllegalArgumentException("Field " + field
+          + " in document is not stored and cannot be analyzed");
+    }
+    return getTokenStream(field, contents, analyzer);
+  }
+
+  // convenience method
+  public static TokenStream getTokenStream(String field, String contents,
+      Analyzer analyzer) {
+    try {
+      return analyzer.reusableTokenStream(field, new StringReader(contents));
+    } catch (IOException ex) {
+      throw new RuntimeException(ex);
+    }
+  }
+
 }

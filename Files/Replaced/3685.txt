@@ -1,4 +1,6 @@
-writer.shutdown();
+return getClass().getSimpleName() + '@' + Integer.toHexString(hashCode()) + " lockFactory=" + getLockFactory();
+
+package org.apache.lucene.store;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -16,365 +18,300 @@ writer.shutdown();
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.solr.search;
-
-
-import org.apache.lucene.analysis.MockAnalyzer;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.Field;
-import org.apache.lucene.document.FieldType;
-import org.apache.lucene.index.DirectoryReader;
-import org.apache.lucene.index.FieldInfo;
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.RandomIndexWriter;
-import org.apache.lucene.index.StoredDocument;
-import org.apache.lucene.index.Term;
-import org.apache.lucene.search.TermQuery;
-import org.apache.lucene.store.Directory;
-import org.junit.Test;
-
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Random;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReentrantLock;
-
-import static org.apache.solr.core.SolrCore.verbose;
-
-public class TestStressLucene extends TestRTGBase {
-
-  // The purpose of this test is to roughly model how solr uses lucene
-  DirectoryReader reader;
-  @Test
-  public void testStressLuceneNRT() throws Exception {
-    final int commitPercent = 5 + random().nextInt(20);
-    final int softCommitPercent = 30+random().nextInt(75); // what percent of the commits are soft
-    final int deletePercent = 4+random().nextInt(25);
-    final int deleteByQueryPercent = 1+random().nextInt(5);
-    final int ndocs = 5 + (random().nextBoolean() ? random().nextInt(25) : random().nextInt(200));
-    int nWriteThreads = 5 + random().nextInt(25);
-
-    final int maxConcurrentCommits = nWriteThreads;   // number of committers at a time... it should be <= maxWarmingSearchers
-
-    final AtomicLong operations = new AtomicLong(100000);  // number of query operations to perform in total
-    int nReadThreads = 5 + random().nextInt(25);
-    final boolean tombstones = random().nextBoolean();
-    final boolean syncCommits = random().nextBoolean();
-
-    verbose("commitPercent=", commitPercent);
-    verbose("softCommitPercent=",softCommitPercent);
-    verbose("deletePercent=",deletePercent);
-    verbose("deleteByQueryPercent=", deleteByQueryPercent);
-    verbose("ndocs=", ndocs);
-    verbose("nWriteThreads=", nWriteThreads);
-    verbose("nReadThreads=", nReadThreads);
-    verbose("maxConcurrentCommits=", maxConcurrentCommits);
-    verbose("operations=", operations);
-    verbose("tombstones=", tombstones);
-    verbose("syncCommits=", syncCommits);
-
-    initModel(ndocs);
-
-    final AtomicInteger numCommitting = new AtomicInteger();
-
-    List<Thread> threads = new ArrayList<>();
-
-
-    final FieldType idFt = new FieldType();
-    idFt.setIndexed(true);
-    idFt.setStored(true);
-    idFt.setOmitNorms(true);
-    idFt.setTokenized(false);
-    idFt.setIndexOptions(FieldInfo.IndexOptions.DOCS_ONLY);
-
-    final FieldType ft2 = new FieldType();
-    ft2.setIndexed(false);
-    ft2.setStored(true);
-
-
-    // model how solr does locking - only allow one thread to do a hard commit at once, and only one thread to do a soft commit, but
-    // a hard commit in progress does not stop a soft commit.
-    final Lock hardCommitLock = syncCommits ? new ReentrantLock() : null;
-    final Lock reopenLock = syncCommits ? new ReentrantLock() : null;
-
-
-    // RAMDirectory dir = new RAMDirectory();
-    // final IndexWriter writer = new IndexWriter(dir, new IndexWriterConfig(TEST_VERSION_CURRENT, new WhitespaceAnalyzer(TEST_VERSION_CURRENT)));
-
-    Directory dir = newDirectory();
-
-    final RandomIndexWriter writer = new RandomIndexWriter(random(), dir, newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())));
-    writer.setDoRandomForceMergeAssert(false);
-
-    // writer.commit();
-    // reader = IndexReader.open(dir);
-    // make this reader an NRT reader from the start to avoid the first non-writer openIfChanged
-    // to only opening at the last commit point.
-    reader = DirectoryReader.open(writer.w, true);
-
-    for (int i=0; i<nWriteThreads; i++) {
-      Thread thread = new Thread("WRITER"+i) {
-        Random rand = new Random(random().nextInt());
-
-        @Override
-        public void run() {
-          try {
-            while (operations.get() > 0) {
-              int oper = rand.nextInt(100);
-
-              if (oper < commitPercent) {
-                if (numCommitting.incrementAndGet() <= maxConcurrentCommits) {
-                  Map<Integer,DocInfo> newCommittedModel;
-                  long version;
-                  DirectoryReader oldReader;
-
-                  boolean softCommit = rand.nextInt(100) < softCommitPercent;
-
-                  if (!softCommit) {
-                    // only allow one hard commit to proceed at once
-                    if (hardCommitLock != null) hardCommitLock.lock();
-                    verbose("hardCommit start");
-
-                    writer.commit();
-                  }
-
-                  if (reopenLock != null) reopenLock.lock();
-
-                  synchronized(globalLock) {
-                    newCommittedModel = new HashMap<>(model);  // take a snapshot
-                    version = snapshotCount++;
-                    oldReader = reader;
-                    oldReader.incRef();  // increment the reference since we will use this for reopening
-                  }
-
-                  if (!softCommit) {
-                    // must commit after taking a snapshot of the model
-                    // writer.commit();
-                  }
-
-                  verbose("reopen start using", oldReader);
-
-                  DirectoryReader newReader;
-                  if (softCommit) {
-                    newReader = DirectoryReader.openIfChanged(oldReader, writer.w, true);
-                  } else {
-                    // will only open to last commit
-                    newReader = DirectoryReader.openIfChanged(oldReader);
-                  }
-
-
-                  if (newReader == null) {
-                    oldReader.incRef();
-                    newReader = oldReader;
-                  }
-                  oldReader.decRef();
-
-                  verbose("reopen result", newReader);
-
-                  synchronized(globalLock) {
-                    assert newReader.getRefCount() > 0;
-                    assert reader.getRefCount() > 0;
-
-                    // install the new reader if it's newest (and check the current version since another reader may have already been installed)
-                    if (newReader.getVersion() > reader.getVersion()) {
-                      reader.decRef();
-                      reader = newReader;
-
-                      // install this snapshot only if it's newer than the current one
-                      if (version >= committedModelClock) {
-                        committedModel = newCommittedModel;
-                        committedModelClock = version;
-                      }
-
-                    } else {
-                      // close if unused
-                      newReader.decRef();
-                    }
-
-                  }
-
-                  if (reopenLock != null) reopenLock.unlock();
-
-                  if (!softCommit) {
-                    if (hardCommitLock != null) hardCommitLock.unlock();
-                  }
-
-                }
-                numCommitting.decrementAndGet();
-                continue;
-              }
-
-
-              int id = rand.nextInt(ndocs);
-              Object sync = syncArr[id];
-
-              // set the lastId before we actually change it sometimes to try and
-              // uncover more race conditions between writing and reading
-              boolean before = rand.nextBoolean();
-              if (before) {
-                lastId = id;
-              }
-
-              // We can't concurrently update the same document and retain our invariants of increasing values
-              // since we can't guarantee what order the updates will be executed.
-              synchronized (sync) {
-                DocInfo info = model.get(id);
-                long val = info.val;
-                long nextVal = Math.abs(val)+1;
-
-                if (oper < commitPercent + deletePercent) {
-                  // add tombstone first
-                  if (tombstones) {
-                    Document d = new Document();
-                    d.add(new Field("id","-"+Integer.toString(id), idFt));
-                    d.add(new Field(field, Long.toString(nextVal), ft2));
-                    verbose("adding tombstone for id",id,"val=",nextVal);
-                    writer.updateDocument(new Term("id", "-"+Integer.toString(id)), d);
-                  }
-
-                  verbose("deleting id",id,"val=",nextVal);
-                  writer.deleteDocuments(new Term("id",Integer.toString(id)));
-                  model.put(id, new DocInfo(0,-nextVal));
-                  verbose("deleting id",id,"val=",nextVal,"DONE");
-
-                } else if (oper < commitPercent + deletePercent + deleteByQueryPercent) {
-                  //assertU("<delete><query>id:" + id + "</query></delete>");
-
-                  // add tombstone first
-                  if (tombstones) {
-                    Document d = new Document();
-                    d.add(new Field("id","-"+Integer.toString(id), idFt));
-                    d.add(new Field(field, Long.toString(nextVal), ft2));
-                    verbose("adding tombstone for id",id,"val=",nextVal);
-                    writer.updateDocument(new Term("id", "-"+Integer.toString(id)), d);
-                  }
-
-                  verbose("deleteByQuery",id,"val=",nextVal);
-                  writer.deleteDocuments(new TermQuery(new Term("id", Integer.toString(id))));
-                  model.put(id, new DocInfo(0,-nextVal));
-                  verbose("deleteByQuery",id,"val=",nextVal,"DONE");
-                } else {
-                  // model.put(id, nextVal);   // uncomment this and this test should fail.
-
-                  // assertU(adoc("id",Integer.toString(id), field, Long.toString(nextVal)));
-                  Document d = new Document();
-                  d.add(new Field("id",Integer.toString(id), idFt));
-                  d.add(new Field(field, Long.toString(nextVal), ft2));
-                  verbose("adding id",id,"val=",nextVal);
-                  writer.updateDocument(new Term("id", Integer.toString(id)), d);
-                  if (tombstones) {
-                    // remove tombstone after new addition (this should be optional?)
-                    verbose("deleting tombstone for id",id);
-                    writer.deleteDocuments(new Term("id","-"+Integer.toString(id)));
-                    verbose("deleting tombstone for id",id,"DONE");
-                  }
-
-                  model.put(id, new DocInfo(0,nextVal));
-                  verbose("adding id",id,"val=",nextVal,"DONE");
-                }
-              }
-
-              if (!before) {
-                lastId = id;
-              }
-            }
-          } catch (Exception  ex) {
-            throw new RuntimeException(ex);
-          }
-        }
-      };
-
-      threads.add(thread);
-    }
-
-
-    for (int i=0; i<nReadThreads; i++) {
-      Thread thread = new Thread("READER"+i) {
-        Random rand = new Random(random().nextInt());
-
-        @Override
-        public void run() {
-          try {
-            while (operations.decrementAndGet() >= 0) {
-              // bias toward a recently changed doc
-              int id = rand.nextInt(100) < 25 ? lastId : rand.nextInt(ndocs);
-
-              // when indexing, we update the index, then the model
-              // so when querying, we should first check the model, and then the index
-
-              DocInfo info;
-              synchronized(globalLock) {
-                info = committedModel.get(id);
-              }
-              long val = info.val;
-
-              IndexReader r;
-              synchronized(globalLock) {
-                r = reader;
-                r.incRef();
-              }
-
-              int docid = getFirstMatch(r, new Term("id",Integer.toString(id)));
-
-              if (docid < 0 && tombstones) {
-                // if we couldn't find the doc, look for it's tombstone
-                docid = getFirstMatch(r, new Term("id","-"+Integer.toString(id)));
-                if (docid < 0) {
-                  if (val == -1L) {
-                    // expected... no doc was added yet
-                    r.decRef();
-                    continue;
-                  }
-                  verbose("ERROR: Couldn't find a doc  or tombstone for id", id, "using reader",r,"expected value",val);
-                  fail("No documents or tombstones found for id " + id + ", expected at least " + val);
-                }
-              }
-
-              if (docid < 0 && !tombstones) {
-                // nothing to do - we can't tell anything from a deleted doc without tombstones
-              } else {
-                if (docid < 0) {
-                  verbose("ERROR: Couldn't find a doc for id", id, "using reader",r);
-                }
-                assertTrue(docid >= 0);   // we should have found the document, or it's tombstone
-                StoredDocument doc = r.document(docid);
-                long foundVal = Long.parseLong(doc.get(field));
-                if (foundVal < Math.abs(val)) {
-                  verbose("ERROR: id",id,"model_val=",val," foundVal=",foundVal,"reader=",reader);
-                }
-                assertTrue(foundVal >= Math.abs(val));
-              }
-
-              r.decRef();
-            }
-          } catch (Throwable e) {
-            operations.set(-1L);
-            throw new RuntimeException(e);
-          }
-        }
-      };
-
-      threads.add(thread);
-    }
-
-
-    for (Thread thread : threads) {
-      thread.start();
-    }
-
-    for (Thread thread : threads) {
-      thread.join();
-    }
-
-    writer.close();
-    reader.close();
-    dir.close();
+
+import java.io.EOFException;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.Closeable;
+import java.nio.file.NoSuchFileException;
+import java.util.Collection; // for javadocs
+
+import org.apache.lucene.util.IOUtils;
+
+/** A Directory is a flat list of files.  Files may be written once, when they
+ * are created.  Once a file is created it may only be opened for read, or
+ * deleted.  Random access is permitted both when reading and writing.
+ *
+ * <p> Java's i/o APIs not used directly, but rather all i/o is
+ * through this API.  This permits things such as: <ul>
+ * <li> implementation of RAM-based indices;
+ * <li> implementation indices stored in a database, via JDBC;
+ * <li> implementation of an index as a single file;
+ * </ul>
+ *
+ * Directory locking is implemented by an instance of {@link
+ * LockFactory}, and can be changed for each Directory
+ * instance using {@link #setLockFactory}.
+ *
+ */
+public abstract class Directory implements Closeable {
+
+  /**
+   * Returns an array of strings, one for each file in the directory.
+   * 
+   * @throws NoSuchDirectoryException if the directory is not prepared for any
+   *         write operations (such as {@link #createOutput(String, IOContext)}).
+   * @throws IOException in case of other IO errors
+   */
+  public abstract String[] listAll() throws IOException;
+
+  /** Returns true iff a file with the given name exists. */
+  public abstract boolean fileExists(String name)
+       throws IOException;
+
+  /** Removes an existing file in the directory. */
+  public abstract void deleteFile(String name)
+       throws IOException;
+
+  /**
+   * Returns the length of a file in the directory. This method follows the
+   * following contract:
+   * <ul>
+   * <li>Throws {@link FileNotFoundException} or {@link NoSuchFileException}
+   * if the file does not exist.
+   * <li>Returns a value &ge;0 if the file exists, which specifies its length.
+   * </ul>
+   * 
+   * @param name the name of the file for which to return the length.
+   * @throws IOException if there was an IO error while retrieving the file's
+   *         length.
+   */
+  public abstract long fileLength(String name) throws IOException;
+
+
+  /** Creates a new, empty file in the directory with the given name.
+      Returns a stream writing this file. */
+  public abstract IndexOutput createOutput(String name, IOContext context)
+       throws IOException;
+
+  /**
+   * Ensure that any writes to these files are moved to
+   * stable storage.  Lucene uses this to properly commit
+   * changes to the index, to prevent a machine/OS crash
+   * from corrupting the index.<br/>
+   * <br/>
+   * NOTE: Clients may call this method for same files over
+   * and over again, so some impls might optimize for that.
+   * For other impls the operation can be a noop, for various
+   * reasons.
+   */
+  public abstract void sync(Collection<String> names) throws IOException;
+
+  /** Returns a stream reading an existing file, with the
+   * specified read buffer size.  The particular Directory
+   * implementation may ignore the buffer size.  Currently
+   * the only Directory implementations that respect this
+   * parameter are {@link FSDirectory} and {@link
+   * CompoundFileDirectory}.
+   * <p>Throws {@link FileNotFoundException} or {@link NoSuchFileException}
+   * if the file does not exist.
+   */
+  public abstract IndexInput openInput(String name, IOContext context) throws IOException; 
+  
+  /** Construct a {@link Lock}.
+   * @param name the name of the lock file
+   */
+  public abstract Lock makeLock(String name);
+
+  /**
+   * Attempt to clear (forcefully unlock and remove) the
+   * specified lock.  Only call this at a time when you are
+   * certain this lock is no longer in use.
+   * @param name name of the lock to be cleared.
+   */
+  public abstract void clearLock(String name) throws IOException;
+
+  /** Closes the store. */
+  @Override
+  public abstract void close()
+       throws IOException;
+
+  /**
+   * Set the LockFactory that this Directory instance should
+   * use for its locking implementation.  Each * instance of
+   * LockFactory should only be used for one directory (ie,
+   * do not share a single instance across multiple
+   * Directories).
+   *
+   * @param lockFactory instance of {@link LockFactory}.
+   */
+  public abstract void setLockFactory(LockFactory lockFactory) throws IOException;
+
+  /**
+   * Get the LockFactory that this Directory instance is
+   * using for its locking implementation.  Note that this
+   * may be null for Directory implementations that provide
+   * their own locking implementation.
+   */
+  public abstract LockFactory getLockFactory();
+
+  /**
+   * Return a string identifier that uniquely differentiates
+   * this Directory instance from other Directory instances.
+   * This ID should be the same if two Directory instances
+   * (even in different JVMs and/or on different machines)
+   * are considered "the same index".  This is how locking
+   * "scopes" to the right index.
+   */
+  public String getLockID() {
+      return this.toString();
   }
 
+  @Override
+  public String toString() {
+    return super.toString() + " lockFactory=" + getLockFactory();
+  }
 
+  /**
+   * Copies the file <i>src</i> to {@link Directory} <i>to</i> under the new
+   * file name <i>dest</i>.
+   * <p>
+   * If you want to copy the entire source directory to the destination one, you
+   * can do so like this:
+   * 
+   * <pre class="prettyprint">
+   * Directory to; // the directory to copy to
+   * for (String file : dir.listAll()) {
+   *   dir.copy(to, file, newFile, IOContext.DEFAULT); // newFile can be either file, or a new name
+   * }
+   * </pre>
+   * <p>
+   * <b>NOTE:</b> this method does not check whether <i>dest</i> exist and will
+   * overwrite it if it does.
+   */
+  public void copy(Directory to, String src, String dest, IOContext context) throws IOException {
+    IndexOutput os = null;
+    IndexInput is = null;
+    IOException priorException = null;
+    try {
+      os = to.createOutput(dest, context);
+      is = openInput(src, context);
+      os.copyBytes(is, is.length());
+    } catch (IOException ioe) {
+      priorException = ioe;
+    } finally {
+      boolean success = false;
+      try {
+        IOUtils.closeWhileHandlingException(priorException, os, is);
+        success = true;
+      } finally {
+        if (!success) {
+          try {
+            to.deleteFile(dest);
+          } catch (Throwable t) {
+          }
+        }
+      }
+    }
+  }
 
+  /**
+   * Creates an {@link IndexInputSlicer} for the given file name.
+   * IndexInputSlicer allows other {@link Directory} implementations to
+   * efficiently open one or more sliced {@link IndexInput} instances from a
+   * single file handle. The underlying file handle is kept open until the
+   * {@link IndexInputSlicer} is closed.
+   * <p>Throws {@link FileNotFoundException} or {@link NoSuchFileException}
+   * if the file does not exist.
+   *
+   * @throws IOException
+   *           if an {@link IOException} occurs
+   * @lucene.internal
+   * @lucene.experimental
+   */
+  public IndexInputSlicer createSlicer(final String name, final IOContext context) throws IOException {
+    ensureOpen();
+    return new IndexInputSlicer() {
+      private final IndexInput base = Directory.this.openInput(name, context);
+      @Override
+      public IndexInput openSlice(String sliceDescription, long offset, long length) {
+        return new SlicedIndexInput("SlicedIndexInput(" + sliceDescription + " in " + base + ")", base, offset, length);
+      }
+      @Override
+      public void close() throws IOException {
+        base.close();
+      }
+    };
+  }
+
+  /**
+   * @throws AlreadyClosedException if this Directory is closed
+   */
+  protected void ensureOpen() throws AlreadyClosedException {}
+  
+  /**
+   * Allows to create one or more sliced {@link IndexInput} instances from a single 
+   * file handle. Some {@link Directory} implementations may be able to efficiently map slices of a file
+   * into memory when only certain parts of a file are required.   
+   * @lucene.internal
+   * @lucene.experimental
+   */
+  public abstract class IndexInputSlicer implements Closeable {
+    /**
+     * Returns an {@link IndexInput} slice starting at the given offset with the given length.
+     */
+    public abstract IndexInput openSlice(String sliceDescription, long offset, long length) throws IOException;
+  }
+  
+  /** Implementation of an IndexInput that reads from a portion of
+   *  a file.
+   */
+  private static final class SlicedIndexInput extends BufferedIndexInput {
+    IndexInput base;
+    long fileOffset;
+    long length;
+    
+    SlicedIndexInput(final String sliceDescription, final IndexInput base, final long fileOffset, final long length) {
+      this(sliceDescription, base, fileOffset, length, BufferedIndexInput.BUFFER_SIZE);
+    }
+    
+    SlicedIndexInput(final String sliceDescription, final IndexInput base, final long fileOffset, final long length, int readBufferSize) {
+      super("SlicedIndexInput(" + sliceDescription + " in " + base + " slice=" + fileOffset + ":" + (fileOffset+length) + ")", readBufferSize);
+      this.base = base.clone();
+      this.fileOffset = fileOffset;
+      this.length = length;
+    }
+    
+    @Override
+    public SlicedIndexInput clone() {
+      SlicedIndexInput clone = (SlicedIndexInput)super.clone();
+      clone.base = base.clone();
+      clone.fileOffset = fileOffset;
+      clone.length = length;
+      return clone;
+    }
+    
+    /** Expert: implements buffer refill.  Reads bytes from the current
+     *  position in the input.
+     * @param b the array to read bytes into
+     * @param offset the offset in the array to start storing bytes
+     * @param len the number of bytes to read
+     */
+    @Override
+    protected void readInternal(byte[] b, int offset, int len) throws IOException {
+      long start = getFilePointer();
+      if(start + len > length)
+        throw new EOFException("read past EOF: " + this);
+      base.seek(fileOffset + start);
+      base.readBytes(b, offset, len, false);
+    }
+    
+    /** Expert: implements seek.  Sets current position in this file, where
+     *  the next {@link #readInternal(byte[],int,int)} will occur.
+     * @see #readInternal(byte[],int,int)
+     */
+    @Override
+    protected void seekInternal(long pos) {}
+    
+    /** Closes the stream to further operations. */
+    @Override
+    public void close() throws IOException {
+      base.close();
+    }
+    
+    @Override
+    public long length() {
+      return length;
+    }
+  }
 }

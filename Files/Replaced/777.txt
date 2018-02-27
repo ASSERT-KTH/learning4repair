@@ -1,13 +1,14 @@
-if (subScorer != null) {
+if ("merge".equals(trace[i].getMethodName())) {
 
-package org.apache.lucene.search;
+package org.apache.lucene.index;
 
-/**
- * Copyright 2004 The Apache Software Foundation
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -19,282 +20,606 @@ package org.apache.lucene.search;
  */
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Iterator;
-import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
-import org.apache.lucene.index.AtomicReaderContext;
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.Term;
+import org.apache.lucene.analysis.MockAnalyzer;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.Field;
+import org.apache.lucene.document.FieldType;
+import org.apache.lucene.document.TextField;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.store.AlreadyClosedException;
+import org.apache.lucene.store.BaseDirectoryWrapper;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.LockObtainFailedException;
+import org.apache.lucene.store.MockDirectoryWrapper;
 import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.LineFileDocs;
+import org.apache.lucene.util.LuceneTestCase.SuppressCodecs;
+import org.apache.lucene.util.LuceneTestCase;
+import org.apache.lucene.util.ThreadInterruptedException;
+import org.apache.lucene.util._TestUtil;
+import org.apache.lucene.util.LuceneTestCase.Slow;
 
 /**
- * A query that generates the union of documents produced by its subqueries, and that scores each document with the maximum
- * score for that document as produced by any subquery, plus a tie breaking increment for any additional matching subqueries.
- * This is useful when searching for a word in multiple fields with different boost factors (so that the fields cannot be
- * combined equivalently into a single search field).  We want the primary score to be the one associated with the highest boost,
- * not the sum of the field scores (as BooleanQuery would give).
- * If the query is "albino elephant" this ensures that "albino" matching one field and "elephant" matching
- * another gets a higher score than "albino" matching both fields.
- * To get this result, use both BooleanQuery and DisjunctionMaxQuery:  for each term a DisjunctionMaxQuery searches for it in
- * each field, while the set of these DisjunctionMaxQuery's is combined into a BooleanQuery.
- * The tie breaker capability allows results that include the same term in multiple fields to be judged better than results that
- * include this term in only the best of those multiple fields, without confusing this with the better case of two different terms
- * in the multiple fields.
+ * MultiThreaded IndexWriter tests
  */
-public class DisjunctionMaxQuery extends Query implements Iterable<Query> {
+@SuppressCodecs("Lucene3x")
+@Slow
+public class TestIndexWriterWithThreads extends LuceneTestCase {
 
-  /* The subqueries */
-  private ArrayList<Query> disjuncts = new ArrayList<Query>();
+  // Used by test cases below
+  private class IndexerThread extends Thread {
 
-  /* Multiple of the non-max disjunct scores added into our final score.  Non-zero values support tie-breaking. */
-  private float tieBreakerMultiplier = 0.0f;
+    boolean diskFull;
+    Throwable error;
+    AlreadyClosedException ace;
+    IndexWriter writer;
+    boolean noErrors;
+    volatile int addCount;
 
-  /** Creates a new empty DisjunctionMaxQuery.  Use add() to add the subqueries.
-   * @param tieBreakerMultiplier the score of each non-maximum disjunct for a document is multiplied by this weight
-   *        and added into the final score.  If non-zero, the value should be small, on the order of 0.1, which says that
-   *        10 occurrences of word in a lower-scored field that is also in a higher scored field is just as good as a unique
-   *        word in the lower scored field (i.e., one that is not in any higher scored field.
-   */
-  public DisjunctionMaxQuery(float tieBreakerMultiplier) {
-    this.tieBreakerMultiplier = tieBreakerMultiplier;
+    public IndexerThread(IndexWriter writer, boolean noErrors) {
+      this.writer = writer;
+      this.noErrors = noErrors;
+    }
+
+    @Override
+    public void run() {
+
+      final Document doc = new Document();
+      FieldType customType = new FieldType(TextField.TYPE_STORED);
+      customType.setStoreTermVectors(true);
+      customType.setStoreTermVectorPositions(true);
+      customType.setStoreTermVectorOffsets(true);
+      
+      doc.add(newField("field", "aaa bbb ccc ddd eee fff ggg hhh iii jjj", customType));
+
+      int idUpto = 0;
+      int fullCount = 0;
+      final long stopTime = System.currentTimeMillis() + 200;
+
+      do {
+        try {
+          writer.updateDocument(new Term("id", ""+(idUpto++)), doc);
+          addCount++;
+        } catch (IOException ioe) {
+          if (VERBOSE) {
+            System.out.println("TEST: expected exc:");
+            ioe.printStackTrace(System.out);
+          }
+          //System.out.println(Thread.currentThread().getName() + ": hit exc");
+          //ioe.printStackTrace(System.out);
+          if (ioe.getMessage().startsWith("fake disk full at") ||
+              ioe.getMessage().equals("now failing on purpose")) {
+            diskFull = true;
+            try {
+              Thread.sleep(1);
+            } catch (InterruptedException ie) {
+              throw new ThreadInterruptedException(ie);
+            }
+            if (fullCount++ >= 5)
+              break;
+          } else {
+            if (noErrors) {
+              System.out.println(Thread.currentThread().getName() + ": ERROR: unexpected IOException:");
+              ioe.printStackTrace(System.out);
+              error = ioe;
+            }
+            break;
+          }
+        } catch (Throwable t) {
+          //t.printStackTrace(System.out);
+          if (noErrors) {
+            System.out.println(Thread.currentThread().getName() + ": ERROR: unexpected Throwable:");
+            t.printStackTrace(System.out);
+            error = t;
+          }
+          break;
+        }
+      } while(System.currentTimeMillis() < stopTime);
+    }
   }
 
-  /**
-   * Creates a new DisjunctionMaxQuery
-   * @param disjuncts a Collection<Query> of all the disjuncts to add
-   * @param tieBreakerMultiplier   the weight to give to each matching non-maximum disjunct
-   */
-  public DisjunctionMaxQuery(Collection<Query> disjuncts, float tieBreakerMultiplier) {
-    this.tieBreakerMultiplier = tieBreakerMultiplier;
-    add(disjuncts);
+  // LUCENE-1130: make sure immediate disk full on creating
+  // an IndexWriter (hit during DW.ThreadState.init()), with
+  // multiple threads, is OK:
+  public void testImmediateDiskFullWithThreads() throws Exception {
+
+    int NUM_THREADS = 3;
+    final int numIterations = TEST_NIGHTLY ? 10 : 3;
+    for(int iter=0;iter<numIterations;iter++) {
+      if (VERBOSE) {
+        System.out.println("\nTEST: iter=" + iter);
+      }
+      MockDirectoryWrapper dir = newMockDirectory();
+      IndexWriter writer = new IndexWriter(
+          dir,
+          newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())).
+              setMaxBufferedDocs(2).
+              setMergeScheduler(new ConcurrentMergeScheduler()).
+              setMergePolicy(newLogMergePolicy(4))
+      );
+      ((ConcurrentMergeScheduler) writer.getConfig().getMergeScheduler()).setSuppressExceptions();
+      dir.setMaxSizeInBytes(4*1024+20*iter);
+
+      IndexerThread[] threads = new IndexerThread[NUM_THREADS];
+
+      for(int i=0;i<NUM_THREADS;i++)
+        threads[i] = new IndexerThread(writer, true);
+
+      for(int i=0;i<NUM_THREADS;i++)
+        threads[i].start();
+
+      for(int i=0;i<NUM_THREADS;i++) {
+        // Without fix for LUCENE-1130: one of the
+        // threads will hang
+        threads[i].join();
+        assertTrue("hit unexpected Throwable", threads[i].error == null);
+      }
+
+      // Make sure once disk space is avail again, we can
+      // cleanly close:
+      dir.setMaxSizeInBytes(0);
+      writer.close(false);
+      dir.close();
+    }
   }
 
-  /** Add a subquery to this disjunction
-   * @param query the disjunct added
-   */
-  public void add(Query query) {
-    disjuncts.add(query);
+
+  // LUCENE-1130: make sure we can close() even while
+  // threads are trying to add documents.  Strictly
+  // speaking, this isn't valid us of Lucene's APIs, but we
+  // still want to be robust to this case:
+  public void testCloseWithThreads() throws Exception {
+    int NUM_THREADS = 3;
+    int numIterations = TEST_NIGHTLY ? 7 : 3;
+    for(int iter=0;iter<numIterations;iter++) {
+      Directory dir = newDirectory();
+
+      IndexWriter writer = new IndexWriter(
+          dir,
+          newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())).
+              setMaxBufferedDocs(10).
+              setMergeScheduler(new ConcurrentMergeScheduler()).
+              setMergePolicy(newLogMergePolicy(4))
+      );
+      ((ConcurrentMergeScheduler) writer.getConfig().getMergeScheduler()).setSuppressExceptions();
+
+      IndexerThread[] threads = new IndexerThread[NUM_THREADS];
+
+      for(int i=0;i<NUM_THREADS;i++)
+        threads[i] = new IndexerThread(writer, false);
+
+      for(int i=0;i<NUM_THREADS;i++)
+        threads[i].start();
+
+      boolean done = false;
+      while(!done) {
+        Thread.sleep(100);
+        for(int i=0;i<NUM_THREADS;i++)
+          // only stop when at least one thread has added a doc
+          if (threads[i].addCount > 0) {
+            done = true;
+            break;
+          } else if (!threads[i].isAlive()) {
+            fail("thread failed before indexing a single document");
+          }
+      }
+
+      writer.close(false);
+
+      // Make sure threads that are adding docs are not hung:
+      for(int i=0;i<NUM_THREADS;i++) {
+        // Without fix for LUCENE-1130: one of the
+        // threads will hang
+        threads[i].join();
+        if (threads[i].isAlive())
+          fail("thread seems to be hung");
+      }
+
+      // Quick test to make sure index is not corrupt:
+      IndexReader reader = DirectoryReader.open(dir);
+      DocsEnum tdocs = _TestUtil.docs(random(), reader,
+                                      "field",
+                                      new BytesRef("aaa"),
+                                      MultiFields.getLiveDocs(reader),
+                                      null,
+                                      0);
+      int count = 0;
+      while(tdocs.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
+        count++;
+      }
+      assertTrue(count > 0);
+      reader.close();
+
+      dir.close();
+    }
   }
 
-  /** Add a collection of disjuncts to this disjunction
-   * via Iterable<Query>
-   * @param disjuncts a collection of queries to add as disjuncts.
-   */
-  public void add(Collection<Query> disjuncts) {
-    this.disjuncts.addAll(disjuncts);
+  // Runs test, with multiple threads, using the specific
+  // failure to trigger an IOException
+  public void _testMultipleThreadsFailure(MockDirectoryWrapper.Failure failure) throws Exception {
+
+    int NUM_THREADS = 3;
+
+    for(int iter=0;iter<2;iter++) {
+      if (VERBOSE) {
+        System.out.println("TEST: iter=" + iter);
+      }
+      MockDirectoryWrapper dir = newMockDirectory();
+
+      IndexWriter writer = new IndexWriter(
+          dir,
+          newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())).
+              setMaxBufferedDocs(2).
+              setMergeScheduler(new ConcurrentMergeScheduler()).
+              setMergePolicy(newLogMergePolicy(4))
+      );
+      ((ConcurrentMergeScheduler) writer.getConfig().getMergeScheduler()).setSuppressExceptions();
+
+      IndexerThread[] threads = new IndexerThread[NUM_THREADS];
+
+      for(int i=0;i<NUM_THREADS;i++)
+        threads[i] = new IndexerThread(writer, true);
+
+      for(int i=0;i<NUM_THREADS;i++)
+        threads[i].start();
+
+      Thread.sleep(10);
+
+      dir.failOn(failure);
+      failure.setDoFail();
+
+      for(int i=0;i<NUM_THREADS;i++) {
+        threads[i].join();
+        assertTrue("hit unexpected Throwable", threads[i].error == null);
+      }
+
+      boolean success = false;
+      try {
+        writer.close(false);
+        success = true;
+      } catch (IOException ioe) {
+        failure.clearDoFail();
+        writer.close(false);
+      }
+      if (VERBOSE) {
+        System.out.println("TEST: success=" + success);
+      }
+
+      if (success) {
+        IndexReader reader = DirectoryReader.open(dir);
+        final Bits delDocs = MultiFields.getLiveDocs(reader);
+        for(int j=0;j<reader.maxDoc();j++) {
+          if (delDocs == null || !delDocs.get(j)) {
+            reader.document(j);
+            reader.getTermVectors(j);
+          }
+        }
+        reader.close();
+      }
+
+      dir.close();
+    }
   }
 
-  /** @return An Iterator<Query> over the disjuncts */
-  public Iterator<Query> iterator() {
-    return disjuncts.iterator();
+  // Runs test, with one thread, using the specific failure
+  // to trigger an IOException
+  public void _testSingleThreadFailure(MockDirectoryWrapper.Failure failure) throws IOException {
+    MockDirectoryWrapper dir = newMockDirectory();
+
+    IndexWriter writer = new IndexWriter(dir, newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer(random()))
+      .setMaxBufferedDocs(2).setMergeScheduler(new ConcurrentMergeScheduler()));
+    final Document doc = new Document();
+    FieldType customType = new FieldType(TextField.TYPE_STORED);
+    customType.setStoreTermVectors(true);
+    customType.setStoreTermVectorPositions(true);
+    customType.setStoreTermVectorOffsets(true);
+    doc.add(newField("field", "aaa bbb ccc ddd eee fff ggg hhh iii jjj", customType));
+
+    for(int i=0;i<6;i++)
+      writer.addDocument(doc);
+
+    dir.failOn(failure);
+    failure.setDoFail();
+    try {
+      writer.addDocument(doc);
+      writer.addDocument(doc);
+      writer.commit();
+      fail("did not hit exception");
+    } catch (IOException ioe) {
+    }
+    failure.clearDoFail();
+    writer.addDocument(doc);
+    writer.close(false);
+    dir.close();
+  }
+
+  // Throws IOException during FieldsWriter.flushDocument and during DocumentsWriter.abort
+  private static class FailOnlyOnAbortOrFlush extends MockDirectoryWrapper.Failure {
+    private boolean onlyOnce;
+    public FailOnlyOnAbortOrFlush(boolean onlyOnce) {
+      this.onlyOnce = onlyOnce;
+    }
+    @Override
+    public void eval(MockDirectoryWrapper dir)  throws IOException {
+
+      // Since we throw exc during abort, eg when IW is
+      // attempting to delete files, we will leave
+      // leftovers: 
+      dir.setAssertNoUnrefencedFilesOnClose(false);
+
+      if (doFail) {
+        StackTraceElement[] trace = new Exception().getStackTrace();
+        boolean sawAbortOrFlushDoc = false;
+        boolean sawClose = false;
+        boolean sawMerge = false;
+        for (int i = 0; i < trace.length; i++) {
+          if ("abort".equals(trace[i].getMethodName()) ||
+              "finishDocument".equals(trace[i].getMethodName())) {
+            sawAbortOrFlushDoc = true;
+          }
+          if ("merge".equals(trace[i])) {
+            sawMerge = true;
+          }
+          if ("close".equals(trace[i].getMethodName())) {
+            sawClose = true;
+          }
+        }
+        if (sawAbortOrFlushDoc && !sawClose && !sawMerge) {
+          if (onlyOnce)
+            doFail = false;
+          //System.out.println(Thread.currentThread().getName() + ": now fail");
+          //new Throwable().printStackTrace(System.out);
+          throw new IOException("now failing on purpose");
+        }
+      }
+    }
+  }
+
+
+
+  // LUCENE-1130: make sure initial IOException, and then 2nd
+  // IOException during rollback(), is OK:
+  public void testIOExceptionDuringAbort() throws IOException {
+    _testSingleThreadFailure(new FailOnlyOnAbortOrFlush(false));
+  }
+
+  // LUCENE-1130: make sure initial IOException, and then 2nd
+  // IOException during rollback(), is OK:
+  public void testIOExceptionDuringAbortOnlyOnce() throws IOException {
+    _testSingleThreadFailure(new FailOnlyOnAbortOrFlush(true));
+  }
+
+  // LUCENE-1130: make sure initial IOException, and then 2nd
+  // IOException during rollback(), with multiple threads, is OK:
+  public void testIOExceptionDuringAbortWithThreads() throws Exception {
+    _testMultipleThreadsFailure(new FailOnlyOnAbortOrFlush(false));
+  }
+
+  // LUCENE-1130: make sure initial IOException, and then 2nd
+  // IOException during rollback(), with multiple threads, is OK:
+  public void testIOExceptionDuringAbortWithThreadsOnlyOnce() throws Exception {
+    _testMultipleThreadsFailure(new FailOnlyOnAbortOrFlush(true));
+  }
+
+  // Throws IOException during DocumentsWriter.writeSegment
+  private static class FailOnlyInWriteSegment extends MockDirectoryWrapper.Failure {
+    private boolean onlyOnce;
+    public FailOnlyInWriteSegment(boolean onlyOnce) {
+      this.onlyOnce = onlyOnce;
+    }
+    @Override
+    public void eval(MockDirectoryWrapper dir)  throws IOException {
+      if (doFail) {
+        StackTraceElement[] trace = new Exception().getStackTrace();
+        for (int i = 0; i < trace.length; i++) {
+          if ("flush".equals(trace[i].getMethodName()) && "org.apache.lucene.index.DocFieldProcessor".equals(trace[i].getClassName())) {
+            if (onlyOnce)
+              doFail = false;
+            //System.out.println(Thread.currentThread().getName() + ": NOW FAIL: onlyOnce=" + onlyOnce);
+            //new Throwable().printStackTrace(System.out);
+            throw new IOException("now failing on purpose");
+          }
+        }
+      }
+    }
+  }
+
+  // LUCENE-1130: test IOException in writeSegment
+  public void testIOExceptionDuringWriteSegment() throws IOException {
+    _testSingleThreadFailure(new FailOnlyInWriteSegment(false));
+  }
+
+  // LUCENE-1130: test IOException in writeSegment
+  public void testIOExceptionDuringWriteSegmentOnlyOnce() throws IOException {
+    _testSingleThreadFailure(new FailOnlyInWriteSegment(true));
+  }
+
+  // LUCENE-1130: test IOException in writeSegment, with threads
+  public void testIOExceptionDuringWriteSegmentWithThreads() throws Exception {
+    _testMultipleThreadsFailure(new FailOnlyInWriteSegment(false));
+  }
+
+  // LUCENE-1130: test IOException in writeSegment, with threads
+  public void testIOExceptionDuringWriteSegmentWithThreadsOnlyOnce() throws Exception {
+    _testMultipleThreadsFailure(new FailOnlyInWriteSegment(true));
   }
   
-  /**
-   * @return the disjuncts.
-   */
-  public ArrayList<Query> getDisjuncts() {
-    return disjuncts;
+  //  LUCENE-3365: Test adding two documents with the same field from two different IndexWriters 
+  //  that we attempt to open at the same time.  As long as the first IndexWriter completes
+  //  and closes before the second IndexWriter time's out trying to get the Lock,
+  //  we should see both documents
+  public void testOpenTwoIndexWritersOnDifferentThreads() throws IOException, InterruptedException {
+     final Directory dir = newDirectory();
+     CountDownLatch oneIWConstructed = new CountDownLatch(1);
+     DelayedIndexAndCloseRunnable thread1 = new DelayedIndexAndCloseRunnable(
+         dir, oneIWConstructed);
+     DelayedIndexAndCloseRunnable thread2 = new DelayedIndexAndCloseRunnable(
+         dir, oneIWConstructed);
+
+     thread1.start();
+     thread2.start();
+     oneIWConstructed.await();
+
+     thread1.startIndexing();
+     thread2.startIndexing();
+
+     thread1.join();
+     thread2.join();
+     
+     // ensure the directory is closed if we hit the timeout and throw assume
+     // TODO: can we improve this in LuceneTestCase? I dont know what the logic would be...
+     try {
+       assumeFalse("aborting test: timeout obtaining lock", thread1.failure instanceof LockObtainFailedException);
+       assumeFalse("aborting test: timeout obtaining lock", thread2.failure instanceof LockObtainFailedException);
+
+       assertFalse("Failed due to: " + thread1.failure, thread1.failed);
+       assertFalse("Failed due to: " + thread2.failure, thread2.failed);
+       // now verify that we have two documents in the index
+       IndexReader reader = DirectoryReader.open(dir);
+       assertEquals("IndexReader should have one document per thread running", 2,
+         reader.numDocs());
+     
+       reader.close();
+     } finally {
+       dir.close();
+     }
   }
+  
+  static class DelayedIndexAndCloseRunnable extends Thread {
+    private final Directory dir;
+    boolean failed = false;
+    Throwable failure = null;
+    private final CountDownLatch startIndexing = new CountDownLatch(1);
+    private CountDownLatch iwConstructed;
 
-  /**
-   * @return tie breaker value for multiple matches.
-   */
-  public float getTieBreakerMultiplier() {
-    return tieBreakerMultiplier;
-  }
-
-  /**
-   * Expert: the Weight for DisjunctionMaxQuery, used to
-   * normalize, score and explain these queries.
-   *
-   * <p>NOTE: this API and implementation is subject to
-   * change suddenly in the next release.</p>
-   */
-  protected class DisjunctionMaxWeight extends Weight {
-
-    /** The Weights for our subqueries, in 1-1 correspondence with disjuncts */
-    protected ArrayList<Weight> weights = new ArrayList<Weight>();  // The Weight's for our subqueries, in 1-1 correspondence with disjuncts
-
-    /** Construct the Weight for this Query searched by searcher.  Recursively construct subquery weights. */
-    public DisjunctionMaxWeight(IndexSearcher searcher) throws IOException {
-      for (Query disjunctQuery : disjuncts) {
-        weights.add(disjunctQuery.createWeight(searcher));
-      }
+    public DelayedIndexAndCloseRunnable(Directory dir,
+                                        CountDownLatch iwConstructed) {
+      this.dir = dir;
+      this.iwConstructed = iwConstructed;
     }
 
-    /** Return our associated DisjunctionMaxQuery */
+    public void startIndexing() {
+      this.startIndexing.countDown();
+    }
+
     @Override
-    public Query getQuery() { return DisjunctionMaxQuery.this; }
-
-    /** Compute the sub of squared weights of us applied to our subqueries.  Used for normalization. */
-    @Override
-    public float getValueForNormalization() throws IOException {
-      float max = 0.0f, sum = 0.0f;
-      for (Weight currentWeight : weights) {
-        float sub = currentWeight.getValueForNormalization();
-        sum += sub;
-        max = Math.max(max, sub);
-        
+    public void run() {
+      try {
+        Document doc = new Document();
+        Field field = newTextField("field", "testData", Field.Store.YES);
+        doc.add(field);
+        IndexWriter writer = new IndexWriter(dir, newIndexWriterConfig(
+                                                                       TEST_VERSION_CURRENT, new MockAnalyzer(random())));
+        iwConstructed.countDown();
+        startIndexing.await();
+        writer.addDocument(doc);
+        writer.close();
+      } catch (Throwable e) {
+        failed = true;
+        failure = e;
+        failure.printStackTrace(System.out);
+        return;
       }
-      float boost = getBoost();
-      return (((sum - max) * tieBreakerMultiplier * tieBreakerMultiplier) + max) * boost * boost;
-    }
-
-    /** Apply the computed normalization factor to our subqueries */
-    @Override
-    public void normalize(float norm, float topLevelBoost) {
-      topLevelBoost *= getBoost();  // Incorporate our boost
-      for (Weight wt : weights) {
-        wt.normalize(norm, topLevelBoost);
-      }
-    }
-
-    /** Create the scorer used to score our associated DisjunctionMaxQuery */
-    @Override
-    public Scorer scorer(AtomicReaderContext context, boolean scoreDocsInOrder,
-        boolean topScorer, Bits acceptDocs) throws IOException {
-      Scorer[] scorers = new Scorer[weights.size()];
-      int idx = 0;
-      for (Weight w : weights) {
-        // we will advance() subscorers
-        Scorer subScorer = w.scorer(context, true, false, acceptDocs);
-        if (subScorer != null && subScorer.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
-          scorers[idx++] = subScorer;
-        }
-      }
-      if (idx == 0) return null; // all scorers did not have documents
-      DisjunctionMaxScorer result = new DisjunctionMaxScorer(this, tieBreakerMultiplier, scorers, idx);
-      return result;
-    }
-
-    /** Explain the score we computed for doc */
-    @Override
-    public Explanation explain(AtomicReaderContext context, int doc) throws IOException {
-      if (disjuncts.size() == 1) return weights.get(0).explain(context,doc);
-      ComplexExplanation result = new ComplexExplanation();
-      float max = 0.0f, sum = 0.0f;
-      result.setDescription(tieBreakerMultiplier == 0.0f ? "max of:" : "max plus " + tieBreakerMultiplier + " times others of:");
-      for (Weight wt : weights) {
-        Explanation e = wt.explain(context, doc);
-        if (e.isMatch()) {
-          result.setMatch(Boolean.TRUE);
-          result.addDetail(e);
-          sum += e.getValue();
-          max = Math.max(max, e.getValue());
-        }
-      }
-      result.setValue(max + (sum - max) * tieBreakerMultiplier);
-      return result;
-    }
-    
-  }  // end of DisjunctionMaxWeight inner class
-
-  /** Create the Weight used to score us */
-  @Override
-  public Weight createWeight(IndexSearcher searcher) throws IOException {
-    return new DisjunctionMaxWeight(searcher);
-  }
-
-  /** Optimize our representation and our subqueries representations
-   * @param reader the IndexReader we query
-   * @return an optimized copy of us (which may not be a copy if there is nothing to optimize) */
-  @Override
-  public Query rewrite(IndexReader reader) throws IOException {
-    int numDisjunctions = disjuncts.size();
-    if (numDisjunctions == 1) {
-      Query singleton = disjuncts.get(0);
-      Query result = singleton.rewrite(reader);
-      if (getBoost() != 1.0f) {
-        if (result == singleton) result = result.clone();
-        result.setBoost(getBoost() * result.getBoost());
-      }
-      return result;
-    }
-    DisjunctionMaxQuery clone = null;
-    for (int i = 0 ; i < numDisjunctions; i++) {
-      Query clause = disjuncts.get(i);
-      Query rewrite = clause.rewrite(reader);
-      if (rewrite != clause) {
-        if (clone == null) clone = this.clone();
-        clone.disjuncts.set(i, rewrite);
-      }
-    }
-    if (clone != null) return clone;
-    else return this;
-  }
-
-  /** Create a shallow copy of us -- used in rewriting if necessary
-   * @return a copy of us (but reuse, don't copy, our subqueries) */
-  @Override @SuppressWarnings("unchecked")
-  public DisjunctionMaxQuery clone() {
-    DisjunctionMaxQuery clone = (DisjunctionMaxQuery)super.clone();
-    clone.disjuncts = (ArrayList<Query>) this.disjuncts.clone();
-    return clone;
-  }
-
-  // inherit javadoc
-  @Override
-  public void extractTerms(Set<Term> terms) {
-    for (Query query : disjuncts) {
-      query.extractTerms(terms);
     }
   }
 
-  /** Prettyprint us.
-   * @param field the field to which we are applied
-   * @return a string that shows what we do, of the form "(disjunct1 | disjunct2 | ... | disjunctn)^boost"
-   */
-  @Override
-  public String toString(String field) {
-    StringBuilder buffer = new StringBuilder();
-    buffer.append("(");
-    int numDisjunctions = disjuncts.size();
-    for (int i = 0 ; i < numDisjunctions; i++) {
-      Query subquery = disjuncts.get(i);
-      if (subquery instanceof BooleanQuery) {   // wrap sub-bools in parens
-        buffer.append("(");
-        buffer.append(subquery.toString(field));
-        buffer.append(")");
-      }
-      else buffer.append(subquery.toString(field));
-      if (i != numDisjunctions-1) buffer.append(" | ");
+  // LUCENE-4147
+  public void testRollbackAndCommitWithThreads() throws Exception {
+    final BaseDirectoryWrapper d = newDirectory();
+    if (d instanceof MockDirectoryWrapper) {
+      ((MockDirectoryWrapper)d).setPreventDoubleWrite(false);
     }
-    buffer.append(")");
-    if (tieBreakerMultiplier != 0.0f) {
-      buffer.append("~");
-      buffer.append(tieBreakerMultiplier);
+
+    final int threadCount = _TestUtil.nextInt(random(), 2, 6);
+
+    final AtomicReference<IndexWriter> writerRef = new AtomicReference<IndexWriter>();
+    writerRef.set(new IndexWriter(d, newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random()))));
+    final LineFileDocs docs = new LineFileDocs(random());
+    final Thread[] threads = new Thread[threadCount];
+    final int iters = atLeast(100);
+    final AtomicBoolean failed = new AtomicBoolean();
+    final Lock rollbackLock = new ReentrantLock();
+    final Lock commitLock = new ReentrantLock();
+    for(int threadID=0;threadID<threadCount;threadID++) {
+      threads[threadID] = new Thread() {
+          @Override
+          public void run() {
+            for(int iter=0;iter<iters && !failed.get();iter++) {
+              //final int x = random().nextInt(5);
+              final int x = random().nextInt(3);
+              try {
+                switch(x) {
+                case 0:
+                  rollbackLock.lock();
+                  if (VERBOSE) {
+                    System.out.println("\nTEST: " + Thread.currentThread().getName() + ": now rollback");
+                  }
+                  try {
+                    writerRef.get().rollback();
+                    if (VERBOSE) {
+                      System.out.println("TEST: " + Thread.currentThread().getName() + ": rollback done; now open new writer");
+                    }
+                    writerRef.set(new IndexWriter(d, newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random()))));
+                  } finally {
+                    rollbackLock.unlock();
+                  }
+                  break;
+                case 1:
+                  commitLock.lock();
+                  if (VERBOSE) {
+                    System.out.println("\nTEST: " + Thread.currentThread().getName() + ": now commit");
+                  }
+                  try {
+                    if (random().nextBoolean()) {
+                      writerRef.get().prepareCommit();
+                    }
+                    writerRef.get().commit();
+                  } catch (AlreadyClosedException ace) {
+                    // ok
+                  } catch (NullPointerException npe) {
+                    // ok
+                  } finally {
+                    commitLock.unlock();
+                  }
+                  break;
+                case 2:
+                  if (VERBOSE) {
+                    System.out.println("\nTEST: " + Thread.currentThread().getName() + ": now add");
+                  }
+                  try {
+                    writerRef.get().addDocument(docs.nextDoc());
+                  } catch (AlreadyClosedException ace) {
+                    // ok
+                  } catch (NullPointerException npe) {
+                    // ok
+                  } catch (AssertionError ae) {
+                    // ok
+                  }
+                  break;
+                }
+              } catch (Throwable t) {
+                failed.set(true);
+                throw new RuntimeException(t);
+              }
+            }
+          }
+        };
+      threads[threadID].start();
     }
-    if (getBoost() != 1.0) {
-      buffer.append("^");
-      buffer.append(getBoost());
+
+    for(int threadID=0;threadID<threadCount;threadID++) {
+      threads[threadID].join();
     }
-    return buffer.toString();
+
+    assertTrue(!failed.get());
+    writerRef.get().close();
+    d.close();
   }
-
-  /** Return true iff we represent the same query as o
-   * @param o another object
-   * @return true iff o is a DisjunctionMaxQuery with the same boost and the same subqueries, in the same order, as us
-   */
-  @Override
-  public boolean equals(Object o) {
-    if (! (o instanceof DisjunctionMaxQuery) ) return false;
-    DisjunctionMaxQuery other = (DisjunctionMaxQuery)o;
-    return this.getBoost() == other.getBoost()
-            && this.tieBreakerMultiplier == other.tieBreakerMultiplier
-            && this.disjuncts.equals(other.disjuncts);
-  }
-
-  /** Compute a hash code for hashing us
-   * @return the hash code
-   */
-  @Override
-  public int hashCode() {
-    return Float.floatToIntBits(getBoost())
-            + Float.floatToIntBits(tieBreakerMultiplier)
-            + disjuncts.hashCode();
-  }
-
-
 }

@@ -1,13 +1,12 @@
-if (keySpace.get() != null && !keySpace.get().equals(keyspace))
+cores.load(solrHome, new ByteArrayInputStream(DEF_SOLR_XML.getBytes("UTF-8")));
 
 /**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,887 +17,807 @@ if (keySpace.get() != null && !keySpace.get().equals(keyspace))
  * limitations under the License.
  */
 
-package org.apache.cassandra.thrift;
+package org.apache.solr.core;
 
-import java.io.IOException;
+import java.io.*;
+import java.nio.channels.FileChannel;
 import java.util.*;
-import java.util.concurrent.TimeoutException;
+import java.util.concurrent.ConcurrentHashMap;
+import java.text.SimpleDateFormat;
 
-import org.apache.cassandra.auth.AllowAllAuthenticator;
-import org.apache.cassandra.concurrent.StageManager;
-import org.apache.cassandra.config.ConfigurationException;
-import org.apache.cassandra.config.KSMetaData;
-import org.apache.cassandra.db.migration.AddColumnFamily;
-import org.apache.cassandra.db.migration.AddKeyspace;
-import org.apache.cassandra.db.migration.DropColumnFamily;
-import org.apache.cassandra.db.migration.DropKeyspace;
-import org.apache.cassandra.db.migration.RenameColumnFamily;
-import org.apache.cassandra.db.migration.RenameKeyspace;
-import org.apache.cassandra.locator.AbstractReplicationStrategy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.clock.AbstractReconciler;
-import org.apache.cassandra.db.clock.TimestampReconciler;
-import org.apache.cassandra.db.filter.QueryPath;
-import org.apache.cassandra.db.marshal.MarshalException;
-import org.apache.cassandra.dht.AbstractBounds;
-import org.apache.cassandra.dht.Bounds;
-import org.apache.cassandra.dht.IPartitioner;
-import org.apache.cassandra.dht.Range;
-import org.apache.cassandra.dht.Token;
-import org.apache.cassandra.service.StorageProxy;
-import org.apache.cassandra.service.StorageService;
-import org.apache.thrift.TException;
+import javax.xml.parsers.ParserConfigurationException;
+import javax.xml.xpath.XPathConstants;
+import javax.xml.xpath.XPath;
+import javax.xml.xpath.XPathExpressionException;
 
-public class CassandraServer implements Cassandra.Iface
+import org.apache.solr.common.SolrException;
+import org.apache.solr.common.params.CoreAdminParams;
+import org.apache.solr.common.util.DOMUtil;
+import org.apache.solr.common.util.XML;
+import org.apache.solr.common.util.FileUtils;
+import org.apache.solr.handler.admin.CoreAdminHandler;
+import org.apache.solr.schema.IndexSchema;
+import org.apache.commons.io.IOUtils;
+import org.w3c.dom.Node;
+import org.w3c.dom.NodeList;
+import org.xml.sax.SAXException;
+
+
+/**
+ * @version $Id$
+ * @since solr 1.3
+ */
+public class CoreContainer 
 {
-    public static String TOKEN_MAP = "token map";
-    private static Logger logger = LoggerFactory.getLogger(CassandraServer.class);
+  private static final String DEFAULT_DEFAULT_CORE_NAME = "collection1";
 
-    private final static List<ColumnOrSuperColumn> EMPTY_COLUMNS = Collections.emptyList();
-    private final static List<Column> EMPTY_SUBCOLUMNS = Collections.emptyList();
+  protected static Logger log = LoggerFactory.getLogger(CoreContainer.class);
+  
+  protected final Map<String, SolrCore> cores = new LinkedHashMap<String, SolrCore>();
+  protected boolean persistent = false;
+  protected String adminPath = null;
+  protected String managementPath = null;
+  protected CoreAdminHandler coreAdminHandler = null;
+  protected File configFile = null;
+  protected String libDir = null;
+  protected ClassLoader libLoader = null;
+  protected SolrResourceLoader loader = null;
+  protected Properties containerProperties;
+  protected Map<String ,IndexSchema> indexSchemaCache;
+  protected String adminHandler;
+  protected boolean shareSchema;
+  protected String solrHome;
+  protected String solrConfigFilenameOverride;
+  private String defaultCoreName = "";
+  
+  // assigned by Initializer
+  private boolean defaultAbortOnConfigError = false;
+  // number of cores that either explicitly, or because of
+  // default, said to abort on config error
+  private int numCoresAbortOnConfigError = 0;
+  
+  public CoreContainer() {
+    solrHome = SolrResourceLoader.locateSolrHome();
+    log.info("New CoreContainer: solrHome=" + solrHome + " instance="+System.identityHashCode(this));
+  }
 
-    // will be set only by login()
-    private ThreadLocal<AccessLevel> loginDone = new ThreadLocal<AccessLevel>() 
-    {
-        @Override
-        protected AccessLevel initialValue()
-        {
-            return AccessLevel.NONE;
-        }
-    };
-    /*
-     * Keyspace associated with session
+  public Properties getContainerProperties() {
+    return containerProperties;
+  }
+
+  // Helper class to initialize the CoreContainer
+  public static class Initializer {
+    protected String solrConfigFilename = null;
+    // default to true for legacy behavior
+    protected boolean abortOnConfigurationError = true;
+
+    public boolean isAbortOnConfigurationError() {
+      return abortOnConfigurationError;
+    }
+    
+    /** Note for no good reason what so ever, this method has only ever
+     * influenced the default behavior of "single core" mode.  when using
+     * solr.xml values specified this way are ignored, and false is the default.
+     * initialize() will modify this value.
      */
-    private ThreadLocal<String> keySpace = new ThreadLocal<String>();
+    public void setAbortOnConfigurationError(boolean abortOnConfigurationError) {
+      this.abortOnConfigurationError = abortOnConfigurationError;
+    }
 
-    /*
-      * Handle to the storage service to interact with the other machines in the
-      * cluster.
-      */
-	private final StorageService storageService;
+    public String getSolrConfigFilename() {
+      return solrConfigFilename;
+    }
+   @Deprecated
+    public void setSolrConfigFilename(String solrConfigFilename) {
+      this.solrConfigFilename = solrConfigFilename;
+    }
 
-    public CassandraServer()
-    {
-        storageService = StorageService.instance;
+    // core container instantiation
+    public CoreContainer initialize() throws IOException,
+        ParserConfigurationException, SAXException {
+      CoreContainer cores = null;
+      String solrHome = SolrResourceLoader.locateSolrHome();
+      File fconf = new File(solrHome, solrConfigFilename == null ? "solr.xml"
+          : solrConfigFilename);
+      log.info("looking for solr.xml: " + fconf.getAbsolutePath());
+      cores = new CoreContainer();
+      cores.solrConfigFilenameOverride = solrConfigFilename;
+      if (fconf.exists()) {
+        // default abortOnConfigurationError ignored in multicore
+        cores.defaultAbortOnConfigError = false;
+        cores.load(solrHome, fconf);
+      } else {
+        cores.defaultAbortOnConfigError = abortOnConfigurationError;
+        cores.load(solrHome, new ByteArrayInputStream(DEF_SOLR_XML.getBytes()));
+        cores.configFile = fconf;
+      }
+      setAbortOnConfigurationError(0 < cores.numCoresAbortOnConfigError);
+      
+      solrConfigFilename = cores.getConfigFile().getName();
+      
+      return cores;
+    }
+  }
+
+  private static Properties getCoreProps(String instanceDir, String file, Properties defaults) {
+    if(file == null) file = "conf"+File.separator+ "solrcore.properties";
+    File corePropsFile = new File(file);
+    if(!corePropsFile.isAbsolute()){
+      corePropsFile = new File(instanceDir, file);
+    }
+    Properties p = defaults;
+    if (corePropsFile.exists() && corePropsFile.isFile()) {
+      p = new Properties(defaults);
+      InputStream is = null;
+      try {
+        is = new FileInputStream(corePropsFile);
+        p.load(is);
+      } catch (IOException e) {
+        log.warn("Error loading properties ",e);
+      } finally{
+        IOUtils.closeQuietly(is);        
+      }
+    }
+    return p;
+  }
+
+  /**
+   * Initalize CoreContainer directly from the constructor
+   * 
+   * @param dir
+   * @param configFile
+   * @throws ParserConfigurationException
+   * @throws IOException
+   * @throws SAXException
+   */
+  public CoreContainer(String dir, File configFile) throws ParserConfigurationException, IOException, SAXException 
+  {
+    this.load(dir, configFile);
+  }
+  
+  /**
+   * Minimal CoreContainer constructor. 
+   * @param loader the CoreContainer resource loader
+   */
+  public CoreContainer(SolrResourceLoader loader) {
+    this.loader = loader;
+    this.solrHome = loader.getInstanceDir();
+  }
+
+  public CoreContainer(String solrHome) {
+    this.solrHome = solrHome;
+  }
+
+  //-------------------------------------------------------------------
+  // Initialization / Cleanup
+  //-------------------------------------------------------------------
+  
+  /**
+   * Load a config file listing the available solr cores.
+   * @param dir the home directory of all resources.
+   * @param configFile the configuration file
+   * @throws javax.xml.parsers.ParserConfigurationException
+   * @throws java.io.IOException
+   * @throws org.xml.sax.SAXException
+   */
+  public void load(String dir, File configFile ) throws ParserConfigurationException, IOException, SAXException {
+    this.configFile = configFile;
+    this.load(dir, new FileInputStream(configFile));
+  } 
+
+  /**
+   * Load a config file listing the available solr cores.
+   * 
+   * @param dir the home directory of all resources.
+   * @param cfgis the configuration file InputStream
+   * @throws ParserConfigurationException
+   * @throws IOException
+   * @throws SAXException
+   */
+  public void load(String dir, InputStream cfgis)
+      throws ParserConfigurationException, IOException, SAXException {
+    this.loader = new SolrResourceLoader(dir);
+    solrHome = loader.getInstanceDir();
+    try {
+      Config cfg = new Config(loader, null, cfgis, null);
+      String dcoreName = cfg.get("solr/cores/@defaultCoreName", null);
+      if(dcoreName != null) {
+        defaultCoreName = dcoreName;
+      }
+      persistent = cfg.getBool( "solr/@persistent", false );
+      libDir     = cfg.get(     "solr/@sharedLib", null);
+      adminPath  = cfg.get(     "solr/cores/@adminPath", null );
+      shareSchema = cfg.getBool("solr/cores/@shareSchema", false );
+      if(shareSchema){
+        indexSchemaCache = new ConcurrentHashMap<String ,IndexSchema>();
+      }
+      adminHandler  = cfg.get("solr/cores/@adminHandler", null );
+      managementPath  = cfg.get("solr/cores/@managementPath", null );
+
+      if (libDir != null) {
+        File f = FileUtils.resolvePath(new File(dir), libDir);
+        log.info( "loading shared library: "+f.getAbsolutePath() );
+        libLoader = SolrResourceLoader.createClassLoader(f, null);
+      }
+
+      if (adminPath != null) {
+        if (adminHandler == null) {
+          coreAdminHandler = new CoreAdminHandler(this);
+        } else {
+          coreAdminHandler = this.createMultiCoreHandler(adminHandler);
+        }
+      }
+
+      try {
+        containerProperties = readProperties(cfg, ((NodeList) cfg.evaluate("solr", XPathConstants.NODESET)).item(0));
+      } catch (Throwable e) {
+        SolrConfig.severeErrors.add(e);
+        SolrException.logOnce(log,null,e);
+      }
+      
+      // before looping over each core, let's check the names and fail 
+      // fast if the same one is reused multiple times.
+      { // local scope, won't need these vars again
+        NodeList nodes = (NodeList)cfg.evaluate("solr/cores/core/@name", 
+                                                XPathConstants.NODESET);
+        Set<String> names = new HashSet<String>();
+        for (int i=0; i<nodes.getLength(); i++) {
+          String name = DOMUtil.getText(nodes.item(i));
+          if (names.contains(name)) {
+            throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
+                                    "Multiple cores found with same name: " + 
+                                    name);
+          }
+          names.add(name);
+        }
+      }
+
+      NodeList nodes = (NodeList)cfg.evaluate("solr/cores/core", XPathConstants.NODESET);
+      for (int i=0; i<nodes.getLength(); i++) {
+        Node node = nodes.item(i);
+        try {
+          String name = DOMUtil.getAttr(node, "name", null);
+          if (null == name) {
+            throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
+                                    "Each core in solr.xml must have a 'name'");
+          }
+          if (name.equals(defaultCoreName)){
+            // for the default core we use a blank name,
+            // later on attempts to access it by it's full name will 
+            // be mapped to this.
+            name="";
+          }
+
+          CoreDescriptor p = new CoreDescriptor(this, name, DOMUtil.getAttr(node, "instanceDir", null));
+
+          // deal with optional settings
+          String opt = DOMUtil.getAttr(node, "config", null);
+          if(solrConfigFilenameOverride != null && name.equals("")) {
+            p.setConfigName(solrConfigFilenameOverride);
+          } else if (opt != null) {
+            p.setConfigName(opt);
+          }
+          opt = DOMUtil.getAttr(node, "schema", null);
+          if (opt != null) {
+            p.setSchemaName(opt);
+          }
+          opt = DOMUtil.getAttr(node, "properties", null);
+          if (opt != null) {
+            p.setPropertiesName(opt);
+          }
+          opt = DOMUtil.getAttr(node, CoreAdminParams.DATA_DIR, null);
+          if (opt != null) {
+            p.setDataDir(opt);
+          }
+
+          p.setCoreProperties(readProperties(cfg, node));
+
+          SolrCore core = create(p);
+          register(name, core, false);
+        }
+        catch (Throwable ex) {
+          SolrConfig.severeErrors.add( ex );
+          SolrException.logOnce(log,null,ex);
+        }
+      }
+    }
+
+    finally {
+      if (cfgis != null) {
+        try { cfgis.close(); } catch (Exception xany) {}
+      }
+    }
+  }
+
+  private Properties readProperties(Config cfg, Node node) throws XPathExpressionException {
+    XPath xpath = cfg.getXPath();
+    NodeList props = (NodeList) xpath.evaluate("property", node, XPathConstants.NODESET);
+    Properties properties = new Properties();
+    for (int i=0; i<props.getLength(); i++) {
+      Node prop = props.item(i);
+      properties.setProperty(DOMUtil.getAttr(prop, "name"), DOMUtil.getAttr(prop, "value"));
+    }
+    return properties;
+  }
+  private boolean isShutDown = false;
+  /**
+   * Stops all cores.
+   */
+  public void shutdown() {
+    synchronized(cores) {
+      try {
+        for(SolrCore core : cores.values()) {
+          core.close();
+        }
+        cores.clear();
+      } finally {
+        isShutDown = true;
+      }
+    }
+  }
+  
+  @Override
+  protected void finalize() throws Throwable {
+    try {
+      if(!isShutDown){
+        log.error("CoreContainer was not shutdown prior to finalize(), indicates a bug -- POSSIBLE RESOURCE LEAK!!!  instance=" + System.identityHashCode(this));
+        shutdown();
+      }
+    } finally {
+      super.finalize();
+    }
+  }
+
+  /**
+   * Registers a SolrCore descriptor in the registry using the specified name.
+   * If returnPrevNotClosed==false, the old core, if different, is closed. if true, it is returned w/o closing the core
+   *
+   * @return a previous core having the same name if it existed
+   */
+  public SolrCore register(String name, SolrCore core, boolean returnPrevNotClosed) {
+    if( core == null ) {
+      throw new RuntimeException( "Can not register a null core." );
+    }
+    if( name == null ||
+        name.indexOf( '/'  ) >= 0 ||
+        name.indexOf( '\\' ) >= 0 ){
+      throw new RuntimeException( "Invalid core name: "+name );
+    }
+
+    SolrCore old = null;
+    synchronized (cores) {
+      old = cores.put(name, core);
+      core.setName(name);
+    }
+
+
+    if( old == null || old == core) {
+      log.info( "registering core: "+name );
+      return null;
+    }
+    else {
+      log.info( "replacing core: "+name );
+      if (!returnPrevNotClosed) {
+        old.close();
+      }
+      return old;
+    }
+  }
+
+
+  /**
+   * Registers a SolrCore descriptor in the registry using the core's name.
+   * If returnPrev==false, the old core, if different, is closed.
+   * @return a previous core having the same name if it existed and returnPrev==true
+   */
+  public SolrCore register(SolrCore core, boolean returnPrev) {
+    return register(core.getName(), core, returnPrev);
+  }
+
+  /**
+   * Creates a new core based on a descriptor but does not register it.
+   *
+   * @param dcore a core descriptor
+   * @return the newly created core
+   * @throws javax.xml.parsers.ParserConfigurationException
+   * @throws java.io.IOException
+   * @throws org.xml.sax.SAXException
+   */
+  public SolrCore create(CoreDescriptor dcore)  throws ParserConfigurationException, IOException, SAXException {
+    // Make the instanceDir relative to the cores instanceDir if not absolute
+    File idir = new File(dcore.getInstanceDir());
+    if (!idir.isAbsolute()) {
+      idir = new File(solrHome, dcore.getInstanceDir());
+    }
+    String instanceDir = idir.getPath();
+    
+    // Initialize the solr config
+    SolrResourceLoader solrLoader = new SolrResourceLoader(instanceDir, libLoader, getCoreProps(instanceDir, dcore.getPropertiesName(),dcore.getCoreProperties()));
+    SolrConfig config = new SolrConfig(solrLoader, dcore.getConfigName(), null);
+
+    if (config.getBool("abortOnConfigurationError",defaultAbortOnConfigError)) {
+      numCoresAbortOnConfigError++;
     }
     
-    protected Map<DecoratedKey, ColumnFamily> readColumnFamily(List<ReadCommand> commands, ConsistencyLevel consistency_level)
-    throws InvalidRequestException, UnavailableException, TimedOutException
-    {
-        // TODO - Support multiple column families per row, right now row only contains 1 column family
-        Map<DecoratedKey, ColumnFamily> columnFamilyKeyMap = new HashMap<DecoratedKey, ColumnFamily>();
-
-        if (consistency_level == ConsistencyLevel.ZERO)
-        {
-            throw new InvalidRequestException("Consistency level zero may not be applied to read operations");
+    IndexSchema schema = null;
+    if(indexSchemaCache != null){
+      //schema sharing is enabled. so check if it already is loaded
+      File schemaFile = new File(dcore.getSchemaName());
+      if (!schemaFile.isAbsolute()) {
+        schemaFile = new File(solrLoader.getInstanceDir() + "conf" + File.separator + dcore.getSchemaName());
+      }
+      if(schemaFile. exists()){
+        String key = schemaFile.getAbsolutePath()+":"+new SimpleDateFormat("yyyyMMddHHmmss", Locale.US).format(new Date(schemaFile.lastModified()));
+        schema = indexSchemaCache.get(key);
+        if(schema == null){
+          log.info("creating new schema object for core: " + dcore.name);
+          schema = new IndexSchema(config, dcore.getSchemaName(), null);
+          indexSchemaCache.put(key,schema);
+        } else {
+          log.info("re-using schema object for core: " + dcore.name);
         }
-        if (consistency_level == ConsistencyLevel.ANY)
-        {
-            throw new InvalidRequestException("Consistency level any may not be applied to read operations");
-        }
-
-        List<Row> rows;
-        try
-        {
-            rows = StorageProxy.readProtocol(commands, consistency_level);
-        }
-        catch (TimeoutException e) 
-        {
-        	throw new TimedOutException();
-        }
-        catch (IOException e)
-        {
-            throw new RuntimeException(e);
-        }
-
-        for (Row row: rows)
-        {
-            columnFamilyKeyMap.put(row.key, row.cf);
-        }
-        return columnFamilyKeyMap;
+      }
     }
-
-    public List<Column> thriftifySubColumns(Collection<IColumn> columns)
-    {
-        if (columns == null || columns.isEmpty())
-        {
-            return EMPTY_SUBCOLUMNS;
-        }
-
-        ArrayList<Column> thriftColumns = new ArrayList<Column>(columns.size());
-        for (IColumn column : columns)
-        {
-            if (column.isMarkedForDelete())
-            {
-                continue;
-            }
-            Column thrift_column = new Column(column.name(), column.value(), thriftifyIClock(column.clock()));
-            if (column instanceof ExpiringColumn)
-            {
-                thrift_column.setTtl(((ExpiringColumn) column).getTimeToLive());
-            }
-            thriftColumns.add(thrift_column);
-        }
-
-        return thriftColumns;
+    if(schema == null){
+      schema = new IndexSchema(config, dcore.getSchemaName(), null);
     }
-
-    public List<ColumnOrSuperColumn> thriftifyColumns(Collection<IColumn> columns, boolean reverseOrder)
-    {
-        ArrayList<ColumnOrSuperColumn> thriftColumns = new ArrayList<ColumnOrSuperColumn>(columns.size());
-        for (IColumn column : columns)
-        {
-            if (column.isMarkedForDelete())
-            {
-                continue;
-            }
-            Column thrift_column = new Column(column.name(), column.value(), thriftifyIClock(column.clock()));
-            if (column instanceof ExpiringColumn)
-            {
-                thrift_column.setTtl(((ExpiringColumn) column).getTimeToLive());
-            }
-            thriftColumns.add(new ColumnOrSuperColumn().setColumn(thrift_column));
-        }
-
-        // we have to do the reversing here, since internally we pass results around in ColumnFamily
-        // objects, which always sort their columns in the "natural" order
-        // TODO this is inconvenient for direct users of StorageProxy
-        if (reverseOrder)
-            Collections.reverse(thriftColumns);
-        return thriftColumns;
-    }
-
-    private List<ColumnOrSuperColumn> thriftifySuperColumns(Collection<IColumn> columns, boolean reverseOrder)
-    {
-        ArrayList<ColumnOrSuperColumn> thriftSuperColumns = new ArrayList<ColumnOrSuperColumn>(columns.size());
-        for (IColumn column : columns)
-        {
-            List<Column> subcolumns = thriftifySubColumns(column.getSubColumns());
-            if (subcolumns.isEmpty())
-            {
-                continue;
-            }
-            SuperColumn superColumn = new SuperColumn(column.name(), subcolumns);
-            thriftSuperColumns.add(new ColumnOrSuperColumn().setSuper_column(superColumn));
-        }
-
-        if (reverseOrder)
-            Collections.reverse(thriftSuperColumns);
-
-        return thriftSuperColumns;
-    }
-
-    private static Clock thriftifyIClock(IClock clock)
-    {
-        Clock thrift_clock = new Clock();
-        if (clock instanceof TimestampClock)
-        {
-            thrift_clock.setTimestamp(((TimestampClock)clock).timestamp());
-        }
-        return thrift_clock;
-    }
-
-    private Map<byte[], List<ColumnOrSuperColumn>> getSlice(List<ReadCommand> commands, ConsistencyLevel consistency_level)
-    throws InvalidRequestException, UnavailableException, TimedOutException
-    {
-        Map<DecoratedKey, ColumnFamily> columnFamilies = readColumnFamily(commands, consistency_level);
-        Map<byte[], List<ColumnOrSuperColumn>> columnFamiliesMap = new HashMap<byte[], List<ColumnOrSuperColumn>>();
-        for (ReadCommand command: commands)
-        {
-            ColumnFamily cf = columnFamilies.get(StorageService.getPartitioner().decorateKey(command.key));
-            boolean reverseOrder = command instanceof SliceFromReadCommand && ((SliceFromReadCommand)command).reversed;
-            List<ColumnOrSuperColumn> thriftifiedColumns = thriftifyColumnFamily(cf, command.queryPath.superColumnName != null, reverseOrder);
-            columnFamiliesMap.put(command.key, thriftifiedColumns);
-        }
-
-        return columnFamiliesMap;
-    }
-
-    private List<ColumnOrSuperColumn> thriftifyColumnFamily(ColumnFamily cf, boolean subcolumnsOnly, boolean reverseOrder)
-    {
-        if (cf == null || cf.getColumnsMap().size() == 0)
-            return EMPTY_COLUMNS;
-        if (subcolumnsOnly)
-        {
-            IColumn column = cf.getColumnsMap().values().iterator().next();
-            Collection<IColumn> subcolumns = column.getSubColumns();
-            if (subcolumns == null || subcolumns.isEmpty())
-                return EMPTY_COLUMNS;
-            else
-                return thriftifyColumns(subcolumns, reverseOrder);
-        }
-        if (cf.isSuper())
-            return thriftifySuperColumns(cf.getSortedColumns(), reverseOrder);        
-        else
-            return thriftifyColumns(cf.getSortedColumns(), reverseOrder);
-    }
-
-    public List<ColumnOrSuperColumn> get_slice(byte[] key, ColumnParent column_parent, SlicePredicate predicate, ConsistencyLevel consistency_level)
-    throws InvalidRequestException, UnavailableException, TimedOutException
-    {
-        if (logger.isDebugEnabled())
-            logger.debug("get_slice");
-        
-        checkKeyspaceAndLoginAuthorized(AccessLevel.READONLY);
-        return multigetSliceInternal(keySpace.get(), Arrays.asList(key), column_parent, predicate, consistency_level).get(key);
-    }
+    SolrCore core = new SolrCore(dcore.getName(), null, config, schema, dcore);
+    return core;
+  }
     
-    public Map<byte[], List<ColumnOrSuperColumn>> multiget_slice(List<byte[]> keys, ColumnParent column_parent, SlicePredicate predicate, ConsistencyLevel consistency_level)
-    throws InvalidRequestException, UnavailableException, TimedOutException
+  /**
+   * @return a Collection of registered SolrCores
+   */
+  public Collection<SolrCore> getCores() {
+    List<SolrCore> lst = new ArrayList<SolrCore>();
+    synchronized (cores) {
+      lst.addAll(this.cores.values());
+    }
+    return lst;
+  }
+
+  /**
+   * @return a Collection of the names that cores are mapped to
+   */
+  public Collection<String> getCoreNames() {
+    List<String> lst = new ArrayList<String>();
+    synchronized (cores) {
+      lst.addAll(this.cores.keySet());
+    }
+    return lst;
+  }
+
+  /** This method is currently experimental.
+   * @return a Collection of the names that a specific core is mapped to.
+   */
+  public Collection<String> getCoreNames(SolrCore core) {
+    List<String> lst = new ArrayList<String>();
+    synchronized (cores) {
+      for (Map.Entry<String,SolrCore> entry : cores.entrySet()) {
+        if (core == entry.getValue()) {
+          lst.add(entry.getKey());
+        }
+      }
+    }
+    return lst;
+  }
+
+  // ---------------- Core name related methods --------------- 
+  /**
+   * Recreates a SolrCore.
+   * While the new core is loading, requests will continue to be dispatched to
+   * and processed by the old core
+   * 
+   * @param name the name of the SolrCore to reload
+   * @throws ParserConfigurationException
+   * @throws IOException
+   * @throws SAXException
+   */
+
+  public void reload(String name) throws ParserConfigurationException, IOException, SAXException {
+    name= checkDefault(name);
+    SolrCore core;
+    synchronized(cores) {
+      core = cores.get(name);
+    }
+    if (core == null)
+      throw new SolrException( SolrException.ErrorCode.BAD_REQUEST, "No such core: " + name );
+
+    SolrCore newCore = create(core.getCoreDescriptor());
+    register(name, newCore, false);
+  }
+
+  private String checkDefault(String name) {
+    return name.length() == 0  || defaultCoreName.equals(name) || name.trim().length() == 0 ? "" : name;
+  } 
+
+  /**
+   * Swaps two SolrCore descriptors.
+   * @param n0
+   * @param n1
+   */
+  public void swap(String n0, String n1) {
+    if( n0 == null || n1 == null ) {
+      throw new SolrException( SolrException.ErrorCode.BAD_REQUEST, "Can not swap unnamed cores." );
+    }
+    n0 = checkDefault(n0);
+    n1 = checkDefault(n1);
+    synchronized( cores ) {
+      SolrCore c0 = cores.get(n0);
+      SolrCore c1 = cores.get(n1);
+      if (c0 == null)
+        throw new SolrException( SolrException.ErrorCode.BAD_REQUEST, "No such core: " + n0 );
+      if (c1 == null)
+        throw new SolrException( SolrException.ErrorCode.BAD_REQUEST, "No such core: " + n1 );
+      cores.put(n0, c1);
+      cores.put(n1, c0);
+
+      c0.setName(n1);
+      c0.getCoreDescriptor().name = n1;
+      c1.setName(n0);
+      c1.getCoreDescriptor().name = n0;
+    }
+
+
+    log.info("swaped: "+n0 + " with " + n1);
+  }
+  
+  /** Removes and returns registered core w/o decrementing it's reference count */
+  public SolrCore remove( String name ) {
+    name = checkDefault(name);    
+    synchronized(cores) {
+      return cores.remove( name );
+    }
+  }
+
+  
+  /** Gets a core by name and increase its refcount.
+   * @see SolrCore#open() 
+   * @see SolrCore#close() 
+   * @param name the core name
+   * @return the core if found
+   */
+  public SolrCore getCore(String name) {
+    name= checkDefault(name);
+    synchronized(cores) {
+      SolrCore core = cores.get(name);
+      if (core != null)
+        core.open();  // increment the ref count while still synchronized
+      return core;
+    }
+  }
+
+  // ---------------- Multicore self related methods ---------------
+  /** 
+   * Creates a CoreAdminHandler for this MultiCore.
+   * @return a CoreAdminHandler
+   */
+  protected CoreAdminHandler createMultiCoreHandler(final String adminHandlerClass) {
+    SolrResourceLoader loader = new SolrResourceLoader(null, libLoader, null);
+    Object obj = loader.newAdminHandlerInstance(CoreContainer.this, adminHandlerClass);
+    if ( !(obj instanceof CoreAdminHandler))
     {
-        if (logger.isDebugEnabled())
-            logger.debug("multiget_slice");
+      throw new SolrException( SolrException.ErrorCode.SERVER_ERROR,
+          "adminHandlerClass is not of type "+ CoreAdminHandler.class );
+      
+    }
+    return (CoreAdminHandler) obj;
+  }
 
-        checkKeyspaceAndLoginAuthorized(AccessLevel.READONLY);
+  public CoreAdminHandler getMultiCoreHandler() {
+    return coreAdminHandler;
+  }
+  
+  public String getDefaultCoreName() {
+    return defaultCoreName;
+  }
+  
+  // all of the following properties aren't synchronized
+  // but this should be OK since they normally won't be changed rapidly
+  public boolean isPersistent() {
+    return persistent;
+  }
+  
+  public void setPersistent(boolean persistent) {
+    this.persistent = persistent;
+  }
+  
+  public String getAdminPath() {
+    return adminPath;
+  }
+  
+  public void setAdminPath(String adminPath) {
+      this.adminPath = adminPath;
+  }
+  
 
-        return multigetSliceInternal(keySpace.get(), keys, column_parent, predicate, consistency_level);
+  public String getManagementPath() {
+    return managementPath;
+  }
+  
+  /**
+   * Sets the alternate path for multicore handling:
+   * This is used in case there is a registered unnamed core (aka name is "") to
+   * declare an alternate way of accessing named cores.
+   * This can also be used in a pseudo single-core environment so admins can prepare
+   * a new version before swapping.
+   * @param path
+   */
+  public void setManagementPath(String path) {
+    this.managementPath = path;
+  }
+  
+  public File getConfigFile() {
+    return configFile;
+  }
+  
+/** Persists the cores config file in cores.xml. */
+  public void persist() {
+    persistFile(null);
+  }
+
+  /** Persists the cores config file in a user provided file. */
+  public void persistFile(File file) {
+    log.info("Persisting cores config to " + (file==null ? configFile : file));
+
+    File tmpFile = null;
+    try {
+      // write in temp first
+      if (file == null) {
+        file = tmpFile = File.createTempFile("solr", ".xml", configFile.getParentFile());
+      }
+      java.io.FileOutputStream out = new java.io.FileOutputStream(file);
+        Writer writer = new BufferedWriter(new OutputStreamWriter(out, "UTF-8"));
+        persist(writer);
+        writer.flush();
+        writer.close();
+        out.close();
+        // rename over origin or copy it this fails
+        if (tmpFile != null) {
+          if (tmpFile.renameTo(configFile))
+            tmpFile = null;
+          else
+            fileCopy(tmpFile, configFile);
+        }
+    } 
+    catch(java.io.FileNotFoundException xnf) {
+      throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, xnf);
+    } 
+    catch(java.io.IOException xio) {
+      throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, xio);
+    } 
+    finally {
+      if (tmpFile != null) {
+        if (!tmpFile.delete())
+          tmpFile.deleteOnExit();
+      }
+    }
+  }
+  
+  /** Write the cores configuration through a writer.*/
+  void persist(Writer w) throws IOException {
+    w.write("<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n");
+    w.write("<solr");
+    if (this.libDir != null) {
+      writeAttribute(w,"sharedLib",libDir);
+    }
+    writeAttribute(w,"persistent",isPersistent());
+    w.write(">\n");
+
+    if (containerProperties != null && !containerProperties.isEmpty())  {
+      writeProperties(w, containerProperties, "  ");
+    }
+    w.write("  <cores");
+    writeAttribute(w, "adminPath",adminPath);
+    if(adminHandler != null) writeAttribute(w, "adminHandler",adminHandler);
+    if(shareSchema) writeAttribute(w, "shareSchema","true");
+    if(!defaultCoreName.equals("")) writeAttribute(w, "defaultCoreName", defaultCoreName);
+    w.write(">\n");
+
+    synchronized(cores) {
+      for (SolrCore solrCore : cores.values()) {
+        persist(w,solrCore.getCoreDescriptor());
+      }
     }
 
-    private Map<byte[], List<ColumnOrSuperColumn>> multigetSliceInternal(String keyspace, List<byte[]> keys, ColumnParent column_parent, SlicePredicate predicate, ConsistencyLevel consistency_level)
-    throws InvalidRequestException, UnavailableException, TimedOutException
-    {
-        ThriftValidation.validateColumnParent(keyspace, column_parent);
-        ThriftValidation.validatePredicate(keyspace, column_parent, predicate);
+    w.write("  </cores>\n");
+    w.write("</solr>\n");
+  }
 
-        List<ReadCommand> commands = new ArrayList<ReadCommand>();
-        if (predicate.column_names != null)
-        {
-            for (byte[] key: keys)
-            {
-                ThriftValidation.validateKey(key);
-                commands.add(new SliceByNamesReadCommand(keyspace, key, column_parent, predicate.column_names));
-            }
-        }
-        else
-        {
-            SliceRange range = predicate.slice_range;
-            for (byte[] key: keys)
-            {
-                ThriftValidation.validateKey(key);
-                commands.add(new SliceFromReadCommand(keyspace, key, column_parent, range.start, range.finish, range.reversed, range.count));
-            }
-        }
-
-        return getSlice(commands, consistency_level);
+  private void writeAttribute(Writer w, String name, Object value) throws IOException {
+    if (value == null) return;
+    w.write(" ");
+    w.write(name);
+    w.write("=\"");
+    XML.escapeAttributeValue(value.toString(), w);
+    w.write("\"");
+  }
+  
+  /** Writes the cores configuration node for a given core. */
+  void persist(Writer w, CoreDescriptor dcore) throws IOException {
+    w.write("    <core");
+    writeAttribute(w,"name",dcore.name.equals("") ? defaultCoreName : dcore.name);
+    writeAttribute(w,"instanceDir",dcore.getInstanceDir());
+    //write config (if not default)
+    String opt = dcore.getConfigName();
+    if (opt != null && !opt.equals(dcore.getDefaultConfigName())) {
+      writeAttribute(w, "config",opt);
     }
-
-    public ColumnOrSuperColumn get(byte[] key, ColumnPath column_path, ConsistencyLevel consistency_level)
-    throws InvalidRequestException, NotFoundException, UnavailableException, TimedOutException
-    {
-        if (logger.isDebugEnabled())
-            logger.debug("get");
-
-        checkKeyspaceAndLoginAuthorized(AccessLevel.READONLY);
-        String keyspace = keySpace.get();
-
-        ThriftValidation.validateColumnPath(keyspace, column_path);
-
-        QueryPath path = new QueryPath(column_path.column_family, column_path.column == null ? null : column_path.super_column);
-        List<byte[]> nameAsList = Arrays.asList(column_path.column == null ? column_path.super_column : column_path.column);
-        ThriftValidation.validateKey(key);
-        ReadCommand command = new SliceByNamesReadCommand(keyspace, key, path, nameAsList);
-
-        Map<DecoratedKey, ColumnFamily> cfamilies = readColumnFamily(Arrays.asList(command), consistency_level);
-
-        ColumnFamily cf = cfamilies.get(StorageService.getPartitioner().decorateKey(command.key));
-        if (cf == null)
-            throw new NotFoundException();
-        List<ColumnOrSuperColumn> tcolumns = thriftifyColumnFamily(cf, command.queryPath.superColumnName != null, false);
-        if (tcolumns.isEmpty())
-            throw new NotFoundException();
-        assert tcolumns.size() == 1;
-        return tcolumns.get(0);
+    //write schema (if not default)
+    opt = dcore.getSchemaName();
+    if (opt != null && !opt.equals(dcore.getDefaultSchemaName())) {
+      writeAttribute(w,"schema",opt);
     }
-
-    public int get_count(byte[] key, ColumnParent column_parent, SlicePredicate predicate, ConsistencyLevel consistency_level)
-    throws InvalidRequestException, UnavailableException, TimedOutException
-    {
-        if (logger.isDebugEnabled())
-            logger.debug("get_count");
-
-        checkKeyspaceAndLoginAuthorized(AccessLevel.READONLY);
-
-        return get_slice(key, column_parent, predicate, consistency_level).size();
+    opt = dcore.getPropertiesName();
+    if (opt != null) {
+      writeAttribute(w,"properties",opt);
     }
-
-    public Map<byte[], Integer> multiget_count(String table, List<byte[]> keys, ColumnParent column_parent, SlicePredicate predicate, ConsistencyLevel consistency_level)
-    throws InvalidRequestException, UnavailableException, TimedOutException
-    {
-        if (logger.isDebugEnabled())
-            logger.debug("multiget_count");
-
-        checkKeyspaceAndLoginAuthorized(AccessLevel.READONLY);
-
-        Map<byte[], Integer> counts = new HashMap<byte[], Integer>();
-        Map<byte[], List<ColumnOrSuperColumn>> columnFamiliesMap = multigetSliceInternal(table, keys, column_parent, predicate, consistency_level);
-
-        for (Map.Entry<byte[], List<ColumnOrSuperColumn>> cf : columnFamiliesMap.entrySet()) {
-          counts.put(cf.getKey(), cf.getValue().size());
-        }
-        return counts;
+    opt = dcore.dataDir;
+    if (opt != null) writeAttribute(w,"dataDir",opt);
+    if (dcore.getCoreProperties() == null || dcore.getCoreProperties().isEmpty())
+      w.write("/>\n"); // core
+    else  {
+      w.write(">\n");
+      writeProperties(w, dcore.getCoreProperties(), "      ");
+      w.write("    </core>\n");
     }
+  }
 
-    public void insert(byte[] key, ColumnParent column_parent, Column column, ConsistencyLevel consistency_level)
-    throws InvalidRequestException, UnavailableException, TimedOutException
-    {
-        if (logger.isDebugEnabled())
-            logger.debug("insert");
-
-        checkKeyspaceAndLoginAuthorized(AccessLevel.READWRITE);
-
-        ThriftValidation.validateKey(key);
-        ThriftValidation.validateColumnParent(keySpace.get(), column_parent);
-        ThriftValidation.validateColumn(keySpace.get(), column_parent, column);
-        IClock cassandra_clock = ThriftValidation.validateClock(column.clock);
-
-        RowMutation rm = new RowMutation(keySpace.get(), key);
-        try
-        {
-            rm.add(new QueryPath(column_parent.column_family, column_parent.super_column, column.name), column.value, cassandra_clock, column.ttl);
-        }
-        catch (MarshalException e)
-        {
-            throw new InvalidRequestException(e.getMessage());
-        }
-        doInsert(consistency_level, rm);
+  private void writeProperties(Writer w, Properties props, String indent) throws IOException {
+    for (Map.Entry<Object, Object> entry : props.entrySet()) {
+      w.write(indent + "<property");
+      writeAttribute(w,"name",entry.getKey());
+      writeAttribute(w,"value",entry.getValue());
+      w.write("/>\n");
     }
+  }
 
-    public void batch_mutate(Map<byte[],Map<String,List<Mutation>>> mutation_map, ConsistencyLevel consistency_level)
-    throws InvalidRequestException, UnavailableException, TimedOutException
-    {
-        if (logger.isDebugEnabled())
-            logger.debug("batch_mutate");
-
-        AccessLevel needed = AccessLevel.READWRITE;
-
-        TOP:
-        for (Map<String, List<Mutation>> submap : mutation_map.values())
-        {
-            for (List<Mutation> mutations: submap.values())
-            {
-                for (Mutation m : mutations)
-                {
-                    if (m.isSetDeletion())
-                    {
-                        needed = AccessLevel.FULL;
-                        break TOP;
-                    }
-                }
-            }
-        }
-        
-        checkKeyspaceAndLoginAuthorized(needed);
-
-        List<RowMutation> rowMutations = new ArrayList<RowMutation>();
-        for (Map.Entry<byte[], Map<String, List<Mutation>>> mutationEntry: mutation_map.entrySet())
-        {
-            byte[] key = mutationEntry.getKey();
-
-            ThriftValidation.validateKey(key);
-            Map<String, List<Mutation>> columnFamilyToMutations = mutationEntry.getValue();
-            for (Map.Entry<String, List<Mutation>> columnFamilyMutations : columnFamilyToMutations.entrySet())
-            {
-                String cfName = columnFamilyMutations.getKey();
-
-                for (Mutation mutation : columnFamilyMutations.getValue())
-                {
-                    ThriftValidation.validateMutation(keySpace.get(), cfName, mutation);
-                }
-            }
-            rowMutations.add(RowMutation.getRowMutationFromMutations(keySpace.get(), key, columnFamilyToMutations));
-        }
-        if (consistency_level == ConsistencyLevel.ZERO)
-        {
-            StorageProxy.mutate(rowMutations);
-        }
-        else
-        {
-            try 
-            {
-            	StorageProxy.mutateBlocking(rowMutations, consistency_level);
-            } 
-            catch (TimeoutException e) 
-            {
-            	throw new TimedOutException();
-            }
-        }
+  /** Copies a src file to a dest file:
+   *  used to circumvent the platform discrepancies regarding renaming files.
+   */
+  public static void fileCopy(File src, File dest) throws IOException {
+    IOException xforward = null;
+    FileInputStream fis =  null;
+    FileOutputStream fos = null;
+    FileChannel fcin = null;
+    FileChannel fcout = null;
+    try {
+      fis = new FileInputStream(src);
+      fos = new FileOutputStream(dest);
+      fcin = fis.getChannel();
+      fcout = fos.getChannel();
+      // do the file copy 32Mb at a time
+      final int MB32 = 32*1024*1024;
+      long size = fcin.size();
+      long position = 0;
+      while (position < size) {
+        position += fcin.transferTo(position, MB32, fcout);
+      }
+    } 
+    catch(IOException xio) {
+      xforward = xio;
+    } 
+    finally {
+      if (fis   != null) try { fis.close(); fis = null; } catch(IOException xio) {}
+      if (fos   != null) try { fos.close(); fos = null; } catch(IOException xio) {}
+      if (fcin  != null && fcin.isOpen() ) try { fcin.close();  fcin = null;  } catch(IOException xio) {}
+      if (fcout != null && fcout.isOpen()) try { fcout.close(); fcout = null; } catch(IOException xio) {}
     }
-
-    public void remove(byte[] key, ColumnPath column_path, Clock clock, ConsistencyLevel consistency_level)
-    throws InvalidRequestException, UnavailableException, TimedOutException
-    {
-        if (logger.isDebugEnabled())
-            logger.debug("remove");
-
-        checkKeyspaceAndLoginAuthorized(AccessLevel.FULL);
-
-        ThriftValidation.validateKey(key);
-        ThriftValidation.validateColumnPathOrParent(keySpace.get(), column_path);
-
-        IClock cassandra_clock = ThriftValidation.validateClock(clock);
-
-        RowMutation rm = new RowMutation(keySpace.get(), key);
-        rm.delete(new QueryPath(column_path), cassandra_clock);
-
-        doInsert(consistency_level, rm);
+    if (xforward != null) {
+      throw xforward;
     }
+  }
 
-    private void doInsert(ConsistencyLevel consistency_level, RowMutation rm) throws UnavailableException, TimedOutException
-    {
-        if (consistency_level != ConsistencyLevel.ZERO)
-        {
-            try 
-            {
-            	StorageProxy.mutateBlocking(Arrays.asList(rm), consistency_level);
-            }
-            catch (TimeoutException e)
-            {
-            	throw new TimedOutException();
-            }
-        }
-        else
-        {
-            StorageProxy.mutate(Arrays.asList(rm));
-        }
-    }
-
-    public Map<String, Map<String, String>> describe_keyspace(String table) throws NotFoundException
-    {
-        Map<String, Map<String, String>> columnFamiliesMap = new HashMap<String, Map<String, String>>();
-
-        KSMetaData ksm = DatabaseDescriptor.getTableDefinition(table); 
-        if (ksm == null)
-            throw new NotFoundException();
-        
-
-        for (Map.Entry<String, CFMetaData> stringCFMetaDataEntry : ksm.cfMetaData().entrySet())
-        {
-            CFMetaData columnFamilyMetaData = stringCFMetaDataEntry.getValue();
-
-            Map<String, String> columnMap = new HashMap<String, String>();
-            columnMap.put("Type", columnFamilyMetaData.cfType.name());
-            columnMap.put("ClockType", columnFamilyMetaData.clockType.name());
-            columnMap.put("Desc", columnFamilyMetaData.comment == null ? columnFamilyMetaData.pretty() : columnFamilyMetaData.comment);
-            columnMap.put("CompareWith", columnFamilyMetaData.comparator.getClass().getName());
-            if (columnFamilyMetaData.cfType == ColumnFamilyType.Super)
-            {
-                columnMap.put("CompareSubcolumnsWith", columnFamilyMetaData.subcolumnComparator.getClass().getName());
-            }
-            columnFamiliesMap.put(columnFamilyMetaData.cfName, columnMap);
-        }
-        return columnFamiliesMap;
-    }
-
-    public List<KeySlice> get_range_slices(ColumnParent column_parent, SlicePredicate predicate, KeyRange range, ConsistencyLevel consistency_level)
-    throws InvalidRequestException, UnavailableException, TException, TimedOutException
-    {
-        if (logger.isDebugEnabled())
-            logger.debug("range_slice");
-
-        String keyspace = keySpace.get();
-        checkKeyspaceAndLoginAuthorized(AccessLevel.READONLY);
-
-        ThriftValidation.validateColumnParent(keyspace, column_parent);
-        ThriftValidation.validatePredicate(keyspace, column_parent, predicate);
-        ThriftValidation.validateKeyRange(range);
-
-        List<Row> rows;
-        try
-        {
-            IPartitioner p = StorageService.getPartitioner();
-            AbstractBounds bounds;
-            if (range.start_key == null)
-            {
-                Token.TokenFactory tokenFactory = p.getTokenFactory();
-                Token left = tokenFactory.fromString(range.start_token);
-                Token right = tokenFactory.fromString(range.end_token);
-                bounds = new Range(left, right);
-            }
-            else
-            {
-                bounds = new Bounds(p.getToken(range.start_key), p.getToken(range.end_key));
-            }
-            rows = StorageProxy.getRangeSlice(new RangeSliceCommand(keyspace, column_parent, predicate, bounds, range.count), consistency_level);
-            assert rows != null;
-        }
-        catch (TimeoutException e)
-        {
-        	throw new TimedOutException();
-        }
-        catch (IOException e)
-        {
-            throw new RuntimeException(e);
-        }
-
-        List<KeySlice> keySlices = new ArrayList<KeySlice>(rows.size());
-        boolean reversed = predicate.slice_range != null && predicate.slice_range.reversed;
-        for (Row row : rows)
-        {
-            List<ColumnOrSuperColumn> thriftifiedColumns = thriftifyColumnFamily(row.cf, column_parent.super_column != null, reversed);
-            keySlices.add(new KeySlice(row.key.key, thriftifiedColumns));
-        }
-
-        return keySlices;
-    }
-
-    public Set<String> describe_keyspaces() throws TException
-    {
-        return DatabaseDescriptor.getTables();
-    }
-
-    public String describe_cluster_name() throws TException
-    {
-        return DatabaseDescriptor.getClusterName();
-    }
-
-    public String describe_version() throws TException
-    {
-        return Constants.VERSION;
-    }
-
-    public List<TokenRange> describe_ring(String keyspace)throws InvalidRequestException
-    {
-        if (!DatabaseDescriptor.getNonSystemTables().contains(keyspace))
-            throw new InvalidRequestException("There is no ring for the keyspace: " + keyspace);
-        List<TokenRange> ranges = new ArrayList<TokenRange>();
-        Token.TokenFactory tf = StorageService.getPartitioner().getTokenFactory();
-        for (Map.Entry<Range, List<String>> entry : StorageService.instance.getRangeToEndpointMap(keyspace).entrySet())
-        {
-            Range range = entry.getKey();
-            List<String> endpoints = entry.getValue();
-            ranges.add(new TokenRange(tf.toString(range.left), tf.toString(range.right), endpoints));
-        }
-        return ranges;
-    }
-
-    public List<String> describe_splits(String keyspace, String cfName, String start_token, String end_token, int keys_per_split) throws TException
-    {
-        Token.TokenFactory tf = StorageService.getPartitioner().getTokenFactory();
-        List<Token> tokens = StorageService.instance.getSplits(keyspace, cfName, new Range(tf.fromString(start_token), tf.fromString(end_token)), keys_per_split);
-        List<String> splits = new ArrayList<String>(tokens.size());
-        for (Token token : tokens)
-        {
-            splits.add(tf.toString(token));
-        }
-        return splits;
-    }
-
-    public AccessLevel login(AuthenticationRequest auth_request) throws AuthenticationException, AuthorizationException, TException
-    {
-        AccessLevel level;
-        
-        if (keySpace.get() == null)
-        {
-            throw new AuthenticationException("You have not set a specific keyspace; please call set_keyspace first");
-        }
-        
-        level = DatabaseDescriptor.getAuthenticator().login(keySpace.get(), auth_request);
-        
-        if (logger.isDebugEnabled())
-            logger.debug("login confirmed; new access level is " + level);
-        
-        loginDone.set(level);
-        return level;
-    }
-
-    public void logout()
-    {
-        keySpace.remove();
-        loginDone.remove();
-
-        if (logger.isDebugEnabled())
-            logger.debug("logout complete");
-    }
-
-    protected void checkKeyspaceAndLoginAuthorized(AccessLevel level) throws InvalidRequestException
-    {
-        if (keySpace.get() == null)
-        {
-            throw new InvalidRequestException("You have not assigned a keyspace; please use set_keyspace (and login if necessary)");
-        }
-        
-        if (!(DatabaseDescriptor.getAuthenticator() instanceof AllowAllAuthenticator))
-        {
-            if (loginDone.get() == null)
-                throw new InvalidRequestException("You have not logged into keyspace " + keySpace.get());
-            if (loginDone.get().getValue() < level.getValue())
-                throw new InvalidRequestException("Your credentials are not sufficient to perform " + level + " operations");
-        }
-    }
-
-    public String system_add_column_family(CfDef cf_def) throws InvalidRequestException, TException
-    {
-        checkKeyspaceAndLoginAuthorized(AccessLevel.FULL);
-
-        // if there is anything going on in the migration stage, fail.
-        if (StageManager.getStage(StageManager.MIGRATION_STAGE).getQueue().size() > 0)
-            throw new InvalidRequestException("This node appears to be handling gossiped migrations.");
-        
-        try
-        {
-            AddColumnFamily add = new AddColumnFamily(convertToCFMetaData(cf_def));
-            add.apply();
-            add.announce();
-            return DatabaseDescriptor.getDefsVersion().toString();
-        }
-        catch (ConfigurationException e)
-        {
-            InvalidRequestException ex = new InvalidRequestException(e.getMessage());
-            ex.initCause(e);
-            throw ex;
-        }
-        catch (IOException e)
-        {
-            InvalidRequestException ex = new InvalidRequestException(e.getMessage());
-            ex.initCause(e);
-            throw ex;
-        }
-    }
-
-    public String system_drop_column_family(String column_family) throws InvalidRequestException, TException
-    {
-        checkKeyspaceAndLoginAuthorized(AccessLevel.FULL);
-        
-        // if there is anything going on in the migration stage, fail.
-        if (StageManager.getStage(StageManager.MIGRATION_STAGE).getQueue().size() > 0)
-            throw new InvalidRequestException("This node appears to be handling gossiped migrations.");
-
-        try
-        {
-            DropColumnFamily drop = new DropColumnFamily(keySpace.get(), column_family, true);
-            drop.apply();
-            drop.announce();
-            return DatabaseDescriptor.getDefsVersion().toString();
-        }
-        catch (ConfigurationException e)
-        {
-            InvalidRequestException ex = new InvalidRequestException(e.getMessage());
-            ex.initCause(e);
-            throw ex;
-        }
-        catch (IOException e)
-        {
-            InvalidRequestException ex = new InvalidRequestException(e.getMessage());
-            ex.initCause(e);
-            throw ex;
-        }
-    }
-
-    public String system_rename_column_family(String old_name, String new_name) throws InvalidRequestException, TException
-    {
-        checkKeyspaceAndLoginAuthorized(AccessLevel.FULL);
-        
-        // if there is anything going on in the migration stage, fail.
-        if (StageManager.getStage(StageManager.MIGRATION_STAGE).getQueue().size() > 0)
-            throw new InvalidRequestException("This node appears to be handling gossiped migrations.");
-
-        try
-        {
-            RenameColumnFamily rename = new RenameColumnFamily(keySpace.get(), old_name, new_name);
-            rename.apply();
-            rename.announce();
-            return DatabaseDescriptor.getDefsVersion().toString();
-        }
-        catch (ConfigurationException e)
-        {
-            InvalidRequestException ex = new InvalidRequestException(e.getMessage());
-            ex.initCause(e);
-            throw ex;
-        }
-        catch (IOException e)
-        {
-            InvalidRequestException ex = new InvalidRequestException(e.getMessage());
-            ex.initCause(e);
-            throw ex;
-        }
-    }
-
-    public String system_add_keyspace(KsDef ks_def) throws InvalidRequestException, TException
-    {
-        // IAuthenticator was devised prior to, and without thought for, dynamic keyspace creation. As
-        // a result, we must choose between letting anyone/everyone create keyspaces (which they likely
-        // won't even be able to use), or be honest and disallow it entirely if configured for auth.
-        if (!(DatabaseDescriptor.getAuthenticator() instanceof AllowAllAuthenticator))
-            throw new InvalidRequestException("Unable to create new keyspace while authentication is enabled.");
-
-        // if there is anything going on in the migration stage, fail.
-        if (StageManager.getStage(StageManager.MIGRATION_STAGE).getQueue().size() > 0)
-            throw new InvalidRequestException("This node appears to be handling gossiped migrations.");
-
-        try
-        {
-            Collection<CFMetaData> cfDefs = new ArrayList<CFMetaData>(ks_def.cf_defs.size());
-            for (CfDef cfDef : ks_def.cf_defs)
-            {
-                cfDefs.add(convertToCFMetaData(cfDef));
-            }
-            
-            KSMetaData ksm = new KSMetaData(
-                    ks_def.name, 
-                    (Class<? extends AbstractReplicationStrategy>)Class.forName(ks_def.strategy_class), 
-                    ks_def.replication_factor, 
-                    cfDefs.toArray(new CFMetaData[cfDefs.size()]));
-            AddKeyspace add = new AddKeyspace(ksm);
-            add.apply();
-            add.announce();
-            return DatabaseDescriptor.getDefsVersion().toString();
-        }
-        catch (ClassNotFoundException e)
-        {
-            InvalidRequestException ex = new InvalidRequestException(e.getMessage());
-            ex.initCause(e);
-            throw ex;
-        }
-        catch (ConfigurationException e)
-        {
-            InvalidRequestException ex = new InvalidRequestException(e.getMessage());
-            ex.initCause(e);
-            throw ex;
-        }
-        catch (IOException e)
-        {
-            InvalidRequestException ex = new InvalidRequestException(e.getMessage());
-            ex.initCause(e);
-            throw ex;
-        }
-    }
-
-    public String system_drop_keyspace(String keyspace) throws InvalidRequestException, TException
-    {
-        checkKeyspaceAndLoginAuthorized(AccessLevel.FULL);
-        
-        // if there is anything going on in the migration stage, fail.
-        if (StageManager.getStage(StageManager.MIGRATION_STAGE).getQueue().size() > 0)
-            throw new InvalidRequestException("This node appears to be handling gossiped migrations.");
-
-        try
-        {
-            DropKeyspace drop = new DropKeyspace(keyspace, true);
-            drop.apply();
-            drop.announce();
-            return DatabaseDescriptor.getDefsVersion().toString();
-        }
-        catch (ConfigurationException e)
-        {
-            InvalidRequestException ex = new InvalidRequestException(e.getMessage());
-            ex.initCause(e);
-            throw ex;
-        }
-        catch (IOException e)
-        {
-            InvalidRequestException ex = new InvalidRequestException(e.getMessage());
-            ex.initCause(e);
-            throw ex;
-        }
-    }
-
-    public String system_rename_keyspace(String old_name, String new_name) throws InvalidRequestException, TException
-    {
-        checkKeyspaceAndLoginAuthorized(AccessLevel.FULL);
-        
-        // if there is anything going on in the migration stage, fail.
-        if (StageManager.getStage(StageManager.MIGRATION_STAGE).getQueue().size() > 0)
-            throw new InvalidRequestException("This node appears to be handling gossiped migrations.");
-
-        try
-        {
-            RenameKeyspace rename = new RenameKeyspace(old_name, new_name);
-            rename.apply();
-            rename.announce();
-            return DatabaseDescriptor.getDefsVersion().toString();
-        }
-        catch (ConfigurationException e)
-        {
-            InvalidRequestException ex = new InvalidRequestException(e.getMessage());
-            ex.initCause(e);
-            throw ex;
-        }
-        catch (IOException e)
-        {
-            InvalidRequestException ex = new InvalidRequestException(e.getMessage());
-            ex.initCause(e);
-            throw ex;
-        }
-    }
-    
-    private CFMetaData convertToCFMetaData(CfDef cf_def) throws InvalidRequestException, ConfigurationException
-    {
-        ColumnFamilyType cfType = ColumnFamilyType.create(cf_def.column_type);
-        if (cfType == null)
-        {
-          throw new InvalidRequestException("Invalid column type " + cf_def.column_type);
-        }
-        ClockType clockType = ClockType.create(cf_def.clock_type);
-        if (clockType == null)
-        {
-            throw new InvalidRequestException("Invalid clock type " + cf_def.clock_type);
-        }
-        AbstractReconciler reconciler = DatabaseDescriptor.getReconciler(cf_def.reconciler);
-        if (reconciler == null)
-        {
-            if (clockType == ClockType.Timestamp)    
-                reconciler = new TimestampReconciler(); // default
-            else
-                throw new ConfigurationException("No reconciler specified for column family " + cf_def.name);
-
-        }
-        
-        return new CFMetaData(
-                    cf_def.table,
-                    cf_def.name,
-                    cfType,
-                    clockType,
-                    DatabaseDescriptor.getComparator(cf_def.comparator_type),
-                    cf_def.subcomparator_type.length() == 0 ? null : DatabaseDescriptor.getComparator(cf_def.subcomparator_type),
-                    reconciler,
-                    cf_def.comment,
-                    cf_def.row_cache_size,
-                    cf_def.preload_row_cache,
-                    cf_def.key_cache_size,
-                    cf_def.read_repair_chance);
-    }
-
-    public void truncate(String cfname) throws InvalidRequestException, UnavailableException, TException
-    {
-        logger.debug("truncating {} in {}", cfname, keySpace.get());
-        checkKeyspaceAndLoginAuthorized(AccessLevel.FULL);
-        try
-        {
-            StorageProxy.truncateBlocking(keySpace.get(), cfname);
-        }
-        catch (TimeoutException e)
-        {
-            throw (UnavailableException) new UnavailableException().initCause(e);
-        }
-        catch (IOException e)
-        {
-            throw (UnavailableException) new UnavailableException().initCause(e);
-        }
-    }
-
-    public void set_keyspace(String keyspace) throws InvalidRequestException, TException {
-        if (DatabaseDescriptor.getTableDefinition(keyspace) == null)
-        {
-            throw new InvalidRequestException("Keyspace does not exist");
-        }
-        
-        // If switching, invalidate previous access level; force a new login.
-        if (keySpace.get() != null && !keySpace.get().equals(keyspace));
-            loginDone.set(AccessLevel.NONE);
-        
-        keySpace.set(keyspace); 
-    }
-
-    public Map<String, List<String>> check_schema_agreement() throws TException, InvalidRequestException
-    {
-        logger.debug("checking schema agreement");      
-        return StorageProxy.checkSchemaAgreement();
-    }
-
-    // main method moved to CassandraDaemon
+  public String getSolrHome() {
+    return solrHome;
+  }
+  private static final String DEF_SOLR_XML ="<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n" +
+          "<solr persistent=\"false\">\n" +
+          "  <cores adminPath=\"/admin/cores\" defaultCoreName=\"" + DEFAULT_DEFAULT_CORE_NAME + "\">\n" +
+          "    <core name=\""+ DEFAULT_DEFAULT_CORE_NAME + "\" instanceDir=\".\" />\n" +
+          "  </cores>\n" +
+          "</solr>";
 }

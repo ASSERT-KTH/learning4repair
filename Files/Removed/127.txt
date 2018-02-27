@@ -1,11 +1,12 @@
 package org.apache.lucene.index;
 
 /**
- * Copyright 2004 The Apache Software Foundation
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -17,816 +18,619 @@ package org.apache.lucene.index;
  */
 
 import java.io.IOException;
-import java.io.PrintStream;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.Random;
+import java.util.Set;
 
-import org.apache.lucene.analysis.WhitespaceAnalyzer;
+import org.apache.lucene.analysis.Analyzer;
+import org.apache.lucene.analysis.MockAnalyzer;
+import org.apache.lucene.codecs.Codec;
 import org.apache.lucene.document.Document;
-import org.apache.lucene.document.Field;
-import org.apache.lucene.document.Field.Index;
-import org.apache.lucene.document.Field.Store;
-import org.apache.lucene.document.Field.TermVector;
-import org.apache.lucene.search.TermQuery;
-import org.apache.lucene.search.IndexSearcher;
-import org.apache.lucene.search.Query;
+import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.MockRAMDirectory;
-import org.apache.lucene.store.AlreadyClosedException;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.FixedBitSet;
+import org.apache.lucene.util.LineFileDocs;
 import org.apache.lucene.util.LuceneTestCase;
-import org.apache.lucene.util._TestUtil;
-import org.apache.lucene.util.ThreadInterruptedException;
+import org.apache.lucene.util.ReaderUtil;
+import org.apache.lucene.util.automaton.AutomatonTestUtil;
+import org.apache.lucene.util.automaton.CompiledAutomaton;
+import org.apache.lucene.util.automaton.RegExp;
 
-public class TestIndexWriterReader extends LuceneTestCase {
-  static PrintStream infoStream;
+/**
+ * Compares one codec against another
+ */
+public class TestDuelingCodecs extends LuceneTestCase {
+  private Directory leftDir;
+  private IndexReader leftReader;
+  private Codec leftCodec;
 
-  public static class HeavyAtomicInt {
-    private int value;
-    public HeavyAtomicInt(int start) {
-      value = start;
-    }
-    public synchronized int addAndGet(int inc) {
-      value += inc;
-      return value;
-    }
-    public synchronized int incrementAndGet() {
-      value++;
-      return value;
-    }
-    public synchronized int intValue() {
-      return value;
-    }
+  private Directory rightDir;
+  private IndexReader rightReader;
+  private Codec rightCodec;
+  
+  private String info;  // for debugging
+
+  @Override
+  public void setUp() throws Exception {
+    super.setUp();
+
+    // for now its SimpleText vs Lucene40(random postings format)
+    // as this gives the best overall coverage. when we have more
+    // codecs we should probably pick 2 from Codec.availableCodecs()
+    
+    // TODO: it would also be nice to support preflex, but it doesn't
+    // support a lot of the current feature set (docvalues, statistics)
+    // so this would make assertEquals complicated.
+
+    leftCodec = Codec.forName("SimpleText");
+    rightCodec = new RandomCodec(random, false);
+    leftDir = newDirectory();
+    rightDir = newDirectory();
+
+    long seed = random.nextLong();
+
+    // must use same seed because of random payloads, etc
+    Analyzer leftAnalyzer = new MockAnalyzer(new Random(seed));
+    Analyzer rightAnalyzer = new MockAnalyzer(new Random(seed));
+    
+    // but these can be different
+    // TODO: this turns this into a really big test of Multi*, is that what we want?
+    IndexWriterConfig leftConfig = newIndexWriterConfig(TEST_VERSION_CURRENT, leftAnalyzer);
+    leftConfig.setCodec(leftCodec);
+    // preserve docids
+    leftConfig.setMergePolicy(newLogMergePolicy());
+
+    IndexWriterConfig rightConfig = newIndexWriterConfig(TEST_VERSION_CURRENT, rightAnalyzer);
+    rightConfig.setCodec(rightCodec);
+    // preserve docids
+    rightConfig.setMergePolicy(newLogMergePolicy());
+
+    // must use same seed because of random docvalues fields, etc
+    RandomIndexWriter leftWriter = new RandomIndexWriter(new Random(seed), leftDir, leftConfig);
+    RandomIndexWriter rightWriter = new RandomIndexWriter(new Random(seed), rightDir, rightConfig);
+    
+    int numdocs = atLeast(100);
+    createRandomIndex(numdocs, leftWriter, seed);
+    createRandomIndex(numdocs, rightWriter, seed);
+
+    leftReader = leftWriter.getReader();
+    leftWriter.close();
+    rightReader = rightWriter.getReader();
+    rightWriter.close();
+    
+    info = "left: " + leftCodec.toString() + " / right: " + rightCodec.toString();
   }
   
-  public static int count(Term t, IndexReader r) throws IOException {
-    int count = 0;
-    TermDocs td = r.termDocs(t);
-    while (td.next()) {
-      td.doc();
-      count++;
-    }
-    td.close();
-    return count;
-  }
-
-  public void testUpdateDocument() throws Exception {
-    boolean optimize = true;
-
-    Directory dir1 = new MockRAMDirectory();
-    IndexWriter writer = new IndexWriter(dir1, new IndexWriterConfig(TEST_VERSION_CURRENT, new WhitespaceAnalyzer(TEST_VERSION_CURRENT)));
-
-    // create the index
-    createIndexNoClose(!optimize, "index1", writer);
-
-    // writer.flush(false, true, true);
-
-    // get a reader
-    IndexReader r1 = writer.getReader();
-    assertTrue(r1.isCurrent());
-
-    String id10 = r1.document(10).getField("id").stringValue();
+  @Override
+  public void tearDown() throws Exception {
+    leftReader.close();
+    rightReader.close();   
+    leftDir.close();
+    rightDir.close();
     
-    Document newDoc = r1.document(10);
-    newDoc.removeField("id");
-    newDoc.add(new Field("id", Integer.toString(8000), Store.YES, Index.NOT_ANALYZED));
-    writer.updateDocument(new Term("id", id10), newDoc);
-    assertFalse(r1.isCurrent());
-
-    IndexReader r2 = writer.getReader();
-    assertTrue(r2.isCurrent());
-    assertEquals(0, count(new Term("id", id10), r2));
-    assertEquals(1, count(new Term("id", Integer.toString(8000)), r2));
-    
-    r1.close();
-    writer.close();
-    assertTrue(r2.isCurrent());
-    
-    IndexReader r3 = IndexReader.open(dir1, true);
-    assertTrue(r3.isCurrent());
-    assertTrue(r2.isCurrent());
-    assertEquals(0, count(new Term("id", id10), r3));
-    assertEquals(1, count(new Term("id", Integer.toString(8000)), r3));
-
-    writer = new IndexWriter(dir1, new IndexWriterConfig(TEST_VERSION_CURRENT, new WhitespaceAnalyzer(TEST_VERSION_CURRENT)));
-    Document doc = new Document();
-    doc.add(new Field("field", "a b c", Field.Store.NO, Field.Index.ANALYZED));
-    writer.addDocument(doc);
-    assertTrue(r2.isCurrent());
-    assertTrue(r3.isCurrent());
-
-    writer.close();
-
-    assertFalse(r2.isCurrent());
-    assertTrue(!r3.isCurrent());
-
-    r2.close();
-    r3.close();
-    
-    dir1.close();
+    super.tearDown();
   }
   
   /**
-   * Test using IW.addIndexes
-   * 
-   * @throws Exception
+   * populates a writer with random stuff. this must be fully reproducable with the seed!
    */
-  public void testAddIndexes() throws Exception {
-    boolean optimize = false;
+  public static void createRandomIndex(int numdocs, RandomIndexWriter writer, long seed) throws IOException {
+    Random random = new Random(seed);
+    // primary source for our data is from linefiledocs, its realistic.
+    LineFileDocs lineFileDocs = new LineFileDocs(random);
 
-    Directory dir1 = new MockRAMDirectory();
-    IndexWriter writer = new IndexWriter(dir1, new IndexWriterConfig(TEST_VERSION_CURRENT, new WhitespaceAnalyzer(TEST_VERSION_CURRENT)));
-    writer.setInfoStream(infoStream);
-    // create the index
-    createIndexNoClose(!optimize, "index1", writer);
-    writer.flush(false, true, true);
-
-    // create a 2nd index
-    Directory dir2 = new MockRAMDirectory();
-    IndexWriter writer2 = new IndexWriter(dir2, new IndexWriterConfig(TEST_VERSION_CURRENT, new WhitespaceAnalyzer(TEST_VERSION_CURRENT)));
-    writer2.setInfoStream(infoStream);
-    createIndexNoClose(!optimize, "index2", writer2);
-    writer2.close();
-
-    IndexReader r0 = writer.getReader();
-    assertTrue(r0.isCurrent());
-    writer.addIndexesNoOptimize(new Directory[] { dir2 });
-    assertFalse(r0.isCurrent());
-    r0.close();
-
-    IndexReader r1 = writer.getReader();
-    assertTrue(r1.isCurrent());
-
-    writer.commit();
-    assertTrue(r1.isCurrent());
-
-    assertEquals(200, r1.maxDoc());
-
-    int index2df = r1.docFreq(new Term("indexname", "index2"));
-
-    assertEquals(100, index2df);
-
-    // verify the docs are from different indexes
-    Document doc5 = r1.document(5);
-    assertEquals("index1", doc5.get("indexname"));
-    Document doc150 = r1.document(150);
-    assertEquals("index2", doc150.get("indexname"));
-    r1.close();
-    writer.close();
-    dir1.close();
+    // TODO: we should add other fields that use things like docs&freqs but omit positions,
+    // because linefiledocs doesn't cover all the possibilities.
+    for (int i = 0; i < numdocs; i++) {
+      writer.addDocument(lineFileDocs.nextDoc());
+    }
   }
   
-  public void testAddIndexes2() throws Exception {
-    boolean optimize = false;
-
-    Directory dir1 = new MockRAMDirectory();
-    IndexWriter writer = new IndexWriter(dir1, new IndexWriterConfig(TEST_VERSION_CURRENT, new WhitespaceAnalyzer(TEST_VERSION_CURRENT)));
-    writer.setInfoStream(infoStream);
-
-    // create a 2nd index
-    Directory dir2 = new MockRAMDirectory();
-    IndexWriter writer2 = new IndexWriter(dir2, new IndexWriterConfig(TEST_VERSION_CURRENT, new WhitespaceAnalyzer(TEST_VERSION_CURRENT)));
-    writer2.setInfoStream(infoStream);
-    createIndexNoClose(!optimize, "index2", writer2);
-    writer2.close();
-
-    writer.addIndexesNoOptimize(new Directory[] { dir2 });
-    writer.addIndexesNoOptimize(new Directory[] { dir2 });
-    writer.addIndexesNoOptimize(new Directory[] { dir2 });
-    writer.addIndexesNoOptimize(new Directory[] { dir2 });
-    writer.addIndexesNoOptimize(new Directory[] { dir2 });
-
-    IndexReader r1 = writer.getReader();
-    assertEquals(500, r1.maxDoc());
-    
-    r1.close();
-    writer.close();
-    dir1.close();
-  }
-
   /**
-   * Deletes using IW.deleteDocuments
-   * 
-   * @throws Exception
+   * checks the two indexes are equivalent
    */
-  public void testDeleteFromIndexWriter() throws Exception {
-    boolean optimize = true;
-
-    Directory dir1 = new MockRAMDirectory();
-    IndexWriter writer = new IndexWriter(dir1, new IndexWriterConfig(TEST_VERSION_CURRENT, new WhitespaceAnalyzer(TEST_VERSION_CURRENT)));
-    writer.setInfoStream(infoStream);
-    // create the index
-    createIndexNoClose(!optimize, "index1", writer);
-    writer.flush(false, true, true);
-    // get a reader
-    IndexReader r1 = writer.getReader();
-
-    String id10 = r1.document(10).getField("id").stringValue();
-
-    // deleted IW docs should not show up in the next getReader
-    writer.deleteDocuments(new Term("id", id10));
-    IndexReader r2 = writer.getReader();
-    assertEquals(1, count(new Term("id", id10), r1));
-    assertEquals(0, count(new Term("id", id10), r2));
-    
-    String id50 = r1.document(50).getField("id").stringValue();
-    assertEquals(1, count(new Term("id", id50), r1));
-    
-    writer.deleteDocuments(new Term("id", id50));
-    
-    IndexReader r3 = writer.getReader();
-    assertEquals(0, count(new Term("id", id10), r3));
-    assertEquals(0, count(new Term("id", id50), r3));
-    
-    String id75 = r1.document(75).getField("id").stringValue();
-    writer.deleteDocuments(new TermQuery(new Term("id", id75)));
-    IndexReader r4 = writer.getReader();
-    assertEquals(1, count(new Term("id", id75), r3));
-    assertEquals(0, count(new Term("id", id75), r4));
-    
-    r1.close();
-    r2.close();
-    r3.close();
-    r4.close();
-    writer.close();
-        
-    // reopen the writer to verify the delete made it to the directory
-    writer = new IndexWriter(dir1, new IndexWriterConfig(TEST_VERSION_CURRENT, new WhitespaceAnalyzer(TEST_VERSION_CURRENT)));
-    writer.setInfoStream(infoStream);
-    IndexReader w2r1 = writer.getReader();
-    assertEquals(0, count(new Term("id", id10), w2r1));
-    w2r1.close();
-    writer.close();
-    dir1.close();
-  }
-
-  public void testAddIndexesAndDoDeletesThreads() throws Throwable {
-    final int numIter = 2;
-    int numDirs = 3;
-    
-    Directory mainDir = new MockRAMDirectory();
-    IndexWriter mainWriter = new IndexWriter(mainDir, new IndexWriterConfig(TEST_VERSION_CURRENT, new WhitespaceAnalyzer(TEST_VERSION_CURRENT)));
-    mainWriter.setInfoStream(infoStream);
-    AddDirectoriesThreads addDirThreads = new AddDirectoriesThreads(numIter, mainWriter);
-    addDirThreads.launchThreads(numDirs);
-    addDirThreads.joinThreads();
-    
-    //assertEquals(100 + numDirs * (3 * numIter / 4) * addDirThreads.NUM_THREADS
-    //    * addDirThreads.NUM_INIT_DOCS, addDirThreads.mainWriter.numDocs());
-    assertEquals(addDirThreads.count.intValue(), addDirThreads.mainWriter.numDocs());
-
-    addDirThreads.close(true);
-    
-    assertTrue(addDirThreads.failures.size() == 0);
-
-    _TestUtil.checkIndex(mainDir);
-
-    IndexReader reader = IndexReader.open(mainDir, true);
-    assertEquals(addDirThreads.count.intValue(), reader.numDocs());
-    //assertEquals(100 + numDirs * (3 * numIter / 4) * addDirThreads.NUM_THREADS
-    //    * addDirThreads.NUM_INIT_DOCS, reader.numDocs());
-    reader.close();
-
-    addDirThreads.closeDir();
-    mainDir.close();
+  public void testEquals() throws Exception {
+    assertReaderStatistics(leftReader, rightReader);
+    assertFields(MultiFields.getFields(leftReader), MultiFields.getFields(rightReader), true);
+    assertNorms(leftReader, rightReader);
+    assertStoredFields(leftReader, rightReader);
+    assertTermVectors(leftReader, rightReader);
+    assertDocValues(leftReader, rightReader);
+    assertDeletedDocs(leftReader, rightReader);
   }
   
-  private class AddDirectoriesThreads {
-    Directory addDir;
-    final static int NUM_THREADS = 5;
-    final static int NUM_INIT_DOCS = 100;
-    int numDirs;
-    final Thread[] threads = new Thread[NUM_THREADS];
-    IndexWriter mainWriter;
-    final List<Throwable> failures = new ArrayList<Throwable>();
-    IndexReader[] readers;
-    boolean didClose = false;
-    HeavyAtomicInt count = new HeavyAtomicInt(0);
-    HeavyAtomicInt numAddIndexesNoOptimize = new HeavyAtomicInt(0);
+  /** 
+   * checks that reader-level statistics are the same 
+   */
+  public void assertReaderStatistics(IndexReader leftReader, IndexReader rightReader) throws Exception {
+    // Somewhat redundant: we never delete docs
+    assertEquals(info, leftReader.maxDoc(), rightReader.maxDoc());
+    assertEquals(info, leftReader.numDocs(), rightReader.numDocs());
+    assertEquals(info, leftReader.numDeletedDocs(), rightReader.numDeletedDocs());
+    assertEquals(info, leftReader.hasDeletions(), rightReader.hasDeletions());
     
-    public AddDirectoriesThreads(int numDirs, IndexWriter mainWriter) throws Throwable {
-      this.numDirs = numDirs;
-      this.mainWriter = mainWriter;
-      addDir = new MockRAMDirectory();
-      IndexWriter writer = new IndexWriter(addDir, new IndexWriterConfig(TEST_VERSION_CURRENT, new WhitespaceAnalyzer(TEST_VERSION_CURRENT)).setMaxBufferedDocs(2));
-      for (int i = 0; i < NUM_INIT_DOCS; i++) {
-        Document doc = createDocument(i, "addindex", 4);
-        writer.addDocument(doc);
-      }
-        
-      writer.close();
-      
-      readers = new IndexReader[numDirs];
-      for (int i = 0; i < numDirs; i++)
-        readers[i] = IndexReader.open(addDir, false);
+    if (leftReader.getUniqueTermCount() != -1 && rightReader.getUniqueTermCount() != -1) {
+      assertEquals(info, leftReader.getUniqueTermCount(), rightReader.getUniqueTermCount());
+    }
+  }
+  
+  /** 
+   * Fields api equivalency 
+   */
+  public void assertFields(Fields leftFields, Fields rightFields, boolean deep) throws Exception {
+    // Fields could be null if there are no postings,
+    // but then it must be null for both
+    if (leftFields == null || rightFields == null) {
+      assertNull(info, leftFields);
+      assertNull(info, rightFields);
+      return;
+    }
+    assertFieldStatistics(leftFields, rightFields);
+    
+    FieldsEnum leftEnum = leftFields.iterator();
+    FieldsEnum rightEnum = rightFields.iterator();
+    
+    String field;
+    while ((field = leftEnum.next()) != null) {
+      assertEquals(info, field, rightEnum.next());
+      assertTerms(leftEnum.terms(), rightEnum.terms(), deep);
+    }
+    assertNull(rightEnum.next());
+  }
+  
+  /** 
+   * checks that top-level statistics on Fields are the same 
+   */
+  public void assertFieldStatistics(Fields leftFields, Fields rightFields) throws Exception {
+    if (leftFields.getUniqueFieldCount() != -1 && rightFields.getUniqueFieldCount() != -1) {
+      assertEquals(info, leftFields.getUniqueFieldCount(), rightFields.getUniqueFieldCount());
     }
     
-    void joinThreads() {
-      for (int i = 0; i < NUM_THREADS; i++)
-        try {
-          threads[i].join();
-        } catch (InterruptedException ie) {
-          throw new ThreadInterruptedException(ie);
+    if (leftFields.getUniqueTermCount() != -1 && rightFields.getUniqueTermCount() != -1) {
+      assertEquals(info, leftFields.getUniqueTermCount(), rightFields.getUniqueTermCount());
+    }
+  }
+  
+  /** 
+   * Terms api equivalency 
+   */
+  public void assertTerms(Terms leftTerms, Terms rightTerms, boolean deep) throws Exception {
+    if (leftTerms == null || rightTerms == null) {
+      assertNull(info, leftTerms);
+      assertNull(info, rightTerms);
+      return;
+    }
+    assertTermsStatistics(leftTerms, rightTerms);
+
+    TermsEnum leftTermsEnum = leftTerms.iterator(null);
+    TermsEnum rightTermsEnum = rightTerms.iterator(null);
+    assertTermsEnum(leftTermsEnum, rightTermsEnum, true);
+    // TODO: test seeking too
+    
+    if (deep) {
+      int numIntersections = atLeast(3);
+      for (int i = 0; i < numIntersections; i++) {
+        String re = AutomatonTestUtil.randomRegexp(random);
+        CompiledAutomaton automaton = new CompiledAutomaton(new RegExp(re, RegExp.NONE).toAutomaton());
+        if (automaton.type == CompiledAutomaton.AUTOMATON_TYPE.NORMAL) {
+          // TODO: test start term too
+          TermsEnum leftIntersection = leftTerms.intersect(automaton, null);
+          TermsEnum rightIntersection = rightTerms.intersect(automaton, null);
+          assertTermsEnum(leftIntersection, rightIntersection, rarely());
         }
-    }
-
-    void close(boolean doWait) throws Throwable {
-      didClose = true;
-      mainWriter.close(doWait);
-    }
-
-    void closeDir() throws Throwable {
-      for (int i = 0; i < numDirs; i++)
-        readers[i].close();
-      addDir.close();
-    }
-    
-    void handle(Throwable t) {
-      t.printStackTrace(System.out);
-      synchronized (failures) {
-        failures.add(t);
       }
     }
-    
-    void launchThreads(final int numIter) {
-      for (int i = 0; i < NUM_THREADS; i++) {
-        threads[i] = new Thread() {
-          @Override
-          public void run() {
-            try {
-              final Directory[] dirs = new Directory[numDirs];
-              for (int k = 0; k < numDirs; k++)
-                dirs[k] = new MockRAMDirectory(addDir);
-              //int j = 0;
-              //while (true) {
-                // System.out.println(Thread.currentThread().getName() + ": iter
-                // j=" + j);
-                for (int x=0; x < numIter; x++) {
-                  // only do addIndexesNoOptimize
-                  doBody(x, dirs);
-                }
-                //if (numIter > 0 && j == numIter)
-                //  break;
-                //doBody(j++, dirs);
-                //doBody(5, dirs);
-              //}
-            } catch (Throwable t) {
-              handle(t);
-            }
-          }
-        };
-      }
-      for (int i = 0; i < NUM_THREADS; i++)
-        threads[i].start();
+  }
+  
+  /** 
+   * checks collection-level statistics on Terms 
+   */
+  public void assertTermsStatistics(Terms leftTerms, Terms rightTerms) throws Exception {
+    assert leftTerms.getComparator() == rightTerms.getComparator();
+    if (leftTerms.getDocCount() != -1 && rightTerms.getDocCount() != -1) {
+      assertEquals(info, leftTerms.getDocCount(), rightTerms.getDocCount());
     }
-    
-    void doBody(int j, Directory[] dirs) throws Throwable {
-      switch (j % 4) {
-        case 0:
-          mainWriter.addIndexesNoOptimize(dirs);
-          mainWriter.optimize();
-          break;
-        case 1:
-          mainWriter.addIndexesNoOptimize(dirs);
-          numAddIndexesNoOptimize.incrementAndGet();
-          break;
-        case 2:
-          mainWriter.addIndexes(readers);
-          break;
-        case 3:
-          mainWriter.commit();
-      }
-      count.addAndGet(dirs.length*NUM_INIT_DOCS);
+    if (leftTerms.getSumDocFreq() != -1 && rightTerms.getSumDocFreq() != -1) {
+      assertEquals(info, leftTerms.getSumDocFreq(), rightTerms.getSumDocFreq());
+    }
+    if (leftTerms.getSumTotalTermFreq() != -1 && rightTerms.getSumTotalTermFreq() != -1) {
+      assertEquals(info, leftTerms.getSumTotalTermFreq(), rightTerms.getSumTotalTermFreq());
+    }
+    if (leftTerms.getUniqueTermCount() != -1 && rightTerms.getUniqueTermCount() != -1) {
+      assertEquals(info, leftTerms.getUniqueTermCount(), rightTerms.getUniqueTermCount());
     }
   }
 
-  public void testIndexWriterReopenSegmentOptimize() throws Exception {
-    doTestIndexWriterReopenSegment(true);
-  }
+  /** 
+   * checks the terms enum sequentially
+   * if deep is false, it does a 'shallow' test that doesnt go down to the docsenums
+   */
+  public void assertTermsEnum(TermsEnum leftTermsEnum, TermsEnum rightTermsEnum, boolean deep) throws Exception {
+    BytesRef term;
+    Bits randomBits = new RandomBits(leftReader.maxDoc(), random.nextDouble(), random);
+    DocsAndPositionsEnum leftPositions = null;
+    DocsAndPositionsEnum rightPositions = null;
+    DocsEnum leftDocs = null;
+    DocsEnum rightDocs = null;
+    
+    while ((term = leftTermsEnum.next()) != null) {
+      assertEquals(info, term, rightTermsEnum.next());
+      assertTermStats(leftTermsEnum, rightTermsEnum);
+      if (deep) {
+        assertDocsAndPositionsEnum(leftPositions = leftTermsEnum.docsAndPositions(null, leftPositions),
+            rightPositions = rightTermsEnum.docsAndPositions(null, rightPositions));
+        assertDocsAndPositionsEnum(leftPositions = leftTermsEnum.docsAndPositions(randomBits, leftPositions),
+            rightPositions = rightTermsEnum.docsAndPositions(randomBits, rightPositions));
 
-  public void testIndexWriterReopenSegment() throws Exception {
-    doTestIndexWriterReopenSegment(false);
-  }
+        assertPositionsSkipping(leftTermsEnum.docFreq(), 
+            leftPositions = leftTermsEnum.docsAndPositions(null, leftPositions),
+            rightPositions = rightTermsEnum.docsAndPositions(null, rightPositions));
+        assertPositionsSkipping(leftTermsEnum.docFreq(), 
+            leftPositions = leftTermsEnum.docsAndPositions(randomBits, leftPositions),
+            rightPositions = rightTermsEnum.docsAndPositions(randomBits, rightPositions));
 
+        // with freqs:
+        assertDocsEnum(leftDocs = leftTermsEnum.docs(null, leftDocs, true),
+            rightDocs = rightTermsEnum.docs(null, rightDocs, true),
+            true);
+        assertDocsEnum(leftDocs = leftTermsEnum.docs(randomBits, leftDocs, true),
+            rightDocs = rightTermsEnum.docs(randomBits, rightDocs, true),
+            true);
+
+        // w/o freqs:
+        assertDocsEnum(leftDocs = leftTermsEnum.docs(null, leftDocs, false),
+            rightDocs = rightTermsEnum.docs(null, rightDocs, false),
+            false);
+        assertDocsEnum(leftDocs = leftTermsEnum.docs(randomBits, leftDocs, false),
+            rightDocs = rightTermsEnum.docs(randomBits, rightDocs, false),
+            false);
+        
+        // with freqs:
+        assertDocsSkipping(leftTermsEnum.docFreq(), 
+            leftDocs = leftTermsEnum.docs(null, leftDocs, true),
+            rightDocs = rightTermsEnum.docs(null, rightDocs, true),
+            true);
+        assertDocsSkipping(leftTermsEnum.docFreq(), 
+            leftDocs = leftTermsEnum.docs(randomBits, leftDocs, true),
+            rightDocs = rightTermsEnum.docs(randomBits, rightDocs, true),
+            true);
+
+        // w/o freqs:
+        assertDocsSkipping(leftTermsEnum.docFreq(), 
+            leftDocs = leftTermsEnum.docs(null, leftDocs, false),
+            rightDocs = rightTermsEnum.docs(null, rightDocs, false),
+            false);
+        assertDocsSkipping(leftTermsEnum.docFreq(), 
+            leftDocs = leftTermsEnum.docs(randomBits, leftDocs, false),
+            rightDocs = rightTermsEnum.docs(randomBits, rightDocs, false),
+            false);
+      }
+    }
+    assertNull(info, rightTermsEnum.next());
+  }
+  
   /**
-   * Tests creating a segment, then check to insure the segment can be seen via
-   * IW.getReader
+   * checks term-level statistics
    */
-  public void doTestIndexWriterReopenSegment(boolean optimize) throws Exception {
-    Directory dir1 = new MockRAMDirectory();
-    IndexWriter writer = new IndexWriter(dir1, new IndexWriterConfig(TEST_VERSION_CURRENT, new WhitespaceAnalyzer(TEST_VERSION_CURRENT)));
-    writer.setInfoStream(infoStream);
-    IndexReader r1 = writer.getReader();
-    assertEquals(0, r1.maxDoc());
-    createIndexNoClose(false, "index1", writer);
-    writer.flush(!optimize, true, true);
-
-    IndexReader iwr1 = writer.getReader();
-    assertEquals(100, iwr1.maxDoc());
-
-    IndexReader r2 = writer.getReader();
-    assertEquals(r2.maxDoc(), 100);
-    // add 100 documents
-    for (int x = 10000; x < 10000 + 100; x++) {
-      Document d = createDocument(x, "index1", 5);
-      writer.addDocument(d);
+  public void assertTermStats(TermsEnum leftTermsEnum, TermsEnum rightTermsEnum) throws Exception {
+    assertEquals(info, leftTermsEnum.docFreq(), rightTermsEnum.docFreq());
+    if (leftTermsEnum.totalTermFreq() != -1 && rightTermsEnum.totalTermFreq() != -1) {
+      assertEquals(info, leftTermsEnum.totalTermFreq(), rightTermsEnum.totalTermFreq());
     }
-    writer.flush(false, true, true);
-    // verify the reader was reopened internally
-    IndexReader iwr2 = writer.getReader();
-    assertTrue(iwr2 != r1);
-    assertEquals(200, iwr2.maxDoc());
-    // should have flushed out a segment
-    IndexReader r3 = writer.getReader();
-    assertTrue(r2 != r3);
-    assertEquals(200, r3.maxDoc());
-
-    // dec ref the readers rather than close them because
-    // closing flushes changes to the writer
-    r1.close();
-    iwr1.close();
-    r2.close();
-    r3.close();
-    iwr2.close();
-    writer.close();
-
-    // test whether the changes made it to the directory
-    writer = new IndexWriter(dir1, new IndexWriterConfig(TEST_VERSION_CURRENT, new WhitespaceAnalyzer(TEST_VERSION_CURRENT)));
-    IndexReader w2r1 = writer.getReader();
-    // insure the deletes were actually flushed to the directory
-    assertEquals(200, w2r1.maxDoc());
-    w2r1.close();
-    writer.close();
-
-    dir1.close();
   }
-
   
-  public static Document createDocument(int n, String indexName, int numFields) {
-    StringBuilder sb = new StringBuilder();
-    Document doc = new Document();
-    doc.add(new Field("id", Integer.toString(n), Store.YES, Index.NOT_ANALYZED, TermVector.WITH_POSITIONS_OFFSETS));
-    doc.add(new Field("indexname", indexName, Store.YES, Index.NOT_ANALYZED, TermVector.WITH_POSITIONS_OFFSETS));
-    sb.append("a");
-    sb.append(n);
-    doc.add(new Field("field1", sb.toString(), Store.YES, Index.ANALYZED, TermVector.WITH_POSITIONS_OFFSETS));
-    sb.append(" b");
-    sb.append(n);
-    for (int i = 1; i < numFields; i++) {
-      doc.add(new Field("field" + (i + 1), sb.toString(), Store.YES,
-                        Index.ANALYZED, TermVector.WITH_POSITIONS_OFFSETS));
-    }
-    return doc;
-  }
-
-  /*
-   * Delete a document by term and return the doc id
-   * 
-   * public static int deleteDocument(Term term, IndexWriter writer) throws
-   * IOException { IndexReader reader = writer.getReader(); TermDocs td =
-   * reader.termDocs(term); int doc = -1; //if (td.next()) { // doc = td.doc();
-   * //} //writer.deleteDocuments(term); td.close(); return doc; }
+  /**
+   * checks docs + freqs + positions + payloads, sequentially
    */
-  
-  public static void createIndex(Directory dir1, String indexName,
-      boolean multiSegment) throws IOException {
-    IndexWriter w = new IndexWriter(dir1, new IndexWriterConfig(
-        TEST_VERSION_CURRENT, new WhitespaceAnalyzer(TEST_VERSION_CURRENT))
-        .setMergePolicy(new LogDocMergePolicy()));
-    for (int i = 0; i < 100; i++) {
-      w.addDocument(createDocument(i, indexName, 4));
-      if (multiSegment && (i % 10) == 0) {
+  public void assertDocsAndPositionsEnum(DocsAndPositionsEnum leftDocs, DocsAndPositionsEnum rightDocs) throws Exception {
+    if (leftDocs == null || rightDocs == null) {
+      assertNull(leftDocs);
+      assertNull(rightDocs);
+      return;
+    }
+    assertTrue(info, leftDocs.docID() == -1 || leftDocs.docID() == DocIdSetIterator.NO_MORE_DOCS);
+    assertTrue(info, rightDocs.docID() == -1 || rightDocs.docID() == DocIdSetIterator.NO_MORE_DOCS);
+    int docid;
+    while ((docid = leftDocs.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+      assertEquals(info, docid, rightDocs.nextDoc());
+      int freq = leftDocs.freq();
+      assertEquals(info, freq, rightDocs.freq());
+      for (int i = 0; i < freq; i++) {
+        assertEquals(info, leftDocs.nextPosition(), rightDocs.nextPosition());
+        assertEquals(info, leftDocs.hasPayload(), rightDocs.hasPayload());
+        if (leftDocs.hasPayload()) {
+          assertEquals(info, leftDocs.getPayload(), rightDocs.getPayload());
+        }
       }
     }
-    if (!multiSegment) {
-      w.optimize();
+    assertEquals(info, DocIdSetIterator.NO_MORE_DOCS, rightDocs.nextDoc());
+  }
+  
+  /**
+   * checks docs + freqs, sequentially
+   */
+  public void assertDocsEnum(DocsEnum leftDocs, DocsEnum rightDocs, boolean hasFreqs) throws Exception {
+    if (leftDocs == null) {
+      assertNull(rightDocs);
+      return;
     }
-    w.close();
+    assertTrue(info, leftDocs.docID() == -1 || leftDocs.docID() == DocIdSetIterator.NO_MORE_DOCS);
+    assertTrue(info, rightDocs.docID() == -1 || rightDocs.docID() == DocIdSetIterator.NO_MORE_DOCS);
+    int docid;
+    while ((docid = leftDocs.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+      assertEquals(info, docid, rightDocs.nextDoc());
+      if (hasFreqs) {
+        assertEquals(info, leftDocs.freq(), rightDocs.freq());
+      }
+    }
+    assertEquals(info, DocIdSetIterator.NO_MORE_DOCS, rightDocs.nextDoc());
+  }
+  
+  /**
+   * checks advancing docs
+   */
+  public void assertDocsSkipping(int docFreq, DocsEnum leftDocs, DocsEnum rightDocs, boolean hasFreqs) throws Exception {
+    if (leftDocs == null) {
+      assertNull(rightDocs);
+      return;
+    }
+    int docid = -1;
+    int averageGap = leftReader.maxDoc() / (1+docFreq);
+    int skipInterval = 16;
+
+    while (true) {
+      if (random.nextBoolean()) {
+        // nextDoc()
+        docid = leftDocs.nextDoc();
+        assertEquals(info, docid, rightDocs.nextDoc());
+      } else {
+        // advance()
+        int skip = docid + (int) Math.ceil(Math.abs(skipInterval + random.nextGaussian() * averageGap));
+        docid = leftDocs.advance(skip);
+        assertEquals(info, docid, rightDocs.advance(skip));
+      }
+      
+      if (docid == DocIdSetIterator.NO_MORE_DOCS) {
+        return;
+      }
+      if (hasFreqs) {
+        assertEquals(info, leftDocs.freq(), rightDocs.freq());
+      }
+    }
+  }
+  
+  /**
+   * checks advancing docs + positions
+   */
+  public void assertPositionsSkipping(int docFreq, DocsAndPositionsEnum leftDocs, DocsAndPositionsEnum rightDocs) throws Exception {
+    if (leftDocs == null || rightDocs == null) {
+      assertNull(leftDocs);
+      assertNull(rightDocs);
+      return;
+    }
+    
+    int docid = -1;
+    int averageGap = leftReader.maxDoc() / (1+docFreq);
+    int skipInterval = 16;
+
+    while (true) {
+      if (random.nextBoolean()) {
+        // nextDoc()
+        docid = leftDocs.nextDoc();
+        assertEquals(info, docid, rightDocs.nextDoc());
+      } else {
+        // advance()
+        int skip = docid + (int) Math.ceil(Math.abs(skipInterval + random.nextGaussian() * averageGap));
+        docid = leftDocs.advance(skip);
+        assertEquals(info, docid, rightDocs.advance(skip));
+      }
+      
+      if (docid == DocIdSetIterator.NO_MORE_DOCS) {
+        return;
+      }
+      int freq = leftDocs.freq();
+      assertEquals(info, freq, rightDocs.freq());
+      for (int i = 0; i < freq; i++) {
+        assertEquals(info, leftDocs.nextPosition(), rightDocs.nextPosition());
+        assertEquals(info, leftDocs.hasPayload(), rightDocs.hasPayload());
+        if (leftDocs.hasPayload()) {
+          assertEquals(info, leftDocs.getPayload(), rightDocs.getPayload());
+        }
+      }
+    }
+  }
+  
+  /** 
+   * checks that norms are the same across all fields 
+   */
+  public void assertNorms(IndexReader leftReader, IndexReader rightReader) throws Exception {
+    Fields leftFields = MultiFields.getFields(leftReader);
+    Fields rightFields = MultiFields.getFields(rightReader);
+    // Fields could be null if there are no postings,
+    // but then it must be null for both
+    if (leftFields == null || rightFields == null) {
+      assertNull(info, leftFields);
+      assertNull(info, rightFields);
+      return;
+    }
+    
+    FieldsEnum fieldsEnum = leftFields.iterator();
+    String field;
+    while ((field = fieldsEnum.next()) != null) {
+      assertEquals(info, leftReader.hasNorms(field), rightReader.hasNorms(field));
+      if (leftReader.hasNorms(field)) {
+        DocValues leftNorms = MultiDocValues.getNormDocValues(leftReader, field);
+        DocValues rightNorms = MultiDocValues.getNormDocValues(rightReader, field);
+        assertDocValues(leftNorms, rightNorms);
+      }
+    }
+  }
+  
+  /** 
+   * checks that stored fields of all documents are the same 
+   */
+  public void assertStoredFields(IndexReader leftReader, IndexReader rightReader) throws Exception {
+    assert leftReader.maxDoc() == rightReader.maxDoc();
+    for (int i = 0; i < leftReader.maxDoc(); i++) {
+      Document leftDoc = leftReader.document(i);
+      Document rightDoc = rightReader.document(i);
+      
+      // TODO: I think this is bogus because we don't document what the order should be
+      // from these iterators, etc. I think the codec should be free to order this stuff
+      // in whatever way it wants (e.g. maybe it packs related fields together or something)
+
+      Iterator<IndexableField> leftIterator = leftDoc.iterator();
+      Iterator<IndexableField> rightIterator = rightDoc.iterator();
+      while (leftIterator.hasNext()) {
+        assertTrue(info, rightIterator.hasNext());
+        assertStoredField(leftIterator.next(), rightIterator.next());
+      }
+      assertFalse(info, rightIterator.hasNext());
+    }
+  }
+  
+  /** 
+   * checks that two stored fields are equivalent 
+   */
+  public void assertStoredField(IndexableField leftField, IndexableField rightField) {
+    assertEquals(info, leftField.name(), rightField.name());
+    assertEquals(info, leftField.binaryValue(), rightField.binaryValue());
+    assertEquals(info, leftField.stringValue(), rightField.stringValue());
+    assertEquals(info, leftField.numericValue(), rightField.numericValue());
+    assertEquals(info, leftField.fieldType().numericType(), rightField.fieldType().numericType());
+    // TODO: should we check the FT at all?
+  }
+  
+  /** 
+   * checks that term vectors across all fields are equivalent 
+   */
+  public void assertTermVectors(IndexReader leftReader, IndexReader rightReader) throws Exception {
+    assert leftReader.maxDoc() == rightReader.maxDoc();
+    for (int i = 0; i < leftReader.maxDoc(); i++) {
+      Fields leftFields = leftReader.getTermVectors(i);
+      Fields rightFields = rightReader.getTermVectors(i);
+      assertFields(leftFields, rightFields, rarely());
+    }
   }
 
-  public static void createIndexNoClose(boolean multiSegment, String indexName,
-      IndexWriter w) throws IOException {
-    for (int i = 0; i < 100; i++) {
-      w.addDocument(createDocument(i, indexName, 4));
+  private static Set<String> getDVFields(IndexReader reader) {
+    Set<String> fields = new HashSet<String>();
+    for(FieldInfo fi : ReaderUtil.getMergedFieldInfos(reader)) {
+      if (fi.hasDocValues()) {
+        fields.add(fi.name);
+      }
     }
-    if (!multiSegment) {
-      w.optimize();
+
+    return fields;
+  }
+  
+  /**
+   * checks that docvalues across all fields are equivalent
+   */
+  public void assertDocValues(IndexReader leftReader, IndexReader rightReader) throws Exception {
+    Set<String> leftValues = getDVFields(leftReader);
+    Set<String> rightValues = getDVFields(rightReader);
+    assertEquals(info, leftValues, rightValues);
+
+    for (String field : leftValues) {
+      DocValues leftDocValues = MultiDocValues.getDocValues(leftReader, field);
+      DocValues rightDocValues = MultiDocValues.getDocValues(rightReader, field);
+      assertDocValues(leftDocValues, rightDocValues);
     }
   }
-
-  private static class MyWarmer extends IndexWriter.IndexReaderWarmer {
-    int warmCount;
+  
+  public void assertDocValues(DocValues leftDocValues, DocValues rightDocValues) throws Exception {
+    assertNotNull(info, leftDocValues);
+    assertNotNull(info, rightDocValues);
+    assertEquals(info, leftDocValues.type(), rightDocValues.type());
+    assertEquals(info, leftDocValues.getValueSize(), rightDocValues.getValueSize());
+    assertDocValuesSource(leftDocValues.getDirectSource(), rightDocValues.getDirectSource());
+    assertDocValuesSource(leftDocValues.getSource(), rightDocValues.getSource());
+  }
+  
+  /**
+   * checks source API
+   */
+  public void assertDocValuesSource(DocValues.Source left, DocValues.Source right) throws Exception {
+    DocValues.Type leftType = left.type();
+    assertEquals(info, leftType, right.type());
+    switch(leftType) {
+      case VAR_INTS:
+      case FIXED_INTS_8:
+      case FIXED_INTS_16:
+      case FIXED_INTS_32:
+      case FIXED_INTS_64:
+        for (int i = 0; i < leftReader.maxDoc(); i++) {
+          assertEquals(info, left.getInt(i), right.getInt(i));
+        }
+        break;
+      case FLOAT_32:
+      case FLOAT_64:
+        for (int i = 0; i < leftReader.maxDoc(); i++) {
+          assertEquals(info, left.getFloat(i), right.getFloat(i), 0F);
+        }
+        break;
+      case BYTES_FIXED_STRAIGHT:
+      case BYTES_FIXED_DEREF:
+      case BYTES_VAR_STRAIGHT:
+      case BYTES_VAR_DEREF:
+        BytesRef b1 = new BytesRef();
+        BytesRef b2 = new BytesRef();
+        for (int i = 0; i < leftReader.maxDoc(); i++) {
+          left.getBytes(i, b1);
+          right.getBytes(i, b2);
+          assertEquals(info, b1, b2);
+        }
+        break;
+      // TODO: can we test these?
+      case BYTES_VAR_SORTED:
+      case BYTES_FIXED_SORTED:
+    }
+  }
+  
+  // TODO: this is kinda stupid, we don't delete documents in the test.
+  public void assertDeletedDocs(IndexReader leftReader, IndexReader rightReader) throws Exception {
+    assert leftReader.numDeletedDocs() == rightReader.numDeletedDocs();
+    Bits leftBits = MultiFields.getLiveDocs(leftReader);
+    Bits rightBits = MultiFields.getLiveDocs(rightReader);
+    
+    if (leftBits == null || rightBits == null) {
+      assertNull(info, leftBits);
+      assertNull(info, rightBits);
+      return;
+    }
+    
+    assert leftReader.maxDoc() == rightReader.maxDoc();
+    assertEquals(info, leftBits.length(), rightBits.length());
+    for (int i = 0; i < leftReader.maxDoc(); i++) {
+      assertEquals(info, leftBits.get(i), rightBits.get(i));
+    }
+  }
+  
+  
+  private static class RandomBits implements Bits {
+    FixedBitSet bits;
+    
+    RandomBits(int maxDoc, double pctLive, Random random) {
+      bits = new FixedBitSet(maxDoc);
+      for (int i = 0; i < maxDoc; i++) {
+        if (random.nextDouble() <= pctLive) {        
+          bits.set(i);
+        }
+      }
+    }
+    
     @Override
-    public void warm(IndexReader reader) throws IOException {
-      warmCount++;
-    }
-  }
-
-  public void testMergeWarmer() throws Exception {
-
-    Directory dir1 = new MockRAMDirectory();
-    // Enroll warmer
-    MyWarmer warmer = new MyWarmer();
-    IndexWriter writer = new IndexWriter(dir1, new IndexWriterConfig(
-        TEST_VERSION_CURRENT, new WhitespaceAnalyzer(TEST_VERSION_CURRENT))
-        .setMaxBufferedDocs(2).setMergedSegmentWarmer(warmer));
-    writer.setInfoStream(infoStream);
-
-    // create the index
-    createIndexNoClose(false, "test", writer);
-
-    // get a reader to put writer into near real-time mode
-    IndexReader r1 = writer.getReader();
-    
-    ((LogMergePolicy) writer.getConfig().getMergePolicy()).setMergeFactor(2);
-
-    for (int i = 0; i < 10; i++) {
-      writer.addDocument(createDocument(i, "test", 4));
-    }
-    ((ConcurrentMergeScheduler) writer.getConfig().getMergeScheduler()).sync();
-
-    assertTrue(warmer.warmCount > 0);
-    final int count = warmer.warmCount;
-
-    writer.addDocument(createDocument(17, "test", 4));
-    writer.optimize();
-    assertTrue(warmer.warmCount > count);
-    
-    writer.close();
-    r1.close();
-    dir1.close();
-  }
-
-  public void testAfterCommit() throws Exception {
-    Directory dir1 = new MockRAMDirectory();
-    IndexWriter writer = new IndexWriter(dir1, new IndexWriterConfig(TEST_VERSION_CURRENT, new WhitespaceAnalyzer(TEST_VERSION_CURRENT)));
-    writer.commit();
-    writer.setInfoStream(infoStream);
-
-    // create the index
-    createIndexNoClose(false, "test", writer);
-
-    // get a reader to put writer into near real-time mode
-    IndexReader r1 = writer.getReader();
-    _TestUtil.checkIndex(dir1);
-    writer.commit();
-    _TestUtil.checkIndex(dir1);
-    assertEquals(100, r1.numDocs());
-
-    for (int i = 0; i < 10; i++) {
-      writer.addDocument(createDocument(i, "test", 4));
-    }
-    ((ConcurrentMergeScheduler) writer.getConfig().getMergeScheduler()).sync();
-
-    IndexReader r2 = r1.reopen();
-    if (r2 != r1) {
-      r1.close();
-      r1 = r2;
-    }
-    assertEquals(110, r1.numDocs());
-    writer.close();
-    r1.close();
-    dir1.close();
-  }
-
-  // Make sure reader remains usable even if IndexWriter closes
-  public void testAfterClose() throws Exception {
-    Directory dir1 = new MockRAMDirectory();
-    IndexWriter writer = new IndexWriter(dir1, new IndexWriterConfig(TEST_VERSION_CURRENT, new WhitespaceAnalyzer(TEST_VERSION_CURRENT)));
-    writer.setInfoStream(infoStream);
-
-    // create the index
-    createIndexNoClose(false, "test", writer);
-
-    IndexReader r = writer.getReader();
-    writer.close();
-
-    _TestUtil.checkIndex(dir1);
-
-    // reader should remain usable even after IndexWriter is closed:
-    assertEquals(100, r.numDocs());
-    Query q = new TermQuery(new Term("indexname", "test"));
-    assertEquals(100, new IndexSearcher(r).search(q, 10).totalHits);
-
-    try {
-      r.reopen();
-      fail("failed to hit AlreadyClosedException");
-    } catch (AlreadyClosedException ace) {
-      // expected
-    }
-    r.close();
-    dir1.close();
-  }
-
-  // Stress test reopen during addIndexes
-  public void testDuringAddIndexes() throws Exception {
-    Directory dir1 = new MockRAMDirectory();
-    final IndexWriter writer = new IndexWriter(dir1, new IndexWriterConfig(TEST_VERSION_CURRENT, new WhitespaceAnalyzer(TEST_VERSION_CURRENT)));
-    writer.setInfoStream(infoStream);
-    ((LogMergePolicy) writer.getConfig().getMergePolicy()).setMergeFactor(2);
-
-    // create the index
-    createIndexNoClose(false, "test", writer);
-    writer.commit();
-
-    final Directory[] dirs = new Directory[10];
-    for (int i=0;i<10;i++) {
-      dirs[i] = new MockRAMDirectory(dir1);
+    public boolean get(int index) {
+      return bits.get(index);
     }
 
-    IndexReader r = writer.getReader();
-
-    final int NUM_THREAD = 5;
-    final float SECONDS = 0.5f;
-
-    final long endTime = (long) (System.currentTimeMillis() + 1000.*SECONDS);
-    final List<Throwable> excs = Collections.synchronizedList(new ArrayList<Throwable>());
-
-    final Thread[] threads = new Thread[NUM_THREAD];
-    for(int i=0;i<NUM_THREAD;i++) {
-      threads[i] = new Thread() {
-          @Override
-          public void run() {
-            do {
-              try {
-                writer.addIndexesNoOptimize(dirs);
-              } catch (Throwable t) {
-                excs.add(t);
-                throw new RuntimeException(t);
-              }
-            } while(System.currentTimeMillis() < endTime);
-          }
-        };
-      threads[i].setDaemon(true);
-      threads[i].start();
+    @Override
+    public int length() {
+      return bits.length();
     }
-
-    int lastCount = 0;
-    while(System.currentTimeMillis() < endTime) {
-      IndexReader r2 = r.reopen();
-      if (r2 != r) {
-        r.close();
-        r = r2;
-      }
-      Query q = new TermQuery(new Term("indexname", "test"));
-      final int count = new IndexSearcher(r).search(q, 10).totalHits;
-      assertTrue(count >= lastCount);
-      lastCount = count;
-    }
-
-    for(int i=0;i<NUM_THREAD;i++) {
-      threads[i].join();
-    }
-    // final check
-    IndexReader r2 = r.reopen();
-    if (r2 != r) {
-      r.close();
-      r = r2;
-    }
-    Query q = new TermQuery(new Term("indexname", "test"));
-    final int count = new IndexSearcher(r).search(q, 10).totalHits;
-    assertTrue(count >= lastCount);
-
-    assertEquals(0, excs.size());
-    writer.close();
-
-    _TestUtil.checkIndex(dir1);
-    r.close();
-    dir1.close();
-  }
-
-  // Stress test reopen during add/delete
-  public void testDuringAddDelete() throws Exception {
-    Directory dir1 = new MockRAMDirectory();
-    final IndexWriter writer = new IndexWriter(dir1, new IndexWriterConfig(TEST_VERSION_CURRENT, new WhitespaceAnalyzer(TEST_VERSION_CURRENT)));
-    writer.setInfoStream(infoStream);
-    ((LogMergePolicy) writer.getConfig().getMergePolicy()).setMergeFactor(2);
-
-    // create the index
-    createIndexNoClose(false, "test", writer);
-    writer.commit();
-
-    IndexReader r = writer.getReader();
-
-    final int NUM_THREAD = 5;
-    final float SECONDS = 0.5f;
-
-    final long endTime = (long) (System.currentTimeMillis() + 1000.*SECONDS);
-    final List<Throwable> excs = Collections.synchronizedList(new ArrayList<Throwable>());
-
-    final Thread[] threads = new Thread[NUM_THREAD];
-    for(int i=0;i<NUM_THREAD;i++) {
-      threads[i] = new Thread() {
-          @Override
-          public void run() {
-            int count = 0;
-            final Random r = new Random();
-            do {
-              try {
-                for(int i=0;i<10;i++) {
-                  writer.addDocument(createDocument(10*count+i, "test", 4));
-                }
-                count++;
-                final int limit = count*10;
-                for(int i=0;i<5;i++) {
-                  int x = r.nextInt(limit);
-                  writer.deleteDocuments(new Term("field3", "b"+x));
-                }
-              } catch (Throwable t) {
-                excs.add(t);
-                throw new RuntimeException(t);
-              }
-            } while(System.currentTimeMillis() < endTime);
-          }
-        };
-      threads[i].setDaemon(true);
-      threads[i].start();
-    }
-
-    int sum = 0;
-    while(System.currentTimeMillis() < endTime) {
-      IndexReader r2 = r.reopen();
-      if (r2 != r) {
-        r.close();
-        r = r2;
-      }
-      Query q = new TermQuery(new Term("indexname", "test"));
-      sum += new IndexSearcher(r).search(q, 10).totalHits;
-    }
-
-    for(int i=0;i<NUM_THREAD;i++) {
-      threads[i].join();
-    }
-    // at least search once
-    IndexReader r2 = r.reopen();
-    if (r2 != r) {
-      r.close();
-      r = r2;
-    }
-    Query q = new TermQuery(new Term("indexname", "test"));
-    sum += new IndexSearcher(r).search(q, 10).totalHits;
-
-    assertTrue("no documents found at all", sum > 0);
-
-    assertEquals(0, excs.size());
-    writer.close();
-
-    _TestUtil.checkIndex(dir1);
-    r.close();
-    dir1.close();
-  }
-
-  public void testExpungeDeletes() throws Throwable {
-    Directory dir = new MockRAMDirectory();
-    final IndexWriter w = new IndexWriter(dir, new IndexWriterConfig(TEST_VERSION_CURRENT, new WhitespaceAnalyzer(TEST_VERSION_CURRENT)));
-    Document doc = new Document();
-    doc.add(new Field("field", "a b c", Field.Store.NO, Field.Index.ANALYZED));
-    Field id = new Field("id", "", Field.Store.NO, Field.Index.NOT_ANALYZED);
-    doc.add(id);
-    id.setValue("0");
-    w.addDocument(doc);
-    id.setValue("1");
-    w.addDocument(doc);
-    w.deleteDocuments(new Term("id", "0"));
-
-    IndexReader r = w.getReader();
-    w.expungeDeletes();
-    w.close();
-    r.close();
-    r = IndexReader.open(dir, true);
-    assertEquals(1, r.numDocs());
-    assertFalse(r.hasDeletions());
-    r.close();
-    dir.close();
-  }
-
-  public void testDeletesNumDocs() throws Throwable {
-    Directory dir = new MockRAMDirectory();
-    final IndexWriter w = new IndexWriter(dir, new IndexWriterConfig(TEST_VERSION_CURRENT, new WhitespaceAnalyzer(TEST_VERSION_CURRENT)));
-    Document doc = new Document();
-    doc.add(new Field("field", "a b c", Field.Store.NO, Field.Index.ANALYZED));
-    Field id = new Field("id", "", Field.Store.NO, Field.Index.NOT_ANALYZED);
-    doc.add(id);
-    id.setValue("0");
-    w.addDocument(doc);
-    id.setValue("1");
-    w.addDocument(doc);
-    IndexReader r = w.getReader();
-    assertEquals(2, r.numDocs());
-    r.close();
-
-    w.deleteDocuments(new Term("id", "0"));
-    r = w.getReader();
-    assertEquals(1, r.numDocs());
-    r.close();
-
-    w.deleteDocuments(new Term("id", "1"));
-    r = w.getReader();
-    assertEquals(0, r.numDocs());
-    r.close();
-
-    w.close();
-    dir.close();
   }
 }

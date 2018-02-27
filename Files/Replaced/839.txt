@@ -1,14 +1,13 @@
-final LineFileDocs docs = new LineFileDocs(random, defaultCodecSupportsDocValues());
-
-package org.apache.lucene.util.fst;
+Comparator<IColumn> comparator = QueryFilter.getColumnComparator(getComparator());
 
 /**
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -19,2103 +18,1055 @@ package org.apache.lucene.util.fst;
  * limitations under the License.
  */
 
-import java.io.BufferedReader;
+package org.apache.cassandra.db;
+
 import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
+import java.io.IOError;
 import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.OutputStreamWriter;
-import java.io.StringWriter;
-import java.io.Writer;
+import java.lang.management.ManagementFactory;
 import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.Condition;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import javax.management.MBeanServer;
+import javax.management.ObjectName;
 
-import org.apache.lucene.analysis.MockAnalyzer;
-import org.apache.lucene.codecs.Codec;
-import org.apache.lucene.codecs.lucene40.Lucene40PostingsFormat;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.Field;
-import org.apache.lucene.document.StringField;
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.IndexWriter;
-import org.apache.lucene.index.IndexWriterConfig;
-import org.apache.lucene.index.MultiFields;
-import org.apache.lucene.index.RandomIndexWriter;
-import org.apache.lucene.index.Term;
-import org.apache.lucene.index.Terms;
-import org.apache.lucene.index.TermsEnum;
-import org.apache.lucene.search.IndexSearcher;
-import org.apache.lucene.search.TermQuery;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.FSDirectory;
-import org.apache.lucene.store.IOContext;
-import org.apache.lucene.store.IndexInput;
-import org.apache.lucene.store.IndexOutput;
-import org.apache.lucene.store.MockDirectoryWrapper;
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.IntsRef;
-import org.apache.lucene.util.LineFileDocs;
-import org.apache.lucene.util.LuceneTestCase;
-import org.apache.lucene.util.LuceneTestCase.UseNoMemoryExpensiveCodec;
-import org.apache.lucene.util.UnicodeUtil;
-import org.apache.lucene.util._TestUtil;
-import org.apache.lucene.util.fst.FST.Arc;
-import org.apache.lucene.util.fst.FST.BytesReader;
+import org.apache.commons.collections.IteratorUtils;
 
-@UseNoMemoryExpensiveCodec
-public class TestFSTs extends LuceneTestCase {
+import com.google.common.collect.Iterables;
+import org.apache.cassandra.concurrent.JMXEnabledThreadPoolExecutor;
+import org.apache.cassandra.concurrent.NamedThreadFactory;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.commitlog.CommitLog;
+import org.apache.cassandra.db.commitlog.CommitLogSegment;
+import org.apache.cassandra.db.filter.*;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.dht.AbstractBounds;
+import org.apache.cassandra.dht.Bounds;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.io.sstable.*;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.thrift.SliceRange;
+import org.apache.cassandra.utils.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-  private MockDirectoryWrapper dir;
+public class ColumnFamilyStore implements ColumnFamilyStoreMBean
+{
+    private static Logger logger_ = LoggerFactory.getLogger(ColumnFamilyStore.class);
 
-  @Override
-  public void setUp() throws Exception {
-    super.setUp();
-    dir = newDirectory();
-    dir.setPreventDoubleWrite(false);
-  }
+    /*
+     * submitFlush first puts [Binary]Memtable.getSortedContents on the flushSorter executor,
+     * which then puts the sorted results on the writer executor.  This is because sorting is CPU-bound,
+     * and writing is disk-bound; we want to be able to do both at once.  When the write is complete,
+     * we turn the writer into an SSTableReader and add it to ssTables_ where it is available for reads.
+     *
+     * For BinaryMemtable that's about all that happens.  For live Memtables there are two other things
+     * that switchMemtable does (which should be the only caller of submitFlush in this case).
+     * First, it puts the Memtable into memtablesPendingFlush, where it stays until the flush is complete
+     * and it's been added as an SSTableReader to ssTables_.  Second, it adds an entry to commitLogUpdater
+     * that waits for the flush to complete, then calls onMemtableFlush.  This allows multiple flushes
+     * to happen simultaneously on multicore systems, while still calling onMF in the correct order,
+     * which is necessary for replay in case of a restart since CommitLog assumes that when onMF is
+     * called, all data up to the given context has been persisted to SSTables.
+     */
+    private static ExecutorService flushSorter_
+            = new JMXEnabledThreadPoolExecutor(1,
+                                               Runtime.getRuntime().availableProcessors(),
+                                               Integer.MAX_VALUE,
+                                               TimeUnit.SECONDS,
+                                               new LinkedBlockingQueue<Runnable>(1 + Runtime.getRuntime().availableProcessors()),
+                                               new NamedThreadFactory("FLUSH-SORTER-POOL"));
+    private static ExecutorService flushWriter_
+            = new JMXEnabledThreadPoolExecutor(1,
+                                               DatabaseDescriptor.getAllDataFileLocations().length,
+                                               Integer.MAX_VALUE,
+                                               TimeUnit.SECONDS,
+                                               new LinkedBlockingQueue<Runnable>(1 + 2 * DatabaseDescriptor.getAllDataFileLocations().length),
+                                               new NamedThreadFactory("FLUSH-WRITER-POOL"));
+    private static ExecutorService commitLogUpdater_ = new JMXEnabledThreadPoolExecutor("MEMTABLE-POST-FLUSHER");
 
-  @Override
-  public void tearDown() throws Exception {
-    // can be null if we force simpletext (funky, some kind of bug in test runner maybe)
-    if (dir != null) dir.close();
-    super.tearDown();
-  }
+    private Set<Memtable> memtablesPendingFlush = new ConcurrentSkipListSet<Memtable>();
 
-  private static BytesRef toBytesRef(IntsRef ir) {
-    BytesRef br = new BytesRef(ir.length);
-    for(int i=0;i<ir.length;i++) {
-      int x = ir.ints[ir.offset+i];
-      assert x >= 0 && x <= 255;
-      br.bytes[i] = (byte) x;
-    }
-    br.length = ir.length;
-    return br;
-  }
+    private final String table_;
+    public final String columnFamily_;
+    private final boolean isSuper_;
 
-  static IntsRef toIntsRef(String s, int inputMode) {
-    return toIntsRef(s, inputMode, new IntsRef(10));
-  }
+    private volatile Integer memtableSwitchCount = 0;
 
-  static IntsRef toIntsRef(String s, int inputMode, IntsRef ir) {
-    if (inputMode == 0) {
-      // utf8
-      return toIntsRef(new BytesRef(s), ir);
-    } else {
-      // utf32
-      return toIntsRefUTF32(s, ir);
-    }
-  }
+    /* This is used to generate the next index for a SSTable */
+    private AtomicInteger fileIndexGenerator_ = new AtomicInteger(0);
 
-  static IntsRef toIntsRefUTF32(String s, IntsRef ir) {
-    final int charLength = s.length();
-    int charIdx = 0;
-    int intIdx = 0;
-    while(charIdx < charLength) {
-      if (intIdx == ir.ints.length) {
-        ir.grow(intIdx+1);
-      }
-      final int utf32 = s.codePointAt(charIdx);
-      ir.ints[intIdx] = utf32;
-      charIdx += Character.charCount(utf32);
-      intIdx++;
-    }
-    ir.length = intIdx;
-    return ir;
-  }
+    /* active memtable associated with this ColumnFamilyStore. */
+    private Memtable memtable_;
 
-  static IntsRef toIntsRef(BytesRef br, IntsRef ir) {
-    if (br.length > ir.ints.length) {
-      ir.grow(br.length);
-    }
-    for(int i=0;i<br.length;i++) {
-      ir.ints[i] = br.bytes[br.offset+i]&0xFF;
-    }
-    ir.length = br.length;
-    return ir;
-  }
+    // TODO binarymemtable ops are not threadsafe (do they need to be?)
+    private AtomicReference<BinaryMemtable> binaryMemtable_;
 
-  public void testBasicFSA() throws IOException {
-    String[] strings = new String[] {"station", "commotion", "elation", "elastic", "plastic", "stop", "ftop", "ftation", "stat"};
-    String[] strings2 = new String[] {"station", "commotion", "elation", "elastic", "plastic", "stop", "ftop", "ftation"};
-    IntsRef[] terms = new IntsRef[strings.length];
-    IntsRef[] terms2 = new IntsRef[strings2.length];
-    for(int inputMode=0;inputMode<2;inputMode++) {
-      if (VERBOSE) {
-        System.out.println("TEST: inputMode=" + inputModeToString(inputMode));
-      }
+    /* SSTables on disk for this column family */
+    private SSTableTracker ssTables_;
 
-      for(int idx=0;idx<strings.length;idx++) {
-        terms[idx] = toIntsRef(strings[idx], inputMode);
-      }
-      for(int idx=0;idx<strings2.length;idx++) {
-        terms2[idx] = toIntsRef(strings2[idx], inputMode);
-      }
-      Arrays.sort(terms2);
+    private LatencyTracker readStats_ = new LatencyTracker();
+    private LatencyTracker writeStats_ = new LatencyTracker();
 
-      doTest(inputMode, terms);
+    private long minRowCompactedSize = 0L;
+    private long maxRowCompactedSize = 0L;
+    private long rowsCompactedTotalSize = 0L;
+    private long rowsCompactedCount = 0L;
     
-      // Test pre-determined FST sizes to make sure we haven't lost minimality (at least on this trivial set of terms):
-
-      // FSA
-      {
-        final Outputs<Object> outputs = NoOutputs.getSingleton();
-        final Object NO_OUTPUT = outputs.getNoOutput();      
-        final List<FSTTester.InputOutput<Object>> pairs = new ArrayList<FSTTester.InputOutput<Object>>(terms2.length);
-        for(IntsRef term : terms2) {
-          pairs.add(new FSTTester.InputOutput<Object>(term, NO_OUTPUT));
-        }
-        FST<Object> fst = new FSTTester<Object>(random, dir, inputMode, pairs, outputs, false).doTest(0, 0, false);
-        assertNotNull(fst);
-        assertEquals(22, fst.getNodeCount());
-        assertEquals(27, fst.getArcCount());
-      }
-
-      // FST ord pos int
-      {
-        final PositiveIntOutputs outputs = PositiveIntOutputs.getSingleton(true);
-        final List<FSTTester.InputOutput<Long>> pairs = new ArrayList<FSTTester.InputOutput<Long>>(terms2.length);
-        for(int idx=0;idx<terms2.length;idx++) {
-          pairs.add(new FSTTester.InputOutput<Long>(terms2[idx], (long) idx));
-        }
-        final FST<Long> fst = new FSTTester<Long>(random, dir, inputMode, pairs, outputs, true).doTest(0, 0, false);
-        assertNotNull(fst);
-        assertEquals(22, fst.getNodeCount());
-        assertEquals(27, fst.getArcCount());
-      }
-
-      // FST byte sequence ord
-      {
-        final ByteSequenceOutputs outputs = ByteSequenceOutputs.getSingleton();
-        final BytesRef NO_OUTPUT = outputs.getNoOutput();      
-        final List<FSTTester.InputOutput<BytesRef>> pairs = new ArrayList<FSTTester.InputOutput<BytesRef>>(terms2.length);
-        for(int idx=0;idx<terms2.length;idx++) {
-          final BytesRef output = random.nextInt(30) == 17 ? NO_OUTPUT : new BytesRef(Integer.toString(idx));
-          pairs.add(new FSTTester.InputOutput<BytesRef>(terms2[idx], output));
-        }
-        final FST<BytesRef> fst = new FSTTester<BytesRef>(random, dir, inputMode, pairs, outputs, false).doTest(0, 0, false);
-        assertNotNull(fst);
-        assertEquals(24, fst.getNodeCount());
-        assertEquals(30, fst.getArcCount());
-      }
-    }
-  }
-
-  private static String simpleRandomString(Random r) {
-    final int end = r.nextInt(10);
-    if (end == 0) {
-      // allow 0 length
-      return "";
-    }
-    final char[] buffer = new char[end];
-    for (int i = 0; i < end; i++) {
-      buffer[i] = (char) _TestUtil.nextInt(r, 97, 102);
-    }
-    return new String(buffer, 0, end);
-  }
-
-  // given set of terms, test the different outputs for them
-  private void doTest(int inputMode, IntsRef[] terms) throws IOException {
-    Arrays.sort(terms);
-
-    // NoOutputs (simple FSA)
+    ColumnFamilyStore(String table, String columnFamilyName, boolean isSuper, int indexValue)
     {
-      final Outputs<Object> outputs = NoOutputs.getSingleton();
-      final Object NO_OUTPUT = outputs.getNoOutput();      
-      final List<FSTTester.InputOutput<Object>> pairs = new ArrayList<FSTTester.InputOutput<Object>>(terms.length);
-      for(IntsRef term : terms) {
-        pairs.add(new FSTTester.InputOutput<Object>(term, NO_OUTPUT));
-      }
-      new FSTTester<Object>(random, dir, inputMode, pairs, outputs, false).doTest();
-    }
+        table_ = table;
+        columnFamily_ = columnFamilyName;
+        isSuper_ = isSuper;
+        fileIndexGenerator_.set(indexValue);
+        memtable_ = new Memtable(this);
+        binaryMemtable_ = new AtomicReference<BinaryMemtable>(new BinaryMemtable(this));
 
-    // PositiveIntOutput (ord)
-    {
-      final PositiveIntOutputs outputs = PositiveIntOutputs.getSingleton(true);
-      final List<FSTTester.InputOutput<Long>> pairs = new ArrayList<FSTTester.InputOutput<Long>>(terms.length);
-      for(int idx=0;idx<terms.length;idx++) {
-        pairs.add(new FSTTester.InputOutput<Long>(terms[idx], (long) idx));
-      }
-      new FSTTester<Long>(random, dir, inputMode, pairs, outputs, true).doTest();
-    }
+        if (logger_.isDebugEnabled())
+            logger_.debug("Starting CFS {}", columnFamily_);
+        // scan for data files corresponding to this CF
+        List<File> sstableFiles = new ArrayList<File>();
+        Pattern auxFilePattern = Pattern.compile("(.*)(-Filter\\.db$|-Index\\.db$)");
+        for (File file : files())
+        {
+            String filename = file.getName();
 
-    // PositiveIntOutput (random monotonically increasing positive number)
-    {
-      final boolean doShare = random.nextBoolean();
-      final PositiveIntOutputs outputs = PositiveIntOutputs.getSingleton(doShare);
-      final List<FSTTester.InputOutput<Long>> pairs = new ArrayList<FSTTester.InputOutput<Long>>(terms.length);
-      long lastOutput = 0;
-      for(int idx=0;idx<terms.length;idx++) {
-        final long value = lastOutput + _TestUtil.nextInt(random, 1, 1000);
-        lastOutput = value;
-        pairs.add(new FSTTester.InputOutput<Long>(terms[idx], value));
-      }
-      new FSTTester<Long>(random, dir, inputMode, pairs, outputs, doShare).doTest();
-    }
-
-    // PositiveIntOutput (random positive number)
-    {
-      final PositiveIntOutputs outputs = PositiveIntOutputs.getSingleton(random.nextBoolean());
-      final List<FSTTester.InputOutput<Long>> pairs = new ArrayList<FSTTester.InputOutput<Long>>(terms.length);
-      for(int idx=0;idx<terms.length;idx++) {
-        pairs.add(new FSTTester.InputOutput<Long>(terms[idx], random.nextLong() & Long.MAX_VALUE));
-      }
-      new FSTTester<Long>(random, dir, inputMode, pairs, outputs, false).doTest();
-    }
-
-    // Pair<ord, (random monotonically increasing positive number>
-    {
-      final PositiveIntOutputs o1 = PositiveIntOutputs.getSingleton(random.nextBoolean());
-      final PositiveIntOutputs o2 = PositiveIntOutputs.getSingleton(random.nextBoolean());
-      final PairOutputs<Long,Long> outputs = new PairOutputs<Long,Long>(o1, o2);
-      final List<FSTTester.InputOutput<PairOutputs.Pair<Long,Long>>> pairs = new ArrayList<FSTTester.InputOutput<PairOutputs.Pair<Long,Long>>>(terms.length);
-      long lastOutput = 0;
-      for(int idx=0;idx<terms.length;idx++) {
-        final long value = lastOutput + _TestUtil.nextInt(random, 1, 1000);
-        lastOutput = value;
-        pairs.add(new FSTTester.InputOutput<PairOutputs.Pair<Long,Long>>(terms[idx],
-                                                                         outputs.newPair((long) idx, value)));
-      }
-      new FSTTester<PairOutputs.Pair<Long,Long>>(random, dir, inputMode, pairs, outputs, false).doTest();
-    }
-
-    // Sequence-of-bytes
-    {
-      final ByteSequenceOutputs outputs = ByteSequenceOutputs.getSingleton();
-      final BytesRef NO_OUTPUT = outputs.getNoOutput();      
-      final List<FSTTester.InputOutput<BytesRef>> pairs = new ArrayList<FSTTester.InputOutput<BytesRef>>(terms.length);
-      for(int idx=0;idx<terms.length;idx++) {
-        final BytesRef output = random.nextInt(30) == 17 ? NO_OUTPUT : new BytesRef(Integer.toString(idx));
-        pairs.add(new FSTTester.InputOutput<BytesRef>(terms[idx], output));
-      }
-      new FSTTester<BytesRef>(random, dir, inputMode, pairs, outputs, false).doTest();
-    }
-
-    // Sequence-of-ints
-    {
-      final IntSequenceOutputs outputs = IntSequenceOutputs.getSingleton();
-      final List<FSTTester.InputOutput<IntsRef>> pairs = new ArrayList<FSTTester.InputOutput<IntsRef>>(terms.length);
-      for(int idx=0;idx<terms.length;idx++) {
-        final String s = Integer.toString(idx);
-        final IntsRef output = new IntsRef(s.length());
-        output.length = s.length();
-        for(int idx2=0;idx2<output.length;idx2++) {
-          output.ints[idx2] = s.charAt(idx2);
-        }
-        pairs.add(new FSTTester.InputOutput<IntsRef>(terms[idx], output));
-      }
-      new FSTTester<IntsRef>(random, dir, inputMode, pairs, outputs, false).doTest();
-    }
-
-    // Up to two positive ints, shared, generally but not
-    // monotonically increasing
-    {
-      if (VERBOSE) {
-        System.out.println("TEST: now test UpToTwoPositiveIntOutputs");
-      }
-      final UpToTwoPositiveIntOutputs outputs = UpToTwoPositiveIntOutputs.getSingleton(true);
-      final List<FSTTester.InputOutput<Object>> pairs = new ArrayList<FSTTester.InputOutput<Object>>(terms.length);
-      long lastOutput = 0;
-      for(int idx=0;idx<terms.length;idx++) {
-        // Sometimes go backwards
-        long value = lastOutput + _TestUtil.nextInt(random, -100, 1000);
-        while(value < 0) {
-          value = lastOutput + _TestUtil.nextInt(random, -100, 1000);
-        }
-        final Object output;
-        if (random.nextInt(5) == 3) {
-          long value2 = lastOutput + _TestUtil.nextInt(random, -100, 1000);
-          while(value2 < 0) {
-            value2 = lastOutput + _TestUtil.nextInt(random, -100, 1000);
-          }
-          output = outputs.get(value, value2);
-        } else {
-          output = outputs.get(value);
-        }
-        pairs.add(new FSTTester.InputOutput<Object>(terms[idx], output));
-      }
-      new FSTTester<Object>(random, dir, inputMode, pairs, outputs, false).doTest();
-    }
-  }
-
-  private static class FSTTester<T> {
-
-    final Random random;
-    final List<InputOutput<T>> pairs;
-    final int inputMode;
-    final Outputs<T> outputs;
-    final Directory dir;
-    final boolean doReverseLookup;
-
-    public FSTTester(Random random, Directory dir, int inputMode, List<InputOutput<T>> pairs, Outputs<T> outputs, boolean doReverseLookup) {
-      this.random = random;
-      this.dir = dir;
-      this.inputMode = inputMode;
-      this.pairs = pairs;
-      this.outputs = outputs;
-      this.doReverseLookup = doReverseLookup;
-    }
-
-    private static class InputOutput<T> implements Comparable<InputOutput<T>> {
-      public final IntsRef input;
-      public final T output;
-
-      public InputOutput(IntsRef input, T output) {
-        this.input = input;
-        this.output = output;
-      }
-
-      public int compareTo(InputOutput<T> other) {
-        if (other instanceof InputOutput) {
-          return input.compareTo((other).input);
-        } else {
-          throw new IllegalArgumentException();
-        }
-      }
-    }
-
-    public void doTest() throws IOException {
-      // no pruning
-      doTest(0, 0, true);
-
-      if (!(outputs instanceof UpToTwoPositiveIntOutputs)) {
-        // simple pruning
-        doTest(_TestUtil.nextInt(random, 1, 1+pairs.size()), 0, true);
-        
-        // leafy pruning
-        doTest(0, _TestUtil.nextInt(random, 1, 1+pairs.size()), true);
-      }
-    }
-
-    // runs the term, returning the output, or null if term
-    // isn't accepted.  if prefixLength is non-null it must be
-    // length 1 int array; prefixLength[0] is set to the length
-    // of the term prefix that matches
-    private T run(FST<T> fst, IntsRef term, int[] prefixLength) throws IOException {
-      assert prefixLength == null || prefixLength.length == 1;
-      final FST.Arc<T> arc = fst.getFirstArc(new FST.Arc<T>());
-      final T NO_OUTPUT = fst.outputs.getNoOutput();
-      T output = NO_OUTPUT;
-      final FST.BytesReader fstReader = fst.getBytesReader(0);
-
-      for(int i=0;i<=term.length;i++) {
-        final int label;
-        if (i == term.length) {
-          label = FST.END_LABEL;
-        } else {
-          label = term.ints[term.offset+i];
-        }
-        // System.out.println("   loop i=" + i + " label=" + label + " output=" + fst.outputs.outputToString(output) + " curArc: target=" + arc.target + " isFinal?=" + arc.isFinal());
-        if (fst.findTargetArc(label, arc, arc, fstReader) == null) {
-          // System.out.println("    not found");
-          if (prefixLength != null) {
-            prefixLength[0] = i;
-            return output;
-          } else {
-            return null;
-          }
-        }
-        output = fst.outputs.add(output, arc.output);
-      }
-
-      if (prefixLength != null) {
-        prefixLength[0] = term.length;
-      }
-
-      return output;
-    }
-
-    private T randomAcceptedWord(FST<T> fst, IntsRef in) throws IOException {
-      FST.Arc<T> arc = fst.getFirstArc(new FST.Arc<T>());
-
-      final List<FST.Arc<T>> arcs = new ArrayList<FST.Arc<T>>();
-      in.length = 0;
-      in.offset = 0;
-      final T NO_OUTPUT = fst.outputs.getNoOutput();
-      T output = NO_OUTPUT;
-
-      while(true) {
-        // read all arcs:
-        fst.readFirstTargetArc(arc, arc);
-        arcs.add(new FST.Arc<T>().copyFrom(arc));
-        while(!arc.isLast()) {
-          fst.readNextArc(arc);
-          arcs.add(new FST.Arc<T>().copyFrom(arc));
-        }
-      
-        // pick one
-        arc = arcs.get(random.nextInt(arcs.size()));
-        arcs.clear();
-
-        // accumulate output
-        output = fst.outputs.add(output, arc.output);
-
-        // append label
-        if (arc.label == FST.END_LABEL) {
-          break;
-        }
-
-        if (in.ints.length == in.length) {
-          in.grow(1+in.length);
-        }
-        in.ints[in.length++] = arc.label;
-      }
-
-      return output;
-    }
-
-
-    FST<T> doTest(int prune1, int prune2, boolean allowRandomSuffixSharing) throws IOException {
-      if (VERBOSE) {
-        System.out.println("\nTEST: prune1=" + prune1 + " prune2=" + prune2);
-      }
-
-      final boolean willRewrite = random.nextBoolean();
-
-      final Builder<T> builder = new Builder<T>(inputMode == 0 ? FST.INPUT_TYPE.BYTE1 : FST.INPUT_TYPE.BYTE4,
-                                                prune1, prune2,
-                                                prune1==0 && prune2==0,
-                                                allowRandomSuffixSharing ? random.nextBoolean() : true,
-                                                allowRandomSuffixSharing ? _TestUtil.nextInt(random, 1, 10) : Integer.MAX_VALUE,
-                                                outputs,
-                                                null,
-                                                willRewrite);
-
-      for(InputOutput<T> pair : pairs) {
-        if (pair.output instanceof UpToTwoPositiveIntOutputs.TwoLongs) {
-          final UpToTwoPositiveIntOutputs _outputs = (UpToTwoPositiveIntOutputs) outputs;
-          final UpToTwoPositiveIntOutputs.TwoLongs twoLongs = (UpToTwoPositiveIntOutputs.TwoLongs) pair.output;
-          @SuppressWarnings("unchecked") final Builder<Object> builderObject = (Builder<Object>) builder;
-          builderObject.add(pair.input, _outputs.get(twoLongs.first));
-          builderObject.add(pair.input, _outputs.get(twoLongs.second));
-        } else {
-          builder.add(pair.input, pair.output);
-        }
-      }
-      FST<T> fst = builder.finish();
-
-      if (random.nextBoolean() && fst != null && !willRewrite) {
-        TestFSTs t = new TestFSTs();
-        IOContext context = t.newIOContext(random);
-        IndexOutput out = dir.createOutput("fst.bin", context);
-        fst.save(out);
-        out.close();
-        IndexInput in = dir.openInput("fst.bin", context);
-        try {
-          fst = new FST<T>(in, outputs);
-        } finally {
-          in.close();
-          dir.deleteFile("fst.bin");
-        }
-      }
-
-      if (VERBOSE && pairs.size() <= 20 && fst != null) {
-        Writer w = new OutputStreamWriter(new FileOutputStream("out.dot"), "UTF-8");
-        Util.toDot(fst, w, false, false);
-        w.close();
-        System.out.println("SAVED out.dot");
-      }
-
-      if (VERBOSE) {
-        if (fst == null) {
-          System.out.println("  fst has 0 nodes (fully pruned)");
-        } else {
-          System.out.println("  fst has " + fst.getNodeCount() + " nodes and " + fst.getArcCount() + " arcs");
-        }
-      }
-
-      if (prune1 == 0 && prune2 == 0) {
-        verifyUnPruned(inputMode, fst);
-      } else {
-        verifyPruned(inputMode, fst, prune1, prune2);
-      }
-
-      if (willRewrite && fst != null) {
-        if (VERBOSE) {
-          System.out.println("TEST: now rewrite");
-        }
-        final FST<T> packed = fst.pack(_TestUtil.nextInt(random, 1, 10), _TestUtil.nextInt(random, 0, 10000000));
-        if (VERBOSE) {
-          System.out.println("TEST: now verify packed FST");
-        }
-        if (prune1 == 0 && prune2 == 0) {
-          verifyUnPruned(inputMode, packed);
-        } else {
-          verifyPruned(inputMode, packed, prune1, prune2);
-        }
-      }
-
-      return fst;
-    }
-
-    // FST is complete
-    private void verifyUnPruned(int inputMode, FST<T> fst) throws IOException {
-
-      final FST<Long> fstLong;
-      final Set<Long> validOutputs;
-      long minLong = Long.MAX_VALUE;
-      long maxLong = Long.MIN_VALUE;
-
-      if (doReverseLookup) {
-        @SuppressWarnings("unchecked") FST<Long> fstLong0 = (FST<Long>) fst;
-        fstLong = fstLong0;
-        validOutputs = new HashSet<Long>();
-        for(InputOutput<T> pair: pairs) {
-          Long output = (Long) pair.output;
-          maxLong = Math.max(maxLong, output);
-          minLong = Math.min(minLong, output);
-          validOutputs.add(output);
-        }
-      } else {
-        fstLong = null;
-        validOutputs = null;
-      }
-
-      if (pairs.size() == 0) {
-        assertNull(fst);
-        return;
-      }
-
-      if (VERBOSE) {
-        System.out.println("TEST: now verify " + pairs.size() + " terms");
-        for(InputOutput<T> pair : pairs) {
-          assertNotNull(pair);
-          assertNotNull(pair.input);
-          assertNotNull(pair.output);
-          System.out.println("  " + inputToString(inputMode, pair.input) + ": " + outputs.outputToString(pair.output));
-        }
-      }
-
-      assertNotNull(fst);
-
-      // visit valid pairs in order -- make sure all words
-      // are accepted, and FSTEnum's next() steps through
-      // them correctly
-      if (VERBOSE) {
-        System.out.println("TEST: check valid terms/next()");
-      }
-      {
-        IntsRefFSTEnum<T> fstEnum = new IntsRefFSTEnum<T>(fst);
-        for(InputOutput<T> pair : pairs) {
-          IntsRef term = pair.input;
-          if (VERBOSE) {
-            System.out.println("TEST: check term=" + inputToString(inputMode, term) + " output=" + fst.outputs.outputToString(pair.output));
-          }
-          Object output = run(fst, term, null);
-          assertNotNull("term " + inputToString(inputMode, term) + " is not accepted", output);
-          assertEquals(pair.output, output);
-
-          // verify enum's next
-          IntsRefFSTEnum.InputOutput<T> t = fstEnum.next();
-          assertNotNull(t);
-          assertEquals("expected input=" + inputToString(inputMode, term) + " but fstEnum returned " + inputToString(inputMode, t.input), term, t.input);
-          assertEquals(pair.output, t.output);
-        }
-        assertNull(fstEnum.next());
-      }
-
-      final Map<IntsRef,T> termsMap = new HashMap<IntsRef,T>();
-      for(InputOutput<T> pair : pairs) {
-        termsMap.put(pair.input, pair.output);
-      }
-
-      if (doReverseLookup && maxLong > minLong) {
-        // Do random lookups so we test null (output doesn't
-        // exist) case:
-        assertNull(Util.getByOutput(fstLong, minLong-7));
-        assertNull(Util.getByOutput(fstLong, maxLong+7));
-
-        final int num = atLeast(100);
-        for(int iter=0;iter<num;iter++) {
-          Long v = minLong + random.nextLong() % (maxLong - minLong);
-          IntsRef input = Util.getByOutput(fstLong, v);
-          assertTrue(validOutputs.contains(v) || input == null);
-        }
-      }
-
-      // find random matching word and make sure it's valid
-      if (VERBOSE) {
-        System.out.println("TEST: verify random accepted terms");
-      }
-      final IntsRef scratch = new IntsRef(10);
-      int num = atLeast(500);
-      for(int iter=0;iter<num;iter++) {
-        T output = randomAcceptedWord(fst, scratch);
-        assertTrue("accepted word " + inputToString(inputMode, scratch) + " is not valid", termsMap.containsKey(scratch));
-        assertEquals(termsMap.get(scratch), output);
-
-        if (doReverseLookup) {
-          //System.out.println("lookup output=" + output + " outs=" + fst.outputs);
-          IntsRef input = Util.getByOutput(fstLong, (Long) output);
-          assertNotNull(input);
-          //System.out.println("  got " + Util.toBytesRef(input, new BytesRef()).utf8ToString());
-          assertEquals(scratch, input);
-        }
-      }
-    
-      // test IntsRefFSTEnum.seek:
-      if (VERBOSE) {
-        System.out.println("TEST: verify seek");
-      }
-      IntsRefFSTEnum<T> fstEnum = new IntsRefFSTEnum<T>(fst);
-      num = atLeast(100);
-      for(int iter=0;iter<num;iter++) {
-        if (VERBOSE) {
-          System.out.println("  iter=" + iter);
-        }
-        if (random.nextBoolean()) {
-          // seek to term that doesn't exist:
-          while(true) {
-            final IntsRef term = toIntsRef(getRandomString(), inputMode);
-            int pos = Collections.binarySearch(pairs, new InputOutput<T>(term, null));
-            if (pos < 0) {
-              pos = -(pos+1);
-              // ok doesn't exist
-              //System.out.println("  seek " + inputToString(inputMode, term));
-              final IntsRefFSTEnum.InputOutput<T> seekResult;
-              if (random.nextInt(3) == 0) {
-                if (VERBOSE) {
-                  System.out.println("  do non-exist seekExact term=" + inputToString(inputMode, term));
+            /* look for and remove orphans. An orphan is a -Filter.db or -Index.db with no corresponding -Data.db. */
+            Matcher matcher = auxFilePattern.matcher(file.getAbsolutePath());
+            if (matcher.matches())
+            {
+                String basePath = matcher.group(1);
+                if (!new File(basePath + "-Data.db").exists())
+                {
+                    logger_.info(String.format("Removing orphan %s", file.getAbsolutePath()));
+                    try
+                    {
+                        FileUtils.deleteWithConfirm(file);
+                    }
+                    catch (IOException e)
+                    {
+                        throw new IOError(e);
+                    }
+                    continue;
                 }
-                seekResult = fstEnum.seekExact(term);
-                pos = -1;
-              } else if (random.nextBoolean()) {
-                if (VERBOSE) {
-                  System.out.println("  do non-exist seekFloor term=" + inputToString(inputMode, term));
-                }
-                seekResult = fstEnum.seekFloor(term);
-                pos--;
-              } else {
-                if (VERBOSE) {
-                  System.out.println("  do non-exist seekCeil term=" + inputToString(inputMode, term));
-                }
-                seekResult = fstEnum.seekCeil(term);
-              }
+            }
 
-              if (pos != -1 && pos < pairs.size()) {
-                //System.out.println("    got " + inputToString(inputMode,seekResult.input) + " output=" + fst.outputs.outputToString(seekResult.output));
-                assertNotNull("got null but expected term=" + inputToString(inputMode, pairs.get(pos).input), seekResult);
-                if (VERBOSE) {
-                  System.out.println("    got " + inputToString(inputMode, seekResult.input));
+            if (((file.length() == 0 && !filename.endsWith("-Compacted")) || (filename.contains("-" + SSTable.TEMPFILE_MARKER))))
+            {
+                try
+                {
+                    FileUtils.deleteWithConfirm(file);
                 }
-                assertEquals("expected " + inputToString(inputMode, pairs.get(pos).input) + " but got " + inputToString(inputMode, seekResult.input), pairs.get(pos).input, seekResult.input);
-                assertEquals(pairs.get(pos).output, seekResult.output);
-              } else {
-                // seeked before start or beyond end
-                //System.out.println("seek=" + seekTerm);
-                assertNull("expected null but got " + (seekResult==null ? "null" : inputToString(inputMode, seekResult.input)), seekResult);
-                if (VERBOSE) {
-                  System.out.println("    got null");
+                catch (IOException e)
+                {
+                    throw new IOError(e);
                 }
-              }
+                continue;
+            }
 
-              break;
+            if (filename.contains("-Data.db"))
+            {
+                sstableFiles.add(file.getAbsoluteFile());
             }
-          }
-        } else {
-          // seek to term that does exist:
-          InputOutput<T> pair = pairs.get(random.nextInt(pairs.size()));
-          final IntsRefFSTEnum.InputOutput<T> seekResult;
-          if (random.nextInt(3) == 2) {
-            if (VERBOSE) {
-              System.out.println("  do exists seekExact term=" + inputToString(inputMode, pair.input));
-            }
-            seekResult = fstEnum.seekExact(pair.input);
-          } else if (random.nextBoolean()) {
-            if (VERBOSE) {
-              System.out.println("  do exists seekFloor " + inputToString(inputMode, pair.input));
-            }
-            seekResult = fstEnum.seekFloor(pair.input);
-          } else {
-            if (VERBOSE) {
-              System.out.println("  do exists seekCeil " + inputToString(inputMode, pair.input));
-            }
-            seekResult = fstEnum.seekCeil(pair.input);
-          }
-          assertNotNull(seekResult);
-          assertEquals("got " + inputToString(inputMode, seekResult.input) + " but expected " + inputToString(inputMode, pair.input), pair.input, seekResult.input);
-          assertEquals(pair.output, seekResult.output);
         }
-      }
+        Collections.sort(sstableFiles, new FileUtils.FileComparator());
 
-      if (VERBOSE) {
-        System.out.println("TEST: mixed next/seek");
-      }
+        /* Load the index files and the Bloom Filters associated with them. */
+        List<SSTableReader> sstables = new ArrayList<SSTableReader>();
+        for (File file : sstableFiles)
+        {
+            String filename = file.getAbsolutePath();
+            if (SSTable.deleteIfCompacted(filename))
+                continue;
 
-      // test mixed next/seek
-      num = atLeast(100);
-      for(int iter=0;iter<num;iter++) {
-        if (VERBOSE) {
-          System.out.println("TEST: iter " + iter);
+            SSTableReader sstable;
+            try
+            {
+                sstable = SSTableReader.open(filename);
+            }
+            catch (IOException ex)
+            {
+                logger_.error("Corrupt file " + filename + "; skipped", ex);
+                continue;
+            }
+            sstables.add(sstable);
         }
-        // reset:
-        fstEnum = new IntsRefFSTEnum<T>(fst);
-        int upto = -1;
-        while(true) {
-          boolean isDone = false;
-          if (upto == pairs.size()-1 || random.nextBoolean()) {
-            // next
-            upto++;
-            if (VERBOSE) {
-              System.out.println("  do next");
-            }
-            isDone = fstEnum.next() == null;
-          } else if (upto != -1 && upto < 0.75 * pairs.size() && random.nextBoolean()) {
-            int attempt = 0;
-            for(;attempt<10;attempt++) {
-              IntsRef term = toIntsRef(getRandomString(), inputMode);
-              if (!termsMap.containsKey(term) && term.compareTo(pairs.get(upto).input) > 0) {
-                int pos = Collections.binarySearch(pairs, new InputOutput<T>(term, null));
-                assert pos < 0;
-                upto = -(pos+1);
+        ssTables_ = new SSTableTracker(table, columnFamilyName);
+        ssTables_.add(sstables);
+    }
 
-                if (random.nextBoolean()) {
-                  upto--;
-                  assertTrue(upto != -1);
-                  if (VERBOSE) {
-                    System.out.println("  do non-exist seekFloor(" + inputToString(inputMode, term) + ")");
-                  }
-                  isDone = fstEnum.seekFloor(term) == null;
-                } else {
-                  if (VERBOSE) {
-                    System.out.println("  do non-exist seekCeil(" + inputToString(inputMode, term) + ")");
-                  }
-                  isDone = fstEnum.seekCeil(term) == null;
-                }
+    public void addToCompactedRowStats(Long rowsize)
+    {
+        if (minRowCompactedSize < 1 || rowsize < minRowCompactedSize)
+            minRowCompactedSize = rowsize;
+        if (rowsize > maxRowCompactedSize)
+            maxRowCompactedSize = rowsize;
+        rowsCompactedCount++;
+        rowsCompactedTotalSize += rowsize;
+    }
 
-                break;
-              }
-            }
-            if (attempt == 10) {
-              continue;
-            }
+    public long getMinRowCompactedSize()
+    {
+        return minRowCompactedSize;
+    }
+
+    public long getMaxRowCompactedSize()
+    {
+        return maxRowCompactedSize;
+    }
+
+    public long getMeanRowCompactedSize()
+    {
+        if (rowsCompactedCount > 0)
+            return rowsCompactedTotalSize / rowsCompactedCount;
+        else
+            return 0L;
+    }
+
+    public static ColumnFamilyStore createColumnFamilyStore(String table, String columnFamily)
+    {
+        /*
+         * Get all data files associated with old Memtables for this table.
+         * These files are named as follows <Table>-1.db, ..., <Table>-n.db. Get
+         * the max which in this case is n and increment it to use it for next
+         * index.
+         */
+        List<Integer> generations = new ArrayList<Integer>();
+        String[] dataFileDirectories = DatabaseDescriptor.getAllDataFileLocationsForTable(table);
+        for (String directory : dataFileDirectories)
+        {
+            File fileDir = new File(directory);
+            File[] files = fileDir.listFiles();
             
-          } else {
-            final int inc = random.nextInt(pairs.size() - upto - 1);
-            upto += inc;
-            if (upto == -1) {
-              upto = 0;
-            }
+            for (File file : files)
+            {
+                String filename = file.getAbsolutePath();
+                String cfName = getColumnFamilyFromFileName(filename);
 
-            if (random.nextBoolean()) {
-              if (VERBOSE) {
-                System.out.println("  do seekCeil(" + inputToString(inputMode, pairs.get(upto).input) + ")");
-              }
-              isDone = fstEnum.seekCeil(pairs.get(upto).input) == null;
-            } else {
-              if (VERBOSE) {
-                System.out.println("  do seekFloor(" + inputToString(inputMode, pairs.get(upto).input) + ")");
-              }
-              isDone = fstEnum.seekFloor(pairs.get(upto).input) == null;
-            }
-          }
-          if (VERBOSE) {
-            if (!isDone) {
-              System.out.println("    got " + inputToString(inputMode, fstEnum.current().input));
-            } else {
-              System.out.println("    got null");
-            }
-          }
-
-          if (upto == pairs.size()) {
-            assertTrue(isDone);
-            break;
-          } else {
-            assertFalse(isDone);
-            assertEquals(pairs.get(upto).input, fstEnum.current().input);
-            assertEquals(pairs.get(upto).output, fstEnum.current().output);
-
-            /*
-            if (upto < pairs.size()-1) {
-              int tryCount = 0;
-              while(tryCount < 10) {
-                final IntsRef t = toIntsRef(getRandomString(), inputMode);
-                if (pairs.get(upto).input.compareTo(t) < 0) {
-                  final boolean expected = t.compareTo(pairs.get(upto+1).input) < 0;
-                  if (VERBOSE) {
-                    System.out.println("TEST: call beforeNext(" + inputToString(inputMode, t) + "); current=" + inputToString(inputMode, pairs.get(upto).input) + " next=" + inputToString(inputMode, pairs.get(upto+1).input) + " expected=" + expected);
-                  }
-                  assertEquals(expected, fstEnum.beforeNext(t));
-                  break;
+                if (cfName.equals(columnFamily))
+                {
+                    generations.add(getGenerationFromFileName(filename));
                 }
-                tryCount++;
-              }
             }
-            */
-          }
         }
-      }
+        Collections.sort(generations);
+        int value = (generations.size() > 0) ? (generations.get(generations.size() - 1)) : 0;
+
+        ColumnFamilyStore cfs = new ColumnFamilyStore(table, columnFamily, "Super".equals(DatabaseDescriptor.getColumnType(table, columnFamily)), value);
+
+        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+        try
+        {
+            ObjectName mbeanName = new ObjectName("org.apache.cassandra.db:type=ColumnFamilyStores,keyspace=" + table + ",columnfamily=" + columnFamily);
+            if (mbs.isRegistered(mbeanName))
+                mbs.unregisterMBean(mbeanName);
+            mbs.registerMBean(cfs, mbeanName);
+        }
+        catch (Exception e)
+        {
+            throw new RuntimeException(e);
+        }
+
+        return cfs;
     }
 
-    private static class CountMinOutput<T> {
-      int count;
-      T output;
-      T finalOutput;
-      boolean isLeaf = true;
-      boolean isFinal;
-    }
-
-    // FST is pruned
-    private void verifyPruned(int inputMode, FST<T> fst, int prune1, int prune2) throws IOException {
-
-      if (VERBOSE) {
-        System.out.println("TEST: now verify pruned " + pairs.size() + " terms; outputs=" + outputs);
-        for(InputOutput<T> pair : pairs) {
-          System.out.println("  " + inputToString(inputMode, pair.input) + ": " + outputs.outputToString(pair.output));
-        }
-      }
-
-      // To validate the FST, we brute-force compute all prefixes
-      // in the terms, matched to their "common" outputs, prune that
-      // set according to the prune thresholds, then assert the FST
-      // matches that same set.
-
-      // NOTE: Crazy RAM intensive!!
-
-      //System.out.println("TEST: tally prefixes");
-
-      // build all prefixes
-      final Map<IntsRef,CountMinOutput<T>> prefixes = new HashMap<IntsRef,CountMinOutput<T>>();
-      final IntsRef scratch = new IntsRef(10);
-      for(InputOutput<T> pair: pairs) {
-        scratch.copyInts(pair.input);
-        for(int idx=0;idx<=pair.input.length;idx++) {
-          scratch.length = idx;
-          CountMinOutput<T> cmo = prefixes.get(scratch);
-          if (cmo == null) {
-            cmo = new CountMinOutput<T>();
-            cmo.count = 1;
-            cmo.output = pair.output;
-            prefixes.put(IntsRef.deepCopyOf(scratch), cmo);
-          } else {
-            cmo.count++;
-            T output1 = cmo.output;
-            if (output1.equals(outputs.getNoOutput())) {
-              output1 = outputs.getNoOutput();
-            }
-            T output2 = pair.output;
-            if (output2.equals(outputs.getNoOutput())) {
-              output2 = outputs.getNoOutput();
-            }
-            cmo.output = outputs.common(output1, output2);
-          }
-          if (idx == pair.input.length) {
-            cmo.isFinal = true;
-            cmo.finalOutput = cmo.output;
-          }
-        }
-      }
-
-      if (VERBOSE) {
-        System.out.println("TEST: now prune");
-      }
-
-      // prune 'em
-      final Iterator<Map.Entry<IntsRef,CountMinOutput<T>>> it = prefixes.entrySet().iterator();
-      while(it.hasNext()) {
-        Map.Entry<IntsRef,CountMinOutput<T>> ent = it.next();
-        final IntsRef prefix = ent.getKey();
-        final CountMinOutput<T> cmo = ent.getValue();
-        if (VERBOSE) {
-          System.out.println("  term prefix=" + inputToString(inputMode, prefix, false) + " count=" + cmo.count + " isLeaf=" + cmo.isLeaf + " output=" + outputs.outputToString(cmo.output) + " isFinal=" + cmo.isFinal);
-        }
-        final boolean keep;
-        if (prune1 > 0) {
-          keep = cmo.count >= prune1;
-        } else {
-          assert prune2 > 0;
-          if (prune2 > 1 && cmo.count >= prune2) {
-            keep = true;
-          } else if (prefix.length > 0) {
-            // consult our parent
-            scratch.length = prefix.length-1;
-            System.arraycopy(prefix.ints, prefix.offset, scratch.ints, 0, scratch.length);
-            final CountMinOutput<T> cmo2 = prefixes.get(scratch);
-            //System.out.println("    parent count = " + (cmo2 == null ? -1 : cmo2.count));
-            keep = cmo2 != null && ((prune2 > 1 && cmo2.count >= prune2) || (prune2 == 1 && (cmo2.count >= 2 || prefix.length <= 1)));
-          } else if (cmo.count >= prune2) {
-            keep = true;
-          } else {
-            keep = false;
-          }
-        }
-
-        if (!keep) {
-          it.remove();
-          //System.out.println("    remove");
-        } else {
-          // clear isLeaf for all ancestors
-          //System.out.println("    keep");
-          scratch.copyInts(prefix);
-          scratch.length--;
-          while(scratch.length >= 0) {
-            final CountMinOutput<T> cmo2 = prefixes.get(scratch);
-            if (cmo2 != null) {
-              //System.out.println("    clear isLeaf " + inputToString(inputMode, scratch));
-              cmo2.isLeaf = false;
-            }
-            scratch.length--;
-          }
-        }
-      }
-
-      if (VERBOSE) {
-        System.out.println("TEST: after prune");
-        for(Map.Entry<IntsRef,CountMinOutput<T>> ent : prefixes.entrySet()) {
-          System.out.println("  " + inputToString(inputMode, ent.getKey(), false) + ": isLeaf=" + ent.getValue().isLeaf + " isFinal=" + ent.getValue().isFinal);
-          if (ent.getValue().isFinal) {
-            System.out.println("    finalOutput=" + outputs.outputToString(ent.getValue().finalOutput));
-          }
-        }
-      }
-
-      if (prefixes.size() <= 1) {
-        assertNull(fst);
-        return;
-      }
-
-      assertNotNull(fst);
-
-      // make sure FST only enums valid prefixes
-      if (VERBOSE) {
-        System.out.println("TEST: check pruned enum");
-      }
-      IntsRefFSTEnum<T> fstEnum = new IntsRefFSTEnum<T>(fst);
-      IntsRefFSTEnum.InputOutput<T> current;
-      while((current = fstEnum.next()) != null) {
-        if (VERBOSE) {
-          System.out.println("  fstEnum.next prefix=" + inputToString(inputMode, current.input, false) + " output=" + outputs.outputToString(current.output));
-        }
-        final CountMinOutput cmo = prefixes.get(current.input);
-        assertNotNull(cmo);
-        assertTrue(cmo.isLeaf || cmo.isFinal);
-        //if (cmo.isFinal && !cmo.isLeaf) {
-        if (cmo.isFinal) {
-          assertEquals(cmo.finalOutput, current.output);
-        } else {
-          assertEquals(cmo.output, current.output);
-        }
-      }
-
-      // make sure all non-pruned prefixes are present in the FST
-      if (VERBOSE) {
-        System.out.println("TEST: verify all prefixes");
-      }
-      final int[] stopNode = new int[1];
-      for(Map.Entry<IntsRef,CountMinOutput<T>> ent : prefixes.entrySet()) {
-        if (ent.getKey().length > 0) {
-          final CountMinOutput<T> cmo = ent.getValue();
-          final T output = run(fst, ent.getKey(), stopNode);
-          if (VERBOSE) {
-            System.out.println("TEST: verify prefix=" + inputToString(inputMode, ent.getKey(), false) + " output=" + outputs.outputToString(cmo.output));
-          }
-          // if (cmo.isFinal && !cmo.isLeaf) {
-          if (cmo.isFinal) {
-            assertEquals(cmo.finalOutput, output);
-          } else {
-            assertEquals(cmo.output, output);
-          }
-          assertEquals(ent.getKey().length, stopNode[0]);
-        }
-      }
-    }
-  }
-
-  public void testRandomWords() throws IOException {
-    testRandomWords(1000, atLeast(2));
-    //testRandomWords(100, 1);
-  }
-
-  String inputModeToString(int mode) {
-    if (mode == 0) {
-      return "utf8";
-    } else {
-      return "utf32";
-    }
-  }
-
-  private void testRandomWords(int maxNumWords, int numIter) throws IOException {
-    for(int iter=0;iter<numIter;iter++) {
-      if (VERBOSE) {
-        System.out.println("\nTEST: iter " + iter);
-      }
-      for(int inputMode=0;inputMode<2;inputMode++) {
-        final int numWords = random.nextInt(maxNumWords+1);
-        Set<IntsRef> termsSet = new HashSet<IntsRef>();
-        IntsRef[] terms = new IntsRef[numWords];
-        while(termsSet.size() < numWords) {
-          final String term = getRandomString();
-          termsSet.add(toIntsRef(term, inputMode));
-        }
-        doTest(inputMode, termsSet.toArray(new IntsRef[termsSet.size()]));
-      }
-    }
-  }
-
-  static String getRandomString() {
-    final String term;
-    if (random.nextBoolean()) {
-      term = _TestUtil.randomRealisticUnicodeString(random);
-    } else {
-      // we want to mix in limited-alphabet symbols so
-      // we get more sharing of the nodes given how few
-      // terms we are testing...
-      term = simpleRandomString(random);
-    }
-    return term;
-  }
-
-  @Nightly
-  public void testBigSet() throws IOException {
-    testRandomWords(_TestUtil.nextInt(random, 50000, 60000), 1);
-  }
-  
-  static String inputToString(int inputMode, IntsRef term) {
-    return inputToString(inputMode, term, true);
-  }
-
-  private static String inputToString(int inputMode, IntsRef term, boolean isValidUnicode) {
-    if (!isValidUnicode) {
-      return term.toString();
-    } else if (inputMode == 0) {
-      // utf8
-      return toBytesRef(term).utf8ToString() + " " + term;
-    } else {
-      // utf32
-      return UnicodeUtil.newString(term.ints, term.offset, term.length) + " " + term;
-    }
-  }
-
-  // Build FST for all unique terms in the test line docs
-  // file, up until a time limit
-  public void testRealTerms() throws Exception {
-
-    // TODO: is this necessary? we use the annotation...
-    final String defaultFormat = _TestUtil.getPostingsFormat("abracadabra");
-    if (defaultFormat.equals("SimpleText") || defaultFormat.equals("Memory")) {
-      // no
-      Codec.setDefault(_TestUtil.alwaysPostingsFormat(new Lucene40PostingsFormat()));
-    }
-
-    final LineFileDocs docs = new LineFileDocs(random);
-    final int RUN_TIME_MSEC = atLeast(500);
-    final IndexWriterConfig conf = newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random)).setMaxBufferedDocs(-1).setRAMBufferSizeMB(64);
-    final File tempDir = _TestUtil.getTempDir("fstlines");
-    final MockDirectoryWrapper dir = newFSDirectory(tempDir);
-    final IndexWriter writer = new IndexWriter(dir, conf);
-    final long stopTime = System.currentTimeMillis() + RUN_TIME_MSEC;
-    Document doc;
-    int docCount = 0;
-    while((doc = docs.nextDoc()) != null && System.currentTimeMillis() < stopTime) {
-      writer.addDocument(doc);
-      docCount++;
-    }
-    IndexReader r = IndexReader.open(writer, true);
-    writer.close();
-    final PositiveIntOutputs outputs = PositiveIntOutputs.getSingleton(random.nextBoolean());
-
-    final boolean doRewrite = random.nextBoolean();
-
-    Builder<Long> builder = new Builder<Long>(FST.INPUT_TYPE.BYTE1, 0, 0, true, true, Integer.MAX_VALUE, outputs, null, doRewrite);
-
-    boolean storeOrd = random.nextBoolean();
-    if (VERBOSE) {
-      if (storeOrd) {
-        System.out.println("FST stores ord");
-      } else {
-        System.out.println("FST stores docFreq");
-      }
-    }
-    Terms terms = MultiFields.getTerms(r, "body");
-    if (terms != null) {
-      final IntsRef scratchIntsRef = new IntsRef();
-      final TermsEnum termsEnum = terms.iterator(null);
-      if (VERBOSE) {
-        System.out.println("TEST: got termsEnum=" + termsEnum);
-      }
-      BytesRef term;
-      int ord = 0;
-      while((term = termsEnum.next()) != null) {
-        if (ord == 0) {
-          try {
-            termsEnum.ord();
-          } catch (UnsupportedOperationException uoe) {
-            if (VERBOSE) {
-              System.out.println("TEST: codec doesn't support ord; FST stores docFreq");
-            }
-            storeOrd = false;
-          }
-        }
-        final int output;
-        if (storeOrd) {
-          output = ord;
-        } else {
-          output = termsEnum.docFreq();
-        }
-        builder.add(Util.toIntsRef(term, scratchIntsRef), (long) output);
-        ord++;
-        if (VERBOSE && ord % 100000 == 0 && LuceneTestCase.TEST_NIGHTLY) {
-          System.out.println(ord + " terms...");
-        }
-      }
-      FST<Long> fst = builder.finish();
-      if (VERBOSE) {
-        System.out.println("FST: " + docCount + " docs; " + ord + " terms; " + fst.getNodeCount() + " nodes; " + fst.getArcCount() + " arcs;" + " " + fst.sizeInBytes() + " bytes");
-      }
-
-      if (ord > 0) {
-        for(int rewriteIter=0;rewriteIter<2;rewriteIter++) {
-          if (rewriteIter == 1) {
-            if (doRewrite) {
-              // Verify again, with packed FST:
-              fst = fst.pack(_TestUtil.nextInt(random, 1, 10), _TestUtil.nextInt(random, 0, 10000000));
-            } else {
-              break;
-            }
-          }
-          // Now confirm BytesRefFSTEnum and TermsEnum act the
-          // same:
-          final BytesRefFSTEnum<Long> fstEnum = new BytesRefFSTEnum<Long>(fst);
-          int num = atLeast(1000);
-          for(int iter=0;iter<num;iter++) {
-            final BytesRef randomTerm = new BytesRef(getRandomString());
-        
-            if (VERBOSE) {
-              System.out.println("TEST: seek non-exist " + randomTerm.utf8ToString() + " " + randomTerm);
-            }
-
-            final TermsEnum.SeekStatus seekResult = termsEnum.seekCeil(randomTerm);
-            final BytesRefFSTEnum.InputOutput fstSeekResult = fstEnum.seekCeil(randomTerm);
-
-            if (seekResult == TermsEnum.SeekStatus.END) {
-              assertNull("got " + (fstSeekResult == null ? "null" : fstSeekResult.input.utf8ToString()) + " but expected null", fstSeekResult);
-            } else {
-              assertSame(termsEnum, fstEnum, storeOrd);
-              for(int nextIter=0;nextIter<10;nextIter++) {
-                if (VERBOSE) {
-                  System.out.println("TEST: next");
-                  if (storeOrd) {
-                    System.out.println("  ord=" + termsEnum.ord());
-                  }
-                }
-                if (termsEnum.next() != null) {
-                  if (VERBOSE) {
-                    System.out.println("  term=" + termsEnum.term().utf8ToString());
-                  }
-                  assertNotNull(fstEnum.next());
-                  assertSame(termsEnum, fstEnum, storeOrd);
-                } else {
-                  if (VERBOSE) {
-                    System.out.println("  end!");
-                  }
-                  BytesRefFSTEnum.InputOutput<Long> nextResult = fstEnum.next();
-                  if (nextResult != null) {
-                    System.out.println("expected null but got: input=" + nextResult.input.utf8ToString() + " output=" + outputs.outputToString(nextResult.output));
-                    fail();
-                  }
-                  break;
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-
-    r.close();
-    dir.close();
-  }
-
-  private void assertSame(TermsEnum termsEnum, BytesRefFSTEnum fstEnum, boolean storeOrd) throws Exception {
-    if (termsEnum.term() == null) {
-      assertNull(fstEnum.current());
-    } else {
-      assertNotNull(fstEnum.current());
-      assertEquals(termsEnum.term().utf8ToString() + " != " + fstEnum.current().input.utf8ToString(), termsEnum.term(), fstEnum.current().input);
-      if (storeOrd) {
-        // fst stored the ord
-        assertEquals("term=" + termsEnum.term().utf8ToString() + " " + termsEnum.term(), termsEnum.ord(), ((Long) fstEnum.current().output).longValue());
-      } else {
-        // fst stored the docFreq
-        assertEquals("term=" + termsEnum.term().utf8ToString() + " " + termsEnum.term(), termsEnum.docFreq(), (int) (((Long) fstEnum.current().output).longValue()));
-      }
-    }
-  }
-
-  private static abstract class VisitTerms<T> {
-    private final String dirOut;
-    private final String wordsFileIn;
-    private int inputMode;
-    private final Outputs<T> outputs;
-    private final Builder<T> builder;
-    private final boolean doPack;
-
-    public VisitTerms(String dirOut, String wordsFileIn, int inputMode, int prune, Outputs<T> outputs, boolean doPack, boolean noArcArrays) {
-      this.dirOut = dirOut;
-      this.wordsFileIn = wordsFileIn;
-      this.inputMode = inputMode;
-      this.outputs = outputs;
-      this.doPack = doPack;
-
-      builder = new Builder<T>(inputMode == 0 ? FST.INPUT_TYPE.BYTE1 : FST.INPUT_TYPE.BYTE4, 0, prune, prune == 0, true, Integer.MAX_VALUE, outputs, null, doPack);
-      builder.setAllowArrayArcs(!noArcArrays);
-    }
-
-    protected abstract T getOutput(IntsRef input, int ord) throws IOException;
-
-    public void run(int limit, boolean verify, boolean verifyByOutput) throws IOException {
-      BufferedReader is = new BufferedReader(new InputStreamReader(new FileInputStream(wordsFileIn), "UTF-8"), 65536);
-      try {
-        final IntsRef intsRef = new IntsRef(10);
-        long tStart = System.currentTimeMillis();
-        int ord = 0;
-        while(true) {
-          String w = is.readLine();
-          if (w == null) {
-            break;
-          }
-          toIntsRef(w, inputMode, intsRef);
-          builder.add(intsRef,
-                      getOutput(intsRef, ord));
-
-          ord++;
-          if (ord % 500000 == 0) {
-            System.out.println(
-                String.format(Locale.ENGLISH, 
-                    "%6.2fs: %9d...", ((System.currentTimeMillis() - tStart) / 1000.0), ord));
-          }
-          if (ord >= limit) {
-            break;
-          }
-        }
-
-        assert builder.getTermCount() == ord;
-        FST<T> fst = builder.finish();
-        if (fst == null) {
-          System.out.println("FST was fully pruned!");
-          System.exit(0);
-        }
-
-        if (dirOut == null) {
-          return;
-        }
-
-        System.out.println(ord + " terms; " + fst.getNodeCount() + " nodes; " + fst.getArcCount() + " arcs; " + fst.getArcWithOutputCount() + " arcs w/ output; tot size " + fst.sizeInBytes());
-        if (fst.getNodeCount() < 100) {
-          Writer w = new OutputStreamWriter(new FileOutputStream("out.dot"), "UTF-8");
-          Util.toDot(fst, w, false, false);
-          w.close();
-          System.out.println("Wrote FST to out.dot");
-        }
-
-        if (doPack) {
-          System.out.println("Pack...");
-          fst = fst.pack(4, 100000000);
-          System.out.println("New size " + fst.sizeInBytes() + " bytes");
-        }
-        
-        Directory dir = FSDirectory.open(new File(dirOut));
-        IndexOutput out = dir.createOutput("fst.bin", IOContext.DEFAULT);
-        fst.save(out);
-        out.close();
-        System.out.println("Saved FST to fst.bin.");
-
-        if (!verify) {
-          return;
-        }
-
-        System.out.println("\nNow verify...");
-
-        while(true) {
-          for(int iter=0;iter<2;iter++) {
-            is.close();
-            is = new BufferedReader(new InputStreamReader(new FileInputStream(wordsFileIn), "UTF-8"), 65536);
-
-            ord = 0;
-            tStart = System.currentTimeMillis();
-            while(true) {
-              String w = is.readLine();
-              if (w == null) {
-                break;
-              }
-              toIntsRef(w, inputMode, intsRef);
-              if (iter == 0) {
-                T expected = getOutput(intsRef, ord);
-                T actual = Util.get(fst, intsRef);
-                if (actual == null) {
-                  throw new RuntimeException("unexpected null output on input=" + w);
-                }
-                if (!actual.equals(expected)) {
-                  throw new RuntimeException("wrong output (got " + outputs.outputToString(actual) + " but expected " + outputs.outputToString(expected) + ") on input=" + w);
-                }
-              } else {
-                // Get by output
-                final Long output = (Long) getOutput(intsRef, ord);
-                @SuppressWarnings("unchecked") final IntsRef actual = Util.getByOutput((FST<Long>) fst, output.longValue());
-                if (actual == null) {
-                  throw new RuntimeException("unexpected null input from output=" + output);
-                }
-                if (!actual.equals(intsRef)) {
-                  throw new RuntimeException("wrong input (got " + actual + " but expected " + intsRef + " from output=" + output);
-                }
-              }
-
-              ord++;
-              if (ord % 500000 == 0) {
-                System.out.println(((System.currentTimeMillis()-tStart)/1000.0) + "s: " + ord + "...");
-              }
-              if (ord >= limit) {
-                break;
-              }
-            }
-
-            double totSec = ((System.currentTimeMillis() - tStart)/1000.0);
-            System.out.println("Verify " + (iter == 1 ? "(by output) " : "") + "took " + totSec + " sec + (" + (int) ((totSec*1000000000/ord)) + " nsec per lookup)");
-
-            if (!verifyByOutput) {
-              break;
-            }
-          }
-
-          // NOTE: comment out to profile lookup...
-          break;
-        }
-
-      } finally {
-        is.close();
-      }
-    }
-  }
-
-  // java -cp build/classes/test:build/classes/test-framework:build/classes/java:lib/junit-4.10.jar org.apache.lucene.util.fst.TestFSTs /x/tmp/allTerms3.txt out
-  public static void main(String[] args) throws IOException {
-    int prune = 0;
-    int limit = Integer.MAX_VALUE;
-    int inputMode = 0;                             // utf8
-    boolean storeOrds = false;
-    boolean storeDocFreqs = false;
-    boolean verify = true;
-    boolean doPack = false;
-    boolean noArcArrays = false;
-    String wordsFileIn = null;
-    String dirOut = null;
-
-    int idx = 0;
-    while (idx < args.length) {
-      if (args[idx].equals("-prune")) {
-        prune = Integer.valueOf(args[1 + idx]);
-        idx++;
-      } else if (args[idx].equals("-limit")) {
-        limit = Integer.valueOf(args[1 + idx]);
-        idx++;
-      } else if (args[idx].equals("-utf8")) {
-        inputMode = 0;
-      } else if (args[idx].equals("-utf32")) {
-        inputMode = 1;
-      } else if (args[idx].equals("-docFreq")) {
-        storeDocFreqs = true;
-      } else if (args[idx].equals("-noArcArrays")) {
-        noArcArrays = true;
-      } else if (args[idx].equals("-ords")) {
-        storeOrds = true;
-      } else if (args[idx].equals("-noverify")) {
-        verify = false;
-      } else if (args[idx].equals("-pack")) {
-        doPack = true;
-      } else if (args[idx].startsWith("-")) {
-        System.err.println("Unrecognized option: " + args[idx]);
-        System.exit(-1);
-      } else {
-        if (wordsFileIn == null) {
-          wordsFileIn = args[idx];
-        } else if (dirOut == null) {
-          dirOut = args[idx];
-        } else {
-          System.err.println("Too many arguments, expected: input [output]");
-          System.exit(-1);
-        }
-      }
-      idx++;
-    }
-    
-    if (wordsFileIn == null) {
-      System.err.println("No input file.");
-      System.exit(-1);
-    }
-
-    // ord benefits from share, docFreqs don't:
-
-    if (storeOrds && storeDocFreqs) {
-      // Store both ord & docFreq:
-      final PositiveIntOutputs o1 = PositiveIntOutputs.getSingleton(true);
-      final PositiveIntOutputs o2 = PositiveIntOutputs.getSingleton(false);
-      final PairOutputs<Long,Long> outputs = new PairOutputs<Long,Long>(o1, o2);
-      new VisitTerms<PairOutputs.Pair<Long,Long>>(dirOut, wordsFileIn, inputMode, prune, outputs, doPack, noArcArrays) {
-        Random rand;
-        @Override
-        public PairOutputs.Pair<Long,Long> getOutput(IntsRef input, int ord) {
-          if (ord == 0) {
-            rand = new Random(17);
-          }
-          return outputs.newPair((long) ord,
-                                 (long) _TestUtil.nextInt(rand, 1, 5000));
-        }
-      }.run(limit, verify, false);
-    } else if (storeOrds) {
-      // Store only ords
-      final PositiveIntOutputs outputs = PositiveIntOutputs.getSingleton(true);
-      new VisitTerms<Long>(dirOut, wordsFileIn, inputMode, prune, outputs, doPack, noArcArrays) {
-        @Override
-        public Long getOutput(IntsRef input, int ord) {
-          return (long) ord;
-        }
-      }.run(limit, verify, true);
-    } else if (storeDocFreqs) {
-      // Store only docFreq
-      final PositiveIntOutputs outputs = PositiveIntOutputs.getSingleton(false);
-      new VisitTerms<Long>(dirOut, wordsFileIn, inputMode, prune, outputs, doPack, noArcArrays) {
-        Random rand;
-        @Override
-        public Long getOutput(IntsRef input, int ord) {
-          if (ord == 0) {
-            rand = new Random(17);
-          }
-          return (long) _TestUtil.nextInt(rand, 1, 5000);
-        }
-      }.run(limit, verify, false);
-    } else {
-      // Store nothing
-      final NoOutputs outputs = NoOutputs.getSingleton();
-      final Object NO_OUTPUT = outputs.getNoOutput();
-      new VisitTerms<Object>(dirOut, wordsFileIn, inputMode, prune, outputs, doPack, noArcArrays) {
-        @Override
-        public Object getOutput(IntsRef input, int ord) {
-          return NO_OUTPUT;
-        }
-      }.run(limit, verify, false);
-    }
-  }
-
-  public void testSingleString() throws Exception {
-    final Outputs<Object> outputs = NoOutputs.getSingleton();
-    final Builder<Object> b = new Builder<Object>(FST.INPUT_TYPE.BYTE1, outputs);
-    b.add(Util.toIntsRef(new BytesRef("foobar"), new IntsRef()), outputs.getNoOutput());
-    final BytesRefFSTEnum<Object> fstEnum = new BytesRefFSTEnum<Object>(b.finish());
-    assertNull(fstEnum.seekFloor(new BytesRef("foo")));
-    assertNull(fstEnum.seekCeil(new BytesRef("foobaz")));
-  }
-
-  /*
-  public void testTrivial() throws Exception {
-
-    // Get outputs -- passing true means FST will share
-    // (delta code) the outputs.  This should result in
-    // smaller FST if the outputs grow monotonically.  But
-    // if numbers are "random", false should give smaller
-    // final size:
-    final NoOutputs outputs = NoOutputs.getSingleton();
-
-    String[] strings = new String[] {"station", "commotion", "elation", "elastic", "plastic", "stop", "ftop", "ftation", "stat"};
-
-    final Builder<Object> builder = new Builder<Object>(FST.INPUT_TYPE.BYTE1,
-                                                        0, 0,
-                                                        true,
-                                                        true,
-                                                        Integer.MAX_VALUE,
-                                                        outputs,
-                                                        null,
-                                                        true);
-    Arrays.sort(strings);
-    final IntsRef scratch = new IntsRef();
-    for(String s : strings) {
-      builder.add(Util.toIntsRef(new BytesRef(s), scratch), outputs.getNoOutput());
-    }
-    final FST<Object> fst = builder.finish();
-    System.out.println("DOT before rewrite");
-    Writer w = new OutputStreamWriter(new FileOutputStream("/mnt/scratch/before.dot"));
-    Util.toDot(fst, w, false, false);
-    w.close();
-
-    final FST<Object> rewrite = new FST<Object>(fst, 1, 100);
-
-    System.out.println("DOT after rewrite");
-    w = new OutputStreamWriter(new FileOutputStream("/mnt/scratch/after.dot"));
-    Util.toDot(rewrite, w, false, false);
-    w.close();
-  }
-  */
-
-  public void testSimple() throws Exception {
-
-    // Get outputs -- passing true means FST will share
-    // (delta code) the outputs.  This should result in
-    // smaller FST if the outputs grow monotonically.  But
-    // if numbers are "random", false should give smaller
-    // final size:
-    final PositiveIntOutputs outputs = PositiveIntOutputs.getSingleton(true);
-
-    // Build an FST mapping BytesRef -> Long
-    final Builder<Long> builder = new Builder<Long>(FST.INPUT_TYPE.BYTE1, outputs);
-
-    final BytesRef a = new BytesRef("a");
-    final BytesRef b = new BytesRef("b");
-    final BytesRef c = new BytesRef("c");
-
-    builder.add(Util.toIntsRef(a, new IntsRef()), 17L);
-    builder.add(Util.toIntsRef(b, new IntsRef()), 42L);
-    builder.add(Util.toIntsRef(c, new IntsRef()), 13824324872317238L);
-
-    final FST<Long> fst = builder.finish();
-
-    assertEquals(13824324872317238L, (long) Util.get(fst, c));
-    assertEquals(42, (long) Util.get(fst, b));
-    assertEquals(17, (long) Util.get(fst, a));
-
-    BytesRefFSTEnum<Long> fstEnum = new BytesRefFSTEnum<Long>(fst);
-    BytesRefFSTEnum.InputOutput<Long> seekResult;
-    seekResult = fstEnum.seekFloor(a);
-    assertNotNull(seekResult);
-    assertEquals(17, (long) seekResult.output);
-
-    // goes to a
-    seekResult = fstEnum.seekFloor(new BytesRef("aa"));
-    assertNotNull(seekResult);
-    assertEquals(17, (long) seekResult.output);
-
-    // goes to b
-    seekResult = fstEnum.seekCeil(new BytesRef("aa"));
-    assertNotNull(seekResult);
-    assertEquals(b, seekResult.input);
-    assertEquals(42, (long) seekResult.output);
-
-    assertEquals(Util.toIntsRef(new BytesRef("c"), new IntsRef()),
-                 Util.getByOutput(fst, 13824324872317238L));
-    assertNull(Util.getByOutput(fst, 47));
-    assertEquals(Util.toIntsRef(new BytesRef("b"), new IntsRef()),
-                 Util.getByOutput(fst, 42));
-    assertEquals(Util.toIntsRef(new BytesRef("a"), new IntsRef()),
-                 Util.getByOutput(fst, 17));
-  }
-
-  public void testPrimaryKeys() throws Exception {
-    Directory dir = newDirectory();
-
-    for(int cycle=0;cycle<2;cycle++) {
-      if (VERBOSE) {
-        System.out.println("TEST: cycle=" + cycle);
-      }
-      RandomIndexWriter w = new RandomIndexWriter(random, dir,
-                                                  newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random)).setOpenMode(IndexWriterConfig.OpenMode.CREATE));
-      Document doc = new Document();
-      Field idField = newField("id", "", StringField.TYPE_UNSTORED);
-      doc.add(idField);
-      
-      final int NUM_IDS = atLeast(200);
-      //final int NUM_IDS = (int) (377 * (1.0+random.nextDouble()));
-      if (VERBOSE) {
-        System.out.println("TEST: NUM_IDS=" + NUM_IDS);
-      }
-      final Set<String> allIDs = new HashSet<String>();
-      for(int id=0;id<NUM_IDS;id++) {
-        String idString;
-        if (cycle == 0) {
-          // PKs are assigned sequentially
-          idString = String.format("%07d", id);
-        } else {
-          while(true) {
-            final String s = Long.toString(random.nextLong());
-            if (!allIDs.contains(s)) {
-              idString = s;
-              break;
-            }
-          }
-        }
-        allIDs.add(idString);
-        idField.setStringValue(idString);
-        w.addDocument(doc);
-      }
-
-      //w.forceMerge(1);
-
-      // turn writer into reader:
-      final IndexReader r = w.getReader();
-      final IndexSearcher s = new IndexSearcher(r);
-      w.close();
-
-      final List<String> allIDsList = new ArrayList<String>(allIDs);
-      final List<String> sortedAllIDsList = new ArrayList<String>(allIDsList);
-      Collections.sort(sortedAllIDsList);
-
-      // Sprinkle in some non-existent PKs:
-      Set<String> outOfBounds = new HashSet<String>();
-      for(int idx=0;idx<NUM_IDS/10;idx++) {
-        String idString;
-        if (cycle == 0) {
-          idString = String.format("%07d", (NUM_IDS + idx));
-        } else {
-          while(true) {
-            idString = Long.toString(random.nextLong());
-            if (!allIDs.contains(idString)) {
-              break;
-            }
-          }
-        }
-        outOfBounds.add(idString);
-        allIDsList.add(idString);
-      }
-
-      // Verify w/ TermQuery
-      for(int iter=0;iter<2*NUM_IDS;iter++) {
-        final String id = allIDsList.get(random.nextInt(allIDsList.size()));
-        final boolean exists = !outOfBounds.contains(id);
-        if (VERBOSE) {
-          System.out.println("TEST: TermQuery " + (exists ? "" : "non-exist ") + " id=" + id);
-        }
-        assertEquals((exists ? "" : "non-exist ") + "id=" + id, exists ? 1 : 0, s.search(new TermQuery(new Term("id", id)), 1).totalHits);
-      }
-
-      // Verify w/ MultiTermsEnum
-      final TermsEnum termsEnum = MultiFields.getTerms(r, "id").iterator(null);
-      for(int iter=0;iter<2*NUM_IDS;iter++) {
-        final String id;
-        final String nextID;
-        final boolean exists;
-
-        if (random.nextBoolean()) {
-          id = allIDsList.get(random.nextInt(allIDsList.size()));
-          exists = !outOfBounds.contains(id);
-          nextID = null;
-          if (VERBOSE) {
-            System.out.println("TEST: exactOnly " + (exists ? "" : "non-exist ") + "id=" + id);
-          }
-        } else {
-          // Pick ID between two IDs:
-          exists = false;
-          final int idv = random.nextInt(NUM_IDS-1);
-          if (cycle == 0) {
-            id = String.format("%07da", idv);
-            nextID = String.format("%07d", idv+1);
-          } else {
-            id = sortedAllIDsList.get(idv) + "a";
-            nextID = sortedAllIDsList.get(idv+1);
-          }
-          if (VERBOSE) {
-            System.out.println("TEST: not exactOnly id=" + id + " nextID=" + nextID);
-          }
-        }
-
-        final boolean useCache = random.nextBoolean();
-        if (VERBOSE) {
-          System.out.println("  useCache=" + useCache);
-        }
-
-        final TermsEnum.SeekStatus status;
-        if (nextID == null) {
-          if (termsEnum.seekExact(new BytesRef(id), useCache)) {
-            status = TermsEnum.SeekStatus.FOUND;
-          } else {
-            status = TermsEnum.SeekStatus.NOT_FOUND;
-          }
-        } else {
-          status = termsEnum.seekCeil(new BytesRef(id), useCache);
-        }
-
-        if (nextID != null) {
-          assertEquals(TermsEnum.SeekStatus.NOT_FOUND, status);
-          assertEquals("expected=" + nextID + " actual=" + termsEnum.term().utf8ToString(), new BytesRef(nextID), termsEnum.term());
-        } else if (!exists) {
-          assertTrue(status == TermsEnum.SeekStatus.NOT_FOUND ||
-                     status == TermsEnum.SeekStatus.END);
-        } else {
-          assertEquals(TermsEnum.SeekStatus.FOUND, status);
-        }
-      }
-
-      r.close();
-    }
-    dir.close();
-  }
-
-  public void testRandomTermLookup() throws Exception {
-    Directory dir = newDirectory();
-
-    RandomIndexWriter w = new RandomIndexWriter(random, dir,
-                                                newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random)).setOpenMode(IndexWriterConfig.OpenMode.CREATE));
-    Document doc = new Document();
-    Field f = newField("field", "", StringField.TYPE_UNSTORED);
-    doc.add(f);
-      
-    final int NUM_TERMS = (int) (1000*RANDOM_MULTIPLIER * (1+random.nextDouble()));
-    if (VERBOSE) {
-      System.out.println("TEST: NUM_TERMS=" + NUM_TERMS);
-    }
-
-    final Set<String> allTerms = new HashSet<String>();
-    while(allTerms.size() < NUM_TERMS) {
-      allTerms.add(simpleRandomString(random));
-    }
-
-    for(String term : allTerms) {
-      f.setStringValue(term);
-      w.addDocument(doc);
-    }
-
-    // turn writer into reader:
-    if (VERBOSE) {
-      System.out.println("TEST: get reader");
-    }
-    IndexReader r = w.getReader();
-    if (VERBOSE) {
-      System.out.println("TEST: got reader=" + r);
-    }
-    IndexSearcher s = new IndexSearcher(r);
-    w.close();
-
-    final List<String> allTermsList = new ArrayList<String>(allTerms);
-    Collections.shuffle(allTermsList, random);
-
-    // verify exact lookup
-    for(String term : allTermsList) {
-      if (VERBOSE) {
-        System.out.println("TEST: term=" + term);
-      }
-      assertEquals("term=" + term, 1, s.search(new TermQuery(new Term("field", term)), 1).totalHits);
-    }
-
-    r.close();
-    dir.close();
-  }
-
-
-  /**
-   * Test state expansion (array format) on close-to-root states. Creates
-   * synthetic input that has one expanded state on each level.
-   * 
-   * @see "https://issues.apache.org/jira/browse/LUCENE-2933" 
-   */
-  public void testExpandedCloseToRoot() throws Exception {
-    class SyntheticData {
-      FST<Object> compile(String[] lines) throws IOException {
-        final NoOutputs outputs = NoOutputs.getSingleton();
-        final Object nothing = outputs.getNoOutput();
-        final Builder<Object> b = new Builder<Object>(FST.INPUT_TYPE.BYTE1, outputs);
-
-        int line = 0;
-        final BytesRef term = new BytesRef();
-        final IntsRef scratchIntsRef = new IntsRef();
-        while (line < lines.length) {
-          String w = lines[line++];
-          if (w == null) {
-            break;
-          }
-          term.copyChars(w);
-          b.add(Util.toIntsRef(term, scratchIntsRef), nothing);
-        }
-        
-        return b.finish();
-      }
-      
-      void generate(ArrayList<String> out, StringBuilder b, char from, char to,
-          int depth) {
-        if (depth == 0 || from == to) {
-          String seq = b.toString() + "_" + out.size() + "_end";
-          out.add(seq);
-        } else {
-          for (char c = from; c <= to; c++) {
-            b.append(c);
-            generate(out, b, from, c == to ? to : from, depth - 1);
-            b.deleteCharAt(b.length() - 1);
-          }
-        }
-      }
-
-      public int verifyStateAndBelow(FST<Object> fst, Arc<Object> arc, int depth) 
-        throws IOException {
-        if (fst.targetHasArcs(arc)) {
-          int childCount = 0;
-          for (arc = fst.readFirstTargetArc(arc, arc);; 
-               arc = fst.readNextArc(arc), childCount++)
-          {
-            boolean expanded = fst.isExpandedTarget(arc);
-            int children = verifyStateAndBelow(fst, new FST.Arc<Object>().copyFrom(arc), depth + 1);
-
-            assertEquals(
-                expanded,
-                (depth <= FST.FIXED_ARRAY_SHALLOW_DISTANCE && 
-                    children >= FST.FIXED_ARRAY_NUM_ARCS_SHALLOW) ||
-                 children >= FST.FIXED_ARRAY_NUM_ARCS_DEEP);
-            if (arc.isLast()) break;
-          }
-
-          return childCount;
-        }
-        return 0;
-      }
-    }
-
-    // Sanity check.
-    assertTrue(FST.FIXED_ARRAY_NUM_ARCS_SHALLOW < FST.FIXED_ARRAY_NUM_ARCS_DEEP);
-    assertTrue(FST.FIXED_ARRAY_SHALLOW_DISTANCE >= 0);
-
-    SyntheticData s = new SyntheticData();
-
-    ArrayList<String> out = new ArrayList<String>();
-    StringBuilder b = new StringBuilder();
-    s.generate(out, b, 'a', 'i', 10);
-    String[] input = out.toArray(new String[out.size()]);
-    Arrays.sort(input);
-    FST<Object> fst = s.compile(input);
-    FST.Arc<Object> arc = fst.getFirstArc(new FST.Arc<Object>());
-    s.verifyStateAndBelow(fst, arc, 1);
-  }
-
-  public void testFinalOutputOnEndState() throws Exception {
-    final PositiveIntOutputs outputs = PositiveIntOutputs.getSingleton(true);
-
-    final Builder<Long> builder = new Builder<Long>(FST.INPUT_TYPE.BYTE4, 2, 0, true, true, Integer.MAX_VALUE, outputs, null, random.nextBoolean());
-    builder.add(Util.toUTF32("stat", new IntsRef()), 17L);
-    builder.add(Util.toUTF32("station", new IntsRef()), 10L);
-    final FST<Long> fst = builder.finish();
-    //Writer w = new OutputStreamWriter(new FileOutputStream("/x/tmp3/out.dot"));
-    StringWriter w = new StringWriter();
-    Util.toDot(fst, w, false, false);
-    w.close();
-    //System.out.println(w.toString());
-    assertTrue(w.toString().indexOf("label=\"t/[7]\"") != -1);
-  }
-
-  public void testInternalFinalState() throws Exception {
-    final PositiveIntOutputs outputs = PositiveIntOutputs.getSingleton(true);
-    final boolean willRewrite = random.nextBoolean();
-    final Builder<Long> builder = new Builder<Long>(FST.INPUT_TYPE.BYTE1, 0, 0, true, true, Integer.MAX_VALUE, outputs, null, willRewrite);
-    builder.add(Util.toIntsRef(new BytesRef("stat"), new IntsRef()), outputs.getNoOutput());
-    builder.add(Util.toIntsRef(new BytesRef("station"), new IntsRef()), outputs.getNoOutput());
-    final FST<Long> fst = builder.finish();
-    StringWriter w = new StringWriter();
-    //Writer w = new OutputStreamWriter(new FileOutputStream("/x/tmp/out.dot"));
-    Util.toDot(fst, w, false, false);
-    w.close();
-    //System.out.println(w.toString());
-    final String expected;
-    if (willRewrite) {
-      expected = "4 -> 3 [label=\"t\" style=\"bold\"";
-    } else {
-      expected = "8 -> 6 [label=\"t\" style=\"bold\"";
-    }
-    assertTrue(w.toString().indexOf(expected) != -1);
-  }
-
-  // Make sure raw FST can differentiate between final vs
-  // non-final end nodes
-  public void testNonFinalStopNode() throws Exception {
-    final PositiveIntOutputs outputs = PositiveIntOutputs.getSingleton(true);
-    final Long nothing = outputs.getNoOutput();
-    final Builder<Long> b = new Builder<Long>(FST.INPUT_TYPE.BYTE1, outputs);
-
-    final FST<Long> fst = new FST<Long>(FST.INPUT_TYPE.BYTE1, outputs, false);
-
-    final Builder.UnCompiledNode<Long> rootNode = new Builder.UnCompiledNode<Long>(b, 0);
-
-    // Add final stop node
+    private Set<File> files()
     {
-      final Builder.UnCompiledNode<Long> node = new Builder.UnCompiledNode<Long>(b, 0);
-      node.isFinal = true;
-      rootNode.addArc('a', node);
-      final Builder.CompiledNode frozen = new Builder.CompiledNode();
-      frozen.node = fst.addNode(node);
-      rootNode.arcs[0].nextFinalOutput = 17L;
-      rootNode.arcs[0].isFinal = true;
-      rootNode.arcs[0].output = nothing;
-      rootNode.arcs[0].target = frozen;
+        Set<File> fileSet = new HashSet<File>();
+        for (String directory : DatabaseDescriptor.getAllDataFileLocationsForTable(table_))
+        {
+            File[] files = new File(directory).listFiles();
+            for (File file : files)
+            {
+                String cfName = getColumnFamilyFromFileName(file.getAbsolutePath());
+                if (cfName.equals(columnFamily_))
+                    fileSet.add(file);
+            }
+        }
+        return fileSet;
     }
 
-    // Add non-final stop node
+    /**
+     * @return the name of the column family
+     */
+    public String getColumnFamilyName()
     {
-      final Builder.UnCompiledNode<Long> node = new Builder.UnCompiledNode<Long>(b, 0);
-      rootNode.addArc('b', node);
-      final Builder.CompiledNode frozen = new Builder.CompiledNode();
-      frozen.node = fst.addNode(node);
-      rootNode.arcs[1].nextFinalOutput = nothing;
-      rootNode.arcs[1].output = 42L;
-      rootNode.arcs[1].target = frozen;
+        return columnFamily_;
     }
 
-    fst.finish(fst.addNode(rootNode));
+    private static String getColumnFamilyFromFileName(String filename)
+    {
+        return SSTable.Descriptor.fromFilename(filename).cfname;
+    }
 
-    StringWriter w = new StringWriter();
-    //Writer w = new OutputStreamWriter(new FileOutputStream("/x/tmp3/out.dot"));
-    Util.toDot(fst, w, false, false);
-    w.close();
-    
-    checkStopNodes(fst, outputs);
+    public static int getGenerationFromFileName(String filename)
+    {
+        return SSTable.Descriptor.fromFilename(filename).generation;
+    }
 
-    // Make sure it still works after save/load:
-    Directory dir = newDirectory();
-    IndexOutput out = dir.createOutput("fst", IOContext.DEFAULT);
-    fst.save(out);
-    out.close();
+    /*
+     * @return a temporary file name for an sstable.
+     * When the sstable object is closed, it will be renamed to a non-temporary
+     * format, so incomplete sstables can be recognized and removed on startup.
+     */
+    public String getFlushPath()
+    {
+        long guessedSize = 2 * DatabaseDescriptor.getMemtableThroughput() * 1024*1024; // 2* adds room for keys, column indexes
+        String location = DatabaseDescriptor.getDataFileLocationForTable(table_, guessedSize);
+        if (location == null)
+            throw new RuntimeException("Insufficient disk space to flush");
+        return getTempSSTablePath(location);
+    }
 
-    IndexInput in = dir.openInput("fst", IOContext.DEFAULT);
-    final FST<Long> fst2 = new FST<Long>(in, outputs);
-    checkStopNodes(fst2, outputs);
-    in.close();
-    dir.close();
-  }
+    public String getTempSSTablePath(String directory)
+    {
+        SSTable.Descriptor desc = new SSTable.Descriptor(new File(directory),
+                                                         table_,
+                                                         columnFamily_,
+                                                         fileIndexGenerator_.incrementAndGet(),
+                                                         true);
+        return desc.filenameFor("Data.db");
+    }
 
-  private void checkStopNodes(FST<Long> fst, PositiveIntOutputs outputs) throws Exception {
-    final Long nothing = outputs.getNoOutput();
-    FST.Arc<Long> startArc = fst.getFirstArc(new FST.Arc<Long>());
-    assertEquals(nothing, startArc.output);
-    assertEquals(nothing, startArc.nextFinalOutput);
+    /** flush the given memtable and swap in a new one for its CFS, if it hasn't been frozen already.  threadsafe. */
+    Future<?> maybeSwitchMemtable(Memtable oldMemtable, final boolean writeCommitLog)
+    {
+        /**
+         *  If we can get the writelock, that means no new updates can come in and 
+         *  all ongoing updates to memtables have completed. We can get the tail
+         *  of the log and use it as the starting position for log replay on recovery.
+         */
+        Table.flusherLock.writeLock().lock();
+        try
+        {
+            if (oldMemtable.isFrozen())
+            {
+                return null;
+            }
+            oldMemtable.freeze();
 
-    FST.Arc<Long> arc = fst.readFirstTargetArc(startArc, new FST.Arc<Long>());
-    assertEquals('a', arc.label);
-    assertEquals(17, arc.nextFinalOutput.longValue());
-    assertTrue(arc.isFinal());
-
-    arc = fst.readNextArc(arc);
-    assertEquals('b', arc.label);
-    assertFalse(arc.isFinal());
-    assertEquals(42, arc.output.longValue());
-  }
-
-  public void testShortestPaths() throws Exception {
-    final PositiveIntOutputs outputs = PositiveIntOutputs.getSingleton(true);
-    final Builder<Long> builder = new Builder<Long>(FST.INPUT_TYPE.BYTE1, outputs);
-
-    final IntsRef scratch = new IntsRef();
-    builder.add(Util.toIntsRef(new BytesRef("aab"), scratch), 22L);
-    builder.add(Util.toIntsRef(new BytesRef("aac"), scratch), 7L);
-    builder.add(Util.toIntsRef(new BytesRef("ax"), scratch), 17L);
-    final FST<Long> fst = builder.finish();
-    //Writer w = new OutputStreamWriter(new FileOutputStream("out.dot"));
-    //Util.toDot(fst, w, false, false);
-    //w.close();
-
-    Util.MinResult[] r = Util.shortestPaths(fst,
-                                           fst.getFirstArc(new FST.Arc<Long>()),
-                                           3);
-    assertEquals(3, r.length);
-
-    assertEquals(Util.toIntsRef(new BytesRef("aac"), scratch), r[0].input);
-    assertEquals(7, r[0].output);
-
-    assertEquals(Util.toIntsRef(new BytesRef("ax"), scratch), r[1].input);
-    assertEquals(17, r[1].output);
-
-    assertEquals(Util.toIntsRef(new BytesRef("aab"), scratch), r[2].input);
-    assertEquals(22, r[2].output);
-  }
-  
-  public void testShortestPathsRandom() throws Exception {
-    int numWords = atLeast(1000);
-    
-    final TreeMap<String,Long> slowCompletor = new TreeMap<String,Long>();
-    final TreeSet<String> allPrefixes = new TreeSet<String>();
-    
-    final PositiveIntOutputs outputs = PositiveIntOutputs.getSingleton(true);
-    final Builder<Long> builder = new Builder<Long>(FST.INPUT_TYPE.BYTE1, outputs);
-    final IntsRef scratch = new IntsRef();
-    
-    for (int i = 0; i < numWords; i++) {
-      String s;
-      while (true) {
-        s = _TestUtil.randomSimpleString(random);
-        if (!slowCompletor.containsKey(s)) {
-          break;
+            final CommitLogSegment.CommitLogContext ctx = writeCommitLog ? CommitLog.instance().getContext() : null;
+            logger_.info(columnFamily_ + " has reached its threshold; switching in a fresh Memtable at " + ctx);
+            final Condition condition = submitFlush(oldMemtable);
+            memtable_ = new Memtable(this);
+            // a second executor that makes sure the onMemtableFlushes get called in the right order,
+            // while keeping the wait-for-flush (future.get) out of anything latency-sensitive.
+            return commitLogUpdater_.submit(new WrappedRunnable()
+            {
+                public void runMayThrow() throws InterruptedException, IOException
+                {
+                    condition.await();
+                    if (writeCommitLog)
+                    {
+                        // if we're not writing to the commit log, we are replaying the log, so marking
+                        // the log header with "you can discard anything written before the context" is not valid
+                        final int cfId = DatabaseDescriptor.getTableMetaData(table_).get(columnFamily_).cfId;
+                        CommitLog.instance().discardCompletedSegments(cfId, ctx);
+                    }
+                }
+            });
         }
-      }
-      
-      for (int j = 1; j < s.length(); j++) {
-        allPrefixes.add(s.substring(0, j));
-      }
-      int weight = _TestUtil.nextInt(random, 1, 100); // weights 1..100
-      slowCompletor.put(s, (long)weight);
-    }
-    
-    for (Map.Entry<String,Long> e : slowCompletor.entrySet()) {
-      //System.out.println("add: " + e);
-      builder.add(Util.toIntsRef(new BytesRef(e.getKey()), scratch), e.getValue());
-    }
-    
-    final FST<Long> fst = builder.finish();
-    //System.out.println("SAVE out.dot");
-    //Writer w = new OutputStreamWriter(new FileOutputStream("out.dot"));
-    //Util.toDot(fst, w, false, false);
-    //w.close();
-    
-    BytesReader reader = fst.getBytesReader(0);
-    
-    //System.out.println("testing: " + allPrefixes.size() + " prefixes");
-    for (String prefix : allPrefixes) {
-      // 1. run prefix against fst, then complete by value
-      //System.out.println("TEST: " + prefix);
-    
-      long prefixOutput = 0;
-      FST.Arc<Long> arc = fst.getFirstArc(new FST.Arc<Long>());
-      for(int idx=0;idx<prefix.length();idx++) {
-        if (fst.findTargetArc((int) prefix.charAt(idx), arc, arc, reader) == null) {
-          fail();
+        finally
+        {
+            Table.flusherLock.writeLock().unlock();
+            if (memtableSwitchCount == Integer.MAX_VALUE)
+            {
+                memtableSwitchCount = 0;
+            }
+            memtableSwitchCount++;
         }
-        prefixOutput += arc.output;
-      }
+    }
 
-      final int topN = _TestUtil.nextInt(random, 1, 10);
+    void switchBinaryMemtable(String key, byte[] buffer)
+    {
+        binaryMemtable_.set(new BinaryMemtable(this));
+        binaryMemtable_.get().put(key, buffer);
+    }
 
-      Util.MinResult[] r = Util.shortestPaths(fst, arc, topN);
+    public void forceFlushIfExpired()
+    {
+        if (memtable_.isExpired())
+            forceFlush();
+    }
 
-      // 2. go thru whole treemap (slowCompletor) and check its actually the best suggestion
-      final List<Util.MinResult> matches = new ArrayList<Util.MinResult>();
+    public Future<?> forceFlush()
+    {
+        if (memtable_.isClean())
+            return null;
 
-      // TODO: could be faster... but its slowCompletor for a reason
-      for (Map.Entry<String,Long> e : slowCompletor.entrySet()) {
-        if (e.getKey().startsWith(prefix)) {
-          //System.out.println("  consider " + e.getKey());
-          matches.add(new Util.MinResult(Util.toIntsRef(new BytesRef(e.getKey().substring(prefix.length())), new IntsRef()),
-                                         e.getValue() - prefixOutput));
+        return maybeSwitchMemtable(memtable_, true);
+    }
+
+    public void forceBlockingFlush() throws ExecutionException, InterruptedException
+    {
+        Future<?> future = forceFlush();
+        if (future != null)
+            future.get();
+    }
+
+    public void forceFlushBinary()
+    {
+        if (binaryMemtable_.get().isClean())
+            return;
+
+        submitFlush(binaryMemtable_.get());
+    }
+
+    /**
+     * Insert/Update the column family for this key.
+     * Caller is responsible for acquiring Table.flusherLock!
+     * param @ lock - lock that needs to be used.
+     * param @ key - key for update/insert
+     * param @ columnFamily - columnFamily changes
+     */
+    Memtable apply(String key, ColumnFamily columnFamily)
+    {
+        long start = System.nanoTime();
+
+        boolean flushRequested = memtable_.isThresholdViolated();
+        memtable_.put(key, columnFamily);
+        writeStats_.addNano(System.nanoTime() - start);
+        
+        return flushRequested ? memtable_ : null;
+    }
+
+    /*
+     * Insert/Update the column family for this key. param @ lock - lock that
+     * needs to be used. param @ key - key for update/insert param @
+     * columnFamily - columnFamily changes
+     */
+    void applyBinary(String key, byte[] buffer)
+    {
+        long start = System.nanoTime();
+        binaryMemtable_.get().put(key, buffer);
+        writeStats_.addNano(System.nanoTime() - start);
+    }
+
+    /*
+     This is complicated because we need to preserve deleted columns, supercolumns, and columnfamilies
+     until they have been deleted for at least GC_GRACE_IN_SECONDS.  But, we do not need to preserve
+     their contents; just the object itself as a "tombstone" that can be used to repair other
+     replicas that do not know about the deletion.
+     */
+    public static ColumnFamily removeDeleted(ColumnFamily cf, int gcBefore)
+    {
+        if (cf == null)
+        {
+            return null;
         }
-      }
 
-      assertTrue(matches.size() > 0);
-      Collections.sort(matches);
-      if (matches.size() > topN) {
-        matches.subList(topN, matches.size()).clear();
-      }
+        if (cf.isSuper())
+            removeDeletedSuper(cf, gcBefore);
+        else
+            removeDeletedStandard(cf, gcBefore);
 
-      assertEquals(matches.size(), r.length);
-
-      for(int hit=0;hit<r.length;hit++) {
-        //System.out.println("  check hit " + hit);
-        assertEquals(matches.get(hit).input, r[hit].input);
-        assertEquals(matches.get(hit).output, r[hit].output);
-      }
-    }
-  }
-
-  public void testLargeOutputsOnArrayArcs() throws Exception {
-    final ByteSequenceOutputs outputs = ByteSequenceOutputs.getSingleton();
-    final Builder<BytesRef> builder = new Builder<BytesRef>(FST.INPUT_TYPE.BYTE1, outputs);
-
-    final byte[] bytes = new byte[300];
-    final IntsRef input = new IntsRef();
-    input.grow(1);
-    input.length = 1;
-    final BytesRef output = new BytesRef(bytes);
-    for(int arc=0;arc<6;arc++) {
-      input.ints[0] = arc;
-      output.bytes[0] = (byte) arc;
-      builder.add(input, BytesRef.deepCopyOf(output));
+        // in case of a timestamp tie, tombstones get priority over non-tombstones.
+        // (we want this to be deterministic to avoid confusion.)
+        if (cf.getColumnCount() == 0 && cf.getLocalDeletionTime() <= gcBefore)
+        {
+            return null;
+        }
+        return cf;
     }
 
-    final FST<BytesRef> fst = builder.finish();
-    for(int arc=0;arc<6;arc++) {
-      input.ints[0] = arc;
-      final BytesRef result = Util.get(fst, input);
-      assertNotNull(result);
-      assertEquals(300, result.length);
-      assertEquals(result.bytes[result.offset], arc);
-      for(int byteIDX=1;byteIDX<result.length;byteIDX++) {
-        assertEquals(0, result.bytes[result.offset+byteIDX]);
-      }
+    private static void removeDeletedStandard(ColumnFamily cf, int gcBefore)
+    {
+        for (byte[] cname : cf.getColumnNames())
+        {
+            IColumn c = cf.getColumnsMap().get(cname);
+            if ((c.isMarkedForDelete() && c.getLocalDeletionTime() <= gcBefore)
+                || c.timestamp() <= cf.getMarkedForDeleteAt())
+            {
+                cf.remove(cname);
+            }
+        }
     }
-  }
+
+    private static void removeDeletedSuper(ColumnFamily cf, int gcBefore)
+    {
+        // TODO assume deletion means "most are deleted?" and add to clone, instead of remove from original?
+        // this could be improved by having compaction, or possibly even removeDeleted, r/m the tombstone
+        // once gcBefore has passed, so if new stuff is added in it doesn't used the wrong algorithm forever
+        for (byte[] cname : cf.getColumnNames())
+        {
+            IColumn c = cf.getColumnsMap().get(cname);
+            long minTimestamp = Math.max(c.getMarkedForDeleteAt(), cf.getMarkedForDeleteAt());
+            for (IColumn subColumn : c.getSubColumns())
+            {
+                if (subColumn.timestamp() <= minTimestamp
+                    || (subColumn.isMarkedForDelete() && subColumn.getLocalDeletionTime() <= gcBefore))
+                {
+                    ((SuperColumn)c).remove(subColumn.name());
+                }
+            }
+            if (c.getSubColumns().isEmpty() && c.getLocalDeletionTime() <= gcBefore)
+            {
+                cf.remove(c.name());
+            }
+        }
+    }
+
+    /*
+     * Called after the Memtable flushes its in-memory data, or we add a file
+     * via bootstrap. This information is
+     * cached in the ColumnFamilyStore. This is useful for reads because the
+     * ColumnFamilyStore first looks in the in-memory store and the into the
+     * disk to find the key. If invoked during recoveryMode the
+     * onMemtableFlush() need not be invoked.
+     *
+     * param @ filename - filename just flushed to disk
+     */
+    public void addSSTable(SSTableReader sstable)
+    {
+        ssTables_.add(Arrays.asList(sstable));
+        CompactionManager.instance.submitMinorIfNeeded(this);
+    }
+
+    /*
+     * Add up all the files sizes this is the worst case file
+     * size for compaction of all the list of files given.
+     */
+    long getExpectedCompactedFileSize(Iterable<SSTableReader> sstables)
+    {
+        long expectedFileSize = 0;
+        for (SSTableReader sstable : sstables)
+        {
+            long size = sstable.length();
+            expectedFileSize = expectedFileSize + size;
+        }
+        return expectedFileSize;
+    }
+
+    /*
+     *  Find the maximum size file in the list .
+     */
+    SSTableReader getMaxSizeFile(Iterable<SSTableReader> sstables)
+    {
+        long maxSize = 0L;
+        SSTableReader maxFile = null;
+        for (SSTableReader sstable : sstables)
+        {
+            if (sstable.length() > maxSize)
+            {
+                maxSize = sstable.length();
+                maxFile = sstable;
+            }
+        }
+        return maxFile;
+    }
+
+    void forceCleanup()
+    {
+        CompactionManager.instance.submitCleanup(ColumnFamilyStore.this);
+    }
+
+    public Table getTable()
+    {
+        return Table.open(table_);
+    }
+
+    void markCompacted(Collection<SSTableReader> sstables)
+    {
+        ssTables_.markCompacted(sstables);
+    }
+
+    boolean isCompleteSSTables(Collection<SSTableReader> sstables)
+    {
+        return ssTables_.getSSTables().equals(new HashSet<SSTableReader>(sstables));
+    }
+
+    void replaceCompactedSSTables(Collection<SSTableReader> sstables, Iterable<SSTableReader> replacements)
+    {
+        ssTables_.replace(sstables, replacements);
+    }
+
+    /**
+     * submits flush sort on the flushSorter executor, which will in turn submit to flushWriter when sorted.
+     * TODO because our executors use CallerRunsPolicy, when flushSorter fills up, no writes will proceed
+     * because the next flush will start executing on the caller, mutation-stage thread that has the
+     * flush write lock held.  (writes aquire this as a read lock before proceeding.)
+     * This is good, because it backpressures flushes, but bad, because we can't write until that last
+     * flushing thread finishes sorting, which will almost always be longer than any of the flushSorter threads proper
+     * (since, by definition, it started last).
+     */
+    Condition submitFlush(IFlushable flushable)
+    {
+        logger_.info("Enqueuing flush of {}", flushable);
+        final Condition condition = new SimpleCondition();
+        flushable.flushAndSignal(condition, flushSorter_, flushWriter_);
+        return condition;
+    }
+
+    public boolean isSuper()
+    {
+        return isSuper_;
+    }
+
+    public int getMemtableColumnsCount()
+    {
+        return getMemtableThreadSafe().getCurrentOperations();
+    }
+
+    public int getMemtableDataSize()
+    {
+        return getMemtableThreadSafe().getCurrentThroughput();
+    }
+
+    public int getMemtableSwitchCount()
+    {
+        return memtableSwitchCount;
+    }
+
+    /**
+     * get the current memtable in a threadsafe fashion.  note that simply "return memtable_" is
+     * incorrect; you need to lock to introduce a thread safe happens-before ordering.
+     *
+     * do NOT use this method to do either a put or get on the memtable object, since it could be
+     * flushed in the meantime (and its executor terminated).
+     *
+     * also do NOT make this method public or it will really get impossible to reason about these things.
+     * @return
+     */
+    private Memtable getMemtableThreadSafe()
+    {
+        Table.flusherLock.readLock().lock();
+        try
+        {
+            return memtable_;
+        }
+        finally
+        {
+            Table.flusherLock.readLock().unlock();
+        }
+    }
+
+    public Collection<SSTableReader> getSSTables()
+    {
+        return ssTables_.getSSTables();
+    }
+
+    public long getReadCount()
+    {
+        return readStats_.getOpCount();
+    }
+
+    public double getRecentReadLatencyMicros()
+    {
+        return readStats_.getRecentLatencyMicros();
+    }
+
+    public long getTotalReadLatencyMicros()
+    {
+        return readStats_.getTotalLatencyMicros();
+    }
+
+// TODO this actually isn't a good meature of pending tasks
+    public int getPendingTasks()
+    {
+        return Table.flusherLock.getQueueLength();
+    }
+
+    public long getWriteCount()
+    {
+        return writeStats_.getOpCount();
+    }
+
+    public long getTotalWriteLatencyMicros()
+    {
+        return writeStats_.getTotalLatencyMicros();
+    }
+
+    public double getRecentWriteLatencyMicros()
+    {
+        return writeStats_.getRecentLatencyMicros();
+    }
+
+    public ColumnFamily getColumnFamily(String key, QueryPath path, byte[] start, byte[] finish, List<byte[]> bitmasks, boolean reversed, int limit)
+    {
+        return getColumnFamily(QueryFilter.getSliceFilter(key, path, start, finish, bitmasks, reversed, limit));
+    }
+
+    public ColumnFamily getColumnFamily(String key, QueryPath path, byte[] start, byte[] finish, boolean reversed, int limit)
+    {
+        return getColumnFamily(QueryFilter.getSliceFilter(key, path, start, finish, null, reversed, limit));
+    }
+
+    public ColumnFamily getColumnFamily(QueryFilter filter)
+    {
+        return getColumnFamily(filter, CompactionManager.getDefaultGCBefore());
+    }
+
+    private ColumnFamily cacheRow(String key)
+    {
+        ColumnFamily cached;
+        if ((cached = ssTables_.getRowCache().get(key)) == null)
+        {
+            cached = getTopLevelColumns(QueryFilter.getIdentityFilter(key, new QueryPath(columnFamily_)), Integer.MIN_VALUE);
+            if (cached == null)
+                return null;
+            ssTables_.getRowCache().put(key, cached);
+        }
+        return cached;
+    }
+
+    /**
+     * get a list of columns starting from a given column, in a specified order.
+     * only the latest version of a column is returned.
+     * @return null if there is no data and no tombstones; otherwise a ColumnFamily
+     */
+    public ColumnFamily getColumnFamily(QueryFilter filter, int gcBefore)
+    {
+        assert columnFamily_.equals(filter.getColumnFamilyName());
+
+        long start = System.nanoTime();
+        try
+        {
+            if (ssTables_.getRowCache().getCapacity() == 0)
+                return removeDeleted(getTopLevelColumns(filter, gcBefore), gcBefore);
+
+            ColumnFamily cached = cacheRow(filter.key);
+            if (cached == null)
+                return null;
+            IColumnIterator ci = filter.getMemtableColumnIterator(cached, null, getComparator());
+            ColumnFamily returnCF = ci.getColumnFamily().cloneMeShallow();
+            filter.collectCollatedColumns(returnCF, ci, gcBefore);
+            // TODO this is necessary because when we collate supercolumns together, we don't check
+            // their subcolumns for relevance, so we need to do a second prune post facto here.
+            return removeDeleted(returnCF, gcBefore);
+        }
+        catch (IOException e)
+        {
+            throw new IOError(e);
+        }
+        finally
+        {
+            readStats_.addNano(System.nanoTime() - start);
+        }
+    }
+
+    private ColumnFamily getTopLevelColumns(QueryFilter filter, int gcBefore)
+    {
+        // we are querying top-level columns, do a merging fetch with indexes.
+        List<IColumnIterator> iterators = new ArrayList<IColumnIterator>();
+        final ColumnFamily returnCF = ColumnFamily.create(table_, columnFamily_);
+        try
+        {
+            IColumnIterator iter;
+
+            /* add the current memtable */
+            Table.flusherLock.readLock().lock();
+            try
+            {
+                iter = filter.getMemtableColumnIterator(memtable_, getComparator());
+            }
+            finally
+            {
+                Table.flusherLock.readLock().unlock();
+            }
+            if (iter != null)
+            {
+                returnCF.delete(iter.getColumnFamily());
+                iterators.add(iter);
+            }
+
+            /* add the memtables being flushed */
+            for (Memtable memtable : getMemtablesPendingFlush())
+            {
+                iter = filter.getMemtableColumnIterator(memtable, getComparator());
+                if (iter != null)
+                {
+                    returnCF.delete(iter.getColumnFamily());
+                    iterators.add(iter);
+                }
+            }
+
+            /* add the SSTables on disk */
+            for (SSTableReader sstable : ssTables_)
+            {
+                iter = filter.getSSTableColumnIterator(sstable);
+                if (iter.hasNext()) // initializes iter.CF
+                {
+                    returnCF.delete(iter.getColumnFamily());
+                }
+                iterators.add(iter);
+            }
+
+            Comparator<IColumn> comparator = filter.getColumnComparator(getComparator());
+            Iterator collated = IteratorUtils.collatedIterator(comparator, iterators);
+            if (!collated.hasNext())
+                return null;
+
+            filter.collectCollatedColumns(returnCF, collated, gcBefore);
+            return returnCF; // caller is responsible for final removeDeleted
+        }
+        catch (IOException e)
+        {
+            throw new IOError(e);
+        }
+        finally
+        {
+            /* close all cursors */
+            for (IColumnIterator ci : iterators)
+            {
+                try
+                {
+                    ci.close();
+                }
+                catch (Throwable th)
+                {
+                    logger_.error("error closing " + ci, th);
+                }
+            }
+        }
+    }
+
+    /**
+      * Fetch a range of rows and columns from memtables/sstables.
+      * 
+      * @param rows The resulting rows fetched during this operation 
+      * @param superColumn Super column to filter by
+      * @param range Either a Bounds, which includes start key, or a Range, which does not.
+      * @param maxResults Maximum rows to return
+      * @param sliceRange Information on how to slice columns
+      * @param columnNames Column names to filter by 
+      * @return true if we found all keys we were looking for, otherwise false
+     */
+    private boolean getRangeRows(List<Row> rows, byte[] superColumn, final AbstractBounds range, int maxResults, SliceRange sliceRange, List<byte[]> columnNames)
+    throws ExecutionException, InterruptedException
+    {
+        final DecoratedKey startWith = new DecoratedKey(range.left, null);
+        final DecoratedKey stopAt = new DecoratedKey(range.right, null);
+        
+        final int gcBefore = CompactionManager.getDefaultGCBefore();
+
+        final QueryPath queryPath =  new QueryPath(columnFamily_, superColumn, null);
+        final SortedSet<byte[]> columnNameSet = new TreeSet<byte[]>(getComparator());
+        if (columnNames != null)
+            columnNameSet.addAll(columnNames);
+
+        final QueryFilter filter = sliceRange == null ? QueryFilter.getNamesFilter(null, queryPath, columnNameSet)
+                                                      : QueryFilter.getSliceFilter(null, queryPath, sliceRange.start, sliceRange.finish, sliceRange.bitmasks, sliceRange.reversed, sliceRange.count);
+
+        Collection<Memtable> memtables = new ArrayList<Memtable>(memtablesPendingFlush);
+
+        Collection<SSTableReader> sstables = new ArrayList<SSTableReader>();
+        Iterables.addAll(sstables, ssTables_);
+
+        RowIterator iterator = RowIteratorFactory.getIterator(memtable_, memtables, sstables, startWith, stopAt, filter, getComparator(), gcBefore);
+
+        try
+        {
+            // pull rows out of the iterator
+            boolean first = true;
+            IPartitioner partitioner = StorageService.getPartitioner(); 
+            while(iterator.hasNext())
+            {
+                Row current = iterator.next();
+            	// TODO store decoratedkey in row?
+                DecoratedKey key = partitioner.decorateKey(current.key);
+
+                if (!stopAt.isEmpty() && stopAt.compareTo(key) < 0)
+                    return true;
+
+                // skip first one
+                if(range instanceof Bounds || !first || !key.equals(startWith))
+                    rows.add(current);
+                first = false;
+
+                if (rows.size() >= maxResults)
+                    return true;
+            }
+            return false;
+        }
+        finally
+        {
+            try
+            {
+                iterator.close();
+            }
+            catch (IOException e)
+            {
+                throw new IOError(e);
+            }
+        }
+    }
+
+    /**
+     *
+     * @param super_column
+     * @param range: either a Bounds, which includes start key, or a Range, which does not.
+     * @param keyMax maximum number of keys to process, regardless of startKey/finishKey
+     * @param sliceRange may be null if columnNames is specified. specifies contiguous columns to return in what order.
+     * @param columnNames may be null if sliceRange is specified. specifies which columns to return in what order.      @return list of key->list<column> tuples.
+     * @throws ExecutionException
+     * @throws InterruptedException
+     */
+    public RangeSliceReply getRangeSlice(byte[] super_column, final AbstractBounds range, int keyMax, SliceRange sliceRange, List<byte[]> columnNames)
+    throws ExecutionException, InterruptedException
+    {
+        List<Row> rows = new ArrayList<Row>();
+        boolean completed;
+        if ((range instanceof Bounds || !((Range)range).isWrapAround()))
+        {
+            completed = getRangeRows(rows, super_column, range, keyMax, sliceRange, columnNames);
+        }
+        else
+        {
+            // wrapped range
+            Token min = StorageService.getPartitioner().getMinimumToken();
+            Range first = new Range(range.left, min);
+            completed = getRangeRows(rows, super_column, first, keyMax, sliceRange, columnNames);
+            if (!completed && min.compareTo(range.right) < 0)
+            {
+                Range second = new Range(min, range.right);
+                getRangeRows(rows, super_column, second, keyMax, sliceRange, columnNames);
+            }
+        }
+
+        return new RangeSliceReply(rows);
+    }
+
+    public AbstractType getComparator()
+    {
+        return DatabaseDescriptor.getComparator(table_, columnFamily_);
+    }
+
+    /**
+     * Take a snap shot of this columnfamily store.
+     * 
+     * @param snapshotName the name of the associated with the snapshot 
+     */
+    public void snapshot(String snapshotName)
+    {
+        try
+        {
+            forceBlockingFlush();
+        }
+        catch (ExecutionException e)
+        {
+            throw new RuntimeException(e);
+        }
+        catch (InterruptedException e)
+        {
+            throw new AssertionError(e);
+        }
+
+        for (SSTableReader ssTable : ssTables_)
+        {
+            try
+            {
+                // mkdir
+                File sourceFile = new File(ssTable.getFilename());
+                File dataDirectory = sourceFile.getParentFile().getParentFile();
+                String snapshotDirectoryPath = Table.getSnapshotPath(dataDirectory.getAbsolutePath(), table_, snapshotName);
+                FileUtils.createDirectory(snapshotDirectoryPath);
+
+                // hard links
+                File targetLink = new File(snapshotDirectoryPath, sourceFile.getName());
+                FileUtils.createHardLink(sourceFile, targetLink);
+
+                sourceFile = new File(ssTable.indexFilename());
+                targetLink = new File(snapshotDirectoryPath, sourceFile.getName());
+                FileUtils.createHardLink(sourceFile, targetLink);
+
+                sourceFile = new File(ssTable.filterFilename());
+                targetLink = new File(snapshotDirectoryPath, sourceFile.getName());
+                FileUtils.createHardLink(sourceFile, targetLink);
+                if (logger_.isDebugEnabled())
+                    logger_.debug("Snapshot for " + table_ + " table data file " + sourceFile.getAbsolutePath() +
+                        " created as " + targetLink.getAbsolutePath());
+            }
+            catch (IOException e)
+            {
+                throw new IOError(e);
+            }
+
+        }
+    }
+
+    public boolean hasUnreclaimedSpace()
+    {
+        return ssTables_.getLiveSize() < ssTables_.getTotalSize();
+    }
+
+    public long getTotalDiskSpaceUsed()
+    {
+        return ssTables_.getTotalSize();
+    }
+
+    public long getLiveDiskSpaceUsed()
+    {
+        return ssTables_.getLiveSize();
+    }
+
+    public int getLiveSSTableCount()
+    {
+        return ssTables_.size();
+    }
+
+    /** raw cached row -- does not fetch the row if it is not present.  not counted in cache statistics.  */
+    public ColumnFamily getRawCachedRow(String key)
+    {
+        return ssTables_.getRowCache().getCapacity() == 0 ? null : ssTables_.getRowCache().getInternal(key);
+    }
+
+    void invalidateCachedRow(String key)
+    {
+        ssTables_.getRowCache().remove(key);
+    }
+
+    public void forceMajorCompaction()
+    {
+        CompactionManager.instance.submitMajor(this);
+    }
+
+    public void invalidateRowCache()
+    {
+        ssTables_.getRowCache().clear();
+    }
+
+    public static Iterable<ColumnFamilyStore> all()
+    {
+        Iterable<ColumnFamilyStore>[] stores = new Iterable[DatabaseDescriptor.getTables().size()];
+        int i = 0;
+        for (Table table : Table.all())
+        {
+            stores[i++] = table.getColumnFamilyStores();
+        }
+        return Iterables.concat(stores);
+    }
+
+    public Iterable<DecoratedKey> allKeySamples()
+    {
+        Collection<SSTableReader> sstables = getSSTables();
+        Iterable<DecoratedKey>[] samples = new Iterable[sstables.size()];
+        int i = 0;
+        for (SSTableReader sstable: sstables)
+        {
+            samples[i++] = sstable.getKeySamples();
+        }
+        return Iterables.concat(samples);
+    }
+
+    /**
+     * for testing.  no effort is made to clear historical memtables.
+     */
+    void clearUnsafe()
+    {
+        memtable_.clearUnsafe();
+        ssTables_.clearUnsafe();
+    }
+
+
+    public Set<Memtable> getMemtablesPendingFlush()
+    {
+        return memtablesPendingFlush;
+    }
 }

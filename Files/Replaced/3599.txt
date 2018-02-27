@@ -1,4 +1,4 @@
-riw.shutdown();
+w.shutdown();
 
 package org.apache.lucene.index;
 
@@ -19,79 +19,97 @@ package org.apache.lucene.index;
  * limitations under the License.
  */
 
-import java.io.IOException;
-
 import org.apache.lucene.analysis.MockAnalyzer;
-import org.apache.lucene.codecs.CodecUtil;
-import org.apache.lucene.codecs.lucene46.Lucene46Codec;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
-import org.apache.lucene.document.NumericDocValuesField;
-import org.apache.lucene.store.CompoundFileDirectory;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.IndexInput;
-import org.apache.lucene.util.IOUtils;
+import org.apache.lucene.document.FieldType;
+import org.apache.lucene.store.MMapDirectory;
+import org.apache.lucene.store.MockDirectoryWrapper;
+import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.LuceneTestCase;
 import org.apache.lucene.util.TestUtil;
+import org.apache.lucene.util.TimeUnits;
+import org.apache.lucene.util.TestUtil;
+import org.apache.lucene.util.LuceneTestCase.SuppressCodecs;
+
+import com.carrotsearch.randomizedtesting.annotations.TimeoutSuite;
+import com.carrotsearch.randomizedtesting.generators.RandomInts;
 
 /**
- * Test that a plain default puts codec headers in all files.
+ * This test creates an index with one segment that is a little larger than 4GB.
  */
-public class TestAllFilesHaveCodecHeader extends LuceneTestCase {
+@SuppressCodecs({ "SimpleText" })
+@TimeoutSuite(millis = 4 * TimeUnits.HOUR)
+public class Test4GBStoredFields extends LuceneTestCase {
+
+  @Nightly
   public void test() throws Exception {
-    Directory dir = newDirectory();
-    IndexWriterConfig conf = newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random()));
-    conf.setCodec(new Lucene46Codec());
-    RandomIndexWriter riw = new RandomIndexWriter(random(), dir, conf);
-    Document doc = new Document();
-    // these fields should sometimes get term vectors, etc
-    Field idField = newStringField("id", "", Field.Store.NO);
-    Field bodyField = newTextField("body", "", Field.Store.NO);
-    Field dvField = new NumericDocValuesField("dv", 5);
-    doc.add(idField);
-    doc.add(bodyField);
-    doc.add(dvField);
-    for (int i = 0; i < 100; i++) {
-      idField.setStringValue(Integer.toString(i));
-      bodyField.setStringValue(TestUtil.randomUnicodeString(random()));
-      riw.addDocument(doc);
-      if (random().nextInt(7) == 0) {
-        riw.commit();
-      }
-      // TODO: we should make a new format with a clean header...
-      // if (random().nextInt(20) == 0) {
-      //  riw.deleteDocuments(new Term("id", Integer.toString(i)));
-      // }
+    MockDirectoryWrapper dir = new MockDirectoryWrapper(random(), new MMapDirectory(createTempDir("4GBStoredFields")));
+    dir.setThrottling(MockDirectoryWrapper.Throttling.NEVER);
+
+    IndexWriter w = new IndexWriter(dir,
+        new IndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random()))
+        .setMaxBufferedDocs(IndexWriterConfig.DISABLE_AUTO_FLUSH)
+        .setRAMBufferSizeMB(256.0)
+        .setMergeScheduler(new ConcurrentMergeScheduler())
+        .setMergePolicy(newLogMergePolicy(false, 10))
+        .setOpenMode(IndexWriterConfig.OpenMode.CREATE));
+
+    MergePolicy mp = w.getConfig().getMergePolicy();
+    if (mp instanceof LogByteSizeMergePolicy) {
+     // 1 petabyte:
+     ((LogByteSizeMergePolicy) mp).setMaxMergeMB(1024*1024*1024);
     }
-    riw.close();
-    checkHeaders(dir);
-    dir.close();
-  }
-  
-  private void checkHeaders(Directory dir) throws IOException {
-    for (String file : dir.listAll()) {
-      if (file.equals(IndexFileNames.SEGMENTS_GEN)) {
-        continue; // segments.gen has no header, thats ok
+
+    final Document doc = new Document();
+    final FieldType ft = new FieldType();
+    ft.setIndexed(false);
+    ft.setStored(true);
+    ft.freeze();
+    final int valueLength = RandomInts.randomIntBetween(random(), 1 << 13, 1 << 20);
+    final byte[] value = new byte[valueLength];
+    for (int i = 0; i < valueLength; ++i) {
+      // random so that even compressing codecs can't compress it
+      value[i] = (byte) random().nextInt(256);
+    }
+    final Field f = new Field("fld", value, ft);
+    doc.add(f);
+
+    final int numDocs = (int) ((1L << 32) / valueLength + 100);
+    for (int i = 0; i < numDocs; ++i) {
+      w.addDocument(doc);
+      if (VERBOSE && i % (numDocs / 10) == 0) {
+        System.out.println(i + " of " + numDocs + "...");
       }
-      if (file.endsWith(IndexFileNames.COMPOUND_FILE_EXTENSION)) {
-        CompoundFileDirectory cfsDir = new CompoundFileDirectory(dir, file, newIOContext(random()), false);
-        checkHeaders(cfsDir); // recurse into cfs
-        cfsDir.close();
-      }
-      IndexInput in = null;
-      boolean success = false;
-      try {
-        in = dir.openInput(file, newIOContext(random()));
-        int val = in.readInt();
-        assertEquals(file + " has no codec header, instead found: " + val, CodecUtil.CODEC_MAGIC, val);
-        success = true;
-      } finally {
-        if (success) {
-          IOUtils.close(in);
-        } else {
-          IOUtils.closeWhileHandlingException(in);
+    }
+    w.forceMerge(1);
+    w.close();
+    if (VERBOSE) {
+      boolean found = false;
+      for (String file : dir.listAll()) {
+        if (file.endsWith(".fdt")) {
+          final long fileLength = dir.fileLength(file);
+          if (fileLength >= 1L << 32) {
+            found = true;
+          }
+          System.out.println("File length of " + file + " : " + fileLength);
         }
       }
+      if (!found) {
+        System.out.println("No .fdt file larger than 4GB, test bug?");
+      }
     }
+
+    DirectoryReader rd = DirectoryReader.open(dir);
+    StoredDocument sd = rd.document(numDocs - 1);
+    assertNotNull(sd);
+    assertEquals(1, sd.getFields().size());
+    BytesRef valueRef = sd.getBinaryValue("fld");
+    assertNotNull(valueRef);
+    assertEquals(new BytesRef(value), valueRef);
+    rd.close();
+
+    dir.close();
   }
+
 }

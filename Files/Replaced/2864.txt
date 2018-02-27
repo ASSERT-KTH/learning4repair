@@ -1,6 +1,6 @@
-static class KeepAllCommits extends IndexDeletionPolicy {
+import org.apache.lucene.search.suggest.Sort.ByteSequencesWriter;
 
-package org.apache.lucene.index;
+package org.apache.lucene.search.suggest.fst;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -18,582 +18,271 @@ package org.apache.lucene.index;
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.Collections;
-import java.util.HashMap;
-import java.util.HashSet;
+import java.util.Comparator;
 import java.util.List;
-import java.util.Map;
-import java.util.Random;
-import java.util.Set;
 
-import org.apache.lucene.analysis.MockAnalyzer;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.Field;
-import org.apache.lucene.document.FieldType;
-import org.apache.lucene.document.TextField;
-import org.apache.lucene.index.IndexWriterConfig.OpenMode;
-import org.apache.lucene.search.IndexSearcher;
-import org.apache.lucene.search.ScoreDoc;
-import org.apache.lucene.search.TermQuery;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.util.LuceneTestCase;
-import org.apache.lucene.util._TestUtil;
+import org.apache.lucene.search.spell.TermFreqIterator;
+import org.apache.lucene.search.suggest.Lookup;
+import org.apache.lucene.search.suggest.SortedTermFreqIteratorWrapper;
+import org.apache.lucene.search.suggest.fst.Sort.ByteSequencesWriter;
+import org.apache.lucene.store.ByteArrayDataInput;
+import org.apache.lucene.store.ByteArrayDataOutput;
+import org.apache.lucene.store.InputStreamDataInput;
+import org.apache.lucene.store.OutputStreamDataOutput;
+import org.apache.lucene.util.ArrayUtil;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.CharsRef;
+import org.apache.lucene.util.IOUtils;
+import org.apache.lucene.util.IntsRef;
+import org.apache.lucene.util.UnicodeUtil;
+import org.apache.lucene.util.fst.Builder;
+import org.apache.lucene.util.fst.FST;
+import org.apache.lucene.util.fst.FST.Arc;
+import org.apache.lucene.util.fst.FST.BytesReader;
+import org.apache.lucene.util.fst.PositiveIntOutputs;
+import org.apache.lucene.util.fst.Util;
+import org.apache.lucene.util.fst.Util.MinResult;
 
-public class TestDirectoryReaderReopen extends LuceneTestCase {
+/**
+ * Suggester based on a weighted FST: it first traverses the prefix, 
+ * then walks the <i>n</i> shortest paths to retrieve top-ranked
+ * suggestions.
+ * <p>
+ * <b>NOTE</b>:
+ * Input weights must be between 0 and {@link Integer#MAX_VALUE}, any
+ * other values will be rejected.
+ * 
+ * @lucene.experimental
+ */
+public class WFSTCompletionLookup extends Lookup {
   
-  public void testReopen() throws Exception {
-    final Directory dir1 = newDirectory();
-    
-    createIndex(random(), dir1, false);
-    performDefaultTests(new TestReopen() {
-
-      @Override
-      protected void modifyIndex(int i) throws IOException {
-        TestDirectoryReaderReopen.modifyIndex(i, dir1);
-      }
-
-      @Override
-      protected DirectoryReader openReader() throws IOException {
-        return DirectoryReader.open(dir1);
-      }
-      
-    });
-    dir1.close();
-    
-    final Directory dir2 = newDirectory();
-    
-    createIndex(random(), dir2, true);
-    performDefaultTests(new TestReopen() {
-
-      @Override
-      protected void modifyIndex(int i) throws IOException {
-        TestDirectoryReaderReopen.modifyIndex(i, dir2);
-      }
-
-      @Override
-      protected DirectoryReader openReader() throws IOException {
-        return DirectoryReader.open(dir2);
-      }
-      
-    });
-    dir2.close();
+  /**
+   * FST<Long>, weights are encoded as costs: (Integer.MAX_VALUE-weight)
+   */
+  // NOTE: like FSTSuggester, this is really a WFSA, if you want to
+  // customize the code to add some output you should use PairOutputs.
+  private FST<Long> fst = null;
+  
+  /** 
+   * True if exact match suggestions should always be returned first.
+   */
+  private final boolean exactFirst;
+  
+  /**
+   * Calls {@link #WFSTCompletionLookup(boolean) WFSTCompletionLookup(true)}
+   */
+  public WFSTCompletionLookup() {
+    this(true);
   }
   
-  // LUCENE-1228: IndexWriter.commit() does not update the index version
-  // populate an index in iterations.
-  // at the end of every iteration, commit the index and reopen/recreate the reader.
-  // in each iteration verify the work of previous iteration. 
-  // try this once with reopen once recreate, on both RAMDir and FSDir.
-  public void testCommitReopen () throws IOException {
-    Directory dir = newDirectory();
-    doTestReopenWithCommit(random(), dir, true);
-    dir.close();
+  /**
+   * Creates a new suggester.
+   * 
+   * @param exactFirst <code>true</code> if suggestions that match the 
+   *        prefix exactly should always be returned first, regardless
+   *        of score. This has no performance impact, but could result
+   *        in low-quality suggestions.
+   */
+  public WFSTCompletionLookup(boolean exactFirst) {
+    this.exactFirst = exactFirst;
   }
-  public void testCommitRecreate () throws IOException {
-    Directory dir = newDirectory();
-    doTestReopenWithCommit(random(), dir, false);
-    dir.close();
+  
+  @Override
+  public void build(TermFreqIterator iterator) throws IOException {
+    BytesRef scratch = new BytesRef();
+    TermFreqIterator iter = new WFSTTermFreqIteratorWrapper(iterator);
+    IntsRef scratchInts = new IntsRef();
+    BytesRef previous = null;
+    PositiveIntOutputs outputs = PositiveIntOutputs.getSingleton(true);
+    Builder<Long> builder = new Builder<Long>(FST.INPUT_TYPE.BYTE1, outputs);
+    while ((scratch = iter.next()) != null) {
+      long cost = iter.weight();
+      
+      if (previous == null) {
+        previous = new BytesRef();
+      } else if (scratch.equals(previous)) {
+        continue; // for duplicate suggestions, the best weight is actually
+                  // added
+      }
+      Util.toIntsRef(scratch, scratchInts);
+      builder.add(scratchInts, cost);
+      previous.copyBytes(scratch);
+    }
+    fst = builder.finish();
   }
 
-  private void doTestReopenWithCommit (Random random, Directory dir, boolean withReopen) throws IOException {
-    IndexWriter iwriter = new IndexWriter(dir, newIndexWriterConfig(
-        TEST_VERSION_CURRENT, new MockAnalyzer(random)).setOpenMode(
-                                                              OpenMode.CREATE).setMergeScheduler(new SerialMergeScheduler()).setMergePolicy(newLogMergePolicy()));
-    iwriter.commit();
-    DirectoryReader reader = DirectoryReader.open(dir);
+  
+  @Override
+  public boolean store(OutputStream output) throws IOException {
     try {
-      int M = 3;
-      FieldType customType = new FieldType(TextField.TYPE_STORED);
-      customType.setTokenized(false);
-      FieldType customType2 = new FieldType(TextField.TYPE_STORED);
-      customType2.setTokenized(false);
-      customType2.setOmitNorms(true);
-      FieldType customType3 = new FieldType();
-      customType3.setStored(true);
-      for (int i=0; i<4; i++) {
-        for (int j=0; j<M; j++) {
-          Document doc = new Document();
-          doc.add(newField("id", i+"_"+j, customType));
-          doc.add(newField("id2", i+"_"+j, customType2));
-          doc.add(newField("id3", i+"_"+j, customType3));
-          iwriter.addDocument(doc);
-          if (i>0) {
-            int k = i-1;
-            int n = j + k*M;
-            Document prevItereationDoc = reader.document(n);
-            assertNotNull(prevItereationDoc);
-            String id = prevItereationDoc.get("id");
-            assertEquals(k+"_"+j, id);
-          }
-        }
-        iwriter.commit();
-        if (withReopen) {
-          // reopen
-          DirectoryReader r2 = DirectoryReader.openIfChanged(reader);
-          if (r2 != null) {
-            reader.close();
-            reader = r2;
-          }
-        } else {
-          // recreate
-          reader.close();
-          reader = DirectoryReader.open(dir);
-        }
+      if (fst == null) {
+        return false;
       }
+      fst.save(new OutputStreamDataOutput(output));
     } finally {
-      iwriter.close();
-      reader.close();
+      IOUtils.close(output);
     }
+    return true;
   }
+
+  @Override
+  public boolean load(InputStream input) throws IOException {
+    try {
+      this.fst = new FST<Long>(new InputStreamDataInput(input), PositiveIntOutputs.getSingleton(true));
+    } finally {
+      IOUtils.close(input);
+    }
+    return true;
+  }
+
+  @Override
+  public List<LookupResult> lookup(CharSequence key, boolean onlyMorePopular, int num) {
+    assert num > 0;
+
+    if (onlyMorePopular) {
+      throw new IllegalArgumentException("this suggester only works with onlyMorePopular=false");
+    }
+
+    if (fst == null) {
+      return Collections.emptyList();
+    }
+
+    BytesRef scratch = new BytesRef(key);
+    int prefixLength = scratch.length;
+    Arc<Long> arc = new Arc<Long>();
     
-  private void performDefaultTests(TestReopen test) throws Exception {
-
-    DirectoryReader index1 = test.openReader();
-    DirectoryReader index2 = test.openReader();
-        
-    TestDirectoryReader.assertIndexEquals(index1, index2);
-
-    // verify that reopen() does not return a new reader instance
-    // in case the index has no changes
-    ReaderCouple couple = refreshReader(index2, false);
-    assertTrue(couple.refreshedReader == index2);
+    // match the prefix portion exactly
+    Long prefixOutput = null;
+    try {
+      prefixOutput = lookupPrefix(scratch, arc);
+    } catch (IOException bogus) { throw new RuntimeException(bogus); }
     
-    couple = refreshReader(index2, test, 0, true);
-    index1.close();
-    index1 = couple.newReader;
-
-    DirectoryReader index2_refreshed = couple.refreshedReader;
-    index2.close();
-    
-    // test if refreshed reader and newly opened reader return equal results
-    TestDirectoryReader.assertIndexEquals(index1, index2_refreshed);
-
-    index2_refreshed.close();
-    assertReaderClosed(index2, true);
-    assertReaderClosed(index2_refreshed, true);
-
-    index2 = test.openReader();
-    
-    for (int i = 1; i < 4; i++) {
-      
-      index1.close();
-      couple = refreshReader(index2, test, i, true);
-      // refresh DirectoryReader
-      index2.close();
-      
-      index2 = couple.refreshedReader;
-      index1 = couple.newReader;
-      TestDirectoryReader.assertIndexEquals(index1, index2);
+    if (prefixOutput == null) {
+      return Collections.<LookupResult>emptyList();
     }
     
-    index1.close();
-    index2.close();
-    assertReaderClosed(index1, true);
-    assertReaderClosed(index2, true);
+    List<LookupResult> results = new ArrayList<LookupResult>(num);
+    CharsRef spare = new CharsRef();
+    if (exactFirst && arc.isFinal()) {
+      spare.grow(scratch.length);
+      UnicodeUtil.UTF8toUTF16(scratch, spare);
+      results.add(new LookupResult(spare.toString(), decodeWeight(prefixOutput + arc.nextFinalOutput)));
+      if (--num == 0) {
+        return results; // that was quick
+      }
+    }
+
+    // complete top-N
+    MinResult<Long> completions[] = null;
+    try {
+      completions = Util.shortestPaths(fst, arc, prefixOutput, weightComparator, num, !exactFirst);
+    } catch (IOException bogus) {
+      throw new RuntimeException(bogus);
+    }
+    
+    BytesRef suffix = new BytesRef(8);
+    for (MinResult<Long> completion : completions) {
+      scratch.length = prefixLength;
+      // append suffix
+      Util.toBytesRef(completion.input, suffix);
+      scratch.append(suffix);
+      spare.grow(scratch.length);
+      UnicodeUtil.UTF8toUTF16(scratch, spare);
+      results.add(new LookupResult(spare.toString(), decodeWeight(completion.output)));
+    }
+    return results;
   }
   
-  public void testThreadSafety() throws Exception {
-    final Directory dir = newDirectory();
-    // NOTE: this also controls the number of threads!
-    final int n = _TestUtil.nextInt(random(), 20, 40);
-    IndexWriter writer = new IndexWriter(dir, newIndexWriterConfig(
-        TEST_VERSION_CURRENT, new MockAnalyzer(random())));
-    for (int i = 0; i < n; i++) {
-      writer.addDocument(createDocument(i, 3));
-    }
-    writer.forceMerge(1);
-    writer.close();
-
-    final TestReopen test = new TestReopen() {      
-      @Override
-      protected void modifyIndex(int i) throws IOException {
-       IndexWriter modifier = new IndexWriter(dir, new IndexWriterConfig(
-         TEST_VERSION_CURRENT, new MockAnalyzer(random())));
-       modifier.addDocument(createDocument(n + i, 6));
-       modifier.close();
-      }
-
-      @Override
-      protected DirectoryReader openReader() throws IOException {
-        return DirectoryReader.open(dir);
-      }      
-    };
+  private Long lookupPrefix(BytesRef scratch, Arc<Long> arc) throws /*Bogus*/IOException {
+    assert 0 == fst.outputs.getNoOutput().longValue();
+    long output = 0;
+    BytesReader bytesReader = fst.getBytesReader();
     
-    final List<ReaderCouple> readers = Collections.synchronizedList(new ArrayList<ReaderCouple>());
-    DirectoryReader firstReader = DirectoryReader.open(dir);
-    DirectoryReader reader = firstReader;
+    fst.getFirstArc(arc);
     
-    ReaderThread[] threads = new ReaderThread[n];
-    final Set<DirectoryReader> readersToClose = Collections.synchronizedSet(new HashSet<DirectoryReader>());
-    
-    for (int i = 0; i < n; i++) {
-      if (i % 2 == 0) {
-        DirectoryReader refreshed = DirectoryReader.openIfChanged(reader);
-        if (refreshed != null) {
-          readersToClose.add(reader);
-          reader = refreshed;
-        }
-      }
-      final DirectoryReader r = reader;
-      
-      final int index = i;    
-      
-      ReaderThreadTask task;
-      
-      if (i < 4 || (i >=10 && i < 14) || i > 18) {
-        task = new ReaderThreadTask() {
-          
-          @Override
-          public void run() throws Exception {
-            Random rnd = LuceneTestCase.random();
-            while (!stopped) {
-              if (index % 2 == 0) {
-                // refresh reader synchronized
-                ReaderCouple c = (refreshReader(r, test, index, true));
-                readersToClose.add(c.newReader);
-                readersToClose.add(c.refreshedReader);
-                readers.add(c);
-                // prevent too many readers
-                break;
-              } else {
-                // not synchronized
-                DirectoryReader refreshed = DirectoryReader.openIfChanged(r);
-                if (refreshed == null) {
-                  refreshed = r;
-                }
-                
-                IndexSearcher searcher = newSearcher(refreshed);
-                ScoreDoc[] hits = searcher.search(
-                    new TermQuery(new Term("field1", "a" + rnd.nextInt(refreshed.maxDoc()))),
-                    null, 1000).scoreDocs;
-                if (hits.length > 0) {
-                  searcher.doc(hits[0].doc);
-                }
-                if (refreshed != r) {
-                  refreshed.close();
-                }
-              }
-              synchronized(this) {
-                wait(_TestUtil.nextInt(random(), 1, 100));
-              }
-            }
-          }
-          
-        };
+    byte[] bytes = scratch.bytes;
+    int pos = scratch.offset;
+    int end = pos + scratch.length;
+    while (pos < end) {
+      if (fst.findTargetArc(bytes[pos++] & 0xff, arc, arc, bytesReader) == null) {
+        return null;
       } else {
-        task = new ReaderThreadTask() {
-          @Override
-          public void run() throws Exception {
-            Random rnd = LuceneTestCase.random();
-            while (!stopped) {
-              int numReaders = readers.size();
-              if (numReaders > 0) {
-                ReaderCouple c =  readers.get(rnd.nextInt(numReaders));
-                TestDirectoryReader.assertIndexEquals(c.newReader, c.refreshedReader);
-              }
-              
-              synchronized(this) {
-                wait(_TestUtil.nextInt(random(), 1, 100));
-              }
-            }
-          }
-        };
-      }
-      
-      threads[i] = new ReaderThread(task);
-      threads[i].start();
-    }
-    
-    synchronized(this) {
-      wait(1000);
-    }
-    
-    for (int i = 0; i < n; i++) {
-      if (threads[i] != null) {
-        threads[i].stopThread();
+        output += arc.output.longValue();
       }
     }
     
-    for (int i = 0; i < n; i++) {
-      if (threads[i] != null) {
-        threads[i].join();
-        if (threads[i].error != null) {
-          String msg = "Error occurred in thread " + threads[i].getName() + ":\n" + threads[i].error.getMessage();
-          fail(msg);
-        }
-      }
-      
-    }
-    
-    for (final DirectoryReader readerToClose : readersToClose) {
-      readerToClose.close();
-    }
-    
-    firstReader.close();
-    reader.close();
-    
-    for (final DirectoryReader readerToClose : readersToClose) {
-      assertReaderClosed(readerToClose, true);
-    }
-
-    assertReaderClosed(reader, true);
-    assertReaderClosed(firstReader, true);
-
-    dir.close();
+    return output;
   }
   
-  private static class ReaderCouple {
-    ReaderCouple(DirectoryReader r1, DirectoryReader r2) {
-      newReader = r1;
-      refreshedReader = r2;
+  /**
+   * Returns the weight associated with an input string,
+   * or null if it does not exist.
+   */
+  public Object get(CharSequence key) {
+    if (fst == null) {
+      return null;
     }
-    
-    DirectoryReader newReader;
-    DirectoryReader refreshedReader;
-  }
-  
-  abstract static class ReaderThreadTask {
-    protected volatile boolean stopped;
-    public void stop() {
-      this.stopped = true;
-    }
-    
-    public abstract void run() throws Exception;
-  }
-  
-  private static class ReaderThread extends Thread {
-    ReaderThreadTask task;
-    Throwable error;
-    
-    
-    ReaderThread(ReaderThreadTask task) {
-      this.task = task;
-    }
-    
-    public void stopThread() {
-      this.task.stop();
-    }
-    
-    @Override
-    public void run() {
-      try {
-        this.task.run();
-      } catch (Throwable r) {
-        r.printStackTrace(System.out);
-        this.error = r;
-      }
-    }
-  }
-  
-  private Object createReaderMutex = new Object();
-  
-  private ReaderCouple refreshReader(DirectoryReader reader, boolean hasChanges) throws IOException {
-    return refreshReader(reader, null, -1, hasChanges);
-  }
-  
-  ReaderCouple refreshReader(DirectoryReader reader, TestReopen test, int modify, boolean hasChanges) throws IOException {
-    synchronized (createReaderMutex) {
-      DirectoryReader r = null;
-      if (test != null) {
-        test.modifyIndex(modify);
-        r = test.openReader();
-      }
-      
-      DirectoryReader refreshed = null;
-      try {
-        refreshed = DirectoryReader.openIfChanged(reader);
-        if (refreshed == null) {
-          refreshed = reader;
-        }
-      } finally {
-        if (refreshed == null && r != null) {
-          // Hit exception -- close opened reader
-          r.close();
-        }
-      }
-      
-      if (hasChanges) {
-        if (refreshed == reader) {
-          fail("No new DirectoryReader instance created during refresh.");
-        }
-      } else {
-        if (refreshed != reader) {
-          fail("New DirectoryReader instance created during refresh even though index had no changes.");
-        }
-      }
-      
-      return new ReaderCouple(r, refreshed);
-    }
-  }
-  
-  public static void createIndex(Random random, Directory dir, boolean multiSegment) throws IOException {
-    IndexWriter.unlock(dir);
-    IndexWriter w = new IndexWriter(dir, LuceneTestCase.newIndexWriterConfig(random,
-        TEST_VERSION_CURRENT, new MockAnalyzer(random))
-        .setMergePolicy(new LogDocMergePolicy()));
-    
-    for (int i = 0; i < 100; i++) {
-      w.addDocument(createDocument(i, 4));
-      if (multiSegment && (i % 10) == 0) {
-        w.commit();
-      }
-    }
-    
-    if (!multiSegment) {
-      w.forceMerge(1);
-    }
-    
-    w.close();
-
-    DirectoryReader r = DirectoryReader.open(dir);
-    if (multiSegment) {
-      assertTrue(r.leaves().size() > 1);
+    Arc<Long> arc = new Arc<Long>();
+    Long result = null;
+    try {
+      result = lookupPrefix(new BytesRef(key), arc);
+    } catch (IOException bogus) { throw new RuntimeException(bogus); }
+    if (result == null || !arc.isFinal()) {
+      return null;
     } else {
-      assertTrue(r.leaves().size() == 1);
+      return Integer.valueOf(decodeWeight(result + arc.nextFinalOutput));
     }
-    r.close();
   }
-
-  public static Document createDocument(int n, int numFields) {
-    StringBuilder sb = new StringBuilder();
-    Document doc = new Document();
-    sb.append("a");
-    sb.append(n);
-    FieldType customType2 = new FieldType(TextField.TYPE_STORED);
-    customType2.setTokenized(false);
-    customType2.setOmitNorms(true);
-    FieldType customType3 = new FieldType();
-    customType3.setStored(true);
-    doc.add(new TextField("field1", sb.toString(), Field.Store.YES));
-    doc.add(new Field("fielda", sb.toString(), customType2));
-    doc.add(new Field("fieldb", sb.toString(), customType3));
-    sb.append(" b");
-    sb.append(n);
-    for (int i = 1; i < numFields; i++) {
-      doc.add(new TextField("field" + (i+1), sb.toString(), Field.Store.YES));
-    }
-    return doc;
-  }
-
-  static void modifyIndex(int i, Directory dir) throws IOException {
-    switch (i) {
-      case 0: {
-        if (VERBOSE) {
-          System.out.println("TEST: modify index");
-        }
-        IndexWriter w = new IndexWriter(dir, new IndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())));
-        w.deleteDocuments(new Term("field2", "a11"));
-        w.deleteDocuments(new Term("field2", "b30"));
-        w.close();
-        break;
-      }
-      case 1: {
-        IndexWriter w = new IndexWriter(dir, new IndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())));
-        w.forceMerge(1);
-        w.close();
-        break;
-      }
-      case 2: {
-        IndexWriter w = new IndexWriter(dir, new IndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())));
-        w.addDocument(createDocument(101, 4));
-        w.forceMerge(1);
-        w.addDocument(createDocument(102, 4));
-        w.addDocument(createDocument(103, 4));
-        w.close();
-        break;
-      }
-      case 3: {
-        IndexWriter w = new IndexWriter(dir, new IndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())));
-        w.addDocument(createDocument(101, 4));
-        w.close();
-        break;
-      }
-    }
-  }  
   
-  static void assertReaderClosed(IndexReader reader, boolean checkSubReaders) {
-    assertEquals(0, reader.getRefCount());
+  /** cost -> weight */
+  private static int decodeWeight(long encoded) {
+    return (int)(Integer.MAX_VALUE - encoded);
+  }
+  
+  /** weight -> cost */
+  private static int encodeWeight(long value) {
+    if (value < 0 || value > Integer.MAX_VALUE) {
+      throw new UnsupportedOperationException("cannot encode value: " + value);
+    }
+    return Integer.MAX_VALUE - (int)value;
+  }
+  
+  private final class WFSTTermFreqIteratorWrapper extends SortedTermFreqIteratorWrapper {
+
+    WFSTTermFreqIteratorWrapper(TermFreqIterator source) throws IOException {
+      super(source);
+    }
+
+    @Override
+    protected void encode(ByteSequencesWriter writer, ByteArrayDataOutput output, byte[] buffer, BytesRef spare, long weight) throws IOException {
+      if (spare.length + 4 >= buffer.length) {
+        buffer = ArrayUtil.grow(buffer, spare.length + 4);
+      }
+      output.reset(buffer);
+      output.writeBytes(spare.bytes, spare.offset, spare.length);
+      output.writeInt(encodeWeight(weight));
+      writer.write(buffer, 0, output.getPosition());
+    }
     
-    if (checkSubReaders && reader instanceof CompositeReader) {
-      // we cannot use reader context here, as reader is
-      // already closed and calling getTopReaderContext() throws AlreadyClosed!
-      List<? extends IndexReader> subReaders = ((CompositeReader) reader).getSequentialSubReaders();
-      for (final IndexReader r : subReaders) {
-        assertReaderClosed(r, checkSubReaders);
-      }
+    @Override
+    protected long decode(BytesRef scratch, ByteArrayDataInput tmpInput) {
+      scratch.length -= 4; // int
+      // skip suggestion:
+      tmpInput.reset(scratch.bytes, scratch.offset+scratch.length, 4);
+      return tmpInput.readInt();
     }
-  }
-
-  abstract static class TestReopen {
-    protected abstract DirectoryReader openReader() throws IOException;
-    protected abstract void modifyIndex(int i) throws IOException;
   }
   
-  static class KeepAllCommits implements IndexDeletionPolicy {
+  static final Comparator<Long> weightComparator = new Comparator<Long> () {
     @Override
-    public void onInit(List<? extends IndexCommit> commits) {
-    }
-    @Override
-    public void onCommit(List<? extends IndexCommit> commits) {
-    }
-  }
-
-  public void testReopenOnCommit() throws Throwable {
-    Directory dir = newDirectory();
-    IndexWriter writer = new IndexWriter(
-        dir,
-        newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())).
-            setIndexDeletionPolicy(new KeepAllCommits()).
-            setMaxBufferedDocs(-1).
-            setMergePolicy(newLogMergePolicy(10))
-    );
-    for(int i=0;i<4;i++) {
-      Document doc = new Document();
-      doc.add(newStringField("id", ""+i, Field.Store.NO));
-      writer.addDocument(doc);
-      Map<String,String> data = new HashMap<String,String>();
-      data.put("index", i+"");
-      writer.setCommitData(data);
-      writer.commit();
-    }
-    for(int i=0;i<4;i++) {
-      writer.deleteDocuments(new Term("id", ""+i));
-      Map<String,String> data = new HashMap<String,String>();
-      data.put("index", (4+i)+"");
-      writer.setCommitData(data);
-      writer.commit();
-    }
-    writer.close();
-
-    DirectoryReader r = DirectoryReader.open(dir);
-    assertEquals(0, r.numDocs());
-
-    Collection<IndexCommit> commits = DirectoryReader.listCommits(dir);
-    for (final IndexCommit commit : commits) {
-      DirectoryReader r2 = DirectoryReader.openIfChanged(r, commit);
-      assertNotNull(r2);
-      assertTrue(r2 != r);
-
-      final Map<String,String> s = commit.getUserData();
-      final int v;
-      if (s.size() == 0) {
-        // First commit created by IW
-        v = -1;
-      } else {
-        v = Integer.parseInt(s.get("index"));
-      }
-      if (v < 4) {
-        assertEquals(1+v, r2.numDocs());
-      } else {
-        assertEquals(7-v, r2.numDocs());
-      }
-      r.close();
-      r = r2;
-    }
-    r.close();
-    dir.close();
-  }
+    public int compare(Long left, Long right) {
+      return left.compareTo(right);
+    }  
+  };
 }

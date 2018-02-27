@@ -1,13 +1,14 @@
-public class SuperColumn implements IColumn, IColumnContainer
+termState.bytesReader = new ByteArrayDataInput();
+
+package org.apache.lucene.index.codecs.standard;
 
 /**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,325 +19,844 @@ public class SuperColumn implements IColumn, IColumnContainer
  * limitations under the License.
  */
 
-package org.apache.cassandra.db;
-
-import java.io.*;
+import java.io.IOException;
 import java.util.Collection;
-import java.util.concurrent.ConcurrentSkipListMap;
-import java.security.MessageDigest;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 
-import org.apache.log4j.Logger;
+import org.apache.lucene.index.DocsAndPositionsEnum;
+import org.apache.lucene.index.DocsEnum;
+import org.apache.lucene.index.FieldInfo;
+import org.apache.lucene.index.IndexFileNames;
+import org.apache.lucene.index.SegmentInfo;
+import org.apache.lucene.index.TermState;
+import org.apache.lucene.index.codecs.BlockTermState;
+import org.apache.lucene.index.codecs.PostingsReaderBase;
+import org.apache.lucene.store.ByteArrayDataInput;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.util.ArrayUtil;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.CodecUtil;
 
-import org.apache.cassandra.io.ICompactSerializer2;
-import org.apache.cassandra.io.util.DataOutputBuffer;
-import org.apache.cassandra.db.marshal.AbstractType;
-import org.apache.cassandra.utils.FBUtilities;
+/** Concrete class that reads the current doc/freq/skip
+ *  postings format. 
+ *  @lucene.experimental */
 
+public class StandardPostingsReader extends PostingsReaderBase {
 
-public final class SuperColumn implements IColumn, IColumnContainer
-{
-	private static Logger logger_ = Logger.getLogger(SuperColumn.class);
+  private final IndexInput freqIn;
+  private final IndexInput proxIn;
 
-    public static SuperColumnSerializer serializer(AbstractType comparator)
-    {
-        return new SuperColumnSerializer(comparator);
-    }
+  int skipInterval;
+  int maxSkipLevels;
+  int skipMinimum;
 
-    private byte[] name_;
-    private ConcurrentSkipListMap<byte[], IColumn> columns_;
-    private AtomicInteger localDeletionTime = new AtomicInteger(Integer.MIN_VALUE);
-	private AtomicLong markedForDeleteAt = new AtomicLong(Long.MIN_VALUE);
+  //private String segment;
 
-    SuperColumn(byte[] name, AbstractType comparator)
-    {
-        this(name, new ConcurrentSkipListMap<byte[], IColumn>(comparator));
-    }
-
-    private SuperColumn(byte[] name, ConcurrentSkipListMap<byte[], IColumn> columns)
-    {
-        assert name != null;
-        assert name.length <= IColumn.MAX_NAME_LENGTH;
-    	name_ = name;
-        columns_ = columns;
-    }
-
-    public AbstractType getComparator()
-    {
-        return (AbstractType)columns_.comparator();
-    }
-
-    public SuperColumn cloneMeShallow()
-    {
-        SuperColumn sc = new SuperColumn(name_, getComparator());
-        sc.markForDeleteAt(localDeletionTime.get(), markedForDeleteAt.get());
-        return sc;
-    }
-
-    public IColumn cloneMe()
-    {
-        SuperColumn sc = new SuperColumn(name_, new ConcurrentSkipListMap<byte[], IColumn>(columns_));
-        sc.markForDeleteAt(localDeletionTime.get(), markedForDeleteAt.get());
-        return sc;
-    }
-
-	public boolean isMarkedForDelete()
-	{
-		return markedForDeleteAt.get() > Long.MIN_VALUE;
-	}
-
-    public byte[] name()
-    {
-    	return name_;
-    }
-
-    public Collection<IColumn> getSubColumns()
-    {
-    	return columns_.values();
-    }
-
-    public IColumn getSubColumn(byte[] columnName)
-    {
-        IColumn column = columns_.get(columnName);
-        assert column == null || column instanceof Column;
-        return column;
-    }
-
-    /**
-     * This calculates the exact size of the sub columns on the fly
-     */
-    public int size()
-    {
-        int size = 0;
-        for (IColumn subColumn : getSubColumns())
-        {
-            size += subColumn.serializedSize();
+  public StandardPostingsReader(Directory dir, SegmentInfo segmentInfo, int readBufferSize, int codecId) throws IOException {
+    freqIn = dir.openInput(IndexFileNames.segmentFileName(segmentInfo.name, codecId, StandardCodec.FREQ_EXTENSION),
+                           readBufferSize);
+    //this.segment = segmentInfo.name;
+    if (segmentInfo.getHasProx()) {
+      boolean success = false;
+      try {
+        proxIn = dir.openInput(IndexFileNames.segmentFileName(segmentInfo.name, codecId, StandardCodec.PROX_EXTENSION),
+                               readBufferSize);
+        success = true;
+      } finally {
+        if (!success) {
+          freqIn.close();
         }
-        return size;
+      }
+    } else {
+      proxIn = null;
+    }
+  }
+
+  public static void files(Directory dir, SegmentInfo segmentInfo, int id, Collection<String> files) throws IOException {
+    files.add(IndexFileNames.segmentFileName(segmentInfo.name, id, StandardCodec.FREQ_EXTENSION));
+    if (segmentInfo.getHasProx()) {
+      files.add(IndexFileNames.segmentFileName(segmentInfo.name, id, StandardCodec.PROX_EXTENSION));
+    }
+  }
+
+  @Override
+  public void init(IndexInput termsIn) throws IOException {
+
+    // Make sure we are talking to the matching past writer
+    CodecUtil.checkHeader(termsIn, StandardPostingsWriter.CODEC,
+      StandardPostingsWriter.VERSION_START, StandardPostingsWriter.VERSION_START);
+
+    skipInterval = termsIn.readInt();
+    maxSkipLevels = termsIn.readInt();
+    skipMinimum = termsIn.readInt();
+  }
+
+  // Must keep final because we do non-standard clone
+  private final static class StandardTermState extends BlockTermState {
+    long freqOffset;
+    long proxOffset;
+    int skipOffset;
+
+    // Only used by the "primary" TermState -- clones don't
+    // copy this (basically they are "transient"):
+    ByteArrayDataInput bytesReader;
+    byte[] bytes;
+
+    @Override
+    public Object clone() {
+      StandardTermState other = new StandardTermState();
+      other.copyFrom(this);
+      return other;
     }
 
-    /**
-     * This returns the size of the super-column when serialized.
-     * @see org.apache.cassandra.db.IColumn#serializedSize()
-    */
-    public int serializedSize()
-    {
-    	/*
-    	 * We need to keep the way we are calculating the column size in sync with the
-    	 * way we are calculating the size for the column family serializer.
-    	 */
-    	return IColumn.UtfPrefix_ + name_.length + DBConstants.intSize_ + DBConstants.longSize_ + DBConstants.intSize_ + size();
+    @Override
+    public void copyFrom(TermState _other) {
+      super.copyFrom(_other);
+      StandardTermState other = (StandardTermState) _other;
+      freqOffset = other.freqOffset;
+      proxOffset = other.proxOffset;
+      skipOffset = other.skipOffset;
+
+      // Do not copy bytes, bytesReader (else TermState is
+      // very heavy, ie drags around the entire block's
+      // byte[]).  On seek back, if next() is in fact used
+      // (rare!), they will be re-read from disk.
     }
 
-    public void remove(byte[] columnName)
-    {
-    	columns_.remove(columnName);
+    @Override
+    public String toString() {
+      return super.toString() + " freqFP=" + freqOffset + " proxFP=" + proxOffset + " skipOffset=" + skipOffset;
+    }
+  }
+
+  @Override
+  public BlockTermState newTermState() {
+    return new StandardTermState();
+  }
+
+  @Override
+  public void close() throws IOException {
+    try {
+      if (freqIn != null) {
+        freqIn.close();
+      }
+    } finally {
+      if (proxIn != null) {
+        proxIn.close();
+      }
+    }
+  }
+
+  /* Reads but does not decode the byte[] blob holding
+     metadata for the current terms block */
+  @Override
+  public void readTermsBlock(IndexInput termsIn, FieldInfo fieldInfo, BlockTermState _termState) throws IOException {
+    final StandardTermState termState = (StandardTermState) _termState;
+
+    final int len = termsIn.readVInt();
+    //System.out.println("SPR.readTermsBlock termsIn.fp=" + termsIn.getFilePointer());
+    if (termState.bytes == null) {
+      termState.bytes = new byte[ArrayUtil.oversize(len, 1)];
+      termState.bytesReader = new ByteArrayDataInput(null);
+    } else if (termState.bytes.length < len) {
+      termState.bytes = new byte[ArrayUtil.oversize(len, 1)];
     }
 
-    public long timestamp()
-    {
-    	throw new UnsupportedOperationException("This operation is not supported for Super Columns.");
+    termsIn.readBytes(termState.bytes, 0, len);
+    termState.bytesReader.reset(termState.bytes, 0, len);
+  }
+
+  @Override
+  public void nextTerm(FieldInfo fieldInfo, BlockTermState _termState)
+    throws IOException {
+    final StandardTermState termState = (StandardTermState) _termState;
+    //System.out.println("StandardR.nextTerm seg=" + segment);
+    final boolean isFirstTerm = termState.termCount == 0;
+
+    if (isFirstTerm) {
+      termState.freqOffset = termState.bytesReader.readVLong();
+    } else {
+      termState.freqOffset += termState.bytesReader.readVLong();
+    }
+    //System.out.println("  dF=" + termState.docFreq);
+    //System.out.println("  freqFP=" + termState.freqOffset);
+    assert termState.freqOffset < freqIn.length();
+
+    if (termState.docFreq >= skipMinimum) {
+      termState.skipOffset = termState.bytesReader.readVInt();
+      //System.out.println("  skipOffset=" + termState.skipOffset + " vs freqIn.length=" + freqIn.length());
+      assert termState.freqOffset + termState.skipOffset < freqIn.length();
+    } else {
+      // undefined
     }
 
-    public long mostRecentLiveChangeAt()
-    {
-        long max = Long.MIN_VALUE;
-        for (IColumn column : columns_.values())
-        {
-            if (!column.isMarkedForDelete() && column.timestamp() > max)
-            {
-                max = column.timestamp();
-            }
+    if (!fieldInfo.omitTermFreqAndPositions) {
+      if (isFirstTerm) {
+        termState.proxOffset = termState.bytesReader.readVLong();
+      } else {
+        termState.proxOffset += termState.bytesReader.readVLong();
+      }
+      //System.out.println("  proxFP=" + termState.proxOffset);
+    }
+  }
+    
+  @Override
+  public DocsEnum docs(FieldInfo fieldInfo, BlockTermState termState, Bits skipDocs, DocsEnum reuse) throws IOException {
+    SegmentDocsEnum docsEnum;
+    if (reuse == null || !(reuse instanceof SegmentDocsEnum)) {
+      docsEnum = new SegmentDocsEnum(freqIn);
+    } else {
+      docsEnum = (SegmentDocsEnum) reuse;
+      if (docsEnum.startFreqIn != freqIn) {
+        // If you are using ParellelReader, and pass in a
+        // reused DocsEnum, it could have come from another
+        // reader also using standard codec
+        docsEnum = new SegmentDocsEnum(freqIn);
+      }
+    }
+    return docsEnum.reset(fieldInfo, (StandardTermState) termState, skipDocs);
+  }
+
+  @Override
+  public DocsAndPositionsEnum docsAndPositions(FieldInfo fieldInfo, BlockTermState termState, Bits skipDocs, DocsAndPositionsEnum reuse) throws IOException {
+    if (fieldInfo.omitTermFreqAndPositions) {
+      return null;
+    }
+    
+    // TODO: refactor
+    if (fieldInfo.storePayloads) {
+      SegmentDocsAndPositionsAndPayloadsEnum docsEnum;
+      if (reuse == null || !(reuse instanceof SegmentDocsAndPositionsAndPayloadsEnum)) {
+        docsEnum = new SegmentDocsAndPositionsAndPayloadsEnum(freqIn, proxIn);
+      } else {
+        docsEnum = (SegmentDocsAndPositionsAndPayloadsEnum) reuse;
+        if (docsEnum.startFreqIn != freqIn) {
+          // If you are using ParellelReader, and pass in a
+          // reused DocsEnum, it could have come from another
+          // reader also using standard codec
+          docsEnum = new SegmentDocsAndPositionsAndPayloadsEnum(freqIn, proxIn);
         }
-        return max;
-    }
-
-    public byte[] value()
-    {
-    	throw new UnsupportedOperationException("This operation is not supported for Super Columns.");
-    }
-
-    public void addColumn(IColumn column)
-    {
-    	assert column instanceof Column : "A super column can only contain simple columns";
-        byte[] name = column.name();
-        IColumn oldColumn = columns_.putIfAbsent(name, column);
-    	if (oldColumn != null)
-        {
-    		while (((Column)oldColumn).comparePriority((Column)column) <= 0)
-            {
-    			if (columns_.replace(name, oldColumn, column))
-                    break;
-                oldColumn = columns_.get(name);
-            }
-    	}
-    }
-
-    /*
-     * Go through each sub column if it exists then as it to resolve itself
-     * if the column does not exist then create it.
-     */
-    public void putColumn(IColumn column)
-    {
-        assert column instanceof SuperColumn;
-
-        for (IColumn subColumn : column.getSubColumns())
-        {
-        	addColumn(subColumn);
+      }
+      return docsEnum.reset(fieldInfo, (StandardTermState) termState, skipDocs);
+    } else {
+      SegmentDocsAndPositionsEnum docsEnum;
+      if (reuse == null || !(reuse instanceof SegmentDocsAndPositionsEnum)) {
+        docsEnum = new SegmentDocsAndPositionsEnum(freqIn, proxIn);
+      } else {
+        docsEnum = (SegmentDocsAndPositionsEnum) reuse;
+        if (docsEnum.startFreqIn != freqIn) {
+          // If you are using ParellelReader, and pass in a
+          // reused DocsEnum, it could have come from another
+          // reader also using standard codec
+          docsEnum = new SegmentDocsAndPositionsEnum(freqIn, proxIn);
         }
-        FBUtilities.atomicSetMax(localDeletionTime, column.getLocalDeletionTime()); // do this first so we won't have a column that's "deleted" but has no local deletion time
-        FBUtilities.atomicSetMax(markedForDeleteAt, column.getMarkedForDeleteAt());
+      }
+      return docsEnum.reset(fieldInfo, (StandardTermState) termState, skipDocs);
+    }
+  }
+
+  // Decodes only docs
+  private class SegmentDocsEnum extends DocsEnum {
+    final IndexInput freqIn;
+    final IndexInput startFreqIn;
+
+    boolean omitTF;                               // does current field omit term freq?
+    boolean storePayloads;                        // does current field store payloads?
+
+    int limit;                                    // number of docs in this posting
+    int ord;                                      // how many docs we've read
+    int doc;                                      // doc we last read
+    int freq;                                     // freq we last read
+
+    Bits skipDocs;
+
+    long freqOffset;
+    int skipOffset;
+
+    boolean skipped;
+    DefaultSkipListReader skipper;
+
+    public SegmentDocsEnum(IndexInput freqIn) throws IOException {
+      startFreqIn = freqIn;
+      this.freqIn = (IndexInput) freqIn.clone();
     }
 
-    public int getObjectCount()
-    {
-    	return 1 + columns_.size();
+    public SegmentDocsEnum reset(FieldInfo fieldInfo, StandardTermState termState, Bits skipDocs) throws IOException {
+      omitTF = fieldInfo.omitTermFreqAndPositions;
+      if (omitTF) {
+        freq = 1;
+      }
+      storePayloads = fieldInfo.storePayloads;
+      this.skipDocs = skipDocs;
+      freqOffset = termState.freqOffset;
+      skipOffset = termState.skipOffset;
+
+      // TODO: for full enum case (eg segment merging) this
+      // seek is unnecessary; maybe we can avoid in such
+      // cases
+      freqIn.seek(termState.freqOffset);
+      limit = termState.docFreq;
+      assert limit > 0;
+      ord = 0;
+      doc = 0;
+      //System.out.println("  sde limit=" + limit + " freqFP=" + freqOffset);
+
+      skipped = false;
+
+      return this;
     }
 
-    public long getMarkedForDeleteAt()
-    {
-        return markedForDeleteAt.get();
-    }
-
-    public IColumn diff(IColumn columnNew)
-    {
-    	IColumn columnDiff = new SuperColumn(columnNew.name(), ((SuperColumn)columnNew).getComparator());
-        if (columnNew.getMarkedForDeleteAt() > getMarkedForDeleteAt())
-        {
-            ((SuperColumn)columnDiff).markForDeleteAt(columnNew.getLocalDeletionTime(), columnNew.getMarkedForDeleteAt());
-        }
-
-        // (don't need to worry about columnNew containing subColumns that are shadowed by
-        // the delete tombstone, since columnNew was generated by CF.resolve, which
-        // takes care of those for us.)
-        for (IColumn subColumn : columnNew.getSubColumns())
-        {
-        	IColumn columnInternal = columns_.get(subColumn.name());
-        	if(columnInternal == null )
-        	{
-        		columnDiff.addColumn(subColumn);
-        	}
-        	else
-        	{
-            	IColumn subColumnDiff = columnInternal.diff(subColumn);
-        		if(subColumnDiff != null)
-        		{
-            		columnDiff.addColumn(subColumnDiff);
-        		}
-        	}
-        }
-
-        if (!columnDiff.getSubColumns().isEmpty() || columnNew.isMarkedForDelete())
-        	return columnDiff;
-        else
-        	return null;
-    }
-
-    public void updateDigest(MessageDigest digest)
-    {
-        assert name_ != null;
-        digest.update(name_);
-        DataOutputBuffer buffer = new DataOutputBuffer();
-        try
-        {
-            buffer.writeLong(markedForDeleteAt.get());
-        }
-        catch (IOException e)
-        {
-            throw new RuntimeException(e);
-        }
-        digest.update(buffer.getData(), 0, buffer.getLength());
-        for (IColumn column : columns_.values())
-        {
-            column.updateDigest(digest);
-        }
-    }
-
-    public String getString(AbstractType comparator)
-    {
-    	StringBuilder sb = new StringBuilder();
-        sb.append("SuperColumn(");
-    	sb.append(comparator.getString(name_));
-
-        if (isMarkedForDelete()) {
-            sb.append(" -delete at ").append(getMarkedForDeleteAt()).append("-");
+    @Override
+    public int nextDoc() throws IOException {
+      while(true) {
+        if (ord == limit) {
+          return doc = NO_MORE_DOCS;
         }
 
-        sb.append(" [");
-        sb.append(getComparator().getColumnsString(columns_.values()));
-        sb.append("])");
+        ord++;
 
-        return sb.toString();
-    }
-
-    public int getLocalDeletionTime()
-    {
-        return localDeletionTime.get();
-    }
-
-    @Deprecated // TODO this is a hack to set initial value outside constructor
-    public void markForDeleteAt(int localDeleteTime, long timestamp)
-    {
-        this.localDeletionTime.set(localDeleteTime);
-        this.markedForDeleteAt.set(timestamp);
-    }
-}
-
-class SuperColumnSerializer implements ICompactSerializer2<IColumn>
-{
-    private AbstractType comparator;
-
-    public SuperColumnSerializer(AbstractType comparator)
-    {
-        this.comparator = comparator;
-    }
-
-    public AbstractType getComparator()
-    {
-        return comparator;
-    }
-
-    public void serialize(IColumn column, DataOutput dos)
-    {
-    	SuperColumn superColumn = (SuperColumn)column;
-        ColumnSerializer.writeName(column.name(), dos);
-        try
-        {
-            dos.writeInt(superColumn.getLocalDeletionTime());
-            dos.writeLong(superColumn.getMarkedForDeleteAt());
-
-            Collection<IColumn> columns = column.getSubColumns();
-            dos.writeInt(columns.size());
-            for (IColumn subColumn : columns)
-            {
-                Column.serializer().serialize(subColumn, dos);
-            }
+        // Decode next doc/freq pair
+        final int code = freqIn.readVInt();
+        if (omitTF) {
+          doc += code;
+        } else {
+          doc += code >>> 1;              // shift off low bit
+          if ((code & 1) != 0) {          // if low bit is set
+            freq = 1;                     // freq is one
+          } else {
+            freq = freqIn.readVInt();     // else read freq
+          }
         }
-        catch (IOException e)
-        {
-            throw new RuntimeException(e);
+
+        if (skipDocs == null || !skipDocs.get(doc)) {
+          break;
         }
+      }
+
+      return doc;
     }
 
-    public IColumn deserialize(DataInput dis) throws IOException
-    {
-        byte[] name = ColumnSerializer.readName(dis);
-        SuperColumn superColumn = new SuperColumn(name, comparator);
-        int localDeleteTime = dis.readInt();
-        if (localDeleteTime != Integer.MIN_VALUE && localDeleteTime <= 0)
-        {
-            throw new IOException("Invalid localDeleteTime read: " + localDeleteTime);
-        }
-        superColumn.markForDeleteAt(localDeleteTime, dis.readLong());
+    @Override
+    public int read() throws IOException {
 
-        /* read the number of columns */
-        int size = dis.readInt();
-        for ( int i = 0; i < size; ++i )
-        {
-            IColumn subColumn = Column.serializer().deserialize(dis);
-            superColumn.addColumn(subColumn);
+      final int[] docs = bulkResult.docs.ints;
+      final int[] freqs = bulkResult.freqs.ints;
+      int i = 0;
+      final int length = docs.length;
+      while (i < length && ord < limit) {
+        ord++;
+        // manually inlined call to next() for speed
+        final int code = freqIn.readVInt();
+        if (omitTF) {
+          doc += code;
+        } else {
+          doc += code >>> 1;              // shift off low bit
+          if ((code & 1) != 0) {          // if low bit is set
+            freq = 1;                     // freq is one
+          } else {
+            freq = freqIn.readVInt();     // else read freq
+          }
         }
-        return superColumn;
+
+        if (skipDocs == null || !skipDocs.get(doc)) {
+          docs[i] = doc;
+          freqs[i] = freq;
+          ++i;
+        }
+      }
+      
+      return i;
     }
+
+    @Override
+    public int docID() {
+      return doc;
+    }
+
+    @Override
+    public int freq() {
+      return freq;
+    }
+
+    @Override
+    public int advance(int target) throws IOException {
+
+      if ((target - skipInterval) >= doc && limit >= skipMinimum) {
+
+        // There are enough docs in the posting to have
+        // skip data, and it isn't too close.
+
+        if (skipper == null) {
+          // This is the first time this enum has ever been used for skipping -- do lazy init
+          skipper = new DefaultSkipListReader((IndexInput) freqIn.clone(), maxSkipLevels, skipInterval);
+        }
+
+        if (!skipped) {
+
+          // This is the first time this posting has
+          // skipped since reset() was called, so now we
+          // load the skip data for this posting
+
+          skipper.init(freqOffset + skipOffset,
+                       freqOffset, 0,
+                       limit, storePayloads);
+
+          skipped = true;
+        }
+
+        final int newOrd = skipper.skipTo(target); 
+
+        if (newOrd > ord) {
+          // Skipper moved
+
+          ord = newOrd;
+          doc = skipper.getDoc();
+          freqIn.seek(skipper.getFreqPointer());
+        }
+      }
+        
+      // scan for the rest:
+      do {
+        nextDoc();
+      } while (target > doc);
+
+      return doc;
+    }
+  }
+
+  // Decodes docs & positions. payloads are not present.
+  private class SegmentDocsAndPositionsEnum extends DocsAndPositionsEnum {
+    final IndexInput startFreqIn;
+    private final IndexInput freqIn;
+    private final IndexInput proxIn;
+
+    int limit;                                    // number of docs in this posting
+    int ord;                                      // how many docs we've read
+    int doc;                                      // doc we last read
+    int freq;                                     // freq we last read
+    int position;
+
+    Bits skipDocs;
+
+    long freqOffset;
+    int skipOffset;
+    long proxOffset;
+
+    int posPendingCount;
+
+    boolean skipped;
+    DefaultSkipListReader skipper;
+    private long lazyProxPointer;
+
+    public SegmentDocsAndPositionsEnum(IndexInput freqIn, IndexInput proxIn) throws IOException {
+      startFreqIn = freqIn;
+      this.freqIn = (IndexInput) freqIn.clone();
+      this.proxIn = (IndexInput) proxIn.clone();
+    }
+
+    public SegmentDocsAndPositionsEnum reset(FieldInfo fieldInfo, StandardTermState termState, Bits skipDocs) throws IOException {
+      assert !fieldInfo.omitTermFreqAndPositions;
+      assert !fieldInfo.storePayloads;
+
+      this.skipDocs = skipDocs;
+
+      // TODO: for full enum case (eg segment merging) this
+      // seek is unnecessary; maybe we can avoid in such
+      // cases
+      freqIn.seek(termState.freqOffset);
+      lazyProxPointer = termState.proxOffset;
+
+      limit = termState.docFreq;
+      assert limit > 0;
+
+      ord = 0;
+      doc = 0;
+      position = 0;
+
+      skipped = false;
+      posPendingCount = 0;
+
+      freqOffset = termState.freqOffset;
+      proxOffset = termState.proxOffset;
+      skipOffset = termState.skipOffset;
+      //System.out.println("StandardR.D&PE reset seg=" + segment + " limit=" + limit + " freqFP=" + freqOffset + " proxFP=" + proxOffset);
+
+      return this;
+    }
+
+    @Override
+    public int nextDoc() throws IOException {
+      while(true) {
+        if (ord == limit) {
+          //System.out.println("StandardR.D&PE seg=" + segment + " nextDoc return doc=END");
+          return doc = NO_MORE_DOCS;
+        }
+
+        ord++;
+
+        // Decode next doc/freq pair
+        final int code = freqIn.readVInt();
+
+        doc += code >>> 1;              // shift off low bit
+        if ((code & 1) != 0) {          // if low bit is set
+          freq = 1;                     // freq is one
+        } else {
+          freq = freqIn.readVInt();     // else read freq
+        }
+        posPendingCount += freq;
+
+        if (skipDocs == null || !skipDocs.get(doc)) {
+          break;
+        }
+      }
+
+      position = 0;
+
+      //System.out.println("StandardR.D&PE nextDoc seg=" + segment + " return doc=" + doc);
+      return doc;
+    }
+
+    @Override
+    public int docID() {
+      return doc;
+    }
+
+    @Override
+    public int freq() {
+      return freq;
+    }
+
+    @Override
+    public int advance(int target) throws IOException {
+
+      //System.out.println("StandardR.D&PE advance target=" + target);
+
+      if ((target - skipInterval) >= doc && limit >= skipMinimum) {
+
+        // There are enough docs in the posting to have
+        // skip data, and it isn't too close
+
+        if (skipper == null) {
+          // This is the first time this enum has ever been used for skipping -- do lazy init
+          skipper = new DefaultSkipListReader((IndexInput) freqIn.clone(), maxSkipLevels, skipInterval);
+        }
+
+        if (!skipped) {
+
+          // This is the first time this posting has
+          // skipped, since reset() was called, so now we
+          // load the skip data for this posting
+
+          skipper.init(freqOffset+skipOffset,
+                       freqOffset, proxOffset,
+                       limit, false);
+
+          skipped = true;
+        }
+
+        final int newOrd = skipper.skipTo(target); 
+
+        if (newOrd > ord) {
+          // Skipper moved
+          ord = newOrd;
+          doc = skipper.getDoc();
+          freqIn.seek(skipper.getFreqPointer());
+          lazyProxPointer = skipper.getProxPointer();
+          posPendingCount = 0;
+          position = 0;
+        }
+      }
+        
+      // Now, linear scan for the rest:
+      do {
+        nextDoc();
+      } while (target > doc);
+
+      return doc;
+    }
+
+    @Override
+    public int nextPosition() throws IOException {
+
+      if (lazyProxPointer != -1) {
+        proxIn.seek(lazyProxPointer);
+        lazyProxPointer = -1;
+      }
+
+      // scan over any docs that were iterated without their positions
+      if (posPendingCount > freq) {
+        position = 0;
+        while(posPendingCount != freq) {
+          if ((proxIn.readByte() & 0x80) == 0) {
+            posPendingCount--;
+          }
+        }
+      }
+
+      position += proxIn.readVInt();
+
+      posPendingCount--;
+
+      assert posPendingCount >= 0: "nextPosition() was called too many times (more than freq() times) posPendingCount=" + posPendingCount;
+
+      return position;
+    }
+
+    /** Returns the payload at this position, or null if no
+     *  payload was indexed. */
+    @Override
+    public BytesRef getPayload() throws IOException {
+      throw new IOException("No payloads exist for this field!");
+    }
+
+    @Override
+    public boolean hasPayload() {
+      return false;
+    }
+  }
+  
+  // Decodes docs & positions & payloads
+  private class SegmentDocsAndPositionsAndPayloadsEnum extends DocsAndPositionsEnum {
+    final IndexInput startFreqIn;
+    private final IndexInput freqIn;
+    private final IndexInput proxIn;
+
+    int limit;                                    // number of docs in this posting
+    int ord;                                      // how many docs we've read
+    int doc;                                      // doc we last read
+    int freq;                                     // freq we last read
+    int position;
+
+    Bits skipDocs;
+
+    long freqOffset;
+    int skipOffset;
+    long proxOffset;
+
+    int posPendingCount;
+    int payloadLength;
+    boolean payloadPending;
+
+    boolean skipped;
+    DefaultSkipListReader skipper;
+    private BytesRef payload;
+    private long lazyProxPointer;
+
+    public SegmentDocsAndPositionsAndPayloadsEnum(IndexInput freqIn, IndexInput proxIn) throws IOException {
+      startFreqIn = freqIn;
+      this.freqIn = (IndexInput) freqIn.clone();
+      this.proxIn = (IndexInput) proxIn.clone();
+    }
+
+    public SegmentDocsAndPositionsAndPayloadsEnum reset(FieldInfo fieldInfo, StandardTermState termState, Bits skipDocs) throws IOException {
+      assert !fieldInfo.omitTermFreqAndPositions;
+      assert fieldInfo.storePayloads;
+      if (payload == null) {
+        payload = new BytesRef();
+        payload.bytes = new byte[1];
+      }
+
+      this.skipDocs = skipDocs;
+
+      // TODO: for full enum case (eg segment merging) this
+      // seek is unnecessary; maybe we can avoid in such
+      // cases
+      freqIn.seek(termState.freqOffset);
+      lazyProxPointer = termState.proxOffset;
+
+      limit = termState.docFreq;
+      ord = 0;
+      doc = 0;
+      position = 0;
+
+      skipped = false;
+      posPendingCount = 0;
+      payloadPending = false;
+
+      freqOffset = termState.freqOffset;
+      proxOffset = termState.proxOffset;
+      skipOffset = termState.skipOffset;
+      //System.out.println("StandardR.D&PE reset seg=" + segment + " limit=" + limit + " freqFP=" + freqOffset + " proxFP=" + proxOffset + " this=" + this);
+
+      return this;
+    }
+
+    @Override
+    public int nextDoc() throws IOException {
+      while(true) {
+        if (ord == limit) {
+          //System.out.println("StandardR.D&PE seg=" + segment + " nextDoc return doc=END");
+          return doc = NO_MORE_DOCS;
+        }
+
+        ord++;
+
+        // Decode next doc/freq pair
+        final int code = freqIn.readVInt();
+
+        doc += code >>> 1;              // shift off low bit
+        if ((code & 1) != 0) {          // if low bit is set
+          freq = 1;                     // freq is one
+        } else {
+          freq = freqIn.readVInt();     // else read freq
+        }
+        posPendingCount += freq;
+
+        if (skipDocs == null || !skipDocs.get(doc)) {
+          break;
+        }
+      }
+
+      position = 0;
+
+      //System.out.println("StandardR.D&PE nextDoc seg=" + segment + " return doc=" + doc);
+      return doc;
+    }
+
+    @Override
+    public int docID() {
+      return doc;
+    }
+
+    @Override
+    public int freq() {
+      return freq;
+    }
+
+    @Override
+    public int advance(int target) throws IOException {
+
+      //System.out.println("StandardR.D&PE advance seg=" + segment + " target=" + target + " this=" + this);
+
+      if ((target - skipInterval) >= doc && limit >= skipMinimum) {
+
+        // There are enough docs in the posting to have
+        // skip data, and it isn't too close
+
+        if (skipper == null) {
+          // This is the first time this enum has ever been used for skipping -- do lazy init
+          skipper = new DefaultSkipListReader((IndexInput) freqIn.clone(), maxSkipLevels, skipInterval);
+        }
+
+        if (!skipped) {
+
+          // This is the first time this posting has
+          // skipped, since reset() was called, so now we
+          // load the skip data for this posting
+          //System.out.println("  init skipper freqOffset=" + freqOffset + " skipOffset=" + skipOffset + " vs len=" + freqIn.length());
+          skipper.init(freqOffset+skipOffset,
+                       freqOffset, proxOffset,
+                       limit, true);
+
+          skipped = true;
+        }
+
+        final int newOrd = skipper.skipTo(target); 
+
+        if (newOrd > ord) {
+          // Skipper moved
+          ord = newOrd;
+          doc = skipper.getDoc();
+          freqIn.seek(skipper.getFreqPointer());
+          lazyProxPointer = skipper.getProxPointer();
+          posPendingCount = 0;
+          position = 0;
+          payloadPending = false;
+          payloadLength = skipper.getPayloadLength();
+        }
+      }
+        
+      // Now, linear scan for the rest:
+      do {
+        nextDoc();
+      } while (target > doc);
+
+      return doc;
+    }
+
+    @Override
+    public int nextPosition() throws IOException {
+
+      if (lazyProxPointer != -1) {
+        proxIn.seek(lazyProxPointer);
+        lazyProxPointer = -1;
+      }
+      
+      if (payloadPending && payloadLength > 0) {
+        // payload of last position as never retrieved -- skip it
+        proxIn.seek(proxIn.getFilePointer() + payloadLength);
+        payloadPending = false;
+      }
+
+      // scan over any docs that were iterated without their positions
+      while(posPendingCount > freq) {
+
+        final int code = proxIn.readVInt();
+
+        if ((code & 1) != 0) {
+          // new payload length
+          payloadLength = proxIn.readVInt();
+          assert payloadLength >= 0;
+        }
+        
+        assert payloadLength != -1;
+        proxIn.seek(proxIn.getFilePointer() + payloadLength);
+
+        posPendingCount--;
+        position = 0;
+        payloadPending = false;
+        //System.out.println("StandardR.D&PE skipPos");
+      }
+
+      // read next position
+      if (payloadPending && payloadLength > 0) {
+        // payload wasn't retrieved for last position
+        proxIn.seek(proxIn.getFilePointer()+payloadLength);
+      }
+
+      final int code = proxIn.readVInt();
+      if ((code & 1) != 0) {
+        // new payload length
+        payloadLength = proxIn.readVInt();
+        assert payloadLength >= 0;
+      }
+      assert payloadLength != -1;
+          
+      payloadPending = true;
+      position += code >>> 1;
+
+      posPendingCount--;
+
+      assert posPendingCount >= 0: "nextPosition() was called too many times (more than freq() times) posPendingCount=" + posPendingCount;
+
+      //System.out.println("StandardR.D&PE nextPos   return pos=" + position);
+      return position;
+    }
+
+    /** Returns the payload at this position, or null if no
+     *  payload was indexed. */
+    @Override
+    public BytesRef getPayload() throws IOException {
+      assert lazyProxPointer == -1;
+      assert posPendingCount < freq;
+      if (!payloadPending) {
+        throw new IOException("Either no payload exists at this term position or an attempt was made to load it more than once.");
+      }
+      if (payloadLength > payload.bytes.length) {
+        payload.grow(payloadLength);
+      }
+
+      proxIn.readBytes(payload.bytes, 0, payloadLength);
+      payload.length = payloadLength;
+      payloadPending = false;
+
+      return payload;
+    }
+
+    @Override
+    public boolean hasPayload() {
+      return payloadPending && payloadLength > 0;
+    }
+  }
 }

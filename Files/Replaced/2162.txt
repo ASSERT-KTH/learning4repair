@@ -1,6 +1,6 @@
-handleResponse(OverseerCollectionProcessor.DELETEALIAS, m, rsp);
+false);
 
-package org.apache.solr.handler.admin;
+package org.apache.lucene.index;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,388 +19,583 @@ package org.apache.solr.handler.admin;
  * limitations under the License.
  */
 
-import org.apache.solr.client.solrj.SolrResponse;
-import org.apache.solr.client.solrj.SolrServerException;
-import org.apache.solr.client.solrj.impl.HttpSolrServer;
-import org.apache.solr.client.solrj.request.CoreAdminRequest;
-import org.apache.solr.client.solrj.request.CoreAdminRequest.RequestSyncShard;
-import org.apache.solr.cloud.DistributedQueue.QueueEvent;
-import org.apache.solr.cloud.Overseer;
-import org.apache.solr.cloud.OverseerCollectionProcessor;
-import org.apache.solr.common.SolrException;
-import org.apache.solr.common.SolrException.ErrorCode;
-import org.apache.solr.common.cloud.ClusterState;
-import org.apache.solr.common.cloud.ImplicitDocRouter;
-import org.apache.solr.common.cloud.ZkCoreNodeProps;
-import org.apache.solr.common.cloud.ZkNodeProps;
-import org.apache.solr.common.cloud.ZkStateReader;
-import org.apache.solr.common.params.CollectionParams.CollectionAction;
-import org.apache.solr.common.params.CoreAdminParams;
-import org.apache.solr.common.params.ModifiableSolrParams;
-import org.apache.solr.common.params.SolrParams;
-import org.apache.solr.common.util.NamedList;
-import org.apache.solr.common.util.SimpleOrderedMap;
-import org.apache.solr.core.CoreContainer;
-import org.apache.solr.handler.RequestHandlerBase;
-import org.apache.solr.request.SolrQueryRequest;
-import org.apache.solr.response.SolrQueryResponse;
-import org.apache.zookeeper.KeeperException;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
-import static org.apache.solr.cloud.Overseer.QUEUE_OPERATION;
-import static org.apache.solr.cloud.OverseerCollectionProcessor.COLL_CONF;
-import static org.apache.solr.cloud.OverseerCollectionProcessor.CREATESHARD;
-import static org.apache.solr.cloud.OverseerCollectionProcessor.CREATE_NODE_SET;
-import static org.apache.solr.cloud.OverseerCollectionProcessor.MAX_SHARDS_PER_NODE;
-import static org.apache.solr.cloud.OverseerCollectionProcessor.NUM_SLICES;
-import static org.apache.solr.cloud.OverseerCollectionProcessor.REPLICATION_FACTOR;
-import static org.apache.solr.cloud.OverseerCollectionProcessor.ROUTER;
-import static org.apache.solr.cloud.OverseerCollectionProcessor.SHARDS_PROP;
-import static org.apache.solr.common.cloud.ZkNodeProps.makeMap;
-import static org.apache.solr.common.cloud.ZkStateReader.COLLECTION_PROP;
-import static org.apache.solr.common.cloud.ZkStateReader.SHARD_ID_PROP;
+import org.apache.lucene.analysis.MockAnalyzer;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.Field;
+import org.apache.lucene.document.FieldType;
+import org.apache.lucene.document.TextField;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.store.AlreadyClosedException;
+import org.apache.lucene.store.BaseDirectoryWrapper;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.MockDirectoryWrapper;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.LineFileDocs;
+import org.apache.lucene.util.LuceneTestCase.SuppressCodecs;
+import org.apache.lucene.util.LuceneTestCase;
+import org.apache.lucene.util.ThreadInterruptedException;
+import org.apache.lucene.util._TestUtil;
+import org.apache.lucene.util.LuceneTestCase.Slow;
 
-public class CollectionsHandler extends RequestHandlerBase {
-  protected static Logger log = LoggerFactory.getLogger(CollectionsHandler.class);
-  protected final CoreContainer coreContainer;
+/**
+ * MultiThreaded IndexWriter tests
+ */
+@SuppressCodecs("Lucene3x")
+@Slow
+public class TestIndexWriterWithThreads extends LuceneTestCase {
 
-  public CollectionsHandler() {
-    super();
-    // Unlike most request handlers, CoreContainer initialization 
-    // should happen in the constructor...  
-    this.coreContainer = null;
-  }
+  // Used by test cases below
+  private class IndexerThread extends Thread {
 
+    boolean diskFull;
+    Throwable error;
+    AlreadyClosedException ace;
+    IndexWriter writer;
+    boolean noErrors;
+    volatile int addCount;
 
-  /**
-   * Overloaded ctor to inject CoreContainer into the handler.
-   *
-   * @param coreContainer Core Container of the solr webapp installed.
-   */
-  public CollectionsHandler(final CoreContainer coreContainer) {
-    this.coreContainer = coreContainer;
-  }
-
-
-  @Override
-  final public void init(NamedList args) {
-
-  }
-
-  /**
-   * The instance of CoreContainer this handler handles. This should be the CoreContainer instance that created this
-   * handler.
-   *
-   * @return a CoreContainer instance
-   */
-  public CoreContainer getCoreContainer() {
-    return this.coreContainer;
-  }
-
-  @Override
-  public void handleRequestBody(SolrQueryRequest req, SolrQueryResponse rsp) throws Exception {
-    // Make sure the cores is enabled
-    CoreContainer cores = getCoreContainer();
-    if (cores == null) {
-      throw new SolrException(SolrException.ErrorCode.BAD_REQUEST,
-              "Core container instance missing");
+    public IndexerThread(IndexWriter writer, boolean noErrors) {
+      this.writer = writer;
+      this.noErrors = noErrors;
     }
 
-    // Make sure that the core is ZKAware
-    if(!cores.isZooKeeperAware()) {
-      throw new SolrException(ErrorCode.BAD_REQUEST,
-          "Solr instance is not running in SolrCloud mode.");
-    }
+    @Override
+    public void run() {
 
-    // Pick the action
-    SolrParams params = req.getParams();
-    CollectionAction action = null;
-    String a = params.get(CoreAdminParams.ACTION);
-    if (a != null) {
-      action = CollectionAction.get(a);
-    }
-    if (action == null) {
-      throw new SolrException(ErrorCode.BAD_REQUEST, "Unknown action: " + a);
-    }
-    
-    switch (action) {
-      case CREATE: {
-        this.handleCreateAction(req, rsp);
-        break;
-      }
-      case DELETE: {
-        this.handleDeleteAction(req, rsp);
-        break;
-      }
-      case RELOAD: {
-        this.handleReloadAction(req, rsp);
-        break;
-      }
-      case SYNCSHARD: {
-        this.handleSyncShardAction(req, rsp);
-        break;
-      }
-      case CREATEALIAS: {
-        this.handleCreateAliasAction(req, rsp);
-        break;
-      }
-      case DELETEALIAS: {
-        this.handleDeleteAliasAction(req, rsp);
-        break;
-      }
-      case SPLITSHARD:  {
-        this.handleSplitShardAction(req, rsp);
-        break;
-      }
-      case DELETESHARD: {
-        this.handleDeleteShardAction(req, rsp);
-        break;
-      }case CREATESHARD: {
-        this.handleCreateShard(req, rsp);
-        break;
-      }
+      final Document doc = new Document();
+      FieldType customType = new FieldType(TextField.TYPE_STORED);
+      customType.setStoreTermVectors(true);
+      customType.setStoreTermVectorPositions(true);
+      customType.setStoreTermVectorOffsets(true);
+      
+      doc.add(newField("field", "aaa bbb ccc ddd eee fff ggg hhh iii jjj", customType));
 
-      default: {
-          throw new RuntimeException("Unknown action: " + action);
-      }
-    }
+      int idUpto = 0;
+      int fullCount = 0;
+      final long stopTime = System.currentTimeMillis() + 200;
 
-    rsp.setHttpCaching(false);
-  }
-  
-  public static long DEFAULT_ZK_TIMEOUT = 60*1000;
-
-  private void handleResponse(String operation, ZkNodeProps m,
-                              SolrQueryResponse rsp) throws KeeperException, InterruptedException {
-    handleResponse(operation, m, rsp, DEFAULT_ZK_TIMEOUT);
-  }
-  
-  private void handleResponse(String operation, ZkNodeProps m,
-      SolrQueryResponse rsp, long timeout) throws KeeperException, InterruptedException {
-    long time = System.currentTimeMillis();
-    QueueEvent event = coreContainer.getZkController()
-        .getOverseerCollectionQueue()
-        .offer(ZkStateReader.toJSON(m), timeout);
-    if (event.getBytes() != null) {
-      SolrResponse response = SolrResponse.deserialize(event.getBytes());
-      rsp.getValues().addAll(response.getResponse());
-      SimpleOrderedMap exp = (SimpleOrderedMap) response.getResponse().get("exception");
-      if (exp != null) {
-        Integer code = (Integer) exp.get("rspCode");
-        rsp.setException(new SolrException(code != null && code != -1 ? ErrorCode.getErrorCode(code) : ErrorCode.SERVER_ERROR, (String)exp.get("msg")));
-      }
-    } else {
-      if (System.currentTimeMillis() - time >= timeout) {
-        throw new SolrException(ErrorCode.SERVER_ERROR, operation
-            + " the collection time out:" + timeout / 1000 + "s");
-      } else if (event.getWatchedEvent() != null) {
-        throw new SolrException(ErrorCode.SERVER_ERROR, operation
-            + " the collection error [Watcher fired on path: "
-            + event.getWatchedEvent().getPath() + " state: "
-            + event.getWatchedEvent().getState() + " type "
-            + event.getWatchedEvent().getType() + "]");
-      } else {
-        throw new SolrException(ErrorCode.SERVER_ERROR, operation
-            + " the collection unkown case");
-      }
-    }
-  }
-  
-  private void handleReloadAction(SolrQueryRequest req, SolrQueryResponse rsp) throws KeeperException, InterruptedException {
-    log.info("Reloading Collection : " + req.getParamString());
-    String name = req.getParams().required().get("name");
-    
-    ZkNodeProps m = new ZkNodeProps(Overseer.QUEUE_OPERATION,
-        OverseerCollectionProcessor.RELOADCOLLECTION, "name", name);
-
-    handleResponse(OverseerCollectionProcessor.RELOADCOLLECTION, m, rsp);
-  }
-  
-  private void handleSyncShardAction(SolrQueryRequest req, SolrQueryResponse rsp) throws KeeperException, InterruptedException, SolrServerException, IOException {
-    log.info("Syncing shard : " + req.getParamString());
-    String collection = req.getParams().required().get("collection");
-    String shard = req.getParams().required().get("shard");
-    
-    ClusterState clusterState = coreContainer.getZkController().getClusterState();
-    
-    ZkNodeProps leaderProps = clusterState.getLeader(collection, shard);
-    ZkCoreNodeProps nodeProps = new ZkCoreNodeProps(leaderProps);
-    
-    HttpSolrServer server = new HttpSolrServer(nodeProps.getBaseUrl());
-    server.setConnectionTimeout(15000);
-    server.setSoTimeout(30000);
-    RequestSyncShard reqSyncShard = new CoreAdminRequest.RequestSyncShard();
-    reqSyncShard.setCollection(collection);
-    reqSyncShard.setShard(shard);
-    reqSyncShard.setCoreName(nodeProps.getCoreName());
-    server.request(reqSyncShard);
-  }
-  
-  private void handleCreateAliasAction(SolrQueryRequest req,
-      SolrQueryResponse rsp) throws Exception {
-    log.info("Create alias action : " + req.getParamString());
-    String name = req.getParams().required().get("name");
-    String collections = req.getParams().required().get("collections");
-    
-    ZkNodeProps m = new ZkNodeProps(Overseer.QUEUE_OPERATION,
-        OverseerCollectionProcessor.CREATEALIAS, "name", name, "collections",
-        collections);
-    
-    handleResponse(OverseerCollectionProcessor.CREATEALIAS, m, rsp);
-  }
-  
-  private void handleDeleteAliasAction(SolrQueryRequest req,
-      SolrQueryResponse rsp) throws Exception {
-    log.info("Delete alias action : " + req.getParamString());
-    String name = req.getParams().required().get("name");
-    
-    ZkNodeProps m = new ZkNodeProps(Overseer.QUEUE_OPERATION,
-        OverseerCollectionProcessor.DELETEALIAS, "name", name);
-    
-    handleResponse(OverseerCollectionProcessor.CREATEALIAS, m, rsp);
-  }
-
-  private void handleDeleteAction(SolrQueryRequest req, SolrQueryResponse rsp) throws KeeperException, InterruptedException {
-    log.info("Deleting Collection : " + req.getParamString());
-    
-    String name = req.getParams().required().get("name");
-    
-    ZkNodeProps m = new ZkNodeProps(Overseer.QUEUE_OPERATION,
-        OverseerCollectionProcessor.DELETECOLLECTION, "name", name);
-
-    handleResponse(OverseerCollectionProcessor.DELETECOLLECTION, m, rsp);
-  }
-
-  // very simple currently, you can pass a template collection, and the new collection is created on
-  // every node the template collection is on
-  // there is a lot more to add - you should also be able to create with an explicit server list
-  // we might also want to think about error handling (add the request to a zk queue and involve overseer?)
-  // as well as specific replicas= options
-  private void handleCreateAction(SolrQueryRequest req,
-      SolrQueryResponse rsp) throws InterruptedException, KeeperException {
-    log.info("Creating Collection : " + req.getParamString());
-    String name = req.getParams().required().get("name");
-    if (name == null) {
-      log.error("Collection name is required to create a new collection");
-      throw new SolrException(ErrorCode.BAD_REQUEST,
-          "Collection name is required to create a new collection");
-    }
-    
-    Map<String,Object> props = new HashMap<String,Object>();
-    props.put(Overseer.QUEUE_OPERATION,
-        OverseerCollectionProcessor.CREATECOLLECTION);
-
-    copyIfNotNull(req.getParams(),props,
-        "name",
-        REPLICATION_FACTOR,
-         COLL_CONF,
-         NUM_SLICES,
-         MAX_SHARDS_PER_NODE,
-        CREATE_NODE_SET ,
-        SHARDS_PROP,
-        "router.");
-
-
-    ZkNodeProps m = new ZkNodeProps(props);
-    handleResponse(OverseerCollectionProcessor.CREATECOLLECTION, m, rsp);
-  }
-
-  private void handleCreateShard(SolrQueryRequest req, SolrQueryResponse rsp) throws KeeperException, InterruptedException {
-    log.info("Create shard: " + req.getParamString());
-    req.getParams().required().check(COLLECTION_PROP, SHARD_ID_PROP);
-    ClusterState clusterState = coreContainer.getZkController().getClusterState();
-    if(!ImplicitDocRouter.NAME.equals( ((Map) clusterState.getCollection(req.getParams().get(COLLECTION_PROP)).get(ROUTER)).get("name") )  )
-      throw new SolrException(ErrorCode.BAD_REQUEST, "shards can be added only to 'implicit' collections" );
-
-    Map<String, Object> map = makeMap(QUEUE_OPERATION, CREATESHARD);
-    copyIfNotNull(req.getParams(),map,COLLECTION_PROP, SHARD_ID_PROP, REPLICATION_FACTOR,CREATE_NODE_SET);
-    ZkNodeProps m = new ZkNodeProps(map);
-    handleResponse(CREATESHARD, m, rsp);
-  }
-
-  private static void copyIfNotNull(SolrParams params, Map<String, Object> props, String... keys) {
-    ArrayList<String> prefixes = new ArrayList<String>(1);
-    if(keys !=null){
-      for (String key : keys) {
-        if(key.endsWith(".")) {
-          prefixes.add(key);
-          continue;
+      do {
+        try {
+          writer.updateDocument(new Term("id", ""+(idUpto++)), doc);
+          addCount++;
+        } catch (IOException ioe) {
+          if (VERBOSE) {
+            System.out.println("TEST: expected exc:");
+            ioe.printStackTrace(System.out);
+          }
+          //System.out.println(Thread.currentThread().getName() + ": hit exc");
+          //ioe.printStackTrace(System.out);
+          if (ioe.getMessage().startsWith("fake disk full at") ||
+              ioe.getMessage().equals("now failing on purpose")) {
+            diskFull = true;
+            try {
+              Thread.sleep(1);
+            } catch (InterruptedException ie) {
+              throw new ThreadInterruptedException(ie);
+            }
+            if (fullCount++ >= 5)
+              break;
+          } else {
+            if (noErrors) {
+              System.out.println(Thread.currentThread().getName() + ": ERROR: unexpected IOException:");
+              ioe.printStackTrace(System.out);
+              error = ioe;
+            }
+            break;
+          }
+        } catch (Throwable t) {
+          //t.printStackTrace(System.out);
+          if (noErrors) {
+            System.out.println(Thread.currentThread().getName() + ": ERROR: unexpected Throwable:");
+            t.printStackTrace(System.out);
+            error = t;
+          }
+          break;
         }
-        String v = params.get(key);
-        if(v != null) props.put(key,v);
-      }
+      } while(System.currentTimeMillis() < stopTime);
     }
-    if(prefixes.isEmpty()) return;
-    Iterator<String> it = params.getParameterNamesIterator();
-    String prefix = null;
-    for(;it.hasNext();){
-      String name = it.next();
-      for (int i = 0; i < prefixes.size(); i++) {
-        if(name.startsWith(prefixes.get(i))){
-          String val = params.get(name);
-          if(val !=null) props.put(name,val);
+  }
+
+  // LUCENE-1130: make sure immediate disk full on creating
+  // an IndexWriter (hit during DW.ThreadState.init()), with
+  // multiple threads, is OK:
+  public void testImmediateDiskFullWithThreads() throws Exception {
+
+    int NUM_THREADS = 3;
+    final int numIterations = TEST_NIGHTLY ? 10 : 3;
+    for(int iter=0;iter<numIterations;iter++) {
+      if (VERBOSE) {
+        System.out.println("\nTEST: iter=" + iter);
+      }
+      MockDirectoryWrapper dir = newMockDirectory();
+      IndexWriter writer = new IndexWriter(
+          dir,
+          newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())).
+              setMaxBufferedDocs(2).
+              setMergeScheduler(new ConcurrentMergeScheduler()).
+              setMergePolicy(newLogMergePolicy(4))
+      );
+      ((ConcurrentMergeScheduler) writer.getConfig().getMergeScheduler()).setSuppressExceptions();
+      dir.setMaxSizeInBytes(4*1024+20*iter);
+
+      IndexerThread[] threads = new IndexerThread[NUM_THREADS];
+
+      for(int i=0;i<NUM_THREADS;i++)
+        threads[i] = new IndexerThread(writer, true);
+
+      for(int i=0;i<NUM_THREADS;i++)
+        threads[i].start();
+
+      for(int i=0;i<NUM_THREADS;i++) {
+        // Without fix for LUCENE-1130: one of the
+        // threads will hang
+        threads[i].join();
+        assertTrue("hit unexpected Throwable", threads[i].error == null);
+      }
+
+      // Make sure once disk space is avail again, we can
+      // cleanly close:
+      dir.setMaxSizeInBytes(0);
+      writer.close(false);
+      dir.close();
+    }
+  }
+
+
+  // LUCENE-1130: make sure we can close() even while
+  // threads are trying to add documents.  Strictly
+  // speaking, this isn't valid us of Lucene's APIs, but we
+  // still want to be robust to this case:
+  public void testCloseWithThreads() throws Exception {
+    int NUM_THREADS = 3;
+    int numIterations = TEST_NIGHTLY ? 7 : 3;
+    for(int iter=0;iter<numIterations;iter++) {
+      Directory dir = newDirectory();
+
+      IndexWriter writer = new IndexWriter(
+          dir,
+          newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())).
+              setMaxBufferedDocs(10).
+              setMergeScheduler(new ConcurrentMergeScheduler()).
+              setMergePolicy(newLogMergePolicy(4))
+      );
+      ((ConcurrentMergeScheduler) writer.getConfig().getMergeScheduler()).setSuppressExceptions();
+
+      IndexerThread[] threads = new IndexerThread[NUM_THREADS];
+
+      for(int i=0;i<NUM_THREADS;i++)
+        threads[i] = new IndexerThread(writer, false);
+
+      for(int i=0;i<NUM_THREADS;i++)
+        threads[i].start();
+
+      boolean done = false;
+      while(!done) {
+        Thread.sleep(100);
+        for(int i=0;i<NUM_THREADS;i++)
+          // only stop when at least one thread has added a doc
+          if (threads[i].addCount > 0) {
+            done = true;
+            break;
+          } else if (!threads[i].isAlive()) {
+            fail("thread failed before indexing a single document");
+          }
+      }
+
+      writer.close(false);
+
+      // Make sure threads that are adding docs are not hung:
+      for(int i=0;i<NUM_THREADS;i++) {
+        // Without fix for LUCENE-1130: one of the
+        // threads will hang
+        threads[i].join();
+        if (threads[i].isAlive())
+          fail("thread seems to be hung");
+      }
+
+      // Quick test to make sure index is not corrupt:
+      IndexReader reader = DirectoryReader.open(dir);
+      DocsEnum tdocs = _TestUtil.docs(random(), reader,
+                                      "field",
+                                      new BytesRef("aaa"),
+                                      MultiFields.getLiveDocs(reader),
+                                      null,
+                                      0);
+      int count = 0;
+      while(tdocs.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
+        count++;
+      }
+      assertTrue(count > 0);
+      reader.close();
+
+      dir.close();
+    }
+  }
+
+  // Runs test, with multiple threads, using the specific
+  // failure to trigger an IOException
+  public void _testMultipleThreadsFailure(MockDirectoryWrapper.Failure failure) throws Exception {
+
+    int NUM_THREADS = 3;
+
+    for(int iter=0;iter<2;iter++) {
+      if (VERBOSE) {
+        System.out.println("TEST: iter=" + iter);
+      }
+      MockDirectoryWrapper dir = newMockDirectory();
+
+      IndexWriter writer = new IndexWriter(
+          dir,
+          newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random())).
+              setMaxBufferedDocs(2).
+              setMergeScheduler(new ConcurrentMergeScheduler()).
+              setMergePolicy(newLogMergePolicy(4))
+      );
+      ((ConcurrentMergeScheduler) writer.getConfig().getMergeScheduler()).setSuppressExceptions();
+
+      IndexerThread[] threads = new IndexerThread[NUM_THREADS];
+
+      for(int i=0;i<NUM_THREADS;i++)
+        threads[i] = new IndexerThread(writer, true);
+
+      for(int i=0;i<NUM_THREADS;i++)
+        threads[i].start();
+
+      Thread.sleep(10);
+
+      dir.failOn(failure);
+      failure.setDoFail();
+
+      for(int i=0;i<NUM_THREADS;i++) {
+        threads[i].join();
+        assertTrue("hit unexpected Throwable", threads[i].error == null);
+      }
+
+      boolean success = false;
+      try {
+        writer.close(false);
+        success = true;
+      } catch (IOException ioe) {
+        failure.clearDoFail();
+        writer.close(false);
+      }
+
+      if (success) {
+        IndexReader reader = DirectoryReader.open(dir);
+        final Bits delDocs = MultiFields.getLiveDocs(reader);
+        for(int j=0;j<reader.maxDoc();j++) {
+          if (delDocs == null || !delDocs.get(j)) {
+            reader.document(j);
+            reader.getTermVectors(j);
+          }
+        }
+        reader.close();
+      }
+
+      dir.close();
+    }
+  }
+
+  // Runs test, with one thread, using the specific failure
+  // to trigger an IOException
+  public void _testSingleThreadFailure(MockDirectoryWrapper.Failure failure) throws IOException {
+    MockDirectoryWrapper dir = newMockDirectory();
+
+    IndexWriter writer = new IndexWriter(dir, newIndexWriterConfig( TEST_VERSION_CURRENT, new MockAnalyzer(random()))
+      .setMaxBufferedDocs(2).setMergeScheduler(new ConcurrentMergeScheduler()));
+    final Document doc = new Document();
+    FieldType customType = new FieldType(TextField.TYPE_STORED);
+    customType.setStoreTermVectors(true);
+    customType.setStoreTermVectorPositions(true);
+    customType.setStoreTermVectorOffsets(true);
+    doc.add(newField("field", "aaa bbb ccc ddd eee fff ggg hhh iii jjj", customType));
+
+    for(int i=0;i<6;i++)
+      writer.addDocument(doc);
+
+    dir.failOn(failure);
+    failure.setDoFail();
+    try {
+      writer.addDocument(doc);
+      writer.addDocument(doc);
+      writer.commit();
+      fail("did not hit exception");
+    } catch (IOException ioe) {
+    }
+    failure.clearDoFail();
+    writer.addDocument(doc);
+    writer.close(false);
+    dir.close();
+  }
+
+  // Throws IOException during FieldsWriter.flushDocument and during DocumentsWriter.abort
+  private static class FailOnlyOnAbortOrFlush extends MockDirectoryWrapper.Failure {
+    private boolean onlyOnce;
+    public FailOnlyOnAbortOrFlush(boolean onlyOnce) {
+      this.onlyOnce = onlyOnce;
+    }
+    @Override
+    public void eval(MockDirectoryWrapper dir)  throws IOException {
+      if (doFail) {
+        StackTraceElement[] trace = new Exception().getStackTrace();
+        boolean sawAbortOrFlushDoc = false;
+        boolean sawClose = false;
+        for (int i = 0; i < trace.length; i++) {
+          if ("abort".equals(trace[i].getMethodName()) ||
+              "finishDocument".equals(trace[i].getMethodName())) {
+            sawAbortOrFlushDoc = true;
+          }
+          if ("close".equals(trace[i].getMethodName())) {
+            sawClose = true;
+          }
+        }
+        if (sawAbortOrFlushDoc && !sawClose) {
+          if (onlyOnce)
+            doFail = false;
+          //System.out.println(Thread.currentThread().getName() + ": now fail");
+          //new Throwable().printStackTrace(System.out);
+          throw new IOException("now failing on purpose");
         }
       }
     }
+  }
 
+
+
+  // LUCENE-1130: make sure initial IOException, and then 2nd
+  // IOException during rollback(), is OK:
+  public void testIOExceptionDuringAbort() throws IOException {
+    _testSingleThreadFailure(new FailOnlyOnAbortOrFlush(false));
+  }
+
+  // LUCENE-1130: make sure initial IOException, and then 2nd
+  // IOException during rollback(), is OK:
+  public void testIOExceptionDuringAbortOnlyOnce() throws IOException {
+    _testSingleThreadFailure(new FailOnlyOnAbortOrFlush(true));
+  }
+
+  // LUCENE-1130: make sure initial IOException, and then 2nd
+  // IOException during rollback(), with multiple threads, is OK:
+  public void testIOExceptionDuringAbortWithThreads() throws Exception {
+    _testMultipleThreadsFailure(new FailOnlyOnAbortOrFlush(false));
+  }
+
+  // LUCENE-1130: make sure initial IOException, and then 2nd
+  // IOException during rollback(), with multiple threads, is OK:
+  public void testIOExceptionDuringAbortWithThreadsOnlyOnce() throws Exception {
+    _testMultipleThreadsFailure(new FailOnlyOnAbortOrFlush(true));
+  }
+
+  // Throws IOException during DocumentsWriter.writeSegment
+  private static class FailOnlyInWriteSegment extends MockDirectoryWrapper.Failure {
+    private boolean onlyOnce;
+    public FailOnlyInWriteSegment(boolean onlyOnce) {
+      this.onlyOnce = onlyOnce;
+    }
+    @Override
+    public void eval(MockDirectoryWrapper dir)  throws IOException {
+      if (doFail) {
+        StackTraceElement[] trace = new Exception().getStackTrace();
+        for (int i = 0; i < trace.length; i++) {
+          if ("flush".equals(trace[i].getMethodName()) && "org.apache.lucene.index.DocFieldProcessor".equals(trace[i].getClassName())) {
+            if (onlyOnce)
+              doFail = false;
+            throw new IOException("now failing on purpose");
+          }
+        }
+      }
+    }
+  }
+
+  // LUCENE-1130: test IOException in writeSegment
+  public void testIOExceptionDuringWriteSegment() throws IOException {
+    _testSingleThreadFailure(new FailOnlyInWriteSegment(false));
+  }
+
+  // LUCENE-1130: test IOException in writeSegment
+  public void testIOExceptionDuringWriteSegmentOnlyOnce() throws IOException {
+    _testSingleThreadFailure(new FailOnlyInWriteSegment(true));
+  }
+
+  // LUCENE-1130: test IOException in writeSegment, with threads
+  public void testIOExceptionDuringWriteSegmentWithThreads() throws Exception {
+    _testMultipleThreadsFailure(new FailOnlyInWriteSegment(false));
+  }
+
+  // LUCENE-1130: test IOException in writeSegment, with threads
+  public void testIOExceptionDuringWriteSegmentWithThreadsOnlyOnce() throws Exception {
+    _testMultipleThreadsFailure(new FailOnlyInWriteSegment(true));
   }
   
-  private void handleDeleteShardAction(SolrQueryRequest req,
-      SolrQueryResponse rsp) throws InterruptedException, KeeperException {
-    log.info("Deleting Shard : " + req.getParamString());
-    String name = req.getParams().required().get(ZkStateReader.COLLECTION_PROP);
-    String shard = req.getParams().required().get(ZkStateReader.SHARD_ID_PROP);
-    
-    Map<String,Object> props = new HashMap<String,Object>();
-    props.put(ZkStateReader.COLLECTION_PROP, name);
-    props.put(Overseer.QUEUE_OPERATION, OverseerCollectionProcessor.DELETESHARD);
-    props.put(ZkStateReader.SHARD_ID_PROP, shard);
+  //  LUCENE-3365: Test adding two documents with the same field from two different IndexWriters 
+  //  that we attempt to open at the same time.  As long as the first IndexWriter completes
+  //  and closes before the second IndexWriter time's out trying to get the Lock,
+  //  we should see both documents
+  public void testOpenTwoIndexWritersOnDifferentThreads() throws IOException, InterruptedException {
+     final Directory dir = newDirectory();
+     CountDownLatch oneIWConstructed = new CountDownLatch(1);
+     DelayedIndexAndCloseRunnable thread1 = new DelayedIndexAndCloseRunnable(
+         dir, oneIWConstructed);
+     DelayedIndexAndCloseRunnable thread2 = new DelayedIndexAndCloseRunnable(
+         dir, oneIWConstructed);
 
-    ZkNodeProps m = new ZkNodeProps(props);
-    handleResponse(OverseerCollectionProcessor.DELETESHARD, m, rsp);
+     thread1.start();
+     thread2.start();
+     oneIWConstructed.await();
+
+     thread1.startIndexing();
+     thread2.startIndexing();
+
+     thread1.join();
+     thread2.join();
+     
+     assertFalse("Failed due to: " + thread1.failure, thread1.failed);
+     assertFalse("Failed due to: " + thread2.failure, thread2.failed);
+     // now verify that we have two documents in the index
+     IndexReader reader = DirectoryReader.open(dir);
+     assertEquals("IndexReader should have one document per thread running", 2,
+         reader.numDocs());
+     
+     reader.close();
+     dir.close();
   }
+  
+  static class DelayedIndexAndCloseRunnable extends Thread {
+    private final Directory dir;
+    boolean failed = false;
+    Throwable failure = null;
+    private final CountDownLatch startIndexing = new CountDownLatch(1);
+    private CountDownLatch iwConstructed;
 
-  private void handleSplitShardAction(SolrQueryRequest req, SolrQueryResponse rsp) throws KeeperException, InterruptedException {
-    log.info("Splitting shard : " + req.getParamString());
-    String name = req.getParams().required().get("collection");
-    // TODO : add support for multiple shards
-    String shard = req.getParams().required().get("shard");
-    // TODO : add support for shard range
-
-    Map<String,Object> props = new HashMap<String,Object>();
-    props.put(Overseer.QUEUE_OPERATION, OverseerCollectionProcessor.SPLITSHARD);
-    props.put("collection", name);
-    props.put(ZkStateReader.SHARD_ID_PROP, shard);
-
-    ZkNodeProps m = new ZkNodeProps(props);
-
-    handleResponse(OverseerCollectionProcessor.SPLITSHARD, m, rsp, DEFAULT_ZK_TIMEOUT * 5);
-  }
-
-  public static ModifiableSolrParams params(String... params) {
-    ModifiableSolrParams msp = new ModifiableSolrParams();
-    for (int i=0; i<params.length; i+=2) {
-      msp.add(params[i], params[i+1]);
+    public DelayedIndexAndCloseRunnable(Directory dir,
+                                        CountDownLatch iwConstructed) {
+      this.dir = dir;
+      this.iwConstructed = iwConstructed;
     }
-    return msp;
+
+    public void startIndexing() {
+      this.startIndexing.countDown();
+    }
+
+    @Override
+    public void run() {
+      try {
+        Document doc = new Document();
+        Field field = newTextField("field", "testData", Field.Store.YES);
+        doc.add(field);
+        IndexWriter writer = new IndexWriter(dir, newIndexWriterConfig(
+                                                                       TEST_VERSION_CURRENT, new MockAnalyzer(random())));
+        iwConstructed.countDown();
+        startIndexing.await();
+        writer.addDocument(doc);
+        writer.close();
+      } catch (Throwable e) {
+        failed = true;
+        failure = e;
+        failure.printStackTrace(System.out);
+        return;
+      }
+    }
   }
 
-  //////////////////////// SolrInfoMBeans methods //////////////////////
+  // LUCENE-4147
+  public void testRollbackAndCommitWithThreads() throws Exception {
+    final BaseDirectoryWrapper d = newFSDirectory(_TestUtil.getTempDir("RollbackAndCommitWithThreads"));
+    if (d instanceof MockDirectoryWrapper) {
+      ((MockDirectoryWrapper)d).setPreventDoubleWrite(false);
+    }
 
-  @Override
-  public String getDescription() {
-    return "Manage SolrCloud Collections";
-  }
+    final int threadCount = _TestUtil.nextInt(random(), 2, 6);
 
-  @Override
-  public String getSource() {
-    return "$URL: https://svn.apache.org/repos/asf/lucene/dev/trunk/solr/core/src/java/org/apache/solr/handler/admin/CollectionHandler.java $";
+    final AtomicReference<IndexWriter> writerRef = new AtomicReference<IndexWriter>();
+    writerRef.set(new IndexWriter(d, newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random()))));
+    final LineFileDocs docs = new LineFileDocs(random());
+    final Thread[] threads = new Thread[threadCount];
+    final int iters = atLeast(1000);
+    final AtomicBoolean failed = new AtomicBoolean();
+    final Lock rollbackLock = new ReentrantLock();
+    final Lock commitLock = new ReentrantLock();
+    for(int threadID=0;threadID<threadCount;threadID++) {
+      threads[threadID] = new Thread() {
+          @Override
+          public void run() {
+            for(int iter=0;iter<iters && !failed.get();iter++) {
+              //final int x = random().nextInt(5);
+              final int x = random().nextInt(3);
+              try {
+                switch(x) {
+                case 0:
+                  rollbackLock.lock();
+                  if (VERBOSE) {
+                    System.out.println("\nTEST: " + Thread.currentThread().getName() + ": now rollback");
+                  }
+                  try {
+                    writerRef.get().rollback();
+                    if (VERBOSE) {
+                      System.out.println("TEST: " + Thread.currentThread().getName() + ": rollback done; now open new writer");
+                    }
+                    writerRef.set(new IndexWriter(d, newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random()))));
+                  } finally {
+                    rollbackLock.unlock();
+                  }
+                  break;
+                case 1:
+                  commitLock.lock();
+                  if (VERBOSE) {
+                    System.out.println("\nTEST: " + Thread.currentThread().getName() + ": now commit");
+                  }
+                  try {
+                    if (random().nextBoolean()) {
+                      writerRef.get().prepareCommit();
+                    }
+                    writerRef.get().commit();
+                  } catch (AlreadyClosedException ace) {
+                    // ok
+                  } catch (NullPointerException npe) {
+                    // ok
+                  } finally {
+                    commitLock.unlock();
+                  }
+                  break;
+                case 2:
+                  if (VERBOSE) {
+                    System.out.println("\nTEST: " + Thread.currentThread().getName() + ": now add");
+                  }
+                  try {
+                    writerRef.get().addDocument(docs.nextDoc());
+                  } catch (AlreadyClosedException ace) {
+                    // ok
+                  } catch (NullPointerException npe) {
+                    // ok
+                  } catch (AssertionError ae) {
+                    // ok
+                  }
+                  break;
+                }
+              } catch (Throwable t) {
+                failed.set(true);
+                throw new RuntimeException(t);
+              }
+            }
+          }
+        };
+      threads[threadID].start();
+    }
+
+    for(int threadID=0;threadID<threadCount;threadID++) {
+      threads[threadID].join();
+    }
+
+    assertTrue(!failed.get());
+    writerRef.get().close();
+    d.close();
   }
 }

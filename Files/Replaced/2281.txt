@@ -1,488 +1,294 @@
-Connection conn = findDriver().connect( jdbcurl, info, loginTimeout );
+message = rm.makeRowMutationMessage(StorageService.Verb.BINARY, MessagingService.version_);
 
 /*
-
-   Derby - Class org.apache.derby.jdbc.EmbeddedSimpleDataSource
-
-   Licensed to the Apache Software Foundation (ASF) under one or more
-   contributor license agreements.  See the NOTICE file distributed with
-   this work for additional information regarding copyright ownership.
-   The ASF licenses this file to You under the Apache License, Version 2.0
-   (the "License"); you may not use this file except in compliance with
-   the License.  You may obtain a copy of the License at
-
-      http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
-
- */
-
-package org.apache.derby.jdbc;
-
-import org.apache.derby.iapi.jdbc.JDBCBoot;
-import org.apache.derby.iapi.reference.Attribute;
-import org.apache.derby.iapi.reference.MessageId;
-import org.apache.derby.iapi.reference.SQLState;
-
-import java.sql.Connection;
-import java.sql.SQLException;
-
-import java.io.PrintWriter;
-import java.util.Properties;
-
-/* -- New jdbc 20 extension types --- */
-import javax.sql.DataSource;
-
-import org.apache.derby.iapi.reference.SQLState;
-import org.apache.derby.iapi.services.i18n.MessageService;
-import org.apache.derby.impl.jdbc.Util;
-
-/**
- * 
- * This datasource is suitable for an application using embedded Derby,
- * running on CDC/Foundation Profile 1.1.
- * <p/>
- * EmbeddedSimpleDataSource is Derby's DataSource implementation
- * for J2ME/CDC/Foundation. It is also supports J2SE platforms.
- * 
- * Supports the same properties as EmbeddedDataSource, see that class for details.
- * <P>
-	EmbeddedSimpleDataSource automatically supports the correct JDBC specification version
-	for the Java Virtual Machine's environment.
-	<UL>
-	<LI> JDBC Optional Package for CDC/Foundation Profile(JSR-169) - J2ME - CDC/Foundation
-	<LI> JDBC 3.0 - Java 2 - JDK 1.4, J2SE 5.0
-	</UL> 
- * @see EmbeddedDataSource
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
-public final class EmbeddedSimpleDataSource implements DataSource {
+ 
+ /**
+  * Cassandra has a back door called the Binary Memtable. The purpose of this backdoor is to
+  * mass import large amounts of data, without using the Thrift interface.
+  *
+  * Inserting data through the binary memtable, allows you to skip the commit log overhead, and an ack
+  * from Thrift on every insert. The example below utilizes Hadoop to generate all the data necessary 
+  * to send to Cassandra, and sends it using the Binary Memtable interface. What Hadoop ends up doing is
+  * creating the actual data that gets put into an SSTable as if you were using Thrift. With enough Hadoop nodes
+  * inserting the data, the bottleneck at this point should become the network.
+  * 
+  * We recommend adjusting the compaction threshold to 0, while the import is running. After the import, you need
+  * to run `nodeprobe -host <IP> flush_binary <Keyspace>` on every node, as this will flush the remaining data still left 
+  * in memory to disk. Then it's recommended to adjust the compaction threshold to it's original value.
+  * 
+  * The example below is a sample Hadoop job, and it inserts SuperColumns. It can be tweaked to work with normal Columns.
+  *
+  * You should construct your data you want to import as rows delimited by a new line. You end up grouping by <Key>
+  * in the mapper, so that the end result generates the data set into a column oriented subset. Once you get to the
+  * reduce aspect, you can generate the ColumnFamilies you want inserted, and send it to your nodes.
+  *
+  * For Cassandra 0.6.4, we modified this example to wait for acks from all Cassandra nodes for each row
+  * before proceeding to the next.  This means to keep Cassandra similarly busy you can either
+  * 1) add more reducer tasks,
+  * 2) remove the "wait for acks" block of code,
+  * 3) parallelize the writing of rows to Cassandra, e.g. with an Executor.
+  *
+  * THIS CANNOT RUN ON THE SAME IP ADDRESS AS A CASSANDRA INSTANCE.
+  */
+  
+package org.apache.cassandra.bulkloader;
 
-	private String password;
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
-	private String user;
+import com.google.common.base.Charsets;
 
-	/**
-	 * The database name.
-	 * 
-	 * @serial
-	 */
-	private String databaseName;
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.ConfigurationException;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.Column;
+import org.apache.cassandra.db.ColumnFamily;
+import org.apache.cassandra.db.ColumnFamilyType;
+import org.apache.cassandra.db.RowMutation;
+import org.apache.cassandra.db.filter.QueryPath;
+import org.apache.cassandra.io.util.DataOutputBuffer;
+import org.apache.cassandra.net.IAsyncResult;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.hadoop.filecache.DistributedCache;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.mapred.*;
 
-	/**
-	 * The data source name.
-	 * 
-	 * @serial
-	 */
-	private String dataSourceName;
+public class CassandraBulkLoader {
+    public static class Map extends MapReduceBase implements Mapper<Text, Text, Text, Text> {
+        public void map(Text key, Text value, OutputCollector<Text, Text> output, Reporter reporter) throws IOException {
+            // This is a simple key/value mapper.
+            output.collect(key, value);
+        }
+    }
 
-	/**
-	 * Description of the database.
-	 * 
-	 * @serial
-	 */
-	private String description;
+    public static class Reduce extends MapReduceBase implements Reducer<Text, Text, Text, Text> {
+        private Path[] localFiles;
+        private JobConf jobconf;
 
-	/**
-	 * Set to "create" if the database should be created.
-	 * 
-	 * @serial
-	 */
-	private String createDatabase;
+        public void configure(JobConf job) {
+            this.jobconf = job;
+            String cassConfig;
 
-	/**
-	 * Set to "shutdown" if the database should be shutdown.
-	 * 
-	 * @serial
-	 */
-	private String shutdownDatabase;
+            // Get the cached files
+            try
+            {
+                localFiles = DistributedCache.getLocalCacheFiles(job);
+            }
+            catch (IOException e)
+            {
+                throw new RuntimeException(e);
+            }
+            cassConfig = localFiles[0].getParent().toString();
 
-	/**
-	 * Derby specific connection attributes.
-	 * 
-	 * @serial
-	 */
-	private String connectionAttributes;
+            System.setProperty("storage-config",cassConfig);
 
-	/** instance variables that will not be serialized */
-	transient private PrintWriter printer;
+            try
+            {
+                StorageService.instance.initClient();
+            }
+            catch (Exception e)
+            {
+                throw new RuntimeException(e);
+            }
+            try
+            {
+                Thread.sleep(10*1000);
+            }
+            catch (InterruptedException e)
+            {
+                throw new RuntimeException(e);
+            }
+        }
 
-	transient private int loginTimeout;
+        public void close()
+        {
+            try
+            {
+                // release the cache
+                DistributedCache.releaseCache(new URI("/cassandra/storage-conf.xml#storage-conf.xml"), this.jobconf);
+            }
+            catch (IOException e)
+            {
+                throw new RuntimeException(e);
+            }
+            catch (URISyntaxException e)
+            {
+                throw new RuntimeException(e);
+            }
+            try
+            {
+                // Sleep just in case the number of keys we send over is small
+                Thread.sleep(3*1000);
+            }
+            catch (InterruptedException e)
+            {
+                throw new RuntimeException(e);
+            }
+            StorageService.instance.stopClient();
+        }
 
-	// Unlike a DataSource, LocalDriver is shared by all
-	// Derby databases in the same jvm.
-	transient private InternalDriver driver;
+        public void reduce(Text key, Iterator<Text> values, OutputCollector<Text, Text> output, Reporter reporter) throws IOException
+        {
+            ColumnFamily columnFamily;
+            String keyspace = "Keyspace1";
+            String cfName = "Super1";
+            Message message;
+            List<ColumnFamily> columnFamilies;
+            columnFamilies = new LinkedList<ColumnFamily>();
+            String line;
 
-	transient private String jdbcurl;
+            /* Create a column family */
+            columnFamily = ColumnFamily.create(keyspace, cfName);
+            while (values.hasNext()) {
+                // Split the value (line based on your own delimiter)
+                line = values.next().toString();
+                String[] fields = line.split("\1");
+                String SuperColumnName = fields[1];
+                String ColumnName = fields[2];
+                String ColumnValue = fields[3];
+                int timestamp = 0;
+                columnFamily.addColumn(new QueryPath(cfName,
+                                                     ByteBuffer.wrap(SuperColumnName.getBytes(Charsets.UTF_8)),
+                                                     ByteBuffer.wrap(ColumnName.getBytes(Charsets.UTF_8))), 
+                                       ByteBuffer.wrap(ColumnValue.getBytes()),
+                                       timestamp);
+            }
 
-	/**
-	 * No-arg constructor.
-	 */
-	public EmbeddedSimpleDataSource() {
-        update();
-	}
+            columnFamilies.add(columnFamily);
 
-	/*
-	 * DataSource methods
-	 */
+            /* Get serialized message to send to cluster */
+            message = createMessage(keyspace, key.getBytes(), cfName, columnFamilies);
+            List<IAsyncResult> results = new ArrayList<IAsyncResult>();
+            for (InetAddress endpoint: StorageService.instance.getNaturalEndpoints(keyspace, ByteBuffer.wrap(key.getBytes())))
+            {
+                /* Send message to end point */
+                results.add(MessagingService.instance().sendRR(message, endpoint));
+            }
+            /* wait for acks */
+            for (IAsyncResult result : results)
+            {
+                try
+                {
+                    result.get(DatabaseDescriptor.getRpcTimeout(), TimeUnit.MILLISECONDS);
+                }
+                catch (TimeoutException e)
+                {
+                    // you should probably add retry logic here
+                    throw new RuntimeException(e);
+                }
+            }
+            
+            output.collect(key, new Text(" inserted into Cassandra node(s)"));
+        }
+    }
 
-	/**
-	 * Gets the maximum time in seconds that this data source can wait while
-	 * attempting to connect to a database. A value of zero means that the
-	 * timeout is the default system timeout if there is one; otherwise it means
-	 * that there is no timeout. When a data source object is created, the login
-	 * timeout is initially zero.
-	 * 
-	 * @return the data source login time limit
-	 * @exception SQLException
-	 *                if a database access error occurs.
-	 */
-	public int getLoginTimeout() throws SQLException {
-		return loginTimeout;
-	}
+    public static void runJob(String[] args)
+    {
+        JobConf conf = new JobConf(CassandraBulkLoader.class);
 
-	/**
-	 * Sets the maximum time in seconds that this data source will wait while
-	 * attempting to connect to a database. A value of zero specifies that the
-	 * timeout is the default system timeout if there is one; otherwise it
-	 * specifies that there is no timeout. When a data source object is created,
-	 * the login timeout is initially zero.
-	 * <P>
-	 * Derby ignores this property.
-	 * 
-	 * @param seconds
-	 *            the data source login time limit
-	 * @exception SQLException
-	 *                if a database access error occurs.
-	 */
-	public void setLoginTimeout(int seconds) throws SQLException {
-		loginTimeout = seconds;
-	}
+        if(args.length >= 4)
+        {
+          conf.setNumReduceTasks(new Integer(args[3]));
+        }
 
-	/**
-	 * Get the log writer for this data source.
-	 * 
-	 * <p>
-	 * The log writer is a character output stream to which all logging and
-	 * tracing messages for this data source object instance will be printed.
-	 * This includes messages printed by the methods of this object, messages
-	 * printed by methods of other objects manufactured by this object, and so
-	 * on. Messages printed to a data source specific log writer are not printed
-	 * to the log writer associated with the java.sql.Drivermanager class. When
-	 * a data source object is created the log writer is initially null, in
-	 * other words, logging is disabled.
-	 * 
-	 * @return the log writer for this data source, null if disabled
-	 * @exception SQLException
-	 *                if a database-access error occurs.
-	 */
-	public PrintWriter getLogWriter() throws SQLException {
-		return printer;
-	}
+        try
+        {
+            // We store the cassandra storage-conf.xml on the HDFS cluster
+            DistributedCache.addCacheFile(new URI("/cassandra/storage-conf.xml#storage-conf.xml"), conf);
+        }
+        catch (URISyntaxException e)
+        {
+            throw new RuntimeException(e);
+        }
+        conf.setInputFormat(KeyValueTextInputFormat.class);
+        conf.setJobName("CassandraBulkLoader_v2");
+        conf.setMapperClass(Map.class);
+        conf.setReducerClass(Reduce.class);
 
-	/**
-	 * Set the log writer for this data source.
-	 * 
-	 * <p>
-	 * The log writer is a character output stream to which all logging and
-	 * tracing messages for this data source object instance will be printed.
-	 * This includes messages printed by the methods of this object, messages
-	 * printed by methods of other objects manufactured by this object, and so
-	 * on. Messages printed to a data source specific log writer are not printed
-	 * to the log writer associated with the java.sql.Drivermanager class. When
-	 * a data source object is created the log writer is initially null, in
-	 * other words, logging is disabled.
-	 * 
-	 * @param out
-	 *            the new log writer; to disable, set to null
-	 * @exception SQLException
-	 *                if a database-access error occurs.
-	 */
-	public void setLogWriter(PrintWriter out) throws SQLException {
-		printer = out;
-	}
+        conf.setOutputKeyClass(Text.class);
+        conf.setOutputValueClass(Text.class);
 
-	/*
-	 * Properties to be seen by Bean - access thru reflection.
-	 */
-	/**
-	 * Set the database name. Setting this property is mandatory. If a database
-	 * named wombat at g:/db needs to be accessed, database name should be set
-	 * to "g:/db/wombat". The database will be booted if it is not already
-	 * running in the system.
-	 * 
-	 * @param databaseName
-	 *            the name of the database
-	 */
-	public final synchronized void setDatabaseName(String databaseName) {
-		this.databaseName = databaseName;
-		update();
-	}
+        FileInputFormat.setInputPaths(conf, new Path(args[1]));
+        FileOutputFormat.setOutputPath(conf, new Path(args[2]));
+        try
+        {
+            JobClient.runJob(conf);
+        }
+        catch (IOException e)
+        {
+            throw new RuntimeException(e);
+        }
+    }
 
-	public String getDatabaseName() {
-		return databaseName;
-	}
+    public static Message createMessage(String keyspace, byte[] key, String columnFamily, List<ColumnFamily> columnFamilies)
+    {
+        ColumnFamily baseColumnFamily;
+        DataOutputBuffer bufOut = new DataOutputBuffer();
+        RowMutation rm;
+        Message message;
+        Column column;
 
-	/**
-	 * Set the data source name. The property is not mandatory. It is used for
-	 * informational purposes only.
-	 * 
-	 * @param dsn
-	 *            the name of the data source
-	 */
-	public final void setDataSourceName(String dsn) {
-		dataSourceName = dsn;
-	}
+        /* Get the first column family from list, this is just to get past validation */
+        baseColumnFamily = new ColumnFamily(ColumnFamilyType.Standard,
+                                            DatabaseDescriptor.getComparator(keyspace, columnFamily),
+                                            DatabaseDescriptor.getSubComparator(keyspace, columnFamily),
+                                            CFMetaData.getId(keyspace, columnFamily));
+        
+        for(ColumnFamily cf : columnFamilies) {
+            bufOut.reset();
+            ColumnFamily.serializer().serializeWithIndexes(cf, bufOut);
+            byte[] data = new byte[bufOut.getLength()];
+            System.arraycopy(bufOut.getData(), 0, data, 0, bufOut.getLength());
 
-	/** @return data source name */
-	public final String getDataSourceName() {
-		return dataSourceName;
-	}
+            column = new Column(FBUtilities.toByteBuffer(cf.id()), ByteBuffer.wrap(data), 0);
+            baseColumnFamily.addColumn(column);
+        }
+        rm = new RowMutation(keyspace, ByteBuffer.wrap(key));
+        rm.add(baseColumnFamily);
 
-	/**
-	 * Set the data source descripton. This property is not mandatory. It is
-	 * used for informational purposes only.
-	 * 
-	 * @param desc
-	 *            the description of the data source
-	 */
-	public final void setDescription(String desc) {
-		description = desc;
-	}
+        try
+        {
+            /* Make message */
+            message = rm.makeRowMutationMessage(StorageService.Verb.BINARY);
+        }
+        catch (IOException e)
+        {
+            throw new RuntimeException(e);
+        }
 
-	/** @return description */
-	public final String getDescription() {
-		return description;
-	}
-
-	/**
-	 * Set the <code>user</code> property for the data source. This is user
-	 * name for any data source getConnection() call that takes no arguments.
-	 */
-	public final void setUser(String user) {
-		this.user = user;
-	}
-
-	/** @return user */
-	public final String getUser() {
-		return user;
-	}
-
-	/**
-	 * Set the <code>password</code> property for the data source. This is
-	 * user's password for any data source getConnection() call that takes no
-	 * arguments.
-	 */
-	public final void setPassword(String password) {
-		this.password = password;
-	}
-
-	/** @return password */
-	public final String getPassword() {
-		return password;
-	}
-
-	/**
-	 * Set this property to create a new database. If this property is not set,
-	 * the database (identified by databaseName) is assumed to be already
-	 * existing.
-	 * 
-	 * @param create
-	 *            if set to the string "create", this data source will try to
-	 *            create a new database of databaseName, or boot the database if
-	 *            one by that name already exists.
-	 */
-	public final void setCreateDatabase(String create) {
-		if (create != null
-				&& create.toLowerCase(java.util.Locale.ENGLISH)
-						.equals("create"))
-			createDatabase = create;
-		else
-			createDatabase = null;
-	}
-
-	/** @return "create" if create is set, or null if not */
-	public final String getCreateDatabase() {
-		return createDatabase;
-	}
-
-	/**
-	 * Set this property if one wishes to shutdown the database identified by
-	 * databaseName.
-	 * 
-	 * @param shutdown
-	 *            if set to the string "shutdown", this data source will
-	 *            shutdown the database if it is running.
-	 */
-	public final void setShutdownDatabase(String shutdown) {
-		if (shutdown != null && shutdown.equalsIgnoreCase("shutdown"))
-			shutdownDatabase = shutdown;
-		else
-			shutdownDatabase = null;
-	}
-
-	/** @return "shutdown" if shutdown is set, or null if not */
-	public final String getShutdownDatabase() {
-		return shutdownDatabase;
-	}
-
-	/**
-	 * Set this property to pass in more Derby specific connection URL
-	 * attributes.
-	<BR>
-   Any attributes that can be set using a property of this DataSource implementation
-   (e.g user, password) should not be set in connectionAttributes. Conflicting
-   settings in connectionAttributes and properties of the DataSource will lead to
-   unexpected behaviour. 
-   	 * 
-	 * @param prop
-	 *            set to the list of Derby connection attributes separated
-	 *            by semi-colons. E.g., to specify an encryption bootPassword of
-	 *            "x8hhk2adf", and set upgrade to true, do the following:
-	 * 
-	 * <PRE>
-	 * 
-	 * ds.setConnectionAttributes("bootPassword=x8hhk2adf;upgrade=true");
-	 * 
-	 * </PRE>
-	 * 
-	 * See Derby's documentation for complete list.
-	 */
-	public final void setConnectionAttributes(String prop) {
-		connectionAttributes = prop;
-		update();
-	}
-
-	/** @return Derby specific connection URL attributes */
-	public final String getConnectionAttributes() {
-		return connectionAttributes;
-	}
-
-	/*
-	 * DataSource methods
-	 */
-
-	/**
-	 * Attempt to establish a database connection.
-	 * 
-	 * @return a Connection to the database
-	 * @exception SQLException
-	 *                if a database-access error occurs.
-	 */
-	public final Connection getConnection() throws SQLException {
-		return this.getConnection(getUser(), getPassword());
-	}
-
-	/**
-	 * Attempt to establish a database connection with the given username and
-	 * password. If the attributeAsPassword property is set to true then the
-	 * password argument is taken to be a list of connection attributes with the
-	 * same format as the connectionAttributes property.
-	 * 
-	 * 
-	 * @param username
-	 *            the database user on whose behalf the Connection is being made
-	 * @param password
-	 *            the user's password
-	 * @return a Connection to the database
-	 * @exception SQLException
-	 *                if a database-access error occurs.
-	 */
-	public final Connection getConnection(String username, String password)
-			throws SQLException {
-
-		Properties info = new Properties();
-		if (username != null)
-			info.put(Attribute.USERNAME_ATTR, username);
-
-		if (password != null)
-			info.put(Attribute.PASSWORD_ATTR, password);
-
-		if (createDatabase != null)
-			info.put(Attribute.CREATE_ATTR, "true");
-		if (shutdownDatabase != null)
-			info.put(Attribute.SHUTDOWN_ATTR, "true");
-
-		Connection conn = findDriver().connect(jdbcurl, info);
-
-		// JDBC driver's getConnection method returns null if
-		// the driver does not handle the request's URL.
-		if (conn == null)
-			throw Util.generateCsSQLException(SQLState.PROPERTY_INVALID_VALUE,
-					Attribute.DBNAME_ATTR, getDatabaseName());
-
-		return conn;
-	}
-
-	private InternalDriver findDriver() throws SQLException {
-		String url = jdbcurl;
-
-		if (driver == null || !driver.acceptsURL(url)) {
-			synchronized (this) {
-				// The driver has either never been booted, or it has been
-				// shutdown by a 'jdbc:derby:;shutdown=true'
-				if (driver == null || !driver.acceptsURL(url)) {
-					
-                    new JDBCBoot().boot(Attribute.PROTOCOL,
-                        new PrintWriter(System.err, true));
-					
-					// If we know the driver, we loaded it. Otherwise only
-					// work if DriverManager has already loaded it.
-
-					driver = InternalDriver.activeDriver();
-					
-					if (driver == null)
-                    {
-                        throw Util.generateCsSQLException( SQLState.CORE_JDBC_DRIVER_UNREGISTERED );
-                    }
-				}
-			}
-		}
-		return driver;
-		// else driver != null and driver can accept url
-	}
-
-	private void update() {
-		StringBuffer sb = new StringBuffer(64);
-
-		sb.append(Attribute.PROTOCOL);
-
-		// Set the database name from the databaseName property
-		String dbName = getDatabaseName();
-
-		if (dbName != null) {
-			dbName = dbName.trim();
-		}
-
-		if (dbName == null || dbName.length() == 0) {
-			// need to put something in so that we do not allow the
-			// database name to be set from the request or from the
-			// connection attributes.
-
-			// this space will selected as the database name (and trimmed to an
-			// empty string)
-			// See the getDatabaseName() code in InternalDriver. Since this is a
-			// non-null
-			// value, it will be selected over any databaseName connection
-			// attribute.
-			dbName = " ";
-		}
-
-		sb.append(dbName);
-
-		String connAttrs = getConnectionAttributes();
-		if (connAttrs != null) {
-			connAttrs = connAttrs.trim();
-			if (connAttrs.length() != 0) {
-				sb.append(';');
-				sb.append(connectionAttributes);
-			}
-		}
-
-		jdbcurl = sb.toString();
-	}
+        return message;
+    }
+    public static void main(String[] args) throws Exception
+    {
+        runJob(args);
+    }
 }

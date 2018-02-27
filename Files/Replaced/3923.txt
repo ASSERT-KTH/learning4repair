@@ -1,13 +1,14 @@
-StringBuilder sb = new StringBuilder();
+import org.apache.lucene.search.IndexSearcher; // javadocs
+
+package org.apache.lucene.search;
 
 /**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,105 +19,200 @@ StringBuilder sb = new StringBuilder();
  * limitations under the License.
  */
 
-package org.apache.cassandra.cql.common;
+import java.io.Closeable;
+import java.io.IOException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Semaphore;
 
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.cql.execution.RuntimeErrorMsg;
-import org.apache.cassandra.db.RowMutation;
-import org.apache.cassandra.service.StorageProxy;
-import org.apache.cassandra.utils.LogUtil;
-import org.apache.log4j.Logger;
-import org.apache.cassandra.cql.execution.*;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.index.NRTManager; // javadocs
+import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.store.AlreadyClosedException;
+import org.apache.lucene.store.Directory;
 
-/**
- * Execution plan for batch setting a set of super columns in a Super column family.
-  *   SET table.super_cf[<rowKey>] = <superColumnMapExpr>;
+/** Utility class to safely share {@link IndexSearcher} instances
+ *  across multiple threads, while periodically reopening.
+ *  This class ensures each IndexSearcher instance is not
+ *  closed until it is no longer needed.
+ *
+ *  <p>Use {@link #acquire} to obtain the current searcher, and
+ *  {@link #release} to release it, like this:
+ *
+ *  <pre>
+ *    IndexSearcher s = manager.acquire();
+ *    try {
+ *      // Do searching, doc retrieval, etc. with s
+ *    } finally {
+ *      manager.release(s);
+ *    }
+ *    // Do not use s after this!
+ *    s = null;
+ *  </pre>
+ *
+ *  <p>In addition you should periodically call {@link
+ *  #maybeReopen}.  While it's possible to call this just
+ *  before running each query, this is discouraged since it
+ *  penalizes the unlucky queries that do the reopen.  It's
+ *  better to  use a separate background thread, that
+ *  periodically calls maybeReopen.  Finally, be sure to
+ *  call {@link #close} once you are done.
+ *
+ *  <p><b>NOTE</b>: if you have an {@link IndexWriter}, it's
+ *  better to use {@link NRTManager} since that class pulls
+ *  near-real-time readers from the IndexWriter.
+ *
+ *  @lucene.experimental
  */
-public class SetSuperColumnMap extends DMLPlan
-{
-    private final static Logger logger_ = Logger.getLogger(SetUniqueKey.class);    
-    private CFMetaData         cfMetaData_;
-    private OperandDef         rowKey_;
-    private SuperColumnMapExpr superColumnMapExpr_;
 
-    /**
-     *  construct an execution plan node to batch set a bunch of super columns in a 
-     *  super column family.
-     *
-     *    SET table.super_cf[<rowKey>] = <superColumnMapExpr>;
-     */
-    public SetSuperColumnMap(CFMetaData cfMetaData, OperandDef rowKey, SuperColumnMapExpr superColumnMapExpr)
-    {
-        cfMetaData_         = cfMetaData;
-        rowKey_             = rowKey;
-        superColumnMapExpr_ = superColumnMapExpr;
+public class SearcherManager implements Closeable {
+
+  // Current searcher
+  private volatile IndexSearcher currentSearcher;
+  private final SearcherWarmer warmer;
+  private final Semaphore reopening = new Semaphore(1);
+  private final ExecutorService es;
+
+  /** Opens an initial searcher from the Directory.
+   *
+   * @param dir Directory to open the searcher from
+   *
+   * @param warmer optional {@link SearcherWarmer}.  Pass
+   *        null if you don't require the searcher to warmed
+   *        before going live.
+   *
+   *  <p><b>NOTE</b>: the provided {@link SearcherWarmer} is
+   *  not invoked for the initial searcher; you should
+   *  warm it yourself if necessary.
+   */
+  public SearcherManager(Directory dir, SearcherWarmer warmer) throws IOException {
+    this(dir, warmer, null);
+  }
+
+  /** Opens an initial searcher from the Directory.
+   *
+   * @param dir Directory to open the searcher from
+   *
+   * @param warmer optional {@link SearcherWarmer}.  Pass
+   *        null if you don't require the searcher to warmed
+   *        before going live.
+   *
+   * @param es optional ExecutorService so different segments can
+   *        be searched concurrently (see {@link
+   *        IndexSearcher#IndexSearcher(IndexReader,ExecutorService)}.  Pass null
+   *        to search segments sequentially.
+   *
+   *  <p><b>NOTE</b>: the provided {@link SearcherWarmer} is
+   *  not invoked for the initial searcher; you should
+   *  warm it yourself if necessary.
+   */
+  public SearcherManager(Directory dir, SearcherWarmer warmer, ExecutorService es) throws IOException {
+    this.es = es;
+    currentSearcher = new IndexSearcher(IndexReader.open(dir), this.es);
+    this.warmer = warmer;
+  }
+
+  /** You must call this, periodically, to perform a
+   *  reopen.  This calls {@link IndexReader#reopen} on the
+   *  underlying reader, and if that returns a new reader,
+   *  it's warmed (if you provided a {@link SearcherWarmer}
+   *  and then swapped into production.
+   *
+   *  <p><b>Threads</b>: it's fine for more than one thread to
+   *  call this at once.  Only the first thread will attempt
+   *  the reopen; subsequent threads will see that another
+   *  thread is already handling reopen and will return
+   *  immediately.  Note that this means if another thread
+   *  is already reopening then subsequent threads will
+   *  return right away without waiting for the reader
+   *  reopen to complete.</p>
+   *
+   *  <p>This method returns true if a new reader was in
+   *  fact opened.</p>
+   */
+  public boolean maybeReopen()
+    throws  IOException {
+
+    if (currentSearcher == null) {
+      throw new AlreadyClosedException("this SearcherManager is closed");
     }
-    
-    public CqlResult execute()
-    {
-        try
-        {
-            RowMutation rm = new RowMutation(cfMetaData_.tableName, (String)(rowKey_.get()));
-            long time = System.currentTimeMillis();
 
-            for (Pair<OperandDef, ColumnMapExpr> superColumn : superColumnMapExpr_)
-            {
-                OperandDef    superColumnKey = superColumn.getFirst();
-                ColumnMapExpr columnMapExpr = superColumn.getSecond();
-                
-                String columnFamily_column = cfMetaData_.cfName + ":" + (String)(superColumnKey.get()) + ":";
-                
-                for (Pair<OperandDef, OperandDef> entry : columnMapExpr)
-                {
-                    OperandDef columnKey = entry.getFirst();
-                    OperandDef value     = entry.getSecond();
-                    rm.add(columnFamily_column + (String)(columnKey.get()), ((String)value.get()).getBytes(), time);
-                }
+    // Ensure only 1 thread does reopen at once; other
+    // threads just return immediately:
+    if (reopening.tryAcquire()) {
+      try {
+        IndexReader newReader = currentSearcher.getIndexReader().reopen();
+        if (newReader != currentSearcher.getIndexReader()) {
+          IndexSearcher newSearcher = new IndexSearcher(newReader, es);
+          boolean success = false;
+          try {
+            if (warmer != null) {
+              warmer.warm(newSearcher);
             }
-            StorageProxy.insert(rm);
-        }
-        catch (Exception e)
-        {
-            logger_.error(LogUtil.throwableToString(e));
-            throw new RuntimeException(RuntimeErrorMsg.GENERIC_ERROR.getMsg());            
-        }
-        return null;
-
-    }
-
-    public String explainPlan()
-    {
-        StringBuffer sb = new StringBuffer();
-        
-        String prefix =
-            String.format("%s Column Family: Batch SET a set of Super Columns: \n" +
-            "   Table Name:     %s\n" +
-            "   Column Famly:   %s\n" +
-            "   RowKey:         %s\n",
-            cfMetaData_.columnType,
-            cfMetaData_.tableName,
-            cfMetaData_.cfName,
-            rowKey_.explain());
-
-        for (Pair<OperandDef, ColumnMapExpr> superColumn : superColumnMapExpr_)
-        {
-            OperandDef    superColumnKey = superColumn.getFirst();
-            ColumnMapExpr columnMapExpr = superColumn.getSecond();
-
-            for (Pair<OperandDef, OperandDef> entry : columnMapExpr)
-            {
-                OperandDef columnKey = entry.getFirst();
-                OperandDef value     = entry.getSecond();
-                sb.append(String.format("     SuperColumnKey: %s\n" + 
-                                        "     ColumnKey:      %s\n" +
-                                        "     Value:          %s\n",
-                                        superColumnKey.explain(),
-                                        columnKey.explain(),
-                                        value.explain()));
+            swapSearcher(newSearcher);
+            success = true;
+          } finally {
+            if (!success) {
+              release(newSearcher);
             }
+          }
+          return true;
+        } else {
+          return false;
         }
-        
-        return prefix + sb.toString();
+      } finally {
+        reopening.release();
+      }
+    } else {
+      return false;
     }
+  }
+
+  /** Obtain the current IndexSearcher.  You must match
+   *  every call to acquire with one call to {@link #release};
+   *  it's best to do so in a finally clause. */
+  public IndexSearcher acquire() {
+    IndexSearcher searcher;
+    do {
+      if ((searcher = currentSearcher) == null) {
+        throw new AlreadyClosedException("this SearcherManager is closed");
+      }
+    } while (!searcher.getIndexReader().tryIncRef());
+    return searcher;
+  }    
+
+  /** Release the searcher previously obtained with {@link
+   *  #acquire}.
+   *
+   *  <p><b>NOTE</b>: it's safe to call this after {@link
+   *  #close}. */
+  public void release(IndexSearcher searcher)
+    throws IOException {
+    searcher.getIndexReader().decRef();
+  }
+
+  // Replaces old searcher with new one - needs to be synced to make close() work
+  private synchronized void swapSearcher(IndexSearcher newSearcher)
+    throws IOException {
+    IndexSearcher oldSearcher = currentSearcher;
+    if (oldSearcher == null) {
+      throw new AlreadyClosedException("this SearcherManager is closed");
+    }
+    currentSearcher = newSearcher;
+    release(oldSearcher);
+  }
+
+  /** Close this SearcherManager to future searching.  Any
+   *  searches still in process in other threads won't be
+   *  affected, and they should still call {@link #release}
+   *  after they are done. */
+  // Not in Java 5: @Override
+  public synchronized void close() throws IOException {
+    if (currentSearcher != null) {
+      // make sure we can call this more than once
+      // closeable javadoc says:
+      //   if this is already closed then invoking this method has no effect.
+      swapSearcher(null);
+    }
+  }
 }
- No newline at end of file

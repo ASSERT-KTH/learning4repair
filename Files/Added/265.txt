@@ -21,158 +21,233 @@ if (logger_.isDebugEnabled())
 package org.apache.cassandra.service;
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
+import java.util.ArrayList;
 import java.util.Map;
-import java.util.Set;
-
-import org.apache.cassandra.db.ColumnFamily;
-import org.apache.cassandra.db.ReadResponse;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.*;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.ReadCommand;
 import org.apache.cassandra.db.Row;
-import org.apache.cassandra.db.RowMutation;
-import org.apache.cassandra.db.RowMutationMessage;
-import org.apache.cassandra.io.DataInputBuffer;
 import org.apache.cassandra.net.EndPoint;
+import org.apache.cassandra.net.IAsyncCallback;
 import org.apache.cassandra.net.Message;
+import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.utils.LogUtil;
 import org.apache.log4j.Logger;
 
-
 /**
- * This class is used by all read functions and is called by the Quorum 
- * when atleast a few of the servers ( few is specified in Quorum)
- * have sent the response . The resolve fn then schedules read repair 
- * and resolution of read data from the various servers.
  * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
  */
-public class ReadResponseResolver implements IResponseResolver<Row>
-{
-	private static Logger logger_ = Logger.getLogger(WriteResponseResolver.class);
 
-	/*
-	 * This method for resolving read data should look at the timestamps of each
-	 * of the columns that are read and should pick up columns with the latest
-	 * timestamp. For those columns where the timestamp is not the latest a
-	 * repair request should be scheduled.
-	 * 
-	 */
-	public Row resolve(List<Message> responses) throws DigestMismatchException
-	{
-        long startTime = System.currentTimeMillis();
-		Row retRow = null;
-		List<Row> rowList = new ArrayList<Row>();
-		List<EndPoint> endPoints = new ArrayList<EndPoint>();
-		String key = null;
-		String table = null;
-		byte[] digest = new byte[0];
-		boolean isDigestQuery = false;
+public class MultiQuorumResponseHandler implements IAsyncCallback
+{ 
+    private static Logger logger_ = Logger.getLogger( QuorumResponseHandler.class );
+    private Lock lock_ = new ReentrantLock();
+    private Condition condition_;
+    /* This maps the keys to the original data read messages */
+    private Map<String, ReadCommand> readMessages_ = new HashMap<String, ReadCommand>();
+    /* This maps the key to its set of replicas */
+    private Map<String, EndPoint[]> endpoints_ = new HashMap<String, EndPoint[]>();
+    /* This maps the groupId to the individual callback for the set of messages */
+    private Map<String, SingleQuorumResponseHandler> handlers_ = new HashMap<String, SingleQuorumResponseHandler>();
+    /* This should hold all the responses for the keys */
+    private List<Row> responses_ = new ArrayList<Row>();
+    private AtomicBoolean done_ = new AtomicBoolean(false);
+    
+    /**
+     * This is used to handle the responses from the individual messages
+     * that are sent out to the replicas.
+     * @author alakshman
+     *
+    */
+    private class SingleQuorumResponseHandler implements IAsyncCallback
+    {
+        private Lock lock_ = new ReentrantLock();
+        private IResponseResolver<Row> responseResolver_;
+        private List<Message> responses_ = new ArrayList<Message>();
         
-        /*
-		 * Populate the list of rows from each of the messages
-		 * Check to see if there is a digest query. If a digest 
-         * query exists then we need to compare the digest with 
-         * the digest of the data that is received.
-        */
-        DataInputBuffer bufIn = new DataInputBuffer();
-		for (Message response : responses)
-		{					            
-            byte[] body = response.getMessageBody();
-            bufIn.reset(body, body.length);
-            try
-            {
-                long start = System.currentTimeMillis();
-                ReadResponse result = ReadResponse.serializer().deserialize(bufIn);
-                logger_.debug( "Response deserialization time : " + (System.currentTimeMillis() - start) + " ms.");
-    			if(!result.isDigestQuery())
-    			{
-    				rowList.add(result.row());
-    				endPoints.add(response.getFrom());
-    				key = result.row().key();
-    				table = result.row().getTable();
-    			}
-    			else
-    			{
-    				digest = result.digest();
-    				isDigestQuery = true;
-    			}
-            }
-            catch( IOException ex )
-            {
-                logger_.info(LogUtil.throwableToString(ex));
-            }
-		}
-		// If there was a digest query compare it with all the data digests 
-		// If there is a mismatch then throw an exception so that read repair can happen.
-		if(isDigestQuery)
-		{
-			for(Row row: rowList)
-			{
-				if( !Arrays.equals(row.digest(), digest) )
-				{
-                    /* Wrap the key as the context in this exception */
-					throw new DigestMismatchException(row.key());
-				}
-			}
-		}
-		
-        /* If the rowList is empty then we had some exception above. */
-        if ( rowList.size() == 0 )
+        SingleQuorumResponseHandler(IResponseResolver<Row> responseResolver)
         {
-            return retRow;
+            responseResolver_ = responseResolver;
         }
         
-        /* Now calculate the resolved row */
-		retRow = new Row(table, key);
-		for (int i = 0 ; i < rowList.size(); i++)
-		{
-			retRow.repair(rowList.get(i));			
-		}
-
-        // At  this point  we have the return row .
-		// Now we need to calculate the differnce 
-		// so that we can schedule read repairs 
-		for (int i = 0 ; i < rowList.size(); i++)
-		{
-			// since retRow is the resolved row it can be used as the super set
-			Row diffRow = rowList.get(i).diff(retRow);
-			if(diffRow == null) // no repair needs to happen
-				continue;
-			// create the row mutation message based on the diff and schedule a read repair 
-			RowMutation rowMutation = new RowMutation(table, key);            			
-	        for (ColumnFamily cf : diffRow.getColumnFamilies())
-	        {
-	            rowMutation.add(cf);
-	        }
-            RowMutationMessage rowMutationMessage = new RowMutationMessage(rowMutation);
-	        ReadRepairManager.instance().schedule(endPoints.get(i),rowMutationMessage);
-		}
-        logger_.info("resolve: " + (System.currentTimeMillis() - startTime) + " ms.");
-		return retRow;
-	}
-
-	public boolean isDataPresent(List<Message> responses)
-	{
-		boolean isDataPresent = false;
-		for (Message response : responses)
-		{
-            byte[] body = response.getMessageBody();
-			DataInputBuffer bufIn = new DataInputBuffer();
-            bufIn.reset(body, body.length);
+        public void attachContext(Object o)
+        {
+            throw new UnsupportedOperationException("This operation is not supported in this implementation");
+        }
+        
+        public void response(Message response)
+        {
+            lock_.lock();
             try
             {
-    			ReadResponse result = ReadResponse.serializer().deserialize(bufIn);
-    			if(!result.isDigestQuery())
-    			{
-    				isDataPresent = true;
-    			}
-                bufIn.close();
+                responses_.add(response);
+                int majority = (DatabaseDescriptor.getReplicationFactor() >> 1) + 1;                            
+                if ( responses_.size() >= majority && responseResolver_.isDataPresent(responses_))
+                {
+                    onCompletion();               
+                }
             }
-            catch(IOException ex)
+            catch ( IOException ex )
             {
-                logger_.info(LogUtil.throwableToString(ex));
-            }                        
-		}
-		return isDataPresent;
-	}
+                logger_.info( LogUtil.throwableToString(ex) );
+            }
+            finally
+            {
+                lock_.unlock();
+            }
+        }
+        
+        private void onCompletion() throws IOException
+        {
+            try
+            {
+                Row row = responseResolver_.resolve(responses_);
+                MultiQuorumResponseHandler.this.onCompleteResponse(row);
+            }
+            catch ( DigestMismatchException ex )
+            {
+                /* 
+                 * The DigestMismatchException has the key for which the mismatch
+                 * occured bundled in it as context 
+                */
+                String key = ex.getMessage();
+                onDigestMismatch(key);
+            }
+        }
+        
+        /**
+         * This method is invoked on a digest match. We pass in the key
+         * in order to retrieve the appropriate data message that needs
+         * to be sent out to the replicas. 
+         * 
+         * @param key for which the mismatch occured.
+        */
+        private void onDigestMismatch(String key) throws IOException
+        {
+            if ( DatabaseDescriptor.getConsistencyCheck())
+            {                                
+                ReadCommand readCommand = readMessages_.get(key);
+                readCommand.setDigestQuery(false);
+                Message messageRepair = readCommand.makeReadMessage();
+                EndPoint[] endpoints = MultiQuorumResponseHandler.this.endpoints_.get(readCommand.key);
+                Message[][] messages = new Message[][]{ {messageRepair, messageRepair, messageRepair} };
+                EndPoint[][] epList = new EndPoint[][]{ endpoints };
+                MessagingService.getMessagingInstance().sendRR(messages, epList, MultiQuorumResponseHandler.this);                
+            }
+        }
+    }
+    
+    public MultiQuorumResponseHandler(Map<String, ReadCommand> readMessages, Map<String, EndPoint[]> endpoints)
+    {        
+        condition_ = lock_.newCondition();
+        readMessages_ = readMessages;
+        endpoints_ = endpoints;
+    }
+    
+    public Row[] get() throws TimeoutException
+    {
+        long startTime = System.currentTimeMillis();
+        lock_.lock();
+        try
+        {            
+            boolean bVal = true;            
+            try
+            {
+                if ( !done_.get() )
+                {                   
+                    bVal = condition_.await(DatabaseDescriptor.getRpcTimeout(), TimeUnit.MILLISECONDS);
+                }
+            }
+            catch ( InterruptedException ex )
+            {
+                logger_.debug( LogUtil.throwableToString(ex) );
+            }
+            
+            if ( !bVal && !done_.get() )
+            {
+                StringBuilder sb = new StringBuilder("");
+                for ( Row row : responses_ )
+                {
+                    sb.append(row.key());
+                    sb.append(":");
+                }                
+                throw new TimeoutException("Operation timed out - received only " +  responses_.size() + " responses from " + sb.toString() + " .");
+            }
+        }
+        finally
+        {
+            lock_.unlock();
+        }
+        
+        logger_.info("MultiQuorumResponseHandler: " + (System.currentTimeMillis() - startTime) + " ms.");
+        return responses_.toArray( new Row[0] );
+    }
+    
+    /**
+     * Invoked when a complete response has been obtained
+     * for one of the sub-groups a.k.a keys for the query 
+     * has been performed.
+     * 
+     * @param row obtained as a result of the response.
+     */
+    void onCompleteResponse(Row row)
+    {        
+        if ( !done_.get() )
+        {
+            responses_.add(row);
+            if ( responses_.size() == readMessages_.size() )
+            {
+                done_.set(true);
+                condition_.signal();                
+            }
+        }
+    }
+    
+    /**
+     * The handler of the response message that has been
+     * sent by one of the replicas for one of the keys.
+     * 
+     * @param message the reponse message for one of the
+     *        message that we sent out.
+     */
+    public void response(Message message)
+    {
+        lock_.lock();
+        try
+        {
+            SingleQuorumResponseHandler handler = handlers_.get(message.getMessageId());
+            handler.response(message);
+        }
+        finally
+        {
+            lock_.unlock();
+        }
+    }
+    
+    /**
+     * The context that is passed in for the query of
+     * multiple keys in the system. For each message 
+     * id in the context register a callback handler 
+     * for the same. This is done so that all responses
+     * for a given key use the same callback handler.
+     * 
+     * @param o the context which is an array of strings
+     *        corresponding to the message id's for each
+     *        key.
+     */
+    public void attachContext(Object o)
+    {
+        String[] gids = (String[])o;
+        for ( String gid : gids )
+        {
+            IResponseResolver<Row> responseResolver = new ReadResponseResolver();
+            SingleQuorumResponseHandler handler = new SingleQuorumResponseHandler(responseResolver);
+            handlers_.put(gid, handler);
+        }
+    }
 }

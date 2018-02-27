@@ -1,5 +1,6 @@
-indexWriter.shutdown();
+public abstract void build(SolrCore core, SolrIndexSearcher searcher) throws IOException;
 
+package org.apache.solr.spelling;
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
@@ -16,295 +17,188 @@ indexWriter.shutdown();
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.lucene.classification;
 
 import org.apache.lucene.analysis.Analyzer;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.Field;
-import org.apache.lucene.document.FieldType;
-import org.apache.lucene.document.TextField;
-import org.apache.lucene.index.AtomicReader;
-import org.apache.lucene.index.RandomIndexWriter;
-import org.apache.lucene.index.SlowCompositeReaderWrapper;
-import org.apache.lucene.search.Query;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.LuceneTestCase;
-import org.apache.lucene.util.TestUtil;
-import org.junit.After;
-import org.junit.Before;
+import org.apache.lucene.analysis.Token;
+import org.apache.lucene.analysis.core.WhitespaceAnalyzer;
+import org.apache.lucene.search.spell.LevensteinDistance;
+import org.apache.lucene.search.spell.StringDistance;
+import org.apache.lucene.search.spell.SuggestWord;
+import org.apache.lucene.search.spell.SuggestWordQueue;
+import org.apache.solr.client.solrj.response.SpellCheckResponse;
+import org.apache.solr.common.params.SpellingParams;
+import org.apache.solr.common.util.NamedList;
+import org.apache.solr.core.SolrCore;
+import org.apache.solr.handler.component.SpellCheckMergeData;
+import org.apache.solr.schema.FieldType;
+import org.apache.solr.search.SolrIndexSearcher;
 
 import java.io.IOException;
-import java.util.Random;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+
 
 /**
- * Base class for testing {@link Classifier}s
+ * <p>
+ * Refer to <a href="http://wiki.apache.org/solr/SpellCheckComponent">SpellCheckComponent</a>
+ * for more details.
+ * </p>
+ * 
+ * @since solr 1.3
  */
-public abstract class ClassificationTestBase<T> extends LuceneTestCase {
-  public final static String POLITICS_INPUT = "Here are some interesting questions and answers about Mitt Romney.. " +
-      "If you don't know the answer to the question about Mitt Romney, then simply click on the answer below the question section.";
-  public static final BytesRef POLITICS_RESULT = new BytesRef("politics");
+public abstract class SolrSpellChecker {
+  public static final String DICTIONARY_NAME = "name";
+  public static final String DEFAULT_DICTIONARY_NAME = "default";
+  public static final String FIELD = "field";
+  public static final String FIELD_TYPE = "fieldType";
+  /** Dictionary name */
+  protected String name;
+  protected Analyzer analyzer;
+  protected String field;
+  protected String fieldTypeName;
 
-  public static final String TECHNOLOGY_INPUT = "Much is made of what the likes of Facebook, Google and Apple know about users." +
-      " Truth is, Amazon may know more.";
-  public static final BytesRef TECHNOLOGY_RESULT = new BytesRef("technology");
-
-  private RandomIndexWriter indexWriter;
-  private Directory dir;
-  private FieldType ft;
-
-  String textFieldName;
-  String categoryFieldName;
-  String booleanFieldName;
-
-  @Override
-  @Before
-  public void setUp() throws Exception {
-    super.setUp();
-    dir = newDirectory();
-    indexWriter = new RandomIndexWriter(random(), dir);
-    textFieldName = "text";
-    categoryFieldName = "cat";
-    booleanFieldName = "bool";
-    ft = new FieldType(TextField.TYPE_STORED);
-    ft.setStoreTermVectors(true);
-    ft.setStoreTermVectorOffsets(true);
-    ft.setStoreTermVectorPositions(true);
+  public String init(NamedList config, SolrCore core) {
+    name = (String) config.get(DICTIONARY_NAME);
+    if (name == null) {
+      name = DEFAULT_DICTIONARY_NAME;
+    }
+    field = (String)config.get(FIELD);
+    if (field != null && core.getSchema().getFieldTypeNoEx(field) != null)  {
+      analyzer = core.getSchema().getFieldType(field).getQueryAnalyzer();
+    }
+    fieldTypeName = (String) config.get(FIELD_TYPE);
+    if (core.getSchema().getFieldTypes().containsKey(fieldTypeName))  {
+      FieldType fieldType = core.getSchema().getFieldTypes().get(fieldTypeName);
+      analyzer = fieldType.getQueryAnalyzer();
+    }
+    if (analyzer == null)   {
+      analyzer = new WhitespaceAnalyzer(core.getSolrConfig().luceneMatchVersion);
+    }
+    return name;
   }
-
-  @Override
-  @After
-  public void tearDown() throws Exception {
-    super.tearDown();
-    indexWriter.close();
-    dir.close();
-  }
-
-  protected void checkCorrectClassification(Classifier<T> classifier, String inputDoc, T expectedResult, Analyzer analyzer, String textFieldName, String classFieldName) throws Exception {
-    checkCorrectClassification(classifier, inputDoc, expectedResult, analyzer, textFieldName, classFieldName, null);
-  }
-
-  protected void checkCorrectClassification(Classifier<T> classifier, String inputDoc, T expectedResult, Analyzer analyzer, String textFieldName, String classFieldName, Query query) throws Exception {
-    AtomicReader atomicReader = null;
+  /**
+   * Integrate spelling suggestions from the various shards in a distributed environment.
+   * 
+   * @param mergeData
+   * @param numSug
+   * @param count
+   * @param extendedResults
+   */
+  public SpellingResult mergeSuggestions(SpellCheckMergeData mergeData, int numSug, int count, boolean extendedResults) {
+    float min = 0.5f;
     try {
-      populateSampleIndex(analyzer);
-      atomicReader = SlowCompositeReaderWrapper.wrap(indexWriter.getReader());
-      classifier.train(atomicReader, textFieldName, classFieldName, analyzer, query);
-      ClassificationResult<T> classificationResult = classifier.assignClass(inputDoc);
-      assertNotNull(classificationResult.getAssignedClass());
-      assertEquals("got an assigned class of " + classificationResult.getAssignedClass(), expectedResult, classificationResult.getAssignedClass());
-      assertTrue("got a not positive score " + classificationResult.getScore(), classificationResult.getScore() > 0);
-    } finally {
-      if (atomicReader != null)
-        atomicReader.close();
+      min = getAccuracy();
+    } catch(UnsupportedOperationException uoe) {
+      //just use .5 as a default
     }
-  }
-  protected void checkOnlineClassification(Classifier<T> classifier, String inputDoc, T expectedResult, Analyzer analyzer, String textFieldName, String classFieldName) throws Exception {
-    checkOnlineClassification(classifier, inputDoc, expectedResult, analyzer, textFieldName, classFieldName, null);
-  }
-
-  protected void checkOnlineClassification(Classifier<T> classifier, String inputDoc, T expectedResult, Analyzer analyzer, String textFieldName, String classFieldName, Query query) throws Exception {
-    AtomicReader atomicReader = null;
+    
+    StringDistance sd = null;
     try {
-      populateSampleIndex(analyzer);
-      atomicReader = SlowCompositeReaderWrapper.wrap(indexWriter.getReader());
-      classifier.train(atomicReader, textFieldName, classFieldName, analyzer, query);
-      ClassificationResult<T> classificationResult = classifier.assignClass(inputDoc);
-      assertNotNull(classificationResult.getAssignedClass());
-      assertEquals("got an assigned class of " + classificationResult.getAssignedClass(), expectedResult, classificationResult.getAssignedClass());
-      assertTrue("got a not positive score " + classificationResult.getScore(), classificationResult.getScore() > 0);
-      updateSampleIndex(analyzer);
-      ClassificationResult<T> secondClassificationResult = classifier.assignClass(inputDoc);
-      assertEquals(classificationResult.getAssignedClass(), secondClassificationResult.getAssignedClass());
-      assertEquals(Double.valueOf(classificationResult.getScore()), Double.valueOf(secondClassificationResult.getScore()));
-
-    } finally {
-      if (atomicReader != null)
-        atomicReader.close();
+      sd = getStringDistance() == null ? new LevensteinDistance() : getStringDistance();    
+    } catch(UnsupportedOperationException uoe) {
+      sd = new LevensteinDistance();
     }
-  }
+    
+    SpellingResult result = new SpellingResult();
+    for (Map.Entry<String, HashSet<String>> entry : mergeData.origVsSuggested.entrySet()) {
+      String original = entry.getKey();
+      
+      //Only use this suggestion if all shards reported it as misspelled.
+      Integer numShards = mergeData.origVsShards.get(original);
+      if(numShards<mergeData.totalNumberShardResponses) {
+        continue;
+      }
+      
+      HashSet<String> suggested = entry.getValue();
+      SuggestWordQueue sugQueue = new SuggestWordQueue(numSug);
+      for (String suggestion : suggested) {
+        SuggestWord sug = mergeData.suggestedVsWord.get(suggestion);
+        sug.score = sd.getDistance(original, sug.string);
+        if (sug.score < min) continue;
+        sugQueue.insertWithOverflow(sug);
+        if (sugQueue.size() == numSug) {
+          // if queue full, maintain the minScore score
+          min = sugQueue.top().score;
+        }
+      }
 
-  private void populateSampleIndex(Analyzer analyzer) throws IOException {
-    indexWriter.deleteAll();
-    indexWriter.commit();
+      // create token
+      SpellCheckResponse.Suggestion suggestion = mergeData.origVsSuggestion.get(original);
+      Token token = new Token(original, suggestion.getStartOffset(), suggestion.getEndOffset());
 
-    String text;
+      // get top 'count' suggestions out of 'sugQueue.size()' candidates
+      SuggestWord[] suggestions = new SuggestWord[Math.min(count, sugQueue.size())];
+      // skip the first sugQueue.size() - count elements
+      for (int k=0; k < sugQueue.size() - count; k++) sugQueue.pop();
+      // now collect the top 'count' responses
+      for (int k = Math.min(count, sugQueue.size()) - 1; k >= 0; k--)  {
+        suggestions[k] = sugQueue.pop();
+      }
 
-    Document doc = new Document();
-    text = "The traveling press secretary for Mitt Romney lost his cool and cursed at reporters " +
-        "who attempted to ask questions of the Republican presidential candidate in a public plaza near the Tomb of " +
-        "the Unknown Soldier in Warsaw Tuesday.";
-    doc.add(new Field(textFieldName, text, ft));
-    doc.add(new Field(categoryFieldName, "politics", ft));
-    doc.add(new Field(booleanFieldName, "true", ft));
-
-    indexWriter.addDocument(doc, analyzer);
-
-    doc = new Document();
-    text = "Mitt Romney seeks to assure Israel and Iran, as well as Jewish voters in the United" +
-        " States, that he will be tougher against Iran's nuclear ambitions than President Barack Obama.";
-    doc.add(new Field(textFieldName, text, ft));
-    doc.add(new Field(categoryFieldName, "politics", ft));
-    doc.add(new Field(booleanFieldName, "true", ft));
-    indexWriter.addDocument(doc, analyzer);
-
-    doc = new Document();
-    text = "And there's a threshold question that he has to answer for the American people and " +
-        "that's whether he is prepared to be commander-in-chief,\" she continued. \"As we look to the past events, we " +
-        "know that this raises some questions about his preparedness and we'll see how the rest of his trip goes.\"";
-    doc.add(new Field(textFieldName, text, ft));
-    doc.add(new Field(categoryFieldName, "politics", ft));
-    doc.add(new Field(booleanFieldName, "true", ft));
-    indexWriter.addDocument(doc, analyzer);
-
-    doc = new Document();
-    text = "Still, when it comes to gun policy, many congressional Democrats have \"decided to " +
-        "keep quiet and not go there,\" said Alan Lizotte, dean and professor at the State University of New York at " +
-        "Albany's School of Criminal Justice.";
-    doc.add(new Field(textFieldName, text, ft));
-    doc.add(new Field(categoryFieldName, "politics", ft));
-    doc.add(new Field(booleanFieldName, "true", ft));
-    indexWriter.addDocument(doc, analyzer);
-
-    doc = new Document();
-    text = "Standing amongst the thousands of people at the state Capitol, Jorstad, director of " +
-        "technology at the University of Wisconsin-La Crosse, documented the historic moment and shared it with the " +
-        "world through the Internet.";
-    doc.add(new Field(textFieldName, text, ft));
-    doc.add(new Field(categoryFieldName, "technology", ft));
-    doc.add(new Field(booleanFieldName, "false", ft));
-    indexWriter.addDocument(doc, analyzer);
-
-    doc = new Document();
-    text = "So, about all those experts and analysts who've spent the past year or so saying " +
-        "Facebook was going to make a phone. A new expert has stepped forward to say it's not going to happen.";
-    doc.add(new Field(textFieldName, text, ft));
-    doc.add(new Field(categoryFieldName, "technology", ft));
-    doc.add(new Field(booleanFieldName, "false", ft));
-    indexWriter.addDocument(doc, analyzer);
-
-    doc = new Document();
-    text = "More than 400 million people trust Google with their e-mail, and 50 million store files" +
-        " in the cloud using the Dropbox service. People manage their bank accounts, pay bills, trade stocks and " +
-        "generally transfer or store huge volumes of personal data online.";
-    doc.add(new Field(textFieldName, text, ft));
-    doc.add(new Field(categoryFieldName, "technology", ft));
-    doc.add(new Field(booleanFieldName, "false", ft));
-    indexWriter.addDocument(doc, analyzer);
-
-    doc = new Document();
-    text = "unlabeled doc";
-    doc.add(new Field(textFieldName, text, ft));
-    indexWriter.addDocument(doc, analyzer);
-
-    indexWriter.commit();
-  }
-
-  protected void checkPerformance(Classifier<T> classifier, Analyzer analyzer, String classFieldName) throws Exception {
-    AtomicReader atomicReader = null;
-    long trainStart = System.currentTimeMillis();
-    try {
-      populatePerformanceIndex(analyzer);
-      atomicReader = SlowCompositeReaderWrapper.wrap(indexWriter.getReader());
-      classifier.train(atomicReader, textFieldName, classFieldName, analyzer);
-      long trainEnd = System.currentTimeMillis();
-      long trainTime = trainEnd - trainStart;
-      assertTrue("training took more than 2 mins : " + trainTime / 1000 + "s", trainTime < 120000);
-    } finally {
-      if (atomicReader != null)
-        atomicReader.close();
+      if (extendedResults) {
+        Integer o = mergeData.origVsFreq.get(original);
+        if (o != null) result.addFrequency(token, o);
+        for (SuggestWord word : suggestions)
+          result.add(token, word.string, word.freq);
+      } else {
+        List<String> words = new ArrayList<String>(sugQueue.size());
+        for (SuggestWord word : suggestions) words.add(word.string);
+        result.add(token, words);
+      }
     }
+    return result;
+  }
+  
+  public Analyzer getQueryAnalyzer() {
+    return analyzer;
   }
 
-  private void populatePerformanceIndex(Analyzer analyzer) throws IOException {
-    indexWriter.deleteAll();
-    indexWriter.commit();
-
-    FieldType ft = new FieldType(TextField.TYPE_STORED);
-    ft.setStoreTermVectors(true);
-    ft.setStoreTermVectorOffsets(true);
-    ft.setStoreTermVectorPositions(true);
-    int docs = 1000;
-    Random random = random();
-    for (int i = 0; i < docs; i++) {
-      boolean b = random.nextBoolean();
-      Document doc = new Document();
-      doc.add(new Field(textFieldName, createRandomString(random), ft));
-      doc.add(new Field(categoryFieldName, b ? "technology" : "politics", ft));
-      doc.add(new Field(booleanFieldName, String.valueOf(b), ft));
-      indexWriter.addDocument(doc, analyzer);
-    }
-    indexWriter.commit();
+  public String getDictionaryName() {
+    return name;
   }
 
-  private String createRandomString(Random random) {
-    StringBuilder builder = new StringBuilder();
-    for (int i = 0; i < 20; i++) {
-      builder.append(TestUtil.randomSimpleString(random, 5));
-      builder.append(" ");
-    }
-    return builder.toString();
+  /**
+   * Reloads the index.  Useful if an external process is responsible for building the spell checker.
+   *
+   * @throws java.io.IOException
+   */
+  public abstract void reload(SolrCore core, SolrIndexSearcher searcher) throws IOException;
+
+  /**
+   * (re)Builds the spelling index.  May be a NOOP if the implementation doesn't require building, or can't be rebuilt.
+   */
+  public abstract void build(SolrCore core, SolrIndexSearcher searcher);
+  
+  /**
+   * Get the value of {@link SpellingParams#SPELLCHECK_ACCURACY} if supported.  
+   * Otherwise throws UnsupportedOperationException.
+   */
+  protected float getAccuracy() {
+    throw new UnsupportedOperationException();
+  }
+  
+  /**
+   * Get the distance implementation used by this spellchecker, or NULL if not applicable.
+   */
+  protected StringDistance getStringDistance()  {
+    throw new UnsupportedOperationException();
   }
 
-  private void updateSampleIndex(Analyzer analyzer) throws Exception {
 
-    String text;
-
-    Document doc = new Document();
-    text = "Warren Bennis says John F. Kennedy grasped a key lesson about the presidency that few have followed.";
-    doc.add(new Field(textFieldName, text, ft));
-    doc.add(new Field(categoryFieldName, "politics", ft));
-    doc.add(new Field(booleanFieldName, "true", ft));
-
-    indexWriter.addDocument(doc, analyzer);
-
-    doc = new Document();
-    text = "Julian Zelizer says Bill Clinton is still trying to shape his party, years after the White House, while George W. Bush opts for a much more passive role.";
-    doc.add(new Field(textFieldName, text, ft));
-    doc.add(new Field(categoryFieldName, "politics", ft));
-    doc.add(new Field(booleanFieldName, "true", ft));
-    indexWriter.addDocument(doc, analyzer);
-
-    doc = new Document();
-    text = "Crossfire: Sen. Tim Scott passes on Sen. Lindsey Graham endorsement";
-    doc.add(new Field(textFieldName, text, ft));
-    doc.add(new Field(categoryFieldName, "politics", ft));
-    doc.add(new Field(booleanFieldName, "true", ft));
-    indexWriter.addDocument(doc, analyzer);
-
-    doc = new Document();
-    text = "Illinois becomes 16th state to allow same-sex marriage.";
-    doc.add(new Field(textFieldName, text, ft));
-    doc.add(new Field(categoryFieldName, "politics", ft));
-    doc.add(new Field(booleanFieldName, "true", ft));
-    indexWriter.addDocument(doc, analyzer);
-
-    doc = new Document();
-    text = "Apple is developing iPhones with curved-glass screens and enhanced sensors that detect different levels of pressure, according to a new report.";
-    doc.add(new Field(textFieldName, text, ft));
-    doc.add(new Field(categoryFieldName, "technology", ft));
-    doc.add(new Field(booleanFieldName, "false", ft));
-    indexWriter.addDocument(doc, analyzer);
-
-    doc = new Document();
-    text = "The Xbox One is Microsoft's first new gaming console in eight years. It's a quality piece of hardware but it's also noteworthy because Microsoft is using it to make a statement.";
-    doc.add(new Field(textFieldName, text, ft));
-    doc.add(new Field(categoryFieldName, "technology", ft));
-    doc.add(new Field(booleanFieldName, "false", ft));
-    indexWriter.addDocument(doc, analyzer);
-
-    doc = new Document();
-    text = "Google says it will replace a Google Maps image after a California father complained it shows the body of his teen-age son, who was shot to death in 2009.";
-    doc.add(new Field(textFieldName, text, ft));
-    doc.add(new Field(categoryFieldName, "technology", ft));
-    doc.add(new Field(booleanFieldName, "false", ft));
-    indexWriter.addDocument(doc, analyzer);
-
-    doc = new Document();
-    text = "second unlabeled doc";
-    doc.add(new Field(textFieldName, text, ft));
-    indexWriter.addDocument(doc, analyzer);
-
-    indexWriter.commit();
+  /**
+   * Get suggestions for the given query.  Tokenizes the query using a field appropriate Analyzer.
+   * The {@link SpellingResult#getSuggestions()} suggestions must be ordered by best suggestion first.
+   * <p/>
+   *
+   * @param options The {@link SpellingOptions} to use
+   * @return The {@link SpellingResult} suggestions
+   * @throws IOException if there is an error producing suggestions
+   */
+  public abstract SpellingResult getSuggestions(SpellingOptions options) throws IOException;
+  
+  public boolean isSuggestionsMayOverlap() {
+    return false;
   }
 }

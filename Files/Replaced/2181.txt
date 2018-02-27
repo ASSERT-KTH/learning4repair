@@ -1,6 +1,24 @@
-false);
+false),
 
-package org.apache.lucene.index;
+package org.apache.lucene.facet.search.sampling;
+
+import java.io.IOException;
+
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.MultiFields;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.index.DocsEnum;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.util.Bits;
+
+import org.apache.lucene.facet.search.DrillDown;
+import org.apache.lucene.facet.search.ScoredDocIDs;
+import org.apache.lucene.facet.search.ScoredDocIDsIterator;
+import org.apache.lucene.facet.search.params.FacetSearchParams;
+import org.apache.lucene.facet.search.results.FacetResult;
+import org.apache.lucene.facet.search.results.FacetResultNode;
+import org.apache.lucene.facet.taxonomy.CategoryPath;
+import org.apache.lucene.facet.taxonomy.TaxonomyReader;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,165 +37,149 @@ package org.apache.lucene.index;
  * limitations under the License.
  */
 
-import java.io.IOException;
-
-import org.apache.lucene.codecs.Codec;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.search.DocIdSetIterator;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.Constants;
-import org.apache.lucene.util.FixedBitSet;
-import org.apache.lucene.util.InfoStream;
-import org.apache.lucene.util.LuceneTestCase;
-import org.apache.lucene.util._TestUtil;
-import org.apache.lucene.util.packed.PackedInts;
-
-
-public class TestSegmentMerger extends LuceneTestCase {
-  //The variables for the new merged segment
-  private Directory mergedDir;
-  private String mergedSegment = "test";
-  //First segment to be merged
-  private Directory merge1Dir;
-  private Document doc1 = new Document();
-  private SegmentReader reader1 = null;
-  //Second Segment to be merged
-  private Directory merge2Dir;
-  private Document doc2 = new Document();
-  private SegmentReader reader2 = null;
-
-  @Override
-  public void setUp() throws Exception {
-    super.setUp();
-    mergedDir = newDirectory();
-    merge1Dir = newDirectory();
-    merge2Dir = newDirectory();
-    DocHelper.setupDoc(doc1);
-    SegmentInfoPerCommit info1 = DocHelper.writeDoc(random(), merge1Dir, doc1);
-    DocHelper.setupDoc(doc2);
-    SegmentInfoPerCommit info2 = DocHelper.writeDoc(random(), merge2Dir, doc2);
-    reader1 = new SegmentReader(info1, DirectoryReader.DEFAULT_TERMS_INDEX_DIVISOR, newIOContext(random()));
-    reader2 = new SegmentReader(info2, DirectoryReader.DEFAULT_TERMS_INDEX_DIVISOR, newIOContext(random()));
+/**
+ * Fix sampling results by counting the intersection between two lists: a
+ * TermDocs (list of documents in a certain category) and a DocIdSetIterator
+ * (list of documents matching the query).
+ * 
+ * 
+ * @lucene.experimental
+ */
+// TODO (Facet): implement also an estimated fixing by ratio (taking into
+// account "translation" of counts!)
+class TakmiSampleFixer implements SampleFixer {
+  
+  private TaxonomyReader taxonomyReader;
+  private IndexReader indexReader;
+  private FacetSearchParams searchParams;
+  
+  public TakmiSampleFixer(IndexReader indexReader,
+      TaxonomyReader taxonomyReader, FacetSearchParams searchParams) {
+    this.indexReader = indexReader;
+    this.taxonomyReader = taxonomyReader;
+    this.searchParams = searchParams;
   }
 
-  @Override
-  public void tearDown() throws Exception {
-    reader1.close();
-    reader2.close();
-    mergedDir.close();
-    merge1Dir.close();
-    merge2Dir.close();
-    super.tearDown();
+  public void fixResult(ScoredDocIDs origDocIds, FacetResult fres)
+      throws IOException {
+    FacetResultNode topRes = fres.getFacetResultNode();
+    fixResultNode(topRes, origDocIds);
+  }
+  
+  /**
+   * Fix result node count, and, recursively, fix all its children
+   * 
+   * @param facetResNode
+   *          result node to be fixed
+   * @param docIds
+   *          docids in effect
+   * @throws IOException
+   */
+  private void fixResultNode(FacetResultNode facetResNode, ScoredDocIDs docIds)
+      throws IOException {
+    recount(facetResNode, docIds);
+    for (FacetResultNode frn : facetResNode.getSubResults()) {
+      fixResultNode(frn, docIds);
+    }
   }
 
-  public void test() {
-    assertTrue(mergedDir != null);
-    assertTrue(merge1Dir != null);
-    assertTrue(merge2Dir != null);
-    assertTrue(reader1 != null);
-    assertTrue(reader2 != null);
+  /**
+   * Internal utility: recount for a facet result node
+   * 
+   * @param fresNode
+   *          result node to be recounted
+   * @param docIds
+   *          full set of matching documents.
+   * @throws IOException
+   */
+  private void recount(FacetResultNode fresNode, ScoredDocIDs docIds)
+      throws IOException {
+    // TODO (Facet): change from void to return the new, smaller docSet, and use
+    // that for the children, as this will make their intersection ops faster.
+    // can do this only when the new set is "sufficiently" smaller.
+    
+    /* We need the category's path name in order to do its recounting.
+     * If it is missing, because the option to label only part of the
+     * facet results was exercise, we need to calculate them anyway, so
+     * in essence sampling with recounting spends some extra cycles for
+     * labeling results for which labels are not required. */
+    CategoryPath catPath = fresNode.getLabel(taxonomyReader); // force labeling
+
+    Term drillDownTerm = DrillDown.term(searchParams, catPath);
+    // TODO (Facet): avoid Multi*?
+    Bits liveDocs = MultiFields.getLiveDocs(indexReader);
+    int updatedCount = countIntersection(MultiFields.getTermDocsEnum(indexReader, liveDocs,
+                                                                     drillDownTerm.field(), drillDownTerm.bytes(),
+                                                                     0),
+                                         docIds.iterator());
+
+    fresNode.setValue(updatedCount);
   }
 
-  public void testMerge() throws IOException {
-    final Codec codec = Codec.getDefault();
-    final SegmentInfo si = new SegmentInfo(mergedDir, Constants.LUCENE_MAIN_VERSION, mergedSegment, -1, false, codec, null, null);
-
-    SegmentMerger merger = new SegmentMerger(si, InfoStream.getDefault(), mergedDir, IndexWriterConfig.DEFAULT_TERM_INDEX_INTERVAL,
-                                             MergeState.CheckAbort.NONE, null, new FieldInfos.FieldNumbers(), newIOContext(random()));
-    merger.add(reader1);
-    merger.add(reader2);
-    MergeState mergeState = merger.merge();
-    int docsMerged = mergeState.segmentInfo.getDocCount();
-    assertTrue(docsMerged == 2);
-    //Should be able to open a new SegmentReader against the new directory
-    SegmentReader mergedReader = new SegmentReader(new SegmentInfoPerCommit(
-                                                         new SegmentInfo(mergedDir, Constants.LUCENE_MAIN_VERSION, mergedSegment, docsMerged,
-                                                                         false, codec, null, null),
-                                                         0, -1L),
-                                                   DirectoryReader.DEFAULT_TERMS_INDEX_DIVISOR, newIOContext(random()));
-    assertTrue(mergedReader != null);
-    assertTrue(mergedReader.numDocs() == 2);
-    Document newDoc1 = mergedReader.document(0);
-    assertTrue(newDoc1 != null);
-    //There are 2 unstored fields on the document
-    assertTrue(DocHelper.numFields(newDoc1) == DocHelper.numFields(doc1) - DocHelper.unstored.size());
-    Document newDoc2 = mergedReader.document(1);
-    assertTrue(newDoc2 != null);
-    assertTrue(DocHelper.numFields(newDoc2) == DocHelper.numFields(doc2) - DocHelper.unstored.size());
-
-    DocsEnum termDocs = _TestUtil.docs(random(), mergedReader,
-                                       DocHelper.TEXT_FIELD_2_KEY,
-                                       new BytesRef("field"),
-                                       MultiFields.getLiveDocs(mergedReader),
-                                       null,
-                                       0);
-    assertTrue(termDocs != null);
-    assertTrue(termDocs.nextDoc() != DocIdSetIterator.NO_MORE_DOCS);
-
-    int tvCount = 0;
-    for(FieldInfo fieldInfo : mergedReader.getFieldInfos()) {
-      if (fieldInfo.hasVectors()) {
-        tvCount++;
-      }
+  /**
+   * Count the size of the intersection between two lists: a TermDocs (list of
+   * documents in a certain category) and a DocIdSetIterator (list of documents
+   * matching a query).
+   */
+  private static int countIntersection(DocsEnum p1, ScoredDocIDsIterator p2)
+      throws IOException {
+    // The documentation of of both TermDocs and DocIdSetIterator claim
+    // that we must do next() before doc(). So we do, and if one of the
+    // lists is empty, obviously return 0;
+    if (p1 == null || p1.nextDoc() == DocIdSetIterator.NO_MORE_DOCS) {
+      return 0;
+    }
+    if (!p2.next()) {
+      return 0;
     }
     
-    //System.out.println("stored size: " + stored.size());
-    assertEquals("We do not have 3 fields that were indexed with term vector", 3, tvCount);
+    int d1 = p1.docID();
+    int d2 = p2.getDocID();
 
-    Terms vector = mergedReader.getTermVectors(0).terms(DocHelper.TEXT_FIELD_2_KEY);
-    assertNotNull(vector);
-    assertEquals(3, vector.size());
-    TermsEnum termsEnum = vector.iterator(null);
-
-    int i = 0;
-    while (termsEnum.next() != null) {
-      String term = termsEnum.term().utf8ToString();
-      int freq = (int) termsEnum.totalTermFreq();
-      //System.out.println("Term: " + term + " Freq: " + freq);
-      assertTrue(DocHelper.FIELD_2_TEXT.indexOf(term) != -1);
-      assertTrue(DocHelper.FIELD_2_FREQS[i] == freq);
-      i++;
-    }
-
-    TestSegmentReader.checkNorms(mergedReader);
-    mergedReader.close();
-  }
-
-  private static boolean equals(MergeState.DocMap map1, MergeState.DocMap map2) {
-    if (map1.maxDoc() != map2.maxDoc()) {
-      return false;
-    }
-    for (int i = 0; i < map1.maxDoc(); ++i) {
-      if (map1.get(i) != map2.get(i)) {
-        return false;
+    int count = 0;
+    for (;;) {
+      if (d1 == d2) {
+        ++count;
+        if (p1.nextDoc() == DocIdSetIterator.NO_MORE_DOCS) {
+          break; // end of list 1, nothing more in intersection
+        }
+        d1 = p1.docID();
+        if (!advance(p2, d1)) {
+          break; // end of list 2, nothing more in intersection
+        }
+        d2 = p2.getDocID();
+      } else if (d1 < d2) {
+        if (p1.advance(d2) == DocIdSetIterator.NO_MORE_DOCS) {
+          break; // end of list 1, nothing more in intersection
+        }
+        d1 = p1.docID();
+      } else /* d1>d2 */ {
+        if (!advance(p2, d1)) {
+          break; // end of list 2, nothing more in intersection
+        }
+        d2 = p2.getDocID();
       }
     }
-    return true;
+    return count;
   }
 
-  public void testBuildDocMap() {
-    final int maxDoc = 128;
-    final FixedBitSet liveDocs = new FixedBitSet(maxDoc);
-
-    MergeState.DocMap docMap1 = MergeState.DocMap.buildDelCountDocmap(maxDoc, maxDoc, liveDocs, PackedInts.COMPACT);
-    MergeState.DocMap docMap2 = MergeState.DocMap.buildDirectDocMap(maxDoc, 0, liveDocs, PackedInts.COMPACT);
-    assertTrue(equals(docMap1, docMap2));
-    
-    liveDocs.set(1);
-    for (int i = 7; i < 79; ++i) {
-      liveDocs.set(i);
+  /**
+   * utility: advance the iterator until finding (or exceeding) specific
+   * document
+   * 
+   * @param iterator
+   *          iterator being advanced
+   * @param targetDoc
+   *          target of advancing
+   * @return false if iterator exhausted, true otherwise.
+   */
+  private static boolean advance(ScoredDocIDsIterator iterator, int targetDoc) {
+    while (iterator.next()) {
+      if (iterator.getDocID() >= targetDoc) {
+        return true; // target reached
+      }
     }
-    liveDocs.set(80);
-    liveDocs.set(88);
-    int numDocs = liveDocs.cardinality();
-    docMap1 = MergeState.DocMap.buildDelCountDocmap(maxDoc, maxDoc - numDocs, liveDocs, PackedInts.COMPACT);
-    docMap2 = MergeState.DocMap.buildDirectDocMap(maxDoc, numDocs, liveDocs, PackedInts.COMPACT);
-    assertTrue(equals(docMap1, docMap2));
-
-    liveDocs.set(0, maxDoc);
-    docMap1 = MergeState.DocMap.buildDelCountDocmap(maxDoc, 0, liveDocs, PackedInts.COMPACT);
-    docMap2 = MergeState.DocMap.buildDirectDocMap(maxDoc, maxDoc, liveDocs, PackedInts.COMPACT);
-    assertTrue(equals(docMap1, docMap2));
+    return false; // exhausted
   }
 }
+ No newline at end of file

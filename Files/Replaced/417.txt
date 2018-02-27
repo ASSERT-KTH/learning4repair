@@ -1,6 +1,18 @@
-protected BlockReader getBlockReader(final IndexInput in, final int[] buffer) {
+void add(int ordinal, int parentOrdinal) {
 
-package org.apache.lucene.codecs.mockintblock;
+package org.apache.lucene.facet.taxonomy.directory;
+
+import java.io.IOException;
+
+import org.apache.lucene.index.CorruptIndexException;
+import org.apache.lucene.index.DocsAndPositionsEnum;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.MultiFields;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.BytesRef;
+
+import org.apache.lucene.facet.taxonomy.TaxonomyReader;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,207 +31,134 @@ package org.apache.lucene.codecs.mockintblock;
  * limitations under the License.
  */
 
-import java.io.IOException;
-
-import org.apache.lucene.codecs.BlockTermsReader;
-import org.apache.lucene.codecs.BlockTermsWriter;
-import org.apache.lucene.codecs.FieldsConsumer;
-import org.apache.lucene.codecs.FieldsProducer;
-import org.apache.lucene.codecs.FixedGapTermsIndexReader;
-import org.apache.lucene.codecs.FixedGapTermsIndexWriter;
-import org.apache.lucene.codecs.PostingsFormat;
-import org.apache.lucene.codecs.PostingsReaderBase;
-import org.apache.lucene.codecs.PostingsWriterBase;
-import org.apache.lucene.codecs.TermsIndexReaderBase;
-import org.apache.lucene.codecs.TermsIndexWriterBase;
-import org.apache.lucene.codecs.intblock.VariableIntBlockIndexInput;
-import org.apache.lucene.codecs.intblock.VariableIntBlockIndexOutput;
-import org.apache.lucene.codecs.sep.IntIndexInput;
-import org.apache.lucene.codecs.sep.IntIndexOutput;
-import org.apache.lucene.codecs.sep.IntStreamFactory;
-import org.apache.lucene.codecs.sep.SepPostingsReader;
-import org.apache.lucene.codecs.sep.SepPostingsWriter;
-import org.apache.lucene.index.SegmentWriteState;
-import org.apache.lucene.index.SegmentReadState;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.IOContext;
-import org.apache.lucene.store.IndexInput;
-import org.apache.lucene.store.IndexOutput;
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.IOUtils;
-
+// getParent() needs to be extremely efficient, to the point that we need
+// to fetch all the data in advance into memory, and answer these calls
+// from memory. Currently we use a large integer array, which is
+// initialized when the taxonomy is opened, and potentially enlarged
+// when it is refresh()ed.
 /**
- * A silly test codec to verify core support for variable
- * sized int block encoders is working.  The int encoder
- * used here writes baseBlockSize ints at once, if the first
- * int is <= 3, else 2*baseBlockSize.
+ * @lucene.experimental
  */
+class ParentArray {
 
-public class MockVariableIntBlockPostingsFormat extends PostingsFormat {
-  private final int baseBlockSize;
-  
-  public MockVariableIntBlockPostingsFormat() {
-    this(1);
+  // These arrays are not syncrhonized. Rather, the reference to the array
+  // is volatile, and the only writing operation (refreshPrefetchArrays)
+  // simply creates a new array and replaces the reference. The volatility
+  // of the reference ensures the correct atomic replacement and its
+  // visibility properties (the content of the array is visible when the
+  // new reference is visible).
+  private volatile int prefetchParentOrdinal[] = null;
+
+  public int[] getArray() {
+    return prefetchParentOrdinal;
   }
 
-  public MockVariableIntBlockPostingsFormat(int baseBlockSize) {
-    super("MockVariableIntBlock");
-    this.baseBlockSize = baseBlockSize;
-  }
-
-  @Override
-  public String toString() {
-    return getName() + "(baseBlockSize="+ baseBlockSize + ")";
-  }
-
-  public static class MockIntFactory extends IntStreamFactory {
-
-    private final int baseBlockSize;
-
-    public MockIntFactory(int baseBlockSize) {
-      this.baseBlockSize = baseBlockSize;
+  /**
+   * refreshPrefetch() refreshes the parent array. Initially, it fills the
+   * array from the positions of an appropriate posting list. If called during
+   * a refresh(), when the arrays already exist, only values for new documents
+   * (those beyond the last one in the array) are read from the positions and
+   * added to the arrays (that are appropriately enlarged). We assume (and
+   * this is indeed a correct assumption in our case) that existing categories
+   * are never modified or deleted.
+   */
+  void refresh(IndexReader indexReader) throws IOException {
+    // Note that it is not necessary for us to obtain the read lock.
+    // The reason is that we are only called from refresh() (precluding
+    // another concurrent writer) or from the constructor (when no method
+    // could be running).
+    // The write lock is also not held during the following code, meaning
+    // that reads *can* happen while this code is running. The "volatile"
+    // property of the prefetchParentOrdinal and prefetchDepth array
+    // references ensure the correct visibility property of the assignment
+    // but other than that, we do *not* guarantee that a reader will not
+    // use an old version of one of these arrays (or both) while a refresh
+    // is going on. But we find this acceptable - until a refresh has
+    // finished, the reader should not expect to see new information
+    // (and the old information is the same in the old and new versions).
+    int first;
+    int num = indexReader.maxDoc();
+    if (prefetchParentOrdinal==null) {
+      prefetchParentOrdinal = new int[num];
+      // Starting Lucene 2.9, following the change LUCENE-1542, we can
+      // no longer reliably read the parent "-1" (see comment in
+      // LuceneTaxonomyWriter.SinglePositionTokenStream). We have no way
+      // to fix this in indexing without breaking backward-compatibility
+      // with existing indexes, so what we'll do instead is just
+      // hard-code the parent of ordinal 0 to be -1, and assume (as is
+      // indeed the case) that no other parent can be -1.
+      if (num>0) {
+        prefetchParentOrdinal[0] = TaxonomyReader.INVALID_ORDINAL;
+      }
+      first = 1;
+    } else {
+      first = prefetchParentOrdinal.length;
+      if (first==num) {
+        return; // nothing to do - no category was added
+      }
+      // In Java 6, we could just do Arrays.copyOf()...
+      int[] newarray = new int[num];
+      System.arraycopy(prefetchParentOrdinal, 0, newarray, 0,
+          prefetchParentOrdinal.length);
+      prefetchParentOrdinal = newarray;
     }
 
-    @Override
-    public IntIndexInput openInput(Directory dir, String fileName, IOContext context) throws IOException {
-      final IndexInput in = dir.openInput(fileName, context);
-      final int baseBlockSize = in.readInt();
-      return new VariableIntBlockIndexInput(in) {
-
-        @Override
-        protected BlockReader getBlockReader(final IndexInput in, final int[] buffer) throws IOException {
-          return new BlockReader() {
-            public void seek(long pos) {}
-            public int readBlock() throws IOException {
-              buffer[0] = in.readVInt();
-              final int count = buffer[0] <= 3 ? baseBlockSize-1 : 2*baseBlockSize-1;
-              assert buffer.length >= count: "buffer.length=" + buffer.length + " count=" + count;
-              for(int i=0;i<count;i++) {
-                buffer[i+1] = in.readVInt();
-              }
-              return 1+count;
-            }
-          };
-        }
-      };
-    }
-
-    @Override
-    public IntIndexOutput createOutput(Directory dir, String fileName, IOContext context) throws IOException {
-      final IndexOutput out = dir.createOutput(fileName, context);
-      boolean success = false;
-      try {
-        out.writeInt(baseBlockSize);
-        VariableIntBlockIndexOutput ret = new VariableIntBlockIndexOutput(out, 2*baseBlockSize) {
-          int pendingCount;
-          final int[] buffer = new int[2+2*baseBlockSize];
-          
-          @Override
-          protected int add(int value) throws IOException {
-            buffer[pendingCount++] = value;
-            // silly variable block length int encoder: if
-            // first value <= 3, we write N vints at once;
-            // else, 2*N
-            final int flushAt = buffer[0] <= 3 ? baseBlockSize : 2*baseBlockSize;
-            
-            // intentionally be non-causal here:
-            if (pendingCount == flushAt+1) {
-              for(int i=0;i<flushAt;i++) {
-                out.writeVInt(buffer[i]);
-              }
-              buffer[0] = buffer[flushAt];
-              pendingCount = 1;
-              return flushAt;
-            } else {
-              return 0;
-            }
+    // Read the new part of the parents array from the positions:
+    // TODO (Facet): avoid Multi*?
+    Bits liveDocs = MultiFields.getLiveDocs(indexReader);
+    DocsAndPositionsEnum positions = MultiFields.getTermPositionsEnum(indexReader, liveDocs,
+                                                                      Consts.FIELD_PAYLOADS, new BytesRef(Consts.PAYLOAD_PARENT),
+                                                                      false);
+      if ((positions == null || positions.advance(first) == DocIdSetIterator.NO_MORE_DOCS) && first < num) {
+        throw new CorruptIndexException("Missing parent data for category " + first);
+      }
+      for (int i=first; i<num; i++) {
+        // Note that we know positions.doc() >= i (this is an
+        // invariant kept throughout this loop)
+        if (positions.docID()==i) {
+          if (positions.freq() == 0) { // shouldn't happen
+            throw new CorruptIndexException(
+                "Missing parent data for category "+i);
           }
-        };
-        success = true;
-        return ret;
-      } finally {
-        if (!success) {
-          IOUtils.closeWhileHandlingException(out);
-        }
+
+          // TODO (Facet): keep a local (non-volatile) copy of the prefetchParentOrdinal
+          // reference, because access to volatile reference is slower (?).
+          // Note: The positions we get here are one less than the position
+          // increment we added originally, so we get here the right numbers:
+          prefetchParentOrdinal[i] = positions.nextPosition();
+
+          if (positions.nextDoc() == DocIdSetIterator.NO_MORE_DOCS) {
+            if ( i+1 < num ) {
+              throw new CorruptIndexException(
+                  "Missing parent data for category "+(i+1));
+            }
+            break;
+          }
+        } else { // this shouldn't happen
+        throw new CorruptIndexException(
+            "Missing parent data for category "+i);
       }
     }
   }
 
-  @Override
-  public FieldsConsumer fieldsConsumer(SegmentWriteState state) throws IOException {
-    PostingsWriterBase postingsWriter = new SepPostingsWriter(state, new MockIntFactory(baseBlockSize));
-
-    boolean success = false;
-    TermsIndexWriterBase indexWriter;
-    try {
-      indexWriter = new FixedGapTermsIndexWriter(state);
-      success = true;
-    } finally {
-      if (!success) {
-        postingsWriter.close();
-      }
+  /**
+   * add() is used in LuceneTaxonomyWriter, not in LuceneTaxonomyReader.
+   * It is only called from a synchronized method, so it is not reentrant,
+   * and also doesn't need to worry about reads happening at the same time.
+   * 
+   * NOTE: add() and refresh() CANNOT be used together. If you call add(),
+   * this changes the arrays and refresh() can no longer be used.
+   */
+  void add(int ordinal, int parentOrdinal) throws IOException {
+    if (ordinal >= prefetchParentOrdinal.length) {
+      // grow the array, if necessary.
+      // In Java 6, we could just do Arrays.copyOf()...
+      int[] newarray = new int[ordinal*2+1];
+      System.arraycopy(prefetchParentOrdinal, 0, newarray, 0,
+          prefetchParentOrdinal.length);
+      prefetchParentOrdinal = newarray;
     }
-
-    success = false;
-    try {
-      FieldsConsumer ret = new BlockTermsWriter(indexWriter, state, postingsWriter);
-      success = true;
-      return ret;
-    } finally {
-      if (!success) {
-        try {
-          postingsWriter.close();
-        } finally {
-          indexWriter.close();
-        }
-      }
-    }
+    prefetchParentOrdinal[ordinal] = parentOrdinal;
   }
 
-  @Override
-  public FieldsProducer fieldsProducer(SegmentReadState state) throws IOException {
-    PostingsReaderBase postingsReader = new SepPostingsReader(state.dir,
-                                                              state.fieldInfos,
-                                                              state.segmentInfo,
-                                                              state.context,
-                                                              new MockIntFactory(baseBlockSize), state.segmentSuffix);
-
-    TermsIndexReaderBase indexReader;
-    boolean success = false;
-    try {
-      indexReader = new FixedGapTermsIndexReader(state.dir,
-                                                       state.fieldInfos,
-                                                       state.segmentInfo.name,
-                                                       state.termsIndexDivisor,
-                                                       BytesRef.getUTF8SortedAsUnicodeComparator(),
-                                                       state.segmentSuffix, state.context);
-      success = true;
-    } finally {
-      if (!success) {
-        postingsReader.close();
-      }
-    }
-
-    success = false;
-    try {
-      FieldsProducer ret = new BlockTermsReader(indexReader,
-                                                state.dir,
-                                                state.fieldInfos,
-                                                state.segmentInfo.name,
-                                                postingsReader,
-                                                state.context,
-                                                1024,
-                                                state.segmentSuffix);
-      success = true;
-      return ret;
-    } finally {
-      if (!success) {
-        try {
-          postingsReader.close();
-        } finally {
-          indexReader.close();
-        }
-      }
-    }
-  }
 }

@@ -17,903 +17,822 @@
  * limitations under the License.
  */
 
-package org.apache.solr.util;
-
-import org.apache.lucene.index.StorableField;
-import org.apache.lucene.index.StoredDocument;
-import org.apache.lucene.search.*;
-import org.apache.lucene.search.BooleanClause.Occur;
-import org.apache.solr.common.SolrDocument;
-import org.apache.solr.common.SolrDocumentList;
-import org.apache.solr.common.SolrException;
-import org.apache.solr.common.params.CommonParams;
-import org.apache.solr.common.params.SolrParams;
-import org.apache.solr.common.util.NamedList;
-import org.apache.solr.common.util.SimpleOrderedMap;
-import org.apache.solr.common.util.StrUtils;
-import org.apache.solr.core.SolrCore;
-import org.apache.solr.handler.component.HighlightComponent;
-import org.apache.solr.handler.component.ResponseBuilder;
-import org.apache.solr.highlight.SolrHighlighter;
-import org.apache.solr.parser.QueryParser;
-import org.apache.solr.request.SolrQueryRequest;
-import org.apache.solr.response.SolrQueryResponse;
-import org.apache.solr.schema.IndexSchema;
-import org.apache.solr.schema.SchemaField;
-import org.apache.solr.search.*;
+package org.apache.noggit;
 
 import java.io.IOException;
-import java.util.*;
-import java.util.regex.Pattern;
-import java.lang.reflect.Method;
-import java.lang.reflect.InvocationTargetException;
+import java.io.Reader;
 
 /**
- * <p>Utilities that may be of use to RequestHandlers.</p>
- *
- * <p>
- * Many of these functions have code that was stolen/mutated from
- * StandardRequestHandler.
- * </p>
- *
- * <p>:TODO: refactor StandardRequestHandler to use these utilities</p>
- *
- * <p>:TODO: Many "standard" functionality methods are not cognisant of
- * default parameter settings.
  */
-public class SolrPluginUtils {
 
-  /**
-   * Set default-ish params on a SolrQueryRequest.
-   *
-   * RequestHandlers can use this method to ensure their defaults and
-   * overrides are visible to other components such as the response writer
-   *
-   * @param req The request whose params we are interested i
-   * @param defaults values to be used if no values are specified in the request params
-   * @param appends values to be appended to those from the request (or defaults) when dealing with multi-val params, or treated as another layer of defaults for singl-val params.
-   * @param invariants values which will be used instead of any request, or default values, regardless of context.
+public class JSONParser {
+
+  /** Event indicating a JSON string value, including member names of objects */
+  public static final int STRING=1;
+  /** Event indicating a JSON number value which fits into a signed 64 bit integer */
+  public static final int LONG=2;
+  /** Event indicating a JSON number value which has a fractional part or an exponent
+   * and with string length <= 23 chars not including sign.  This covers
+   * all representations of normal values for Double.toString().
    */
-  public static void setDefaults(SolrQueryRequest req, SolrParams defaults,
-                                 SolrParams appends, SolrParams invariants) {
+  public static final int NUMBER=3;
+  /** Event indicating a JSON number value that was not produced by toString of any
+   * Java primitive numerics such as Double or Long.  It is either
+   * an integer outside the range of a 64 bit signed integer, or a floating
+   * point value with a string representation of more than 23 chars.
+    */
+  public static final int BIGNUMBER=4;
+  /** Event indicating a JSON boolean */
+  public static final int BOOLEAN=5;
+  /** Event indicating a JSON null */
+  public static final int NULL=6;
+  /** Event indicating the start of a JSON object */
+  public static final int OBJECT_START=7;
+  /** Event indicating the end of a JSON object */
+  public static final int OBJECT_END=8;
+  /** Event indicating the start of a JSON array */
+  public static final int ARRAY_START=9;
+  /** Event indicating the end of a JSON array */
+  public static final int ARRAY_END=10;
+  /** Event indicating the end of input has been reached */
+  public static final int EOF=11;
 
-      SolrParams p = req.getParams();
-      p = SolrParams.wrapDefaults(p, defaults);
-      p = SolrParams.wrapAppended(p, appends);
-      p = SolrParams.wrapDefaults(invariants, p);
+  public static class ParseException extends RuntimeException {
+    public ParseException(String msg) {
+      super(msg);
+    }
+  }
 
-      req.setParams(p);
+  public static String getEventString( int e )
+  {
+    switch( e )
+    {
+    case STRING: return "STRING";
+    case LONG: return "LONG";
+    case NUMBER: return "NUMBER";
+    case BIGNUMBER: return "BIGNUMBER";
+    case BOOLEAN: return "BOOLEAN";
+    case NULL: return "NULL";
+    case OBJECT_START: return "OBJECT_START";
+    case OBJECT_END: return "OBJECT_END";
+    case ARRAY_START: return "ARRAY_START";
+    case ARRAY_END: return "ARRAY_END";
+    case EOF: return "EOF";
+    }
+    return "Unknown: "+e;
+  }
+
+  private static final CharArr devNull = new NullCharArr();
+
+
+  final char[] buf;  // input buffer with JSON text in it
+  int start;         // current position in the buffer
+  int end;           // end position in the buffer (one past last valid index)
+  final Reader in;   // optional reader to obtain data from
+  boolean eof=false; // true if the end of the stream was reached.
+  long gpos;          // global position = gpos + start
+
+  int event;         // last event read
+
+  public JSONParser(Reader in) {
+    this(in, new char[8192]);
+    // 8192 matches the default buffer size of a BufferedReader so double
+    // buffering of the data is avoided.
+  }
+
+  public JSONParser(Reader in, char[] buffer) {
+    this.in = in;
+    this.buf = buffer;
+  }
+
+  // idea - if someone passes us a CharArrayReader, we could
+  // directly use that buffer as it's protected.
+
+  public JSONParser(char[] data, int start, int end) {
+    this.in = null;
+    this.buf = data;
+    this.start = start;
+    this.end = end;
+  }
+
+  public JSONParser(String data) {
+    this(data, 0, data.length());
+  }
+
+  public JSONParser(String data, int start, int end) {
+    this.in = null;
+    this.start = start;
+    this.end = end;
+    this.buf = new char[end-start];
+    data.getChars(start,end,buf,0);
+  }
+
+  // temporary output buffer
+  private final CharArr out = new CharArr(64);
+
+  // We need to keep some state in order to (at a minimum) know if
+  // we should skip ',' or ':'.
+  private byte[] stack = new byte[16];
+  private int ptr=0;     // pointer into the stack of parser states
+  private byte state=0;  // current parser state
+
+  // parser states stored in the stack
+  private static final byte DID_OBJSTART =1;  // '{' just read
+  private static final byte DID_ARRSTART =2;  // '[' just read
+  private static final byte DID_ARRELEM =3;   // array element just read
+  private static final byte DID_MEMNAME =4;   // object member name (map key) just read
+  private static final byte DID_MEMVAL =5;    // object member value (map val) just read
+
+  // info about value that was just read (or is in the middle of being read)
+  private int valstate;
+
+  // push current parser state (use at start of new container)
+  private final void push() {
+    if (ptr >= stack.length) {
+      // doubling here is probably overkill, but anything that needs to double more than
+      // once (32 levels deep) is very atypical anyway.
+      byte[] newstack = new byte[stack.length<<1];
+      System.arraycopy(stack,0,newstack,0,stack.length);
+      stack = newstack;
+    }
+    stack[ptr++] = state;
+  }
+
+  // pop  parser state (use at end of container)
+  private final void pop() {
+    if (--ptr<0) {
+      throw err("Unbalanced container");
+    } else {
+      state = stack[ptr];
+    }
+  }
+
+  protected void fill() throws IOException {
+    if (in!=null) {
+      gpos += end;
+      start=0;
+      int num = in.read(buf,0,buf.length);
+      end = num>=0 ? num : 0;
+    }
+    if (start>=end) eof=true;
+  }
+
+  private void getMore() throws IOException {
+    fill();
+    if (start>=end) {
+      throw err(null);
+    }
+  }
+
+  protected int getChar() throws IOException {
+    if (start>=end) {
+      fill();
+      if (start>=end) return -1;
+    }
+    return buf[start++];
+  }
+
+  private int getCharNWS() throws IOException {
+    for (;;) {
+      int ch = getChar();
+      if (!(ch==' ' || ch=='\t' || ch=='\n' || ch=='\r')) return ch;
+    }
+  }
+
+  private void expect(char[] arr) throws IOException {
+    for (int i=1; i<arr.length; i++) {
+      int ch = getChar();
+      if (ch != arr[i]) {
+        throw err("Expected " + new String(arr));
+      }
+    }
+  }
+
+  private ParseException err(String msg) {
+    // We can't tell if EOF was hit by comparing start<=end
+    // because the illegal char could have been the last in the buffer
+    // or in the stream.  To deal with this, the "eof" var was introduced
+    if (!eof && start>0) start--;  // backup one char
+    String chs = "char=" + ((start>=end) ? "(EOF)" : "" + (char)buf[start]);
+    String pos = "position=" + (gpos+start);
+    String tot = chs + ',' + pos + getContext();
+    if (msg==null) {
+      if (start>=end) msg = "Unexpected EOF";
+      else msg="JSON Parse Error";
+    }
+    return new ParseException(msg + ": " + tot);
+  }
+
+  private String getContext() {
+    String context = "";
+    if (start>=0) {
+      context += " BEFORE='" + errEscape(Math.max(start-60,0), start+1) + "'";
+    }
+    if (start<end) {
+      context += " AFTER='" + errEscape(start+1, start+40) + "'";
+    }
+    return context;
+  }
+
+  private String errEscape(int a, int b) {
+    b = Math.min(b, end);
+    if (a>=b) return "";
+    return new String(buf, a, b-a).replaceAll("\\s+"," ");
   }
 
 
+  private boolean bool; // boolean value read
+  private long lval;    // long value read
+  private int nstate;   // current state while reading a number
+  private static final int HAS_FRACTION = 0x01;  // nstate flag, '.' already read
+  private static final int HAS_EXPONENT = 0x02;  // nstate flag, '[eE][+-]?[0-9]' already read
 
-  /**
-   * SolrIndexSearch.numDocs(Query,Query) freaks out if the filtering
-   * query is null, so we use this workarround.
+  /** Returns the long read... only significant if valstate==LONG after
+   * this call.  firstChar should be the first numeric digit read.
    */
-  public static int numDocs(SolrIndexSearcher s, Query q, Query f)
-    throws IOException {
+  private long readNumber(int firstChar, boolean isNeg) throws IOException {
+    out.unsafeWrite(firstChar);   // unsafe OK since we know output is big enough
+    // We build up the number in the negative plane since it's larger (by one) than
+    // the positive plane.
+    long v = '0' - firstChar;
+     // can't overflow a long in 18 decimal digits (i.e. 17 additional after the first).
+     // we also need 22 additional to handle double so we'll handle in 2 separate loops.
+    int i;
+    for (i=0; i<17; i++) {
+      int ch = getChar();
+      // TODO: is this switch faster as an if-then-else?
+      switch(ch) {
+        case '0':
+        case '1':
+        case '2':
+        case '3':
+        case '4':
+        case '5':
+        case '6':
+        case '7':
+        case '8':
+        case '9':
+          v = v*10 - (ch-'0');
+          out.unsafeWrite(ch);
+          continue;
+        case '.':
+          out.unsafeWrite('.');
+          valstate = readFrac(out,22-i);
+          return 0;
+        case 'e':
+        case 'E':
+          out.unsafeWrite(ch);
+          nstate=0;
+          valstate = readExp(out,22-i);
+          return 0;
+        default:
+          // return the number, relying on nextEvent() to return an error
+          // for invalid chars following the number.
+          if (ch!=-1) --start;   // push back last char if not EOF
 
-    return (null == f) ? s.getDocSet(q).size() : s.numDocs(q,f);
+          valstate = LONG;
+          return isNeg ? v : -v;
+      }
+    }
 
+    // after this, we could overflow a long and need to do extra checking
+    boolean overflow = false;
+    long maxval = isNeg ? Long.MIN_VALUE : -Long.MAX_VALUE;
+
+    for (; i<22; i++) {
+      int ch = getChar();
+      switch(ch) {
+        case '0':
+        case '1':
+        case '2':
+        case '3':
+        case '4':
+        case '5':
+        case '6':
+        case '7':
+        case '8':
+        case '9':
+          if (v < (0x8000000000000000L/10)) overflow=true;  // can't multiply by 10 w/o overflowing
+          v *= 10;
+          int digit = ch - '0';
+          if (v < maxval + digit) overflow=true; // can't add digit w/o overflowing
+          v -= digit;
+          out.unsafeWrite(ch);
+          continue;
+        case '.':
+          out.unsafeWrite('.');
+          valstate = readFrac(out,22-i);
+          return 0;
+        case 'e':
+        case 'E':
+          out.unsafeWrite(ch);
+          nstate=0;
+          valstate = readExp(out,22-i);
+          return 0;
+        default:
+          // return the number, relying on nextEvent() to return an error
+          // for invalid chars following the number.
+          if (ch!=-1) --start;   // push back last char if not EOF
+
+          valstate = overflow ? BIGNUMBER : LONG;
+          return isNeg ? v : -v;
+      }
+    }
+
+
+    nstate=0;
+    valstate = BIGNUMBER;
+    return 0;
+  }
+
+  
+  // read digits right of decimal point
+  private int readFrac(CharArr arr, int lim) throws IOException {
+    nstate = HAS_FRACTION;  // deliberate set instead of '|'
+    while(--lim>=0) {
+      int ch = getChar();
+      if (ch>='0' && ch<='9') {
+        arr.write(ch);
+      } else if (ch=='e' || ch=='E') {
+        arr.write(ch);
+        return readExp(arr,lim);
+      } else {
+        if (ch!=-1) start--; // back up
+        return NUMBER;
+      }
+    }
+    return BIGNUMBER;
   }
 
 
+  // call after 'e' or 'E' has been seen to read the rest of the exponent
+  private int readExp(CharArr arr, int lim) throws IOException {
+    nstate |= HAS_EXPONENT;
+    int ch = getChar(); lim--;
 
+    if (ch=='+' || ch=='-') {
+      arr.write(ch);
+      ch = getChar(); lim--;
+    }
 
+    // make sure at least one digit is read.
+    if (ch<'0' || ch>'9') {
+      throw err("missing exponent number");
+    }
+    arr.write(ch);
 
-
-  private final static Pattern splitList=Pattern.compile(",| ");
-
-  /** Split a value that may contain a comma, space of bar separated list. */
-  public static String[] split(String value){
-     return splitList.split(value.trim(), 0);
+    return readExpDigits(arr,lim);
   }
 
+  // continuation of readExpStart
+  private int readExpDigits(CharArr arr, int lim) throws IOException {
+    while (--lim>=0) {
+      int ch = getChar();
+      if (ch>='0' && ch<='9') {
+        arr.write(ch);
+      } else {
+        if (ch!=-1) start--; // back up
+        return NUMBER;
+      }
+    }
+    return BIGNUMBER;
+  }
 
-  /**
-   * Pre-fetch documents into the index searcher's document cache.
-   *
-   * This is an entirely optional step which you might want to perform for
-   * the following reasons:
-   *
-   * <ul>
-   *     <li>Locates the document-retrieval costs in one spot, which helps
-   *     detailed performance measurement</li>
-   *
-   *     <li>Determines a priori what fields will be needed to be fetched by
-   *     various subtasks, like response writing and highlighting.  This
-   *     minimizes the chance that many needed fields will be loaded lazily.
-   *     (it is more efficient to load all the field we require normally).</li>
-   * </ul>
-   *
-   * If lazy field loading is disabled, this method does nothing.
-   */
-  public static void optimizePreFetchDocs(ResponseBuilder rb,
-                                          DocList docs,
-                                          Query query,
-                                          SolrQueryRequest req,
-                                          SolrQueryResponse res) throws IOException {
-    SolrIndexSearcher searcher = req.getSearcher();
-    if(!searcher.enableLazyFieldLoading) {
-      // nothing to do
+  private void continueNumber(CharArr arr) throws IOException {
+    if (arr != out) arr.write(out);
+
+    if ((nstate & HAS_EXPONENT)!=0){
+      readExpDigits(arr, Integer.MAX_VALUE);
+      return;
+    }
+    if (nstate != 0) {
+      readFrac(arr, Integer.MAX_VALUE);
       return;
     }
 
-    ReturnFields returnFields = res.getReturnFields();
-    if(returnFields.getLuceneFieldNames() != null) {
-      Set<String> fieldFilter = returnFields.getLuceneFieldNames();
-
-      if (rb.doHighlights) {
-        // copy return fields list
-        fieldFilter = new HashSet<String>(fieldFilter);
-        // add highlight fields
-
-        SolrHighlighter highlighter = HighlightComponent.getHighlighter(req.getCore());
-        for (String field: highlighter.getHighlightFields(query, req, null))
-          fieldFilter.add(field);
-
-        // fetch unique key if one exists.
-        SchemaField keyField = req.getSearcher().getSchema().getUniqueKeyField();
-        if(null != keyField)
-          fieldFilter.add(keyField.getName());
+    for(;;) {
+      int ch = getChar();
+      if (ch>='0' && ch <='9') {
+        arr.write(ch);
+      } else if (ch=='.') {
+        arr.write(ch);
+        readFrac(arr,Integer.MAX_VALUE);
+        return;
+      } else if (ch=='e' || ch=='E') {
+        arr.write(ch);
+        readExp(arr,Integer.MAX_VALUE);
+        return;
+      } else {
+        if (ch!=-1) start--;
+        return;
       }
-
-      // get documents
-      DocIterator iter = docs.iterator();
-      for (int i=0; i<docs.size(); i++) {
-        searcher.doc(iter.nextDoc(), fieldFilter);
-      }
-
     }
-
   }
 
 
-  public static Set<String> getDebugInterests(String[] params, ResponseBuilder rb){
-    Set<String> debugInterests = new HashSet<String>();
-    if (params != null) {
-      for (int i = 0; i < params.length; i++) {
-        if (params[i].equalsIgnoreCase("all") || params[i].equalsIgnoreCase("true")){
-          rb.setDebug(true);
-          break;
-          //still might add others
-        } else if (params[i].equals(CommonParams.TIMING)){
-          rb.setDebugTimings(true);
-        } else if (params[i].equals(CommonParams.QUERY)){
-          rb.setDebugQuery(true);
-        } else if (params[i].equals(CommonParams.RESULTS)){
-          rb.setDebugResults(true);
+  private int hexval(int hexdig) {
+    if (hexdig>='0' && hexdig <='9') {
+      return hexdig-'0';
+    } else if (hexdig>='A' && hexdig <='F') {
+      return hexdig+(10-'A');
+    } else if (hexdig>='a' && hexdig <='f') {
+      return hexdig+(10-'a');
+    }
+    throw err("invalid hex digit");
+  }
+
+  // backslash has already been read when this is called
+  private char readEscapedChar() throws IOException {
+    switch (getChar()) {
+      case '"' : return '"';
+      case '\\' : return '\\';
+      case '/' : return '/';
+      case 'n' : return '\n';
+      case 'r' : return '\r';
+      case 't' : return '\t';
+      case 'f' : return '\f';
+      case 'b' : return '\b';
+      case 'u' :
+        return (char)(
+               (hexval(getChar()) << 12)
+             | (hexval(getChar()) << 8)
+             | (hexval(getChar()) << 4)
+             | (hexval(getChar())));
+    }
+    throw err("Invalid character escape in string");
+  }
+
+  // a dummy buffer we can use to point at other buffers
+  private final CharArr tmp = new CharArr(null,0,0);
+
+  private CharArr readStringChars() throws IOException {
+     char c=0;
+     int i;
+     for (i=start; i<end; i++) {
+      c = buf[i];
+      if (c=='"') {
+        tmp.set(buf,start,i);  // directly use input buffer
+        start=i+1; // advance past last '"'
+        return tmp;
+      } else if (c=='\\') {
+        break;
+      }
+    }
+    out.reset();
+    readStringChars2(out, i);
+    return out;
+  }
+
+
+  // middle is the pointer to the middle of a buffer to start scanning for a non-string
+  // character ('"' or "/").  start<=middle<end
+  // this should be faster for strings with fewer escapes, but probably slower for many escapes.
+  private void readStringChars2(CharArr arr, int middle) throws IOException {
+    for (;;) {
+      if (middle>=end) {
+        arr.write(buf,start,middle-start);
+        start=middle;
+        getMore();
+        middle=start;
+      }
+      int ch = buf[middle++];
+      if (ch=='"') {
+        int len = middle-start-1;        
+        if (len>0) arr.write(buf,start,len);
+        start=middle;
+        return;
+      } else if (ch=='\\') {
+        int len = middle-start-1;
+        if (len>0) arr.write(buf,start,len);
+        start=middle;
+        arr.write(readEscapedChar());
+        middle=start;
+      }
+    }
+  }
+
+
+  /*** alternate implelentation
+  // middle is the pointer to the middle of a buffer to start scanning for a non-string
+  // character ('"' or "/").  start<=middle<end
+  private void readStringChars2a(CharArr arr, int middle) throws IOException {
+    int ch=0;
+    for(;;) {
+      // find the next non-string char
+      for (; middle<end; middle++) {
+        ch = buf[middle];
+        if (ch=='"' || ch=='\\') break;
+      }
+
+      arr.write(buf,start,middle-start);
+      if (middle>=end) {
+        getMore();
+        middle=start;
+      } else {
+        start = middle+1;   // set buffer pointer to correct spot
+        if (ch=='"') {
+          valstate=0;
+          return;
+        } else if (ch=='\\') {
+          arr.write(readEscapedChar());
+          if (start>=end) getMore();
+          middle=start;
         }
       }
     }
-    return debugInterests;
   }
-  /**
-   * <p>
-   * Returns a NamedList containing many "standard" pieces of debugging
-   * information.
-   * </p>
-   *
+  ***/
+
+
+  // return the next event when parser is in a neutral state (no
+  // map separators or array element separators to read
+  private int next(int ch) throws IOException {
+    for(;;) {
+      switch (ch) {
+        case ' ':
+        case '\t': break;
+        case '\r':
+        case '\n': break;  // try and keep track of linecounts?
+        case '"' :
+          valstate = STRING;
+          return STRING;
+        case '{' :
+          push();
+          state= DID_OBJSTART;
+          return OBJECT_START;
+        case '[':
+          push();
+          state=DID_ARRSTART;
+          return ARRAY_START;
+        case '0' :
+          out.reset();
+          //special case '0'?  If next char isn't '.' val=0
+          ch=getChar();
+          if (ch=='.') {
+            start--; ch='0';
+            readNumber('0',false);
+            return valstate;
+          } else if (ch>'9' || ch<'0') {
+            out.unsafeWrite('0');
+            if (ch!=-1) start--;
+            lval = 0;
+            valstate=LONG;
+            return LONG;
+          } else {
+            throw err("Leading zeros not allowed");
+          }
+        case '1' :
+        case '2' :
+        case '3' :
+        case '4' :
+        case '5' :
+        case '6' :
+        case '7' :
+        case '8' :
+        case '9' :
+          out.reset();
+          lval = readNumber(ch,false);
+          return valstate;
+        case '-' :
+          out.reset();
+          out.unsafeWrite('-');
+          ch = getChar();
+          if (ch<'0' || ch>'9') throw err("expected digit after '-'");
+          lval = readNumber(ch,true);
+          return valstate;
+        case 't':
+          valstate=BOOLEAN;
+          // TODO: test performance of this non-branching inline version.
+          // if ((('r'-getChar())|('u'-getChar())|('e'-getChar())) != 0) err("");
+          expect(JSONUtil.TRUE_CHARS);
+          bool=true;
+          return BOOLEAN;
+        case 'f':
+          valstate=BOOLEAN;
+          expect(JSONUtil.FALSE_CHARS);
+          bool=false;
+          return BOOLEAN;
+        case 'n':
+          valstate=NULL;
+          expect(JSONUtil.NULL_CHARS);
+          return NULL;
+        case -1:
+          if (getLevel()>0) throw err("Premature EOF");
+          return EOF;
+        default: throw err(null);
+      }
+
+      ch = getChar();
+    }
+  }
+
+  public String toString() {
+    return "start="+start+",end="+end+",state="+state+"valstate="+valstate;
+  }
+
+
+  /** Returns the next event encountered in the JSON stream, one of
    * <ul>
-   * <li>rawquerystring - the 'q' param exactly as specified by the client
-   * </li>
-   * <li>querystring - the 'q' param after any preprocessing done by the plugin
-   * </li>
-   * <li>parsedquery - the main query executed formated by the Solr
-   *     QueryParsing utils class (which knows about field types)
-   * </li>
-   * <li>parsedquery_toString - the main query executed formated by it's
-   *     own toString method (in case it has internal state Solr
-   *     doesn't know about)
-   * </li>
-   * <li>explain - the list of score explanations for each document in
-   *     results against query.
-   * </li>
-   * <li>otherQuery - the query string specified in 'explainOther' query param.
-   * </li>
-   * <li>explainOther - the list of score explanations for each document in
-   *     results against 'otherQuery'
-   * </li>
+   * <li>{@link #STRING}</li>
+   * <li>{@link #LONG}</li>
+   * <li>{@link #NUMBER}</li>
+   * <li>{@link #BIGNUMBER}</li>
+   * <li>{@link #BOOLEAN}</li>
+   * <li>{@link #NULL}</li>
+   * <li>{@link #OBJECT_START}</li>
+   * <li>{@link #OBJECT_END}</li>
+   * <li>{@link #OBJECT_END}</li>
+   * <li>{@link #ARRAY_START}</li>
+   * <li>{@link #ARRAY_END}</li>
+   * <li>{@link #EOF}</li>
    * </ul>
-   *
-   * @param req the request we are dealing with
-   * @param userQuery the users query as a string, after any basic
-   *                  preprocessing has been done
-   * @param query the query built from the userQuery
-   *              (and perhaps other clauses) that identifies the main
-   *              result set of the response.
-   * @param results the main result set of the response
-   * @return The debug info
-   * @throws java.io.IOException if there was an IO error
    */
-  public static NamedList doStandardDebug(
-          SolrQueryRequest req,
-          String userQuery,
-          Query query,
-          DocList results,
-          boolean dbgQuery,
-          boolean dbgResults)
-          throws IOException 
-  {
-    NamedList dbg = new SimpleOrderedMap();
-    doStandardQueryDebug(req, userQuery, query, dbgQuery, dbg);
-    doStandardResultsDebug(req, query, results, dbgResults, dbg);
-    return dbg;
-  }
-  
-  public static void doStandardQueryDebug(
-          SolrQueryRequest req,
-          String userQuery,
-          Query query,
-          boolean dbgQuery,
-          NamedList dbg)
-  {
-    if (dbgQuery) {
-      /* userQuery may have been pre-processed .. expose that */
-      dbg.add("rawquerystring", req.getParams().get(CommonParams.Q));
-      dbg.add("querystring", userQuery);
-
-     /* QueryParsing.toString isn't perfect, use it to see converted
-      * values, use regular toString to see any attributes of the
-      * underlying Query it may have missed.
-      */
-      dbg.add("parsedquery", QueryParsing.toString(query, req.getSchema()));
-      dbg.add("parsedquery_toString", query.toString());
+  public int nextEvent() throws IOException {
+    if (valstate==STRING) {
+      readStringChars2(devNull,start);
     }
-  }
-  
-  public static void doStandardResultsDebug(
-          SolrQueryRequest req,
-          Query query,
-          DocList results,
-          boolean dbgResults,
-          NamedList dbg) throws IOException
-  {
-    if (dbgResults) {
-      SolrIndexSearcher searcher = req.getSearcher();
-      IndexSchema schema = req.getSchema();
-      boolean explainStruct = req.getParams().getBool(CommonParams.EXPLAIN_STRUCT, false);
-
-      NamedList<Explanation> explain = getExplanations(query, results, searcher, schema);
-      dbg.add("explain", explainStruct
-              ? explanationsToNamedLists(explain)
-              : explanationsToStrings(explain));
-
-      String otherQueryS = req.getParams().get(CommonParams.EXPLAIN_OTHER);
-      if (otherQueryS != null && otherQueryS.length() > 0) {
-        DocList otherResults = doSimpleQuery(otherQueryS, req, 0, 10);
-        dbg.add("otherQuery", otherQueryS);
-        NamedList<Explanation> explainO = getExplanations(query, otherResults, searcher, schema);
-        dbg.add("explainOther", explainStruct
-                ? explanationsToNamedLists(explainO)
-                : explanationsToStrings(explainO));
-      }
-    }
-  }
-
-  public static NamedList<Object> explanationToNamedList(Explanation e) {
-    NamedList<Object> out = new SimpleOrderedMap<Object>();
-
-    out.add("match", e.isMatch());
-    out.add("value", e.getValue());
-    out.add("description", e.getDescription());
-
-    Explanation[] details = e.getDetails();
-
-    // short circut out
-    if (null == details || 0 == details.length) return out;
-
-    List<NamedList<Object>> kids
-      = new ArrayList<NamedList<Object>>(details.length);
-    for (Explanation d : details) {
-      kids.add(explanationToNamedList(d));
-    }
-    out.add("details", kids);
-
-    return out;
-  }
-
-  public static NamedList<NamedList<Object>> explanationsToNamedLists
-    (NamedList<Explanation> explanations) {
-
-    NamedList<NamedList<Object>> out
-      = new SimpleOrderedMap<NamedList<Object>>();
-    for (Map.Entry<String,Explanation> entry : explanations) {
-      out.add(entry.getKey(), explanationToNamedList(entry.getValue()));
-    }
-    return out;
-  }
-
-  /**
-   * Generates an NamedList of Explanations for each item in a list of docs.
-   *
-   * @param query The Query you want explanations in the context of
-   * @param docs The Documents you want explained relative that query
-   */
-  public static NamedList<Explanation> getExplanations
-    (Query query,
-     DocList docs,
-     SolrIndexSearcher searcher,
-     IndexSchema schema) throws IOException {
-
-    NamedList<Explanation> explainList = new SimpleOrderedMap<Explanation>();
-    DocIterator iterator = docs.iterator();
-    for (int i=0; i<docs.size(); i++) {
-      int id = iterator.nextDoc();
-
-      StoredDocument doc = searcher.doc(id);
-      String strid = schema.printableUniqueKey(doc);
-
-      explainList.add(strid, searcher.explain(query, id) );
-    }
-    return explainList;
-  }
-
-  private static NamedList<String> explanationsToStrings
-    (NamedList<Explanation> explanations) {
-
-    NamedList<String> out = new SimpleOrderedMap<String>();
-    for (Map.Entry<String,Explanation> entry : explanations) {
-      out.add(entry.getKey(), "\n"+entry.getValue().toString());
-    }
-    return out;
-  }
-
-
-  /**
-   * Executes a basic query
-   */
-  public static DocList doSimpleQuery(String sreq,
-                                      SolrQueryRequest req,
-                                      int start, int limit) throws IOException {
-    List<String> commands = StrUtils.splitSmart(sreq,';');
-
-    String qs = commands.size() >= 1 ? commands.get(0) : "";
-    try {
-    Query query = QParser.getParser(qs, null, req).getQuery();
-
-    // If the first non-query, non-filter command is a simple sort on an indexed field, then
-    // we can use the Lucene sort ability.
-    Sort sort = null;
-    if (commands.size() >= 2) {
-      sort = QueryParsing.parseSort(commands.get(1), req);
+    else if (valstate==BIGNUMBER) {
+      continueNumber(devNull);
     }
 
-    DocList results = req.getSearcher().getDocList(query,(DocSet)null, sort, start, limit);
-    return results;
-    } catch (SyntaxError e) {
-      throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, "Error parsing query: " + qs);
-    }
+    valstate=0;
 
-  }
-  private static final Pattern whitespacePattern = Pattern.compile("\\s+");
-  private static final Pattern caratPattern = Pattern.compile("\\^");
-  private static final Pattern tildePattern = Pattern.compile("[~]");
-
-  /**
-   * Given a string containing fieldNames and boost info,
-   * converts it to a Map from field name to boost info.
-   *
-   * <p>
-   * Doesn't care if boost info is negative, you're on your own.
-   * </p>
-   * <p>
-   * Doesn't care if boost info is missing, again: you're on your own.
-   * </p>
-   *
-   * @param in a String like "fieldOne^2.3 fieldTwo fieldThree^-0.4"
-   * @return Map of fieldOne =&gt; 2.3, fieldTwo =&gt; null, fieldThree =&gt; -0.4
-   */
-  public static Map<String,Float> parseFieldBoosts(String in) {
-    return parseFieldBoosts(new String[]{in});
-  }
-  /**
-   * Like <code>parseFieldBoosts(String)</code>, but parses all the strings
-   * in the provided array (which may be null).
-   *
-   * @param fieldLists an array of Strings eg. <code>{"fieldOne^2.3", "fieldTwo", fieldThree^-0.4}</code>
-   * @return Map of fieldOne =&gt; 2.3, fieldTwo =&gt; null, fieldThree =&gt; -0.4
-   */
-  public static Map<String,Float> parseFieldBoosts(String[] fieldLists) {
-    if (null == fieldLists || 0 == fieldLists.length) {
-      return new HashMap<String,Float>();
-    }
-    Map<String, Float> out = new HashMap<String,Float>(7);
-    for (String in : fieldLists) {
-      if (null == in) {
-        continue;
-      }
-      in = in.trim();
-      if(in.length()==0) {
-        continue;
-      }
-      
-      String[] bb = whitespacePattern.split(in);
-      for (String s : bb) {
-        String[] bbb = caratPattern.split(s);
-        out.put(bbb[0], 1 == bbb.length ? null : Float.valueOf(bbb[1]));
-      }
-    }
-    return out;
-  }
-  /**
-  
-  /**
-   * Like {@link #parseFieldBoosts}, but allows for an optional slop value prefixed by "~".
-   *
-   * @param fieldLists - an array of Strings eg. <code>{"fieldOne^2.3", "fieldTwo", fieldThree~5^-0.4}</code>
-   * @param wordGrams - (0=all words, 2,3 = shingle size)
-   * @param defaultSlop - the default slop for this param
-   * @return - FieldParams containing the fieldname,boost,slop,and shingle size
-   */
-  public static List<FieldParams> parseFieldBoostsAndSlop(String[] fieldLists,int wordGrams,int defaultSlop) {
-    if (null == fieldLists || 0 == fieldLists.length) {
-        return new ArrayList<FieldParams>();
-    }
-    List<FieldParams> out = new ArrayList<FieldParams>();
-    for (String in : fieldLists) {
-      if (null == in) {
-        continue;
-      }
-      in = in.trim();
-      if(in.length()==0) {
-        continue;
-      }
-      String[] fieldConfigs = whitespacePattern.split(in);
-      for (String s : fieldConfigs) {
-        String[] fieldAndSlopVsBoost = caratPattern.split(s);
-        String[] fieldVsSlop = tildePattern.split(fieldAndSlopVsBoost[0]);
-        String field = fieldVsSlop[0];
-        int slop  = (2 == fieldVsSlop.length) ? Integer.valueOf(fieldVsSlop[1]) : defaultSlop;
-        Float boost = (1 == fieldAndSlopVsBoost.length) ? 1  : Float.valueOf(fieldAndSlopVsBoost[1]);
-        FieldParams fp = new FieldParams(field,wordGrams,slop,boost);
-        out.add(fp);
-      }
-    }
-    return out;
-  }
-
-
-  /**
-   * Checks the number of optional clauses in the query, and compares it
-   * with the specification string to determine the proper value to use.
-   *
-   * <p>
-   * Details about the specification format can be found
-   * <a href="doc-files/min-should-match.html">here</a>
-   * </p>
-   *
-   * <p>A few important notes...</p>
-   * <ul>
-   * <li>
-   * If the calculations based on the specification determine that no
-   * optional clauses are needed, BooleanQuerysetMinMumberShouldMatch
-   * will never be called, but the usual rules about BooleanQueries
-   * still apply at search time (a BooleanQuery containing no required
-   * clauses must still match at least one optional clause)
-   * <li>
-   * <li>
-   * No matter what number the calculation arrives at,
-   * BooleanQuery.setMinShouldMatch() will never be called with a
-   * value greater then the number of optional clauses (or less then 1)
-   * </li>
-   * </ul>
-   *
-   * <p>:TODO: should optimize the case where number is same
-   * as clauses to just make them all "required"
-   * </p>
-   */
-  public static void setMinShouldMatch(BooleanQuery q, String spec) {
-
-    int optionalClauses = 0;
-    for (BooleanClause c : q.clauses()) {
-      if (c.getOccur() == Occur.SHOULD) {
-        optionalClauses++;
-      }
-    }
-
-    int msm = calculateMinShouldMatch(optionalClauses, spec);
-    if (0 < msm) {
-      q.setMinimumNumberShouldMatch(msm);
-    }
-  }
-
-  // private static Pattern spaceAroundLessThanPattern = Pattern.compile("\\s*<\\s*");
-  private static Pattern spaceAroundLessThanPattern = Pattern.compile("(\\s+<\\s*)|(\\s*<\\s+)");
-  private static Pattern spacePattern = Pattern.compile(" ");
-  private static Pattern lessThanPattern = Pattern.compile("<");
-
-  /**
-   * helper exposed for UnitTests
-   * @see #setMinShouldMatch
-   */
-  static int calculateMinShouldMatch(int optionalClauseCount, String spec) {
-
-    int result = optionalClauseCount;
-    spec = spec.trim();
-
-    if (-1 < spec.indexOf("<")) {
-      /* we have conditional spec(s) */
-      spec = spaceAroundLessThanPattern.matcher(spec).replaceAll("<");
-      for (String s : spacePattern.split(spec)) {
-        String[] parts = lessThanPattern.split(s,0);
-        int upperBound = Integer.parseInt(parts[0]);
-        if (optionalClauseCount <= upperBound) {
-          return result;
-        } else {
-          result = calculateMinShouldMatch
-            (optionalClauseCount, parts[1]);
+    int ch;   // TODO: factor out getCharNWS() to here and check speed
+    switch (state) {
+      case 0:
+        return event = next(getCharNWS());
+      case DID_OBJSTART:
+        ch = getCharNWS();
+        if (ch=='}') {
+          pop();
+          return event = OBJECT_END;
         }
-      }
-      return result;
+        if (ch != '"') {
+          throw err("Expected string");
+        }
+        state = DID_MEMNAME;
+        valstate = STRING;
+        return event = STRING;
+      case DID_MEMNAME:
+        ch = getCharNWS();
+        if (ch!=':') {
+          throw err("Expected key,value separator ':'");
+        }
+        state = DID_MEMVAL;  // set state first because it might be pushed...
+        return event = next(getChar());
+      case DID_MEMVAL:
+        ch = getCharNWS();
+        if (ch=='}') {
+          pop();
+          return event = OBJECT_END;
+        } else if (ch!=',') {
+          throw err("Expected ',' or '}'");
+        }
+        ch = getCharNWS();
+        if (ch != '"') {
+          throw err("Expected string");
+        }
+        state = DID_MEMNAME;
+        valstate = STRING;
+        return event = STRING;
+      case DID_ARRSTART:
+        ch = getCharNWS();
+        if (ch==']') {
+          pop();
+          return event = ARRAY_END;
+        }
+        state = DID_ARRELEM;  // set state first, might be pushed...
+        return event = next(ch);
+      case DID_ARRELEM:
+        ch = getCharNWS();
+        if (ch==']') {
+          pop();
+          return event = ARRAY_END;
+        } else if (ch!=',') {
+          throw err("Expected ',' or ']'");
+        }
+        // state = DID_ARRELEM;
+        return event = next(getChar());
     }
+    return 0;
+  }
 
-    /* otherwise, simple expresion */
+  public int lastEvent() {
+    return event;
+  }
 
-    if (-1 < spec.indexOf('%')) {
-      /* percentage - assume the % was the last char.  If not, let Integer.parseInt fail. */
-      spec = spec.substring(0,spec.length()-1);
-      int percent = Integer.parseInt(spec);
-      float calc = (result * percent) * (1/100f);
-      result = calc < 0 ? result + (int)calc : (int)calc;
+  public boolean wasKey()
+  {
+    return state == DID_MEMNAME;
+  }
+  
+
+  private void goTo(int what) throws IOException {
+    if (valstate==what) { valstate=0; return; }
+    if (valstate==0) {
+      int ev = nextEvent();      // TODO
+      if (valstate!=what) {
+        throw err("type mismatch");
+      }
+      valstate=0;
+    }
+    else {
+      throw err("type mismatch");
+    }
+  }
+
+  /** Returns the JSON string value, decoding any escaped characters. */
+  public String getString() throws IOException {
+    return getStringChars().toString();
+  }
+
+  /** Returns the characters of a JSON string value, decoding any escaped characters.
+   * <p/>The underlying buffer of the returned <code>CharArr</code> should *not* be
+   * modified as it may be shared with the input buffer.
+   * <p/>The returned <code>CharArr</code> will only be valid up until
+   * the next JSONParser method is called.  Any required data should be
+   * read before that point.
+   */
+  public CharArr getStringChars() throws IOException {
+    goTo(STRING);
+    return readStringChars();
+  }
+
+  /** Reads a JSON string into the output, decoding any escaped characters. */
+  public void getString(CharArr output) throws IOException {
+    goTo(STRING);
+    readStringChars2(output,start);
+  }
+
+  /** Reads a number from the input stream and parses it as a long, only if
+   * the value will in fact fit into a signed 64 bit integer. */
+  public long getLong() throws IOException {
+    goTo(LONG);
+    return lval;
+  }
+
+  /** Reads a number from the input stream and parses it as a double */
+  public double getDouble() throws IOException {
+    return Double.parseDouble(getNumberChars().toString());
+  }
+
+  /** Returns the characters of a JSON numeric value.
+   * <p/>The underlying buffer of the returned <code>CharArr</code> should *not* be
+   * modified as it may be shared with the input buffer.
+   * <p/>The returned <code>CharArr</code> will only be valid up until
+   * the next JSONParser method is called.  Any required data should be
+   * read before that point.
+   */  
+  public CharArr getNumberChars() throws IOException {
+    int ev=0;
+    if (valstate==0) ev = nextEvent();
+
+    if (valstate == LONG || valstate == NUMBER) {
+      valstate=0;
+      return out;
+    }
+    else if (valstate==BIGNUMBER) {
+      continueNumber(out);
+      valstate=0;
+      return out;
     } else {
-      int calc = Integer.parseInt(spec);
-      result = calc < 0 ? result + calc : calc;
+      throw err("Unexpected " + ev);
     }
-
-    return (optionalClauseCount < result ?
-            optionalClauseCount : (result < 0 ? 0 : result));
-
   }
 
-
-  /**
-   * Recursively walks the "from" query pulling out sub-queries and
-   * adding them to the "to" query.
-   *
-   * <p>
-   * Boosts are multiplied as needed.  Sub-BooleanQueryies which are not
-   * optional will not be flattened.  From will be mangled durring the walk,
-   * so do not attempt to reuse it.
-   * </p>
-   */
-  public static void flattenBooleanQuery(BooleanQuery to, BooleanQuery from) {
-
-    for (BooleanClause clause : from.clauses()) {
-
-      Query cq = clause.getQuery();
-      cq.setBoost(cq.getBoost() * from.getBoost());
-
-      if (cq instanceof BooleanQuery
-          && !clause.isRequired()
-          && !clause.isProhibited()) {
-
-        /* we can recurse */
-        flattenBooleanQuery(to, (BooleanQuery)cq);
-
-      } else {
-        to.add(clause);
-      }
+  /** Reads a JSON numeric value into the output. */
+  public void getNumberChars(CharArr output) throws IOException {
+    int ev=0;
+    if (valstate==0) ev=nextEvent();
+    if (valstate == LONG || valstate == NUMBER) output.write(this.out);
+    else if (valstate==BIGNUMBER) {
+      continueNumber(output);
+    } else {
+      throw err("Unexpected " + ev);
     }
+    valstate=0;
+  }
+
+  /** Reads a boolean value */  
+  public boolean getBoolean() throws IOException {
+    goTo(BOOLEAN);
+    return bool;
+  }
+
+  /** Reads a null value */
+  public void getNull() throws IOException {
+    goTo(NULL);
   }
 
   /**
-   * Escapes all special characters except '"', '-', and '+'
+   * @return the current nesting level, the number of parent objects or arrays.
    */
-  public static CharSequence partialEscape(CharSequence s) {
-    StringBuilder sb = new StringBuilder();
-    for (int i = 0; i < s.length(); i++) {
-      char c = s.charAt(i);
-      if (c == '\\' || c == '!' || c == '(' || c == ')' ||
-          c == ':'  || c == '^' || c == '[' || c == ']' || c == '/' ||
-          c == '{'  || c == '}' || c == '~' || c == '*' || c == '?'
-          ) {
-        sb.append('\\');
-      }
-      sb.append(c);
-    }
-    return sb;
-  }
-
-  // Pattern to detect dangling operator(s) at end of query
-  // \s+[-+\s]+$
-  private final static Pattern DANGLING_OP_PATTERN = Pattern.compile( "\\s+[-+\\s]+$" );
-  // Pattern to detect consecutive + and/or - operators
-  // \s+[+-](?:\s*[+-]+)+
-  private final static Pattern CONSECUTIVE_OP_PATTERN = Pattern.compile( "\\s+[+-](?:\\s*[+-]+)+" );
-
-  /**
-   * Strips operators that are used illegally, otherwise reuturns it's
-   * input.  Some examples of illegal user queries are: "chocolate +-
-   * chip", "chocolate - - chip", and "chocolate chip -".
-   */
-  public static CharSequence stripIllegalOperators(CharSequence s) {
-    String temp = CONSECUTIVE_OP_PATTERN.matcher( s ).replaceAll( " " );
-    return DANGLING_OP_PATTERN.matcher( temp ).replaceAll( "" );
-  }
-
-  /**
-   * Returns it's input if there is an even (ie: balanced) number of
-   * '"' characters -- otherwise returns a String in which all '"'
-   * characters are striped out.
-   */
-  public static CharSequence stripUnbalancedQuotes(CharSequence s) {
-    int count = 0;
-    for (int i = 0; i < s.length(); i++) {
-      if (s.charAt(i) == '\"') { count++; }
-    }
-    if (0 == (count & 1)) {
-      return s;
-    }
-    return s.toString().replace("\"","");
-  }
-
-  public static NamedList removeNulls(NamedList nl) {
-    for (int i=0; i<nl.size(); i++) {
-      if (nl.getName(i)==null) {
-        NamedList newList = nl instanceof SimpleOrderedMap ? new SimpleOrderedMap() : new NamedList();
-        for (int j=0; j<nl.size(); j++) {
-          String n = nl.getName(j);
-          if (n != null) {
-            newList.add(n, nl.getVal(j));
-          }
-        }
-        return newList;
-      }
-    }
-    return nl;
-  }
-
-  /**
-   * A subclass of SolrQueryParser that supports aliasing fields for
-   * constructing DisjunctionMaxQueries.
-   */
-  public static class DisjunctionMaxQueryParser extends SolrQueryParser {
-
-    /** A simple container for storing alias info
-     * @see #aliases
-     */
-    protected static class Alias {
-      public float tie;
-      public Map<String,Float> fields;
-    }
-
-    /**
-     * Where we store a map from field name we expect to see in our query
-     * string, to Alias object containing the fields to use in our
-     * DisjunctionMaxQuery and the tiebreaker to use.
-     */
-    protected Map<String,Alias> aliases = new HashMap<String,Alias>(3);
-    public DisjunctionMaxQueryParser(QParser qp, String defaultField) {
-      super(qp,defaultField);
-      // don't trust that our parent class won't ever change it's default
-      setDefaultOperator(QueryParser.Operator.OR);
-    }
-
-    /**
-     * Add an alias to this query parser.
-     *
-     * @param field the field name that should trigger alias mapping
-     * @param fieldBoosts the mapping from fieldname to boost value that
-     *                    should be used to build up the clauses of the
-     *                    DisjunctionMaxQuery.
-     * @param tiebreaker to the tiebreaker to be used in the
-     *                   DisjunctionMaxQuery
-     * @see SolrPluginUtils#parseFieldBoosts
-     */
-    public void addAlias(String field, float tiebreaker,
-                         Map<String,Float> fieldBoosts) {
-
-      Alias a = new Alias();
-      a.tie = tiebreaker;
-      a.fields = fieldBoosts;
-      aliases.put(field, a);
-    }
-
-    /**
-     * Delegates to the super class unless the field has been specified
-     * as an alias -- in which case we recurse on each of
-     * the aliased fields, and the results are composed into a
-     * DisjunctionMaxQuery.  (so yes: aliases which point at other
-     * aliases should work)
-     */
-    @Override
-    protected Query getFieldQuery(String field, String queryText, boolean quoted)
-      throws SyntaxError {
-
-      if (aliases.containsKey(field)) {
-
-        Alias a = aliases.get(field);
-        DisjunctionMaxQuery q = new DisjunctionMaxQuery(a.tie);
-
-        /* we might not get any valid queries from delegation,
-         * in which case we should return null
-         */
-        boolean ok = false;
-
-        for (String f : a.fields.keySet()) {
-
-          Query sub = getFieldQuery(f,queryText,quoted);
-          if (null != sub) {
-            if (null != a.fields.get(f)) {
-              sub.setBoost(a.fields.get(f));
-            }
-            q.add(sub);
-            ok = true;
-          }
-        }
-        return ok ? q : null;
-
-      } else {
-        try {
-          return super.getFieldQuery(field, queryText, quoted);
-        } catch (Exception e) {
-          return null;
-        }
-      }
-    }
-
-  }
-
-  /**
-   * Determines the correct Sort based on the request parameter "sort"
-   *
-   * @return null if no sort is specified.
-   */
-  public static Sort getSort(SolrQueryRequest req) {
-
-    String sort = req.getParams().get(CommonParams.SORT);
-    if (null == sort || sort.equals("")) {
-      return null;
-    }
-
-    SolrException sortE = null;
-    Sort ss = null;
-    try {
-      ss = QueryParsing.parseSort(sort, req);
-    } catch (SolrException e) {
-      sortE = e;
-    }
-
-    if ((null == ss) || (null != sortE)) {
-      /* we definitely had some sort of sort string from the user,
-       * but no SortSpec came out of it
-       */
-      SolrCore.log.warn("Invalid sort \""+sort+"\" was specified, ignoring", sortE);
-      return null;
-    }
-
-    return ss;
-  }
-
-  /** Turns an array of query strings into a List of Query objects.
-   *
-   * @return null if no queries are generated
-   */
-  public static List<Query> parseQueryStrings(SolrQueryRequest req,
-                                              String[] queries) throws SyntaxError {
-    if (null == queries || 0 == queries.length) return null;
-    List<Query> out = new ArrayList<Query>(queries.length);
-    for (String q : queries) {
-      if (null != q && 0 != q.trim().length()) {
-        out.add(QParser.getParser(q, null, req).getQuery());
-      }
-    }
-    return out;
-  }
-
-  /**
-   * A CacheRegenerator that can be used whenever the items in the cache
-   * are not dependant on the current searcher.
-   *
-   * <p>
-   * Flat out copies the oldKey=&gt;oldVal pair into the newCache
-   * </p>
-   */
-  public static class IdentityRegenerator implements CacheRegenerator {
-    public boolean regenerateItem(SolrIndexSearcher newSearcher,
-                                  SolrCache newCache,
-                                  SolrCache oldCache,
-                                  Object oldKey,
-                                  Object oldVal)
-      throws IOException {
-
-      newCache.put(oldKey,oldVal);
-      return true;
-    }
-  }
-
-  /**
-   * Convert a DocList to a SolrDocumentList
-   *
-   * The optional param "ids" is populated with the lucene document id
-   * for each SolrDocument.
-   *
-   * @param docs The {@link org.apache.solr.search.DocList} to convert
-   * @param searcher The {@link org.apache.solr.search.SolrIndexSearcher} to use to load the docs from the Lucene index
-   * @param fields The names of the Fields to load
-   * @param ids A map to store the ids of the docs
-   * @return The new {@link org.apache.solr.common.SolrDocumentList} containing all the loaded docs
-   * @throws java.io.IOException if there was a problem loading the docs
-   * @since solr 1.4
-   */
-  public static SolrDocumentList docListToSolrDocumentList(
-      DocList docs,
-      SolrIndexSearcher searcher,
-      Set<String> fields,
-      Map<SolrDocument, Integer> ids ) throws IOException
-  {
-    IndexSchema schema = searcher.getSchema();
-
-    SolrDocumentList list = new SolrDocumentList();
-    list.setNumFound(docs.matches());
-    list.setMaxScore(docs.maxScore());
-    list.setStart(docs.offset());
-
-    DocIterator dit = docs.iterator();
-
-    while (dit.hasNext()) {
-      int docid = dit.nextDoc();
-
-      StoredDocument luceneDoc = searcher.doc(docid, fields);
-      SolrDocument doc = new SolrDocument();
-      
-      for( StorableField field : luceneDoc) {
-        if (null == fields || fields.contains(field.name())) {
-          SchemaField sf = schema.getField( field.name() );
-          doc.addField( field.name(), sf.getType().toObject( field ) );
-        }
-      }
-      if (docs.hasScores() && (null == fields || fields.contains("score"))) {
-        doc.addField("score", dit.score());
-      }
-
-      list.add( doc );
-
-      if( ids != null ) {
-        ids.put( doc, new Integer(docid) );
-      }
-    }
-    return list;
-  }
-
-
-  public static void invokeSetters(Object bean, NamedList initArgs) {
-    if (initArgs == null) return;
-    Class clazz = bean.getClass();
-    Method[] methods = clazz.getMethods();
-    Iterator<Map.Entry<String, Object>> iterator = initArgs.iterator();
-    while (iterator.hasNext()) {
-      Map.Entry<String, Object> entry = iterator.next();
-      String key = entry.getKey();
-      String setterName = "set" + String.valueOf(Character.toUpperCase(key.charAt(0))) + key.substring(1);
-      Method method = null;
-      try {
-        for (Method m : methods) {
-          if (m.getName().equals(setterName) && m.getParameterTypes().length == 1) {
-            method = m;
-            break;
-          }
-        }
-        if (method == null) {
-          throw new RuntimeException("no setter corrresponding to '" + key + "' in " + clazz.getName());
-        }
-        Class pClazz = method.getParameterTypes()[0];
-        Object val = entry.getValue();
-        method.invoke(bean, val);
-      } catch (InvocationTargetException e1) {
-        throw new RuntimeException("Error invoking setter " + setterName + " on class : " + clazz.getName(), e1);
-      } catch (IllegalAccessException e1) {
-        throw new RuntimeException("Error invoking setter " + setterName + " on class : " + clazz.getName(), e1);
-      }
-    }
+  public int getLevel() {
+    return ptr;
   }
   
+  public long getPosition()
+  {
+    return gpos+start;
+  }
 }
-
-
-
-
-
-

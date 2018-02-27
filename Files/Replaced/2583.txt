@@ -1,8 +1,8 @@
-final String indexFileName = IndexFileNames.segmentFileName(state.segmentName, state.segmentSuffix, TERMS_INDEX_EXTENSION);
+super(PER_FIELD_REUSE_STRATEGY);
 
-package org.apache.lucene.index.codecs;
+package org.apache.lucene.analysis;
 
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -19,290 +19,136 @@ package org.apache.lucene.index.codecs;
  * limitations under the License.
  */
 
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.List;
+import java.io.Reader;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Random;
 
-import org.apache.lucene.index.FieldInfo;
-import org.apache.lucene.index.FieldInfos;
-import org.apache.lucene.index.IndexFileNames;
-import org.apache.lucene.index.SegmentWriteState;
-import org.apache.lucene.store.IndexOutput;
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.CodecUtil;
-import org.apache.lucene.util.IOUtils;
-import org.apache.lucene.util.fst.Builder;
-import org.apache.lucene.util.fst.FST;
-import org.apache.lucene.util.fst.PositiveIntOutputs;
+import org.apache.lucene.util.LuceneTestCase;
+import org.apache.lucene.util.automaton.CharacterRunAutomaton;
 
 /**
- * Selects index terms according to provided pluggable
- * IndexTermPolicy, and stores them in a prefix trie that's
- * loaded entirely in RAM stored as an FST.  This terms
- * index only supports unsigned byte term sort order
- * (unicode codepoint order when the bytes are UTF8).
- *
- * @lucene.experimental */
-public class VariableGapTermsIndexWriter extends TermsIndexWriterBase {
-  protected final IndexOutput out;
+ * Analyzer for testing
+ * <p>
+ * This analyzer is a replacement for Whitespace/Simple/KeywordAnalyzers
+ * for unit tests. If you are testing a custom component such as a queryparser
+ * or analyzer-wrapper that consumes analysis streams, its a great idea to test
+ * it with this analyzer instead. MockAnalyzer has the following behavior:
+ * <ul>
+ *   <li>By default, the assertions in {@link MockTokenizer} are turned on for extra
+ *       checks that the consumer is consuming properly. These checks can be disabled
+ *       with {@link #setEnableChecks(boolean)}.
+ *   <li>Payload data is randomly injected into the stream for more thorough testing
+ *       of payloads.
+ * </ul>
+ * @see MockTokenizer
+ */
+public final class MockAnalyzer extends Analyzer {
+  private final CharacterRunAutomaton runAutomaton;
+  private final boolean lowerCase;
+  private final CharacterRunAutomaton filter;
+  private int positionIncrementGap;
+  private final Random random;
+  private Map<String,Integer> previousMappings = new HashMap<String,Integer>();
+  private boolean enableChecks = true;
+  private int maxTokenLength = MockTokenizer.DEFAULT_MAX_TOKEN_LENGTH;
 
-  /** Extension of terms index file */
-  static final String TERMS_INDEX_EXTENSION = "tiv";
-
-  final static String CODEC_NAME = "VARIABLE_GAP_TERMS_INDEX";
-  final static int VERSION_START = 0;
-  final static int VERSION_CURRENT = VERSION_START;
-
-  private final List<FSTFieldWriter> fields = new ArrayList<FSTFieldWriter>();
-  private final FieldInfos fieldInfos; // unread
-  private final IndexTermSelector policy;
-
-  /** @lucene.experimental */
-  public static abstract class IndexTermSelector {
-    // Called sequentially on every term being written,
-    // returning true if this term should be indexed
-    public abstract boolean isIndexTerm(BytesRef term, TermStats stats);
-    public abstract void newField(FieldInfo fieldInfo);
+  /**
+   * Creates a new MockAnalyzer.
+   * 
+   * @param random Random for payloads behavior
+   * @param runAutomaton DFA describing how tokenization should happen (e.g. [a-zA-Z]+)
+   * @param lowerCase true if the tokenizer should lowercase terms
+   * @param filter DFA describing how terms should be filtered (set of stopwords, etc)
+   */
+  public MockAnalyzer(Random random, CharacterRunAutomaton runAutomaton, boolean lowerCase, CharacterRunAutomaton filter) {
+    super(new PerFieldReuseStrategy());
+    // TODO: this should be solved in a different way; Random should not be shared (!).
+    this.random = new Random(random.nextLong());
+    this.runAutomaton = runAutomaton;
+    this.lowerCase = lowerCase;
+    this.filter = filter;
   }
 
-  /** Same policy as {@link FixedGapTermsIndexWriter} */
-  public static final class EveryNTermSelector extends IndexTermSelector {
-    private int count;
-    private final int interval;
-
-    public EveryNTermSelector(int interval) {
-      this.interval = interval;
-      // First term is first indexed term:
-      count = interval;
-    }
-
-    @Override
-    public boolean isIndexTerm(BytesRef term, TermStats stats) {
-      if (count >= interval) {
-        count = 1;
-        return true;
-      } else {
-        count++;
-        return false;
-      }
-    }
-
-    @Override
-    public void newField(FieldInfo fieldInfo) {
-      count = interval;
-    }
+  /**
+   * Calls {@link #MockAnalyzer(Random, CharacterRunAutomaton, boolean, CharacterRunAutomaton) 
+   * MockAnalyzer(random, runAutomaton, lowerCase, MockTokenFilter.EMPTY_STOPSET, false}).
+   */
+  public MockAnalyzer(Random random, CharacterRunAutomaton runAutomaton, boolean lowerCase) {
+    this(random, runAutomaton, lowerCase, MockTokenFilter.EMPTY_STOPSET);
   }
 
-  /** Sets an index term when docFreq >= docFreqThresh, or
-   *  every interval terms.  This should reduce seek time
-   *  to high docFreq terms.  */
-  public static final class EveryNOrDocFreqTermSelector extends IndexTermSelector {
-    private int count;
-    private final int docFreqThresh;
-    private final int interval;
-
-    public EveryNOrDocFreqTermSelector(int docFreqThresh, int interval) {
-      this.interval = interval;
-      this.docFreqThresh = docFreqThresh;
-
-      // First term is first indexed term:
-      count = interval;
-    }
-
-    @Override
-    public boolean isIndexTerm(BytesRef term, TermStats stats) {
-      if (stats.docFreq >= docFreqThresh || count >= interval) {
-        count = 1;
-        return true;
-      } else {
-        count++;
-        return false;
-      }
-    }
-
-    @Override
-    public void newField(FieldInfo fieldInfo) {
-      count = interval;
-    }
-  }
-
-  // TODO: it'd be nice to let the FST builder prune based
-  // on term count of each node (the prune1/prune2 that it
-  // accepts), and build the index based on that.  This
-  // should result in a more compact terms index, more like
-  // a prefix trie than the other selectors, because it
-  // only stores enough leading bytes to get down to N
-  // terms that may complete that prefix.  It becomes
-  // "deeper" when terms are dense, and "shallow" when they
-  // are less dense.
-  //
-  // However, it's not easy to make that work this this
-  // API, because that pruning doesn't immediately know on
-  // seeing each term whether that term will be a seek point
-  // or not.  It requires some non-causality in the API, ie
-  // only on seeing some number of future terms will the
-  // builder decide which past terms are seek points.
-  // Somehow the API'd need to be able to return a "I don't
-  // know" value, eg like a Future, which only later on is
-  // flipped (frozen) to true or false.
-  //
-  // We could solve this with a 2-pass approach, where the
-  // first pass would build an FSA (no outputs) solely to
-  // determine which prefixes are the 'leaves' in the
-  // pruning. The 2nd pass would then look at this prefix
-  // trie to mark the seek points and build the FST mapping
-  // to the true output.
-  //
-  // But, one downside to this approach is that it'd result
-  // in uneven index term selection.  EG with prune1=10, the
-  // resulting index terms could be as frequent as every 10
-  // terms or as rare as every <maxArcCount> * 10 (eg 2560),
-  // in the extremes.
-
-  public VariableGapTermsIndexWriter(SegmentWriteState state, IndexTermSelector policy) throws IOException {
-    final String indexFileName = IndexFileNames.segmentFileName(state.segmentName, state.formatId, TERMS_INDEX_EXTENSION);
-    out = state.directory.createOutput(indexFileName, state.context);
-    boolean success = false;
-    try {
-      fieldInfos = state.fieldInfos;
-      this.policy = policy;
-      writeHeader(out);
-      success = true;
-    } finally {
-      if (!success) {
-        IOUtils.closeWhileHandlingException(out);
-      }
-    }
-  }
-  
-  protected void writeHeader(IndexOutput out) throws IOException {
-    CodecUtil.writeHeader(out, CODEC_NAME, VERSION_CURRENT);
-    // Placeholder for dir offset
-    out.writeLong(0);
+  /** 
+   * Create a Whitespace-lowercasing analyzer with no stopwords removal.
+   * <p>
+   * Calls {@link #MockAnalyzer(Random, CharacterRunAutomaton, boolean, CharacterRunAutomaton) 
+   * MockAnalyzer(random, MockTokenizer.WHITESPACE, true, MockTokenFilter.EMPTY_STOPSET, false}).
+   */
+  public MockAnalyzer(Random random) {
+    this(random, MockTokenizer.WHITESPACE, true);
   }
 
   @Override
-  public FieldWriter addField(FieldInfo field, long termsFilePointer) throws IOException {
-    ////System.out.println("VGW: field=" + field.name);
-    policy.newField(field);
-    FSTFieldWriter writer = new FSTFieldWriter(field, termsFilePointer);
-    fields.add(writer);
-    return writer;
+  public TokenStreamComponents createComponents(String fieldName, Reader reader) {
+    MockTokenizer tokenizer = new MockTokenizer(reader, runAutomaton, lowerCase, maxTokenLength);
+    tokenizer.setEnableChecks(enableChecks);
+    MockTokenFilter filt = new MockTokenFilter(tokenizer, filter);
+    return new TokenStreamComponents(tokenizer, maybePayload(filt, fieldName));
   }
-
-  /** NOTE: if your codec does not sort in unicode code
-   *  point order, you must override this method, to simply
-   *  return indexedTerm.length. */
-  protected int indexedTermPrefixLength(final BytesRef priorTerm, final BytesRef indexedTerm) {
-    // As long as codec sorts terms in unicode codepoint
-    // order, we can safely strip off the non-distinguishing
-    // suffix to save RAM in the loaded terms index.
-    final int idxTermOffset = indexedTerm.offset;
-    final int priorTermOffset = priorTerm.offset;
-    final int limit = Math.min(priorTerm.length, indexedTerm.length);
-    for(int byteIdx=0;byteIdx<limit;byteIdx++) {
-      if (priorTerm.bytes[priorTermOffset+byteIdx] != indexedTerm.bytes[idxTermOffset+byteIdx]) {
-        return byteIdx+1;
+  
+  private synchronized TokenFilter maybePayload(TokenFilter stream, String fieldName) {
+    Integer val = previousMappings.get(fieldName);
+    if (val == null) {
+      val = -1; // no payloads
+      if (LuceneTestCase.rarely(random)) {
+        switch(random.nextInt(3)) {
+          case 0: val = -1; // no payloads
+                  break;
+          case 1: val = Integer.MAX_VALUE; // variable length payload
+                  break;
+          case 2: val = random.nextInt(12); // fixed length payload
+                  break;
+        }
       }
+      if (LuceneTestCase.VERBOSE) {
+        if (val == Integer.MAX_VALUE) {
+          System.out.println("MockAnalyzer: field=" + fieldName + " gets variable length payloads");
+        } else if (val != -1) {
+          System.out.println("MockAnalyzer: field=" + fieldName + " gets fixed length=" + val + " payloads");
+        }
+      }
+      previousMappings.put(fieldName, val); // save it so we are consistent for this field
     }
-    return Math.min(1+priorTerm.length, indexedTerm.length);
+    
+    if (val == -1)
+      return stream;
+    else if (val == Integer.MAX_VALUE)
+      return new MockVariableLengthPayloadFilter(random, stream);
+    else
+      return new MockFixedLengthPayloadFilter(random, stream, val);
   }
-
-  private class FSTFieldWriter extends FieldWriter {
-    private final Builder<Long> fstBuilder;
-    private final PositiveIntOutputs fstOutputs;
-    private final long startTermsFilePointer;
-
-    final FieldInfo fieldInfo;
-    int numIndexTerms;
-    FST<Long> fst;
-    final long indexStart;
-
-    private final BytesRef lastTerm = new BytesRef();
-    private boolean first = true;
-
-    public FSTFieldWriter(FieldInfo fieldInfo, long termsFilePointer) throws IOException {
-      this.fieldInfo = fieldInfo;
-      fstOutputs = PositiveIntOutputs.getSingleton(true);
-      fstBuilder = new Builder<Long>(FST.INPUT_TYPE.BYTE1, fstOutputs);
-      indexStart = out.getFilePointer();
-      ////System.out.println("VGW: field=" + fieldInfo.name);
-
-      // Always put empty string in
-      fstBuilder.add(new BytesRef(), fstOutputs.get(termsFilePointer));
-      startTermsFilePointer = termsFilePointer;
-    }
-
-    @Override
-    public boolean checkIndexTerm(BytesRef text, TermStats stats) throws IOException {
-      //System.out.println("VGW: index term=" + text.utf8ToString());
-      // NOTE: we must force the first term per field to be
-      // indexed, in case policy doesn't:
-      if (policy.isIndexTerm(text, stats) || first) {
-        first = false;
-        //System.out.println("  YES");
-        return true;
-      } else {
-        lastTerm.copy(text);
-        return false;
-      }
-    }
-
-    @Override
-    public void add(BytesRef text, TermStats stats, long termsFilePointer) throws IOException {
-      if (text.length == 0) {
-        // We already added empty string in ctor
-        assert termsFilePointer == startTermsFilePointer;
-        return;
-      }
-      final int lengthSave = text.length;
-      text.length = indexedTermPrefixLength(lastTerm, text);
-      try {
-        fstBuilder.add(text, fstOutputs.get(termsFilePointer));
-      } finally {
-        text.length = lengthSave;
-      }
-      lastTerm.copy(text);
-    }
-
-    @Override
-    public void finish(long termsFilePointer) throws IOException {
-      fst = fstBuilder.finish();
-      if (fst != null) {
-        fst.save(out);
-      }
-    }
+  
+  public void setPositionIncrementGap(int positionIncrementGap){
+    this.positionIncrementGap = positionIncrementGap;
   }
-
-  public void close() throws IOException {
-    try {
-    final long dirStart = out.getFilePointer();
-    final int fieldCount = fields.size();
-
-    int nonNullFieldCount = 0;
-    for(int i=0;i<fieldCount;i++) {
-      FSTFieldWriter field = fields.get(i);
-      if (field.fst != null) {
-        nonNullFieldCount++;
-      }
-    }
-
-    out.writeVInt(nonNullFieldCount);
-    for(int i=0;i<fieldCount;i++) {
-      FSTFieldWriter field = fields.get(i);
-      if (field.fst != null) {
-        out.writeVInt(field.fieldInfo.number);
-        out.writeVLong(field.indexStart);
-      }
-    }
-    writeTrailer(dirStart);
-    } finally {
-    out.close();
+  
+  @Override
+  public int getPositionIncrementGap(String fieldName){
+    return positionIncrementGap;
   }
+  
+  /** 
+   * Toggle consumer workflow checking: if your test consumes tokenstreams normally you
+   * should leave this enabled.
+   */
+  public void setEnableChecks(boolean enableChecks) {
+    this.enableChecks = enableChecks;
   }
-
-  protected void writeTrailer(long dirStart) throws IOException {
-    out.seek(CodecUtil.headerLength(CODEC_NAME));
-    out.writeLong(dirStart);
+  
+  /** 
+   * Toggle maxTokenLength for MockTokenizer
+   */
+  public void setMaxTokenLength(int length) {
+    this.maxTokenLength = length;
   }
 }

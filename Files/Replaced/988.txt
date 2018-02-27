@@ -1,14 +1,13 @@
-import org.apache.lucene.index.codecs.docvalues.DocValuesCodec;
-
-package org.apache.lucene.index.values;
+public Message getMessage(Integer version) throws IOException
 
 /**
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -19,699 +18,879 @@ package org.apache.lucene.index.values;
  * limitations under the License.
  */
 
-import java.io.Closeable;
+package org.apache.cassandra.gms;
+
+import java.io.ByteArrayOutputStream;
+import java.io.DataOutputStream;
+import java.io.IOError;
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.EnumSet;
-import java.util.List;
+import java.net.InetAddress;
+import java.util.*;
+import java.util.Map.Entry;
+import java.util.concurrent.*;
 
-import org.apache.lucene.analysis.MockAnalyzer;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.Field;
-import org.apache.lucene.document.Fieldable;
-import org.apache.lucene.document.ValuesField;
-import org.apache.lucene.document.Field.Index;
-import org.apache.lucene.document.Field.Store;
-import org.apache.lucene.index.CorruptIndexException;
-import org.apache.lucene.index.Fields;
-import org.apache.lucene.index.FieldsEnum;
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.IndexWriter;
-import org.apache.lucene.index.IndexWriterConfig;
-import org.apache.lucene.index.LogDocMergePolicy;
-import org.apache.lucene.index.LogMergePolicy;
-import org.apache.lucene.index.MergePolicy;
-import org.apache.lucene.index.MultiFields;
-import org.apache.lucene.index.Term;
-import org.apache.lucene.index.codecs.CodecProvider;
-import org.apache.lucene.index.values.DocValues.SortedSource;
-import org.apache.lucene.index.values.DocValues.Source;
-import org.apache.lucene.index.values.codec.DocValuesCodec;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.LockObtainFailedException;
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.FloatsRef;
-import org.apache.lucene.util.LongsRef;
-import org.apache.lucene.util.LuceneTestCase;
-import org.apache.lucene.util.OpenBitSet;
-import org.apache.lucene.util.UnicodeUtil;
-import org.apache.lucene.util._TestUtil;
-import org.junit.After;
-import org.junit.AfterClass;
-import org.junit.Before;
-import org.junit.BeforeClass;
+import org.apache.cassandra.net.MessageProducer;
+import org.cliffc.high_scale_lib.NonBlockingHashMap;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-public class TestIndexValues extends LuceneTestCase {
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.service.StorageService;
 
-  // TODO test addIndexes
-  private static DocValuesCodec docValuesCodec;
+/**
+ * This module is responsible for Gossiping information for the local endpoint. This abstraction
+ * maintains the list of live and dead endpoints. Periodically i.e. every 1 second this module
+ * chooses a random node and initiates a round of Gossip with it. A round of Gossip involves 3
+ * rounds of messaging. For instance if node A wants to initiate a round of Gossip with node B
+ * it starts off by sending node B a GossipDigestSynMessage. Node B on receipt of this message
+ * sends node A a GossipDigestAckMessage. On receipt of this message node A sends node B a
+ * GossipDigestAck2Message which completes a round of Gossip. This module as and when it hears one
+ * of the three above mentioned messages updates the Failure Detector with the liveness information.
+ */
 
-  @BeforeClass
-  public static void beforeClassLuceneTestCaseJ4() {
-    LuceneTestCase.beforeClassLuceneTestCaseJ4();
-    final CodecProvider cp = CodecProvider.getDefault();
-    docValuesCodec = new DocValuesCodec(cp.lookup(CodecProvider.getDefaultCodec()));
-    cp.register(docValuesCodec);
-    CodecProvider.setDefaultCodec(docValuesCodec.name);
-  }
-  
-  @AfterClass
-  public static void afterClassLuceneTestCaseJ4() {
-    final CodecProvider cp = CodecProvider.getDefault();
-    cp.unregister(docValuesCodec);
-    LuceneTestCase.afterClassLuceneTestCaseJ4();    
-  }
-  
-  
-  public void testBytesStraight() throws IOException {
-    runTestBytes(Bytes.Mode.STRAIGHT, true);
-    runTestBytes(Bytes.Mode.STRAIGHT, false);
-  }
+public class Gossiper implements IFailureDetectionEventListener
+{
+    static final ApplicationState[] STATES = ApplicationState.values();
+    private ScheduledFuture<?> scheduledGossipTask;
+    public final static int intervalInMillis = 1000;
+    public final static int QUARANTINE_DELAY = StorageService.RING_DELAY * 2;
+    private static Logger logger = LoggerFactory.getLogger(Gossiper.class);
+    public static final Gossiper instance = new Gossiper();
 
-  public void testBytesDeref() throws IOException {
-    runTestBytes(Bytes.Mode.DEREF, true);
-    runTestBytes(Bytes.Mode.DEREF, false);
-  }
-
-  public void testBytesSorted() throws IOException {
-    runTestBytes(Bytes.Mode.SORTED, true);
-    runTestBytes(Bytes.Mode.SORTED, false);
-  }
-
-  // nocommit -- for sorted test, do our own Sort of the
-  // values and verify it's identical
-  public void runTestBytes(final Bytes.Mode mode, final boolean fixedSize)
-      throws IOException {
-
-    final BytesRef bytesRef = new BytesRef();
-
-    final Comparator<BytesRef> comp = mode == Bytes.Mode.SORTED ? BytesRef
-        .getUTF8SortedAsUnicodeComparator() : null;
-
-    Directory dir = newDirectory();
-    Writer w = Bytes.getWriter(dir, "test", mode, comp, fixedSize);
-    int maxDoc = 220;
-    final String[] values = new String[maxDoc];
-    final int lenMin, lenMax;
-    if (fixedSize) {
-      lenMin = lenMax = 3 + random.nextInt(7);
-    } else {
-      lenMin = 1;
-      lenMax = 15 + random.nextInt(6);
-    }
-    for (int i = 0; i < 100; i++) {
-      final String s;
-      if (i > 0 && random.nextInt(5) <= 2) {
-        // use prior value
-        s = values[2 * random.nextInt(i)];
-      } else {
-        s = _TestUtil.randomUnicodeString(random, lenMin, lenMax);
-      }
-      values[2 * i] = s;
-
-      UnicodeUtil.UTF16toUTF8(s, 0, s.length(), bytesRef);
-      w.add(2 * i, bytesRef);
-    }
-    w.finish(maxDoc);
-
-    DocValues r = Bytes.getValues(dir, "test", mode, fixedSize, maxDoc);
-    for (int iter = 0; iter < 2; iter++) {
-      ValuesEnum bytesEnum = r.getEnum();
-      assertNotNull("enum is null", bytesEnum);
-      ValuesAttribute attr = bytesEnum.addAttribute(ValuesAttribute.class);
-      assertNotNull("attribute is null", attr);
-      BytesRef ref = attr.bytes();
-      assertNotNull("BytesRef is null - enum not initialized to use bytes",
-          attr);
-
-      for (int i = 0; i < 2; i++) {
-        final int idx = 2 * i;
-        assertEquals("doc: " + idx, idx, bytesEnum.advance(idx));
-        String utf8String = ref.utf8ToString();
-        assertEquals("doc: " + idx + " lenLeft: " + values[idx].length()
-            + " lenRight: " + utf8String.length(), values[idx], utf8String);
-      }
-      assertEquals(ValuesEnum.NO_MORE_DOCS, bytesEnum.advance(maxDoc));
-      assertEquals(ValuesEnum.NO_MORE_DOCS, bytesEnum.advance(maxDoc + 1));
-
-      bytesEnum.close();
-    }
-
-    // Verify we can load source twice:
-    for (int iter = 0; iter < 2; iter++) {
-      Source s;
-      DocValues.SortedSource ss;
-      if (mode == Bytes.Mode.SORTED) {
-        s = ss = r.loadSorted(comp);
-      } else {
-        s = r.load();
-        ss = null;
-      }
-
-      for (int i = 0; i < 100; i++) {
-        final int idx = 2 * i;
-        assertNotNull("doc " + idx + "; value=" + values[idx], s.bytes(idx));
-        assertEquals("doc " + idx, values[idx], s.bytes(idx).utf8ToString());
-        if (ss != null) {
-          assertEquals("doc " + idx, values[idx], ss.getByOrd(ss.ord(idx))
-              .utf8ToString());
-          DocValues.SortedSource.LookupResult result = ss
-              .getByValue(new BytesRef(values[idx]));
-          assertTrue(result.found);
-          assertEquals(ss.ord(idx), result.ord);
+    private long aVeryLongTime;
+    private long FatClientTimeout;
+    private Random random = new Random();
+    private Comparator<InetAddress> inetcomparator = new Comparator<InetAddress>()
+    {
+        public int compare(InetAddress addr1,  InetAddress addr2)
+        {
+            return addr1.getHostAddress().compareTo(addr2.getHostAddress());
         }
-      }
+    };
 
-      // Lookup random strings:
-      if (mode == Bytes.Mode.SORTED) {
-        final int numValues = ss.getValueCount();
-        for (int i = 0; i < 1000; i++) {
-          BytesRef bytesValue = new BytesRef(_TestUtil.randomUnicodeString(
-              random, lenMin, lenMax));
-          SortedSource.LookupResult result = ss.getByValue(bytesValue);
-          if (result.found) {
-            assert result.ord > 0;
-            assertTrue(bytesValue.bytesEquals(ss.getByOrd(result.ord)));
-            int count = 0;
-            for (int k = 0; k < 100; k++) {
-              if (bytesValue.utf8ToString().equals(values[2 * k])) {
-                assertEquals(ss.ord(2 * k), result.ord);
-                count++;
-              }
+    /* subscribers for interest in EndpointState change */
+    private List<IEndpointStateChangeSubscriber> subscribers = new CopyOnWriteArrayList<IEndpointStateChangeSubscriber>();
+
+    /* live member set */
+    private Set<InetAddress> liveEndpoints = new ConcurrentSkipListSet<InetAddress>(inetcomparator);
+
+    /* unreachable member set */
+    private Map<InetAddress, Long> unreachableEndpoints = new ConcurrentHashMap<InetAddress, Long>();
+
+    /* initial seeds for joining the cluster */
+    private Set<InetAddress> seeds = new ConcurrentSkipListSet<InetAddress>(inetcomparator);
+
+    /* map where key is the endpoint and value is the state associated with the endpoint */
+    Map<InetAddress, EndpointState> endpointStateMap = new ConcurrentHashMap<InetAddress, EndpointState>();
+
+    /* map where key is endpoint and value is timestamp when this endpoint was removed from
+     * gossip. We will ignore any gossip regarding these endpoints for QUARANTINE_DELAY time
+     * after removal to prevent nodes from falsely reincarnating during the time when removal
+     * gossip gets propagated to all nodes */
+    private Map<InetAddress, Long> justRemovedEndpoints = new ConcurrentHashMap<InetAddress, Long>();
+    
+    // protocol versions of the other nodes in the cluster
+    private final ConcurrentMap<InetAddress, Integer> versions = new NonBlockingHashMap<InetAddress, Integer>();
+
+    private class GossipTask implements Runnable
+    {
+        public void run()
+        {
+            try
+            {
+                //wait on messaging service to start listening
+                MessagingService.instance().waitUntilListening();
+                
+                /* Update the local heartbeat counter. */
+                endpointStateMap.get(FBUtilities.getLocalAddress()).getHeartBeatState().updateHeartBeat();
+                if (logger.isTraceEnabled())
+                    logger.trace("My heartbeat is now " + endpointStateMap.get(FBUtilities.getLocalAddress()).getHeartBeatState().getHeartBeatVersion());
+                final List<GossipDigest> gDigests = new ArrayList<GossipDigest>();
+                Gossiper.instance.makeRandomGossipDigest(gDigests);
+
+                if ( gDigests.size() > 0 )
+                {
+                    MessageProducer prod = new MessageProducer()
+                    {
+                        public Message getMessage(int version) throws IOException
+                        {
+                            return makeGossipDigestSynMessage(gDigests, version);
+                        }
+                    };
+                    /* Gossip to some random live member */
+                    boolean gossipedToSeed = doGossipToLiveMember(prod);
+
+                    /* Gossip to some unreachable member with some probability to check if he is back up */
+                    doGossipToUnreachableMember(prod);
+
+                    /* Gossip to a seed if we did not do so above, or we have seen less nodes
+                       than there are seeds.  This prevents partitions where each group of nodes
+                       is only gossiping to a subset of the seeds.
+
+                       The most straightforward check would be to check that all the seeds have been
+                       verified either as live or unreachable.  To avoid that computation each round,
+                       we reason that:
+
+                       either all the live nodes are seeds, in which case non-seeds that come online
+                       will introduce themselves to a member of the ring by definition,
+
+                       or there is at least one non-seed node in the list, in which case eventually
+                       someone will gossip to it, and then do a gossip to a random seed from the
+                       gossipedToSeed check.
+
+                       See CASSANDRA-150 for more exposition. */
+                    if (!gossipedToSeed || liveEndpoints.size() < seeds.size())
+                        doGossipToSeed(prod);
+
+                    if (logger.isTraceEnabled())
+                        logger.trace("Performing status check ...");
+                    doStatusCheck();
+                }
             }
-            assertTrue(count > 0);
-          } else {
-            assert result.ord >= 0;
-            if (result.ord == 0) {
-              final BytesRef firstRef = ss.getByOrd(1);
-              // random string was before our first
-              assertTrue(firstRef.compareTo(bytesValue) > 0);
-            } else if (result.ord == numValues) {
-              final BytesRef lastRef = ss.getByOrd(numValues);
-              // random string was after our last
-              assertTrue(lastRef.compareTo(bytesValue) < 0);
-            } else {
-              // random string fell between two of our values
-              final BytesRef before = (BytesRef) ss.getByOrd(result.ord)
-                  .clone();
-              final BytesRef after = ss.getByOrd(result.ord + 1);
-              assertTrue(before.compareTo(bytesValue) < 0);
-              assertTrue(bytesValue.compareTo(after) < 0);
-
+            catch (Exception e)
+            {
+                logger.error("Gossip error", e);
             }
-          }
         }
-      }
     }
 
-    r.close();
-    dir.close();
-  }
-
-  public void testInts() throws IOException {
-    long maxV = 1;
-    final int NUM_VALUES = 1000;
-    final long[] values = new long[NUM_VALUES];
-    for (int rx = 1; rx < 63; rx++, maxV *= 2) {
-      for (int b = 0; b < 2; b++) {
-        Directory dir = newDirectory();
-        boolean useFixedArrays = b == 0;
-        Writer w = Ints.getWriter(dir, "test", useFixedArrays);
-        for (int i = 0; i < NUM_VALUES; i++) {
-          final long v = random.nextLong() % (1 + maxV);
-          values[i] = v;
-          w.add(i, v);
-        }
-        final int additionalDocs = 1 + random.nextInt(9);
-        w.finish(NUM_VALUES + additionalDocs);
-
-        DocValues r = Ints.getValues(dir, "test", useFixedArrays);
-        for (int iter = 0; iter < 2; iter++) {
-          Source s = r.load();
-          for (int i = 0; i < NUM_VALUES; i++) {
-            final long v = s.ints(i);
-            assertEquals("index " + i + " b: " + b, values[i], v);
-          }
-        }
-
-        for (int iter = 0; iter < 2; iter++) {
-          ValuesEnum iEnum = r.getEnum();
-          ValuesAttribute attr = iEnum.addAttribute(ValuesAttribute.class);
-          LongsRef ints = attr.ints();
-          for (int i = 0; i < NUM_VALUES; i++) {
-            assertEquals(i, iEnum.nextDoc());
-            assertEquals(values[i], ints.get());
-          }
-          for (int i = NUM_VALUES; i < NUM_VALUES + additionalDocs; i++) {
-            assertEquals(i, iEnum.nextDoc());
-            assertEquals("" + i, 0, ints.get());
-          }
-
-          iEnum.close();
-        }
-
-        for (int iter = 0; iter < 2; iter++) {
-          ValuesEnum iEnum = r.getEnum();
-          ValuesAttribute attr = iEnum.addAttribute(ValuesAttribute.class);
-          LongsRef ints = attr.ints();
-          for (int i = 0; i < NUM_VALUES; i += 1 + random.nextInt(25)) {
-            assertEquals(i, iEnum.advance(i));
-            assertEquals(values[i], ints.get());
-          }
-          for (int i = NUM_VALUES; i < NUM_VALUES + additionalDocs; i++) {
-            assertEquals(i, iEnum.advance(i));
-            assertEquals("" + i, 0, ints.get());
-          }
-
-          iEnum.close();
-        }
-        r.close();
-        dir.close();
-      }
-    }
-  }
-
-  public void testFloats4() throws IOException {
-    runTestFloats(4, 0.00001);
-  }
-
-  private void runTestFloats(int precision, double delta) throws IOException {
-    Directory dir = newDirectory();
-    Writer w = Floats.getWriter(dir, "test", precision);
-    final int NUM_VALUES = 1000;
-    final double[] values = new double[NUM_VALUES];
-    for (int i = 0; i < NUM_VALUES; i++) {
-      final double v = precision == 4 ? random.nextFloat() : random
-          .nextDouble();
-      values[i] = v;
-      w.add(i, v);
-    }
-    final int additionalValues = 1 + random.nextInt(10);
-    w.finish(NUM_VALUES + additionalValues);
-
-    DocValues r = Floats.getValues(dir, "test", NUM_VALUES + additionalValues);
-    for (int iter = 0; iter < 2; iter++) {
-      Source s = r.load();
-      for (int i = 0; i < NUM_VALUES; i++) {
-        assertEquals(values[i], s.floats(i), 0.0f);
-      }
+    private Gossiper()
+    {
+        // 3 days
+        aVeryLongTime = 259200 * 1000;
+        // half of QUARATINE_DELAY, to ensure justRemovedEndpoints has enough leeway to prevent re-gossip
+        FatClientTimeout = (long)(QUARANTINE_DELAY / 2);
+        /* register with the Failure Detector for receiving Failure detector events */
+        FailureDetector.instance.registerFailureDetectionEventListener(this);
     }
 
-    for (int iter = 0; iter < 2; iter++) {
-      ValuesEnum fEnum = r.getEnum();
-      ValuesAttribute attr = fEnum.addAttribute(ValuesAttribute.class);
-      FloatsRef floats = attr.floats();
-      for (int i = 0; i < NUM_VALUES; i++) {
-        assertEquals(i, fEnum.nextDoc());
-        assertEquals(values[i], floats.get(), delta);
-      }
-      for (int i = NUM_VALUES; i < NUM_VALUES + additionalValues; i++) {
-        assertEquals(i, fEnum.nextDoc());
-        assertEquals(0.0, floats.get(), delta);
-      }
-      fEnum.close();
-    }
-    for (int iter = 0; iter < 2; iter++) {
-      ValuesEnum fEnum = r.getEnum();
-      ValuesAttribute attr = fEnum.addAttribute(ValuesAttribute.class);
-      FloatsRef floats = attr.floats();
-      for (int i = 0; i < NUM_VALUES; i += 1 + random.nextInt(25)) {
-        assertEquals(i, fEnum.advance(i));
-        assertEquals(values[i], floats.get(), delta);
-      }
-      for (int i = NUM_VALUES; i < NUM_VALUES + additionalValues; i++) {
-        assertEquals(i, fEnum.advance(i));
-        assertEquals(0.0, floats.get(), delta);
-      }
-      fEnum.close();
+    /**
+     * Register for interesting state changes.
+     * @param subscriber module which implements the IEndpointStateChangeSubscriber
+     */
+    public void register(IEndpointStateChangeSubscriber subscriber)
+    {
+        subscribers.add(subscriber);
     }
 
-    r.close();
-    dir.close();
-  }
-
-  public void testFloats8() throws IOException {
-    runTestFloats(8, 0.0);
-  }
-
-  /**
-   * Tests complete indexing of {@link Values} including deletions, merging and
-   * sparse value fields on Compound-File
-   */
-  public void testCFSIndex() throws IOException {
-    // without deletions
-    IndexWriterConfig cfg = writerConfig(true);
-    // primitives - no deletes
-    runTestNumerics(cfg, false);
-
-    cfg = writerConfig(true);
-    // bytes - no deletes
-    runTestIndexBytes(cfg, false);
-
-    // with deletions
-    cfg = writerConfig(true);
-    // primitives
-    runTestNumerics(cfg, true);
-
-    cfg = writerConfig(true);
-    // bytes
-    runTestIndexBytes(cfg, true);
-  }
-
-  /**
-   * Tests complete indexing of {@link Values} including deletions, merging and
-   * sparse value fields on None-Compound-File
-   */
-  public void testIndex() throws IOException {
-    //
-    // without deletions
-    IndexWriterConfig cfg = writerConfig(false);
-    // primitives - no deletes
-    runTestNumerics(cfg, false);
-
-    cfg = writerConfig(false);
-    // bytes - no deletes
-    runTestIndexBytes(cfg, false);
-
-    // with deletions
-    cfg = writerConfig(false);
-    // primitives
-    runTestNumerics(cfg, true);
-
-    cfg = writerConfig(false);
-    // bytes
-    runTestIndexBytes(cfg, true);
-  }
-
-  private IndexWriterConfig writerConfig(boolean useCompoundFile) {
-    final IndexWriterConfig cfg = newIndexWriterConfig(TEST_VERSION_CURRENT,
-        new MockAnalyzer());
-    MergePolicy mergePolicy = cfg.getMergePolicy();
-    if (mergePolicy instanceof LogMergePolicy) {
-      ((LogMergePolicy) mergePolicy).setUseCompoundFile(useCompoundFile);
-    } else if (useCompoundFile) {
-      LogMergePolicy policy = new LogDocMergePolicy();
-      policy.setUseCompoundFile(useCompoundFile);
-      cfg.setMergePolicy(policy);
+    /**
+     * Unregister interest for state changes.
+     * @param subscriber module which implements the IEndpointStateChangeSubscriber
+     */
+    public void unregister(IEndpointStateChangeSubscriber subscriber)
+    {
+        subscribers.remove(subscriber);
     }
-    return cfg;
-  }
-
-  public void runTestNumerics(IndexWriterConfig cfg, boolean withDeletions)
-      throws IOException {
-    Directory d = newDirectory();
-    IndexWriter w = new IndexWriter(d, cfg);
-    final int numValues = 350;
-    final List<Values> numVariantList = new ArrayList<Values>(NUMERICS);
-
-    // run in random order to test if fill works correctly during merges
-    Collections.shuffle(numVariantList, random);
-    for (Values val : numVariantList) {
-      OpenBitSet deleted = indexValues(w, numValues, val, numVariantList,
-          withDeletions, 7);
-      List<Closeable> closeables = new ArrayList<Closeable>();
-      IndexReader r = IndexReader.open(w);
-      final int numRemainingValues = (int) (numValues - deleted.cardinality());
-      final int base = r.numDocs() - numRemainingValues;
-      switch (val) {
-      case PACKED_INTS:
-      case PACKED_INTS_FIXED: {
-        DocValues intsReader = getDocValues(r, val.name());
-        Source ints = intsReader.load();
-        ValuesEnum intsEnum = intsReader.getEnum();
-        assertNotNull(intsEnum);
-        LongsRef enumRef = intsEnum.addAttribute(ValuesAttribute.class).ints();
-        for (int i = 0; i < base; i++) {
-          assertEquals(0, ints.ints(i));
-          assertEquals(val.name() + " base: " + base + " index: " + i, i,
-              random.nextBoolean() ? intsEnum.advance(i) : intsEnum.nextDoc());
-          assertEquals(0, enumRef.get());
-        }
-        int expected = 0;
-        for (int i = base; i < r.numDocs(); i++, expected++) {
-          while (deleted.get(expected)) {
-            expected++;
-          }
-          assertEquals("advance failed at index: " + i + " of " + r.numDocs()
-              + " docs", i, intsEnum.advance(i));
-          assertEquals(expected, ints.ints(i));
-          assertEquals(expected, enumRef.get());
-
-        }
-      }
-        break;
-      case SIMPLE_FLOAT_4BYTE:
-      case SIMPLE_FLOAT_8BYTE: {
-        DocValues floatReader = getDocValues(r, val.name());
-        Source floats = floatReader.load();
-        ValuesEnum floatEnum = floatReader.getEnum();
-        assertNotNull(floatEnum);
-        FloatsRef enumRef = floatEnum.addAttribute(ValuesAttribute.class)
-            .floats();
-
-        for (int i = 0; i < base; i++) {
-          assertEquals(0.0d, floats.floats(i), 0.0d);
-          assertEquals(i, random.nextBoolean() ? floatEnum.advance(i)
-              : floatEnum.nextDoc());
-          assertEquals("index " + i, 0.0, enumRef.get(), 0.0);
-        }
-        int expected = 0;
-        for (int i = base; i < r.numDocs(); i++, expected++) {
-          while (deleted.get(expected)) {
-            expected++;
-          }
-          assertEquals("advance failed at index: " + i + " of " + r.numDocs()
-              + " docs base:" + base, i, floatEnum.advance(i));
-          assertEquals("index " + i, 2.0 * expected, enumRef.get(), 0.00001);
-          assertEquals("index " + i, 2.0 * expected, floats.floats(i), 0.00001);
-        }
-      }
-        break;
-      default:
-        fail("unexpected value " + val);
-      }
-
-      closeables.add(r);
-      for (Closeable toClose : closeables) {
-        toClose.close();
-      }
+    
+    public void setVersion(InetAddress address, int version)
+    {
+        Integer old = versions.put(address, version);
     }
-    w.close();
-    d.close();
-  }
-
-  private static EnumSet<Values> BYTES = EnumSet.of(Values.BYTES_FIXED_DEREF,
-      Values.BYTES_FIXED_SORTED, Values.BYTES_FIXED_STRAIGHT,
-      Values.BYTES_VAR_DEREF, Values.BYTES_VAR_SORTED,
-      Values.BYTES_VAR_STRAIGHT);
-
-  private static EnumSet<Values> STRAIGHT_BYTES = EnumSet.of(
-      Values.BYTES_FIXED_STRAIGHT, Values.BYTES_VAR_STRAIGHT);
-
-  private static EnumSet<Values> NUMERICS = EnumSet.of(Values.PACKED_INTS,
-      Values.PACKED_INTS_FIXED, Values.SIMPLE_FLOAT_4BYTE,
-      Values.SIMPLE_FLOAT_8BYTE);
-
-  private static Index[] IDX_VALUES = new Index[] { Index.ANALYZED,
-      Index.ANALYZED_NO_NORMS, Index.NOT_ANALYZED, Index.NOT_ANALYZED_NO_NORMS };
-
-  private OpenBitSet indexValues(IndexWriter w, int numValues, Values value,
-      List<Values> valueVarList, boolean withDeletions, int multOfSeven)
-      throws CorruptIndexException, IOException {
-    final boolean isNumeric = NUMERICS.contains(value);
-    OpenBitSet deleted = new OpenBitSet(numValues);
-    Document doc = new Document();
-    Fieldable field = random.nextBoolean() ? new ValuesField(value.name())
-        : newField(value.name(), _TestUtil.randomRealisticUnicodeString(random,
-            10), IDX_VALUES[random.nextInt(IDX_VALUES.length)]);
-    doc.add(field);
-
-    ValuesAttribute valuesAttribute = ValuesField.values(field);
-    valuesAttribute.setType(value);
-    final LongsRef intsRef = valuesAttribute.ints();
-    final FloatsRef floatsRef = valuesAttribute.floats();
-    final BytesRef bytesRef = valuesAttribute.bytes();
-
-    final String idBase = value.name() + "_";
-    final byte[] b = new byte[multOfSeven];
-    if (bytesRef != null) {
-      bytesRef.bytes = b;
-      bytesRef.length = b.length;
-      bytesRef.offset = 0;
+    
+    public Integer getVersion(InetAddress address)
+    {
+        Integer v = versions.get(address);
+        if (v == null)
+        {
+            // we don't know the version. assume current. we'll know soon enough if that was incorrect.
+            logger.debug("Assuming current protocol version for {}", address);
+            return MessagingService.version_;
+        }
+        else
+            return v;
     }
-    // 
-    byte upto = 0;
-    for (int i = 0; i < numValues; i++) {
-      if (isNumeric) {
-        switch (value) {
-        case PACKED_INTS:
-        case PACKED_INTS_FIXED:
-          intsRef.set(i);
-          break;
-        case SIMPLE_FLOAT_4BYTE:
-        case SIMPLE_FLOAT_8BYTE:
-          floatsRef.set(2.0f * i);
-          break;
-        default:
-          fail("unexpected value " + value);
-        }
-      } else {
-        for (int j = 0; j < b.length; j++) {
-          b[j] = upto++;
-        }
-      }
-      doc.removeFields("id");
-      doc.add(new Field("id", idBase + i, Store.YES,
-          Index.NOT_ANALYZED_NO_NORMS));
-      w.addDocument(doc);
+    
 
-      if (i % 7 == 0) {
-        if (withDeletions && random.nextBoolean()) {
-          Values val = valueVarList.get(random.nextInt(1 + valueVarList
-              .indexOf(value)));
-          final int randInt = val == value ? random.nextInt(1 + i) : random
-              .nextInt(numValues);
-          w.deleteDocuments(new Term("id", val.name() + "_" + randInt));
-          if (val == value) {
-            deleted.set(randInt);
-          }
-        }
-        w.commit();
-
-      }
+    public Set<InetAddress> getLiveMembers()
+    {
+        Set<InetAddress> liveMbrs = new HashSet<InetAddress>(liveEndpoints);
+        if (!liveMbrs.contains(FBUtilities.getLocalAddress()))
+            liveMbrs.add(FBUtilities.getLocalAddress());
+        return liveMbrs;
     }
-    w.commit();
 
-    // nocommit test unoptimized with deletions
-    if (true || withDeletions || random.nextBoolean())
-      w.optimize();
-    return deleted;
-  }
+    public Set<InetAddress> getUnreachableMembers()
+    {
+        return unreachableEndpoints.keySet();
+    }
 
-  public void runTestIndexBytes(IndexWriterConfig cfg, boolean withDeletions)
-      throws CorruptIndexException, LockObtainFailedException, IOException {
-    Directory d = newDirectory();
-    IndexWriter w = new IndexWriter(d, cfg);
-    final List<Values> byteVariantList = new ArrayList<Values>(BYTES);
+    public long getEndpointDowntime(InetAddress ep)
+    {
+        Long downtime = unreachableEndpoints.get(ep);
+        if (downtime != null)
+            return System.currentTimeMillis() - downtime;
+        else
+            return 0L;
+    }
 
-    // run in random order to test if fill works correctly during merges
-    Collections.shuffle(byteVariantList, random);
-    final int numValues = 350;
-    for (Values byteIndexValue : byteVariantList) {
-      List<Closeable> closeables = new ArrayList<Closeable>();
+    /**
+     * This method is part of IFailureDetectionEventListener interface. This is invoked
+     * by the Failure Detector when it convicts an end point.
+     *
+     * param @ endpoint end point that is convicted.
+    */
+    public void convict(InetAddress endpoint)
+    {
+        EndpointState epState = endpointStateMap.get(endpoint);
+        if (epState.isAlive())
+        {
+            markDead(endpoint, epState);
+        }
+    }
 
-      int bytesSize = 7 + random.nextInt(128);
-      OpenBitSet deleted = indexValues(w, numValues, byteIndexValue,
-          byteVariantList, withDeletions, bytesSize);
-      final IndexReader r = IndexReader.open(w);
-      assertEquals(0, r.numDeletedDocs());
-      final int numRemainingValues = (int) (numValues - deleted.cardinality());
-      final int base = r.numDocs() - numRemainingValues;
+    /**
+     * Return either: the greatest heartbeat or application state
+     * @param epState
+     * @return
+     */
+    int getMaxEndpointStateVersion(EndpointState epState)
+    {
+        int maxVersion = epState.getHeartBeatState().getHeartBeatVersion();
+        for (VersionedValue value : epState.getApplicationStateMap().values())
+            maxVersion = Math.max(maxVersion,  value.version);
+        return maxVersion;
+    }
 
-      DocValues bytesReader = getDocValues(r, byteIndexValue.name());
-      assertNotNull("field " + byteIndexValue.name()
-          + " returned null reader - maybe merged failed", bytesReader);
-      Source bytes = bytesReader.load();
-      ValuesEnum bytesEnum = bytesReader.getEnum();
-      assertNotNull(bytesEnum);
-      final ValuesAttribute attr = bytesEnum
-          .addAttribute(ValuesAttribute.class);
-      byte upto = 0;
-      // test the filled up slots for correctness
-      for (int i = 0; i < base; i++) {
-        final BytesRef br = bytes.bytes(i);
-        String msg = " field: " + byteIndexValue.name() + " at index: " + i
-            + " base: " + base + " numDocs:" + r.numDocs();
-        switch (byteIndexValue) {
-        case BYTES_VAR_STRAIGHT:
-        case BYTES_FIXED_STRAIGHT:
-          assertEquals(i, bytesEnum.advance(i));
-          // fixed straight returns bytesref with zero bytes all of fixed
-          // length
-          assertNotNull("expected none null - " + msg, br);
-          if (br.length != 0) {
-            assertEquals("expected zero bytes of length " + bytesSize + " - "
-                + msg, bytesSize, br.length);
-            for (int j = 0; j < br.length; j++) {
-              assertEquals("Byte at index " + j + " doesn't match - " + msg, 0,
-                  br.bytes[br.offset + j]);
+    /**
+     * Removes the endpoint from unreachable endpoint set
+     *
+     * @param endpoint endpoint to be removed from the current membership.
+    */
+    private void evictFromMembership(InetAddress endpoint)
+    {
+        unreachableEndpoints.remove(endpoint);
+    }
+
+    /**
+     * Removes the endpoint completely from Gossip
+     */
+    public void removeEndpoint(InetAddress endpoint)
+    {
+        // do subscribers first so anything in the subscriber that depends on gossiper state won't get confused
+        for (IEndpointStateChangeSubscriber subscriber : subscribers)
+            subscriber.onRemove(endpoint);
+
+        liveEndpoints.remove(endpoint);
+        unreachableEndpoints.remove(endpoint);
+        // do not remove endpointState until the quarantine expires
+        FailureDetector.instance.remove(endpoint);
+        versions.remove(endpoint);
+        justRemovedEndpoints.put(endpoint, System.currentTimeMillis());
+    }
+
+    /**
+     * The gossip digest is built based on randomization
+     * rather than just looping through the collection of live endpoints.
+     *
+     * @param gDigests list of Gossip Digests.
+    */
+    private void makeRandomGossipDigest(List<GossipDigest> gDigests)
+    {
+        EndpointState epState;
+        int generation = 0;
+        int maxVersion = 0;
+
+        // local epstate will be part of endpointStateMap
+        List<InetAddress> endpoints = new ArrayList<InetAddress>(endpointStateMap.keySet());
+        Collections.shuffle(endpoints, random);
+        for (InetAddress endpoint : endpoints)
+        {
+            epState = endpointStateMap.get(endpoint);
+            if (epState != null)
+            {
+                generation = epState.getHeartBeatState().getGeneration();
+                maxVersion = getMaxEndpointStateVersion(epState);
             }
-          }
-          break;
-        case BYTES_VAR_SORTED:
-        case BYTES_FIXED_SORTED:
-        case BYTES_VAR_DEREF:
-        case BYTES_FIXED_DEREF:
-        default:
-          assertNotNull("expected none null - " + msg, br);
-          if (br.length != 0) {
-            bytes.bytes(i);
-          }
-          assertEquals("expected empty bytes - " + br.utf8ToString() + msg, 0,
-              br.length);
-        }
-      }
-      final BytesRef enumRef = attr.bytes();
-
-      // test the actual doc values added in this iteration
-      assertEquals(base + numRemainingValues, r.numDocs());
-      int v = 0;
-      for (int i = base; i < r.numDocs(); i++) {
-
-        String msg = " field: " + byteIndexValue.name() + " at index: " + i
-            + " base: " + base + " numDocs:" + r.numDocs() + " bytesSize: "
-            + bytesSize;
-        while (withDeletions && deleted.get(v++)) {
-          upto += bytesSize;
+            gDigests.add(new GossipDigest(endpoint, generation, maxVersion));
         }
 
-        BytesRef br = bytes.bytes(i);
-        if (bytesEnum.docID() != i)
-          assertEquals("seek failed for index " + i + " " + msg, i, bytesEnum
-              .advance(i));
-        for (int j = 0; j < br.length; j++, upto++) {
-          assertEquals(
-              "EnumRef Byte at index " + j + " doesn't match - " + msg, upto,
-              enumRef.bytes[enumRef.offset + j]);
-          assertEquals("SourceRef Byte at index " + j + " doesn't match - "
-              + msg, upto, br.bytes[br.offset + j]);
+        if (logger.isTraceEnabled())
+        {
+            StringBuilder sb = new StringBuilder();
+            for ( GossipDigest gDigest : gDigests )
+            {
+                sb.append(gDigest);
+                sb.append(" ");
+            }
+                logger.trace("Gossip Digests are : " + sb.toString());
         }
-      }
-
-      // clean up
-      closeables.add(r);
-      for (Closeable toClose : closeables) {
-        toClose.close();
-      }
     }
 
-    w.close();
-    d.close();
-  }
-
-  private DocValues getDocValues(IndexReader reader, String field)
-      throws IOException {
-    boolean optimized = reader.isOptimized();
-    Fields fields = optimized ? reader.getSequentialSubReaders()[0].fields() : MultiFields
-        .getFields(reader);
-//    return fields.docValues(field);
-    switch (random.nextInt(optimized ? 3 : 2)) {
-    case 0:
-      return fields.docValues(field);
-    case 1:
-      FieldsEnum iterator = fields.iterator();
-      String name;
-      while ((name = iterator.next()) != null) {
-        if (name.equals(field))
-          return iterator.docValues();
-      }
-      throw new RuntimeException("no such field " + field);
-    case 2:
-      return reader.getSequentialSubReaders()[0].docValues(field);
+    public boolean isKnownEndpoint(InetAddress endpoint)
+    {
+        return endpointStateMap.containsKey(endpoint);
     }
-throw new RuntimeException();
-}
 
+    public int getCurrentGenerationNumber(InetAddress endpoint)
+    {
+    	return endpointStateMap.get(endpoint).getHeartBeatState().getGeneration();
+    }
+
+    Message makeGossipDigestSynMessage(List<GossipDigest> gDigests, int version) throws IOException
+    {
+        GossipDigestSynMessage gDigestMessage = new GossipDigestSynMessage(DatabaseDescriptor.getClusterName(), gDigests);
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        DataOutputStream dos = new DataOutputStream( bos );
+        GossipDigestSynMessage.serializer().serialize(gDigestMessage, dos, version);
+        return new Message(FBUtilities.getLocalAddress(), StorageService.Verb.GOSSIP_DIGEST_SYN, bos.toByteArray(), version);
+    }
+
+    Message makeGossipDigestAckMessage(GossipDigestAckMessage gDigestAckMessage, int version) throws IOException
+    {
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        DataOutputStream dos = new DataOutputStream(bos);
+        GossipDigestAckMessage.serializer().serialize(gDigestAckMessage, dos, version);
+        return new Message(FBUtilities.getLocalAddress(), StorageService.Verb.GOSSIP_DIGEST_ACK, bos.toByteArray(), version);
+    }
+
+    Message makeGossipDigestAck2Message(GossipDigestAck2Message gDigestAck2Message, int version) throws IOException
+    {
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        DataOutputStream dos = new DataOutputStream(bos);
+        GossipDigestAck2Message.serializer().serialize(gDigestAck2Message, dos, version);
+        return new Message(FBUtilities.getLocalAddress(), StorageService.Verb.GOSSIP_DIGEST_ACK2, bos.toByteArray(), version);
+    }
+
+    /**
+     * Returns true if the chosen target was also a seed. False otherwise
+     *
+     *  @param prod produces a message to send
+     *  @param epSet a set of endpoint from which a random endpoint is chosen.
+     *  @return true if the chosen endpoint is also a seed.
+     */
+    private boolean sendGossip(MessageProducer prod, Set<InetAddress> epSet)
+    {
+        int size = epSet.size();
+        /* Generate a random number from 0 -> size */
+        List<InetAddress> liveEndpoints = new ArrayList<InetAddress>(epSet);
+        int index = (size == 1) ? 0 : random.nextInt(size);
+        InetAddress to = liveEndpoints.get(index);
+        if (logger.isTraceEnabled())
+            logger.trace("Sending a GossipDigestSynMessage to {} ...", to);
+        try
+        {
+            MessagingService.instance().sendOneWay(prod.getMessage(getVersion(to)), to);
+        }
+        catch (IOException ex)
+        {
+            throw new IOError(ex);
+        }        
+        return seeds.contains(to);
+    }
+
+    /* Sends a Gossip message to a live member and returns true if the recipient was a seed */
+    private boolean doGossipToLiveMember(MessageProducer prod)
+    {
+        int size = liveEndpoints.size();
+        if ( size == 0 )
+            return false;
+        return sendGossip(prod, liveEndpoints);
+    }
+
+    /* Sends a Gossip message to an unreachable member */
+    private void doGossipToUnreachableMember(MessageProducer prod)
+    {
+        double liveEndpointCount = liveEndpoints.size();
+        double unreachableEndpointCount = unreachableEndpoints.size();
+        if ( unreachableEndpointCount > 0 )
+        {
+            /* based on some probability */
+            double prob = unreachableEndpointCount / (liveEndpointCount + 1);
+            double randDbl = random.nextDouble();
+            if ( randDbl < prob )
+                sendGossip(prod, unreachableEndpoints.keySet());
+        }
+    }
+
+    /* Gossip to a seed for facilitating partition healing */
+    private void doGossipToSeed(MessageProducer prod)
+    {
+        int size = seeds.size();
+        if ( size > 0 )
+        {
+            if ( size == 1 && seeds.contains(FBUtilities.getLocalAddress()) )
+            {
+                return;
+            }
+
+            if ( liveEndpoints.size() == 0 )
+            {
+                sendGossip(prod, seeds);
+            }
+            else
+            {
+                /* Gossip with the seed with some probability. */
+                double probability = seeds.size() / (double)( liveEndpoints.size() + unreachableEndpoints.size() );
+                double randDbl = random.nextDouble();
+                if ( randDbl <= probability )
+                    sendGossip(prod, seeds);
+            }
+        }
+    }
+
+    private void doStatusCheck()
+    {
+        long now = System.currentTimeMillis();
+
+        Set<InetAddress> eps = endpointStateMap.keySet();
+        for ( InetAddress endpoint : eps )
+        {
+            if ( endpoint.equals(FBUtilities.getLocalAddress()) )
+                continue;
+
+            FailureDetector.instance.interpret(endpoint);
+            EndpointState epState = endpointStateMap.get(endpoint);
+            if ( epState != null )
+            {
+                long duration = now - epState.getUpdateTimestamp();
+
+                // check if this is a fat client. fat clients are removed automatically from
+                // gosip after FatClientTimeout
+                if (!epState.getHasToken() && !epState.isAlive() && (duration > FatClientTimeout))
+                {
+                    if (StorageService.instance.getTokenMetadata().isMember(endpoint))
+                        epState.setHasToken(true);
+                    else
+                    {
+                        if (!justRemovedEndpoints.containsKey(endpoint)) // if the node was decommissioned, it will have been removed but still appear as a fat client
+                        {
+                            logger.info("FatClient " + endpoint + " has been silent for " + FatClientTimeout + "ms, removing from gossip");
+                            removeEndpoint(endpoint); // after quarantine justRemoveEndpoints will remove the state
+                        }
+                    }
+                }
+
+                if ( !epState.isAlive() && (duration > aVeryLongTime) )
+                {
+                    evictFromMembership(endpoint);
+                }
+            }
+        }
+        
+        if (!justRemovedEndpoints.isEmpty())
+        {
+            for (Map.Entry<InetAddress, Long> entry : justRemovedEndpoints.entrySet())
+            {
+                if ((now - entry.getValue()) > QUARANTINE_DELAY)
+                {
+                    if (logger.isDebugEnabled())
+                        logger.debug(QUARANTINE_DELAY + " elapsed, " + entry.getKey() + " gossip quarantine over");
+                    justRemovedEndpoints.remove(entry.getKey());
+                    endpointStateMap.remove(entry.getKey());
+                }
+            }
+        }
+    }
+
+    public EndpointState getEndpointStateForEndpoint(InetAddress ep)
+    {
+        return endpointStateMap.get(ep);
+    }
+
+    EndpointState getStateForVersionBiggerThan(InetAddress forEndpoint, int version)
+    {
+        EndpointState epState = endpointStateMap.get(forEndpoint);
+        EndpointState reqdEndpointState = null;
+
+        if ( epState != null )
+        {
+            /*
+             * Here we try to include the Heart Beat state only if it is
+             * greater than the version passed in. It might happen that
+             * the heart beat version maybe lesser than the version passed
+             * in and some application state has a version that is greater
+             * than the version passed in. In this case we also send the old
+             * heart beat and throw it away on the receiver if it is redundant.
+            */
+            int localHbVersion = epState.getHeartBeatState().getHeartBeatVersion();
+            if ( localHbVersion > version )
+            {
+                reqdEndpointState = new EndpointState(epState.getHeartBeatState());
+                if (logger.isTraceEnabled())
+                    logger.trace("local heartbeat version " + localHbVersion + " greater than " + version + " for " + forEndpoint);
+            }
+            /* Accumulate all application states whose versions are greater than "version" variable */
+            for (Entry<ApplicationState, VersionedValue> entry : epState.getApplicationStateMap().entrySet())
+            {
+                VersionedValue value = entry.getValue();
+                if ( value.version > version )
+                {
+                    if ( reqdEndpointState == null )
+                    {
+                        reqdEndpointState = new EndpointState(epState.getHeartBeatState());
+                    }
+                    final ApplicationState key = entry.getKey();
+                    if (logger.isTraceEnabled())
+                        logger.trace("Adding state " + key + ": " + value.value);
+                    reqdEndpointState.addApplicationState(key, value);
+                }
+            }
+        }
+        return reqdEndpointState;
+    }
+
+    /** determine which endpoint started up earlier */
+    public int compareEndpointStartup(InetAddress addr1, InetAddress addr2)
+    {
+        EndpointState ep1 = getEndpointStateForEndpoint(addr1);
+        EndpointState ep2 = getEndpointStateForEndpoint(addr2);
+        assert ep1 != null && ep2 != null;
+        return ep1.getHeartBeatState().getGeneration() - ep2.getHeartBeatState().getGeneration();
+    }    
+
+    void notifyFailureDetector(List<GossipDigest> gDigests)
+    {
+        for ( GossipDigest gDigest : gDigests )
+        {
+            notifyFailureDetector(gDigest.endpoint, endpointStateMap.get(gDigest.endpoint));
+        }
+    }
+
+    void notifyFailureDetector(Map<InetAddress, EndpointState> remoteEpStateMap)
+    {
+        for (Entry<InetAddress, EndpointState> entry : remoteEpStateMap.entrySet())
+        {
+            notifyFailureDetector(entry.getKey(), entry.getValue());
+        }
+    }
+
+    void notifyFailureDetector(InetAddress endpoint, EndpointState remoteEndpointState)
+    {
+        IFailureDetector fd = FailureDetector.instance;
+        EndpointState localEndpointState = endpointStateMap.get(endpoint);
+        /*
+         * If the local endpoint state exists then report to the FD only
+         * if the versions workout.
+        */
+        if ( localEndpointState != null )
+        {
+            int localGeneration = localEndpointState.getHeartBeatState().getGeneration();
+            int remoteGeneration = remoteEndpointState.getHeartBeatState().getGeneration();
+            if ( remoteGeneration > localGeneration )
+            {
+                fd.report(endpoint);
+                return;
+            }
+
+            if ( remoteGeneration == localGeneration )
+            {
+                int localVersion = getMaxEndpointStateVersion(localEndpointState);
+                int remoteVersion = remoteEndpointState.getHeartBeatState().getHeartBeatVersion();
+                if ( remoteVersion > localVersion )
+                {
+                    fd.report(endpoint);
+                }
+            }
+        }
+
+    }
+
+    private void markAlive(InetAddress addr, EndpointState localState)
+    {
+        if (logger.isTraceEnabled())
+            logger.trace("marking as alive {}", addr);
+        localState.markAlive();
+        liveEndpoints.add(addr);
+        unreachableEndpoints.remove(addr);
+        logger.info("InetAddress {} is now UP", addr);
+        for (IEndpointStateChangeSubscriber subscriber : subscribers)
+            subscriber.onAlive(addr, localState);
+        if (logger.isTraceEnabled())
+            logger.trace("Notified " + subscribers);
+    }
+
+    private void markDead(InetAddress addr, EndpointState localState)
+    {
+        if (logger.isTraceEnabled())
+            logger.trace("marking as dead {}", addr);
+        localState.markDead();
+        liveEndpoints.remove(addr);
+        unreachableEndpoints.put(addr, System.currentTimeMillis());
+        logger.info("InetAddress {} is now dead.", addr);
+        for (IEndpointStateChangeSubscriber subscriber : subscribers)
+            subscriber.onDead(addr, localState);
+        if (logger.isTraceEnabled())
+            logger.trace("Notified " + subscribers);
+    }
+
+    /**
+     * This method is called whenever there is a "big" change in ep state (a generation change for a known node).
+     *
+     * @param ep endpoint
+     * @param epState EndpointState for the endpoint
+     */
+    private void handleMajorStateChange(InetAddress ep, EndpointState epState)
+    {
+        if (endpointStateMap.get(ep) != null)
+            logger.info("Node {} has restarted, now UP again", ep);
+        else
+            logger.info("Node {} is now part of the cluster", ep);
+        if (logger.isTraceEnabled())
+            logger.trace("Adding endpoint state for " + ep);
+        endpointStateMap.put(ep, epState);
+        markAlive(ep, epState);
+        for (IEndpointStateChangeSubscriber subscriber : subscribers)
+            subscriber.onJoin(ep, epState);
+    }
+
+    void applyStateLocally(Map<InetAddress, EndpointState> epStateMap)
+    {
+        for (Entry<InetAddress, EndpointState> entry : epStateMap.entrySet())
+        {
+            InetAddress ep = entry.getKey();
+            if ( ep.equals(FBUtilities.getLocalAddress()))
+                continue;
+            if (justRemovedEndpoints.containsKey(ep))
+            {
+                if (logger.isTraceEnabled())
+                    logger.trace("Ignoring gossip for " + ep + " because it is quarantined");
+                continue;
+            }
+
+            EndpointState localEpStatePtr = endpointStateMap.get(ep);
+            EndpointState remoteState = entry.getValue();
+            /*
+                If state does not exist just add it. If it does then add it if the remote generation is greater.
+                If there is a generation tie, attempt to break it by heartbeat version.
+            */
+            if ( localEpStatePtr != null )
+            {
+            	int localGeneration = localEpStatePtr.getHeartBeatState().getGeneration();
+            	int remoteGeneration = remoteState.getHeartBeatState().getGeneration();
+                if (logger.isTraceEnabled())
+                    logger.trace(ep + "local generation " + localGeneration + ", remote generation " + remoteGeneration);
+
+            	if (remoteGeneration > localGeneration)
+            	{
+                    if (logger.isTraceEnabled())
+                        logger.trace("Updating heartbeat state generation to " + remoteGeneration + " from " + localGeneration + " for " + ep);
+                    // major state change will handle the update by inserting the remote state directly
+                    handleMajorStateChange(ep, remoteState);
+            	}
+            	else if ( remoteGeneration == localGeneration ) // generation has not changed, apply new states
+            	{
+	                /* find maximum state */
+	                int localMaxVersion = getMaxEndpointStateVersion(localEpStatePtr);
+	                int remoteMaxVersion = getMaxEndpointStateVersion(remoteState);
+	                if ( remoteMaxVersion > localMaxVersion )
+	                {
+                        // apply states, but do not notify since there is no major change
+	                    applyNewStates(ep, localEpStatePtr, remoteState);
+	                }
+                    else if (logger.isTraceEnabled())
+                            logger.trace("Ignoring remote version " + remoteMaxVersion + " <= " + localMaxVersion + " for " + ep);
+            	}
+                else
+                {
+                    if (logger.isTraceEnabled())
+                        logger.trace("Ignoring remote generation " + remoteGeneration + " < " + localGeneration);
+                }
+            }
+            else
+            {
+                // this is a new node
+            	handleMajorStateChange(ep, remoteState);
+            }
+        }
+    }
+
+    private void applyNewStates(InetAddress addr, EndpointState localState, EndpointState remoteState)
+    {
+        // don't assert here, since if the node restarts the version will go back to zero
+        int oldVersion = localState.getHeartBeatState().getHeartBeatVersion();
+        Map<ApplicationState, VersionedValue> localAppStateMap = localState.getApplicationStateMap();
+
+        localState.setHeartBeatState(remoteState.getHeartBeatState());
+        if (logger.isTraceEnabled())
+            logger.trace("Updating heartbeat state version to " + localState.getHeartBeatState().getHeartBeatVersion() + " from " + oldVersion + " for " + addr + " ...");
+
+        for (Entry<ApplicationState, VersionedValue> remoteEntry : remoteState.getApplicationStateMap().entrySet())
+        {
+            ApplicationState remoteKey = remoteEntry.getKey();
+            VersionedValue remoteValue = remoteEntry.getValue();
+
+            assert remoteState.getHeartBeatState().getGeneration() == localState.getHeartBeatState().getGeneration();
+            localState.addApplicationState(remoteKey, remoteValue);
+            doNotifications(addr, remoteKey, remoteValue);
+        }
+    }
+
+    // notify that an application state has changed
+    private void doNotifications(InetAddress addr, ApplicationState state, VersionedValue value)
+    {
+        for (IEndpointStateChangeSubscriber subscriber : subscribers)
+        {
+            subscriber.onChange(addr, state, value);
+        }
+    }
+
+    /* Request all the state for the endpoint in the gDigest */
+    private void requestAll(GossipDigest gDigest, List<GossipDigest> deltaGossipDigestList, int remoteGeneration)
+    {
+        /* We are here since we have no data for this endpoint locally so request everthing. */
+        deltaGossipDigestList.add( new GossipDigest(gDigest.getEndpoint(), remoteGeneration, 0) );
+        if (logger.isTraceEnabled())
+            logger.trace("requestAll for " + gDigest.getEndpoint());
+    }
+
+    /* Send all the data with version greater than maxRemoteVersion */
+    private void sendAll(GossipDigest gDigest, Map<InetAddress, EndpointState> deltaEpStateMap, int maxRemoteVersion)
+    {
+        EndpointState localEpStatePtr = getStateForVersionBiggerThan(gDigest.getEndpoint(), maxRemoteVersion) ;
+        if ( localEpStatePtr != null )
+            deltaEpStateMap.put(gDigest.getEndpoint(), localEpStatePtr);
+    }
+
+    /*
+        This method is used to figure the state that the Gossiper has but Gossipee doesn't. The delta digests
+        and the delta state are built up.
+    */
+    void examineGossiper(List<GossipDigest> gDigestList, List<GossipDigest> deltaGossipDigestList, Map<InetAddress, EndpointState> deltaEpStateMap)
+    {
+        for ( GossipDigest gDigest : gDigestList )
+        {
+            int remoteGeneration = gDigest.getGeneration();
+            int maxRemoteVersion = gDigest.getMaxVersion();
+            /* Get state associated with the end point in digest */
+            EndpointState epStatePtr = endpointStateMap.get(gDigest.getEndpoint());
+            /*
+                Here we need to fire a GossipDigestAckMessage. If we have some data associated with this endpoint locally
+                then we follow the "if" path of the logic. If we have absolutely nothing for this endpoint we need to
+                request all the data for this endpoint.
+            */
+            if ( epStatePtr != null )
+            {
+                int localGeneration = epStatePtr.getHeartBeatState().getGeneration();
+                /* get the max version of all keys in the state associated with this endpoint */
+                int maxLocalVersion = getMaxEndpointStateVersion(epStatePtr);
+                if ( remoteGeneration == localGeneration && maxRemoteVersion == maxLocalVersion )
+                    continue;
+
+                if ( remoteGeneration > localGeneration )
+                {
+                    /* we request everything from the gossiper */
+                    requestAll(gDigest, deltaGossipDigestList, remoteGeneration);
+                }
+                else if ( remoteGeneration < localGeneration )
+                {
+                    /* send all data with generation = localgeneration and version > 0 */
+                    sendAll(gDigest, deltaEpStateMap, 0);
+                }
+                else if ( remoteGeneration == localGeneration )
+                {
+                    /*
+                        If the max remote version is greater then we request the remote endpoint send us all the data
+                        for this endpoint with version greater than the max version number we have locally for this
+                        endpoint.
+                        If the max remote version is lesser, then we send all the data we have locally for this endpoint
+                        with version greater than the max remote version.
+                    */
+                    if ( maxRemoteVersion > maxLocalVersion )
+                    {
+                        deltaGossipDigestList.add( new GossipDigest(gDigest.getEndpoint(), remoteGeneration, maxLocalVersion) );
+                    }
+                    else if ( maxRemoteVersion < maxLocalVersion )
+                    {
+                        /* send all data with generation = localgeneration and version > maxRemoteVersion */
+                        sendAll(gDigest, deltaEpStateMap, maxRemoteVersion);
+                    }
+                }
+            }
+            else
+            {
+                /* We are here since we have no data for this endpoint locally so request everything. */
+                requestAll(gDigest, deltaGossipDigestList, remoteGeneration);
+            }
+        }
+    }
+
+    /**
+     * Start the gossiper with the generation # retrieved from the System
+     * table
+     */
+    public void start(int generationNbr)
+    {
+        /* Get the seeds from the config and initialize them. */
+        Set<InetAddress> seedHosts = DatabaseDescriptor.getSeeds();
+        for (InetAddress seed : seedHosts)
+        {
+            if (seed.equals(FBUtilities.getLocalAddress()))
+                continue;
+            seeds.add(seed);
+        }
+
+        /* initialize the heartbeat state for this localEndpoint */
+        EndpointState localState = endpointStateMap.get(FBUtilities.getLocalAddress());
+        if ( localState == null )
+        {
+            HeartBeatState hbState = new HeartBeatState(generationNbr);
+            localState = new EndpointState(hbState);
+            localState.markAlive();
+            endpointStateMap.put(FBUtilities.getLocalAddress(), localState);
+        }
+
+        //notify snitches that Gossiper is about to start
+        DatabaseDescriptor.getEndpointSnitch().gossiperStarting();
+        if (logger.isTraceEnabled())
+            logger.trace("gossip started with generation " + localState.getHeartBeatState().getGeneration());
+
+        scheduledGossipTask = StorageService.scheduledTasks.scheduleWithFixedDelay(new GossipTask(),
+                                                                                   Gossiper.intervalInMillis,
+                                                                                   Gossiper.intervalInMillis,
+                                                                                   TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * Add an endpoint we knew about previously, but whose state is unknown
+     */
+    public void addSavedEndpoint(InetAddress ep)
+    {
+        EndpointState epState = endpointStateMap.get(ep);
+        if (epState == null)
+        {
+            epState = new EndpointState(new HeartBeatState(0));
+            epState.markDead();
+            epState.setHasToken(true);
+            endpointStateMap.put(ep, epState);
+            unreachableEndpoints.put(ep, System.currentTimeMillis());
+            if (logger.isTraceEnabled())
+                logger.trace("Adding saved endpoint " + ep + " " + epState.getHeartBeatState().getGeneration());
+        }
+    }
+
+    public void addLocalApplicationState(ApplicationState state, VersionedValue value)
+    {
+        assert !StorageService.instance.isClientMode();
+        EndpointState epState = endpointStateMap.get(FBUtilities.getLocalAddress());
+        assert epState != null;
+        epState.addApplicationState(state, value);
+    }
+
+    public void stop()
+    {
+        scheduledGossipTask.cancel(false);
+    }
+
+    public boolean isEnabled()
+    {
+        return !scheduledGossipTask.isCancelled();
+    }
+
+    /**
+     * This should *only* be used for testing purposes.
+     */
+    public void initializeNodeUnsafe(InetAddress addr, int generationNbr) {
+        /* initialize the heartbeat state for this localEndpoint */
+        EndpointState localState = endpointStateMap.get(addr);
+        if ( localState == null )
+        {
+            HeartBeatState hbState = new HeartBeatState(generationNbr);
+            localState = new EndpointState(hbState);
+            localState.markAlive();
+            endpointStateMap.put(addr, localState);
+        }
+    }
 }

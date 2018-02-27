@@ -1,249 +1,419 @@
-import org.apache.derby.iapi.error.ExceptionUtil;
-
-/*
-
-   Derby - Class org.apache.derby.impl.jdbc.LOBInputStream
-
-   Licensed to the Apache Software Foundation (ASF) under one
-   or more contributor license agreements.  See the NOTICE file
-   distributed with this work for additional information
-   regarding copyright ownership.  The ASF licenses this file
-   to you under the Apache License, Version 2.0 (the
-   "License"); you may not use this file except in compliance
-   with the License.  You may obtain a copy of the License at
-
-     http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing,
-   software distributed under the License is distributed on an
-   "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-   KIND, either express or implied.  See the License for the
-   specific language governing permissions and limitations
-   under the License.
-
- */
-package org.apache.derby.impl.jdbc;
-
-import java.io.EOFException;
-import java.io.IOException;
-import java.io.InputStream;
-import org.apache.derby.iapi.error.StandardException;
-import org.apache.derby.iapi.reference.SQLState;
-import org.apache.derby.iapi.services.i18n.MessageService;
-import org.apache.derby.iapi.services.sanity.SanityManager;
-import org.apache.derby.iapi.types.PositionedStream;
-import org.apache.derby.shared.common.error.ExceptionUtil;
+executors = Executors.newScheduledThreadPool(3, new BlueprintThreadFactory("Blueprint Extender"));
 
 /**
- * This input stream is built on top of {@link LOBStreamControl}.
- * <p>
- * All the read methods are routed to {@link LOBStreamControl}.
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
  */
+package org.apache.aries.blueprint.container;
 
-public class LOBInputStream
-    extends InputStream
-    implements PositionedStream {
+import java.io.File;
+import java.net.MalformedURLException;
+import java.net.URL;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.Enumeration;
+import java.util.HashMap;
+import java.util.Hashtable;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 
-    private boolean closed;
-    private final LOBStreamControl control;
-    private long pos;
-    private long updateCount;
+import org.apache.aries.blueprint.BlueprintConstants;
+import org.apache.aries.blueprint.ParserService;
+import org.apache.aries.blueprint.namespace.NamespaceHandlerRegistryImpl;
+import org.apache.aries.blueprint.utils.HeaderParser;
+import org.apache.aries.blueprint.utils.HeaderParser.PathElement;
+import org.apache.aries.util.tracker.AriesBundleTrackerCustomizer;
+import org.osgi.framework.Bundle;
+import org.osgi.framework.BundleActivator;
+import org.osgi.framework.BundleContext;
+import org.osgi.framework.BundleEvent;
+import org.osgi.framework.Constants;
+import org.osgi.framework.ServiceReference;
+import org.osgi.framework.ServiceRegistration;
+import org.osgi.framework.SynchronousBundleListener;
+import org.osgi.service.blueprint.container.BlueprintContainer;
+import org.osgi.service.blueprint.container.BlueprintEvent;
+import org.osgi.util.tracker.BundleTracker;
+import org.osgi.util.tracker.BundleTrackerCustomizer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-    LOBInputStream(LOBStreamControl control, long position) {
-        closed = false;
-        this.control = control;
-        pos = position;
-        updateCount = control.getUpdateCount ();
+/**
+ * This is the blueprint extender that listens to blueprint bundles.  it implements the sync
+ * bundle listener but it doesn't register the listener and uses the bundle tracker instead.
+ *
+ * @version $Rev$, $Date$
+ */
+public class BlueprintExtender implements BundleActivator, SynchronousBundleListener {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(BlueprintExtender.class);
+
+    private BundleContext context;
+    private ScheduledExecutorService executors;
+    private Map<Bundle, BlueprintContainerImpl> containers;
+    private BlueprintEventDispatcher eventDispatcher;
+    private NamespaceHandlerRegistry handlers;
+    private BundleTracker bt;
+    private ServiceRegistration parserServiceReg;
+
+    public void start(BundleContext context) {
+        LOGGER.debug("Starting blueprint extender...");
+
+        this.context = context;
+        handlers = new NamespaceHandlerRegistryImpl(context);
+        executors = Executors.newScheduledThreadPool(3);
+        eventDispatcher = new BlueprintEventDispatcher(context, executors);
+        containers = new HashMap<Bundle, BlueprintContainerImpl>();
+
+        ServiceReference sr = this.context.getServiceReference("org.osgi.service.framework.CompositeBundleFactory");
+        if (sr == null) {
+            bt = new BundleTracker(context, Bundle.STARTING | Bundle.ACTIVE | Bundle.STOPPING, new BlueprintBundleTrackerCustomizer()); 
+        } else {
+            // composite bundle factory service is active, let's track blueprint bundles installed in the child frameworks too.
+            bt = new BundleTracker(context, Bundle.STARTING | Bundle.ACTIVE | Bundle.STOPPING, new BlueprintMutilBundleTrackerCustomizer());   
+        }
+        bt.open();
+
+        // Create and publish a ParserService
+        parserServiceReg = context.registerService(ParserService.class.getName(), 
+            new ParserServiceImpl (handlers), 
+            new Hashtable<Object, Object>()); 
+        
+        LOGGER.debug("Blueprint extender started");
     }
 
     /**
-     * Reads up to <code>len</code> bytes of data from the input stream into
-     * an array of bytes.  An attempt is made to read as many as
-     * <code>len</code> bytes, but a smaller number may be read.
-     * The number of bytes actually read is returned as an integer.
-     *
-     * <p> This method blocks until input data is available, end of file is
-     * detected, or an exception is thrown.
-     *
-     * <p> If <code>b</code> is <code>null</code>, a
-     * <code>NullPointerException</code> is thrown.
-     *
-     * <p> If <code>off</code> is negative, or <code>len</code> is negative, or
-     * <code>off+len</code> is greater than the length of the array
-     * <code>b</code>, then an <code>IndexOutOfBoundsException</code> is
-     * thrown.
-     *
-     * <p> If <code>len</code> is zero, then no bytes are read and
-     * <code>0</code> is returned; otherwise, there is an attempt to read at
-     * least one byte. If no byte is available because the stream is at end of
-     * file, the value <code>-1</code> is returned; otherwise, at least one
-     * byte is read and stored into <code>b</code>.
-     *
-     * <p> The first byte read is stored into element <code>b[off]</code>, the
-     * next one into <code>b[off+1]</code>, and so on. The number of bytes read
-     * is, at most, equal to <code>len</code>. Let <i>k</i> be the number of
-     * bytes actually read; these bytes will be stored in elements
-     * <code>b[off]</code> through <code>b[off+</code><i>k</i><code>-1]</code>,
-     * leaving elements <code>b[off+</code><i>k</i><code>]</code> through
-     * <code>b[off+len-1]</code> unaffected.
-     *
-     * <p> In every case, elements <code>b[0]</code> through
-     * <code>b[off]</code> and elements <code>b[off+len]</code> through
-     * <code>b[b.length-1]</code> are unaffected.
-     *
-     * <p> If the first byte cannot be read for any reason other than end of
-     * file, then an <code>IOException</code> is thrown. In particular, an
-     * <code>IOException</code> is thrown if the input stream has been closed.
-     *
-     * <p> The <code>read(b,</code> <code>off,</code> <code>len)</code> method
-     * for class <code>InputStream</code> simply calls the method
-     * <code>read()</code> repeatedly. If the first such call results in an
-     * <code>IOException</code>, that exception is returned from the call to
-     * the <code>read(b,</code> <code>off,</code> <code>len)</code> method.  If
-     * any subsequent call to <code>read()</code> results in a
-     * <code>IOException</code>, the exception is caught and treated as if it
-     * were end of file; the bytes read up to that point are stored into
-     * <code>b</code> and the number of bytes read before the exception
-     * occurred is returned.  Subclasses are encouraged to provide a more
-     * efficient implementation of this method.
-     *
-     * @param b     the buffer into which the data is read.
-     * @param off   the start offset in array <code>b</code>
-     *                   at which the data is written.
-     * @param len   the maximum number of bytes to read.
-     * @return the total number of bytes read into the buffer, or
-     *             <code>-1</code> if there is no more data because the end of
-     *             the stream has been reached.
-     * @exception IOException  if an I/O error occurs.
-     * @exception NullPointerException  if <code>b</code> is <code>null</code>.
-     * @see java.io.InputStream#read()
+     * this method checks the initial bundle that are installed/active before
+     * bundle tracker is opened.  
      */
-    public int read(byte[] b, int off, int len) throws IOException {
-        if (closed)
-            throw new IOException (
-                   MessageService.getTextMessage(SQLState.LANG_STREAM_CLOSED));
-        try {
-            int ret = control.read(b, off, len, pos);
-            if (ret != -1) {
-                pos += ret;
-                return ret;
+    private void checkInitialBundle(Bundle b) {
+        // If the bundle is active, check it
+        if (b.getState() == Bundle.ACTIVE) {
+            checkBundle(b);
+            // Also check bundles in the starting state with a lazy activation
+            // policy
+        } else if (b.getState() == Bundle.STARTING) {
+            String activationPolicyHeader = (String) b.getHeaders().get(
+                    Constants.BUNDLE_ACTIVATIONPOLICY);
+            if (activationPolicyHeader != null
+                    && activationPolicyHeader
+                            .startsWith(Constants.ACTIVATION_LAZY)) {
+                checkBundle(b);
             }
-            return -1;
-        } catch (StandardException se) {
-            String state = se.getSQLState();
-            if (state.equals(ExceptionUtil.getSQLStateFromIdentifier(
-                                        SQLState.BLOB_POSITION_TOO_LARGE))) {
-                return -1;
-            } else if (state.equals(ExceptionUtil.getSQLStateFromIdentifier(
-                                            SQLState.BLOB_INVALID_OFFSET))) {
-                throw new ArrayIndexOutOfBoundsException(se.getMessage());
+        }
+        
+    }
+
+    public void stop(BundleContext context) {
+        LOGGER.debug("Stopping blueprint extender...");
+        if (bt != null) {
+        	bt.close();
+        }
+        
+        parserServiceReg.unregister();
+
+        // Orderly shutdown of containers
+        while (!containers.isEmpty()) {
+            for (Bundle bundle : getBundlesToDestroy()) {
+                destroyContext(bundle);
+            }
+        }
+        this.eventDispatcher.destroy();
+        this.handlers.destroy();
+        executors.shutdown();
+        LOGGER.debug("Blueprint extender stopped");
+    }
+
+    private List<Bundle> getBundlesToDestroy() {
+        List<Bundle> bundlesToDestroy = new ArrayList<Bundle>();
+        for (Bundle bundle : containers.keySet()) {
+            ServiceReference[] references = bundle.getRegisteredServices();
+            int usage = 0;
+            if (references != null) {
+                for (ServiceReference reference : references) {
+                    usage += getServiceUsage(reference);
+                }
+            }
+            LOGGER.debug("Usage for bundle {} is {}", bundle, usage);
+            if (usage == 0) {
+                bundlesToDestroy.add(bundle);
+            }
+        }
+        if (!bundlesToDestroy.isEmpty()) {
+            Collections.sort(bundlesToDestroy, new Comparator<Bundle>() {
+                public int compare(Bundle b1, Bundle b2) {
+                    return (int) (b2.getLastModified() - b1.getLastModified());
+                }
+            });
+            LOGGER.debug("Selected bundles {} for destroy (no services in use)", bundlesToDestroy);
+        } else {
+            ServiceReference ref = null;
+            for (Bundle bundle : containers.keySet()) {
+                ServiceReference[] references = bundle.getRegisteredServices();
+                for (ServiceReference reference : references) {
+                    if (getServiceUsage(reference) == 0) {
+                        continue;
+                    }
+                    if (ref == null || reference.compareTo(ref) < 0) {
+                        LOGGER.debug("Currently selecting bundle {} for destroy (with reference {})", bundle, reference);
+                        ref = reference;
+                    }
+                }
+            }
+            bundlesToDestroy.add(ref.getBundle());
+            LOGGER.debug("Selected bundle {} for destroy (lowest ranking service)", bundlesToDestroy);
+        }
+        return bundlesToDestroy;
+    }
+
+    private static int getServiceUsage(ServiceReference ref) {
+        Bundle[] usingBundles = ref.getUsingBundles();
+        return (usingBundles != null) ? usingBundles.length : 0;        
+    }
+    
+    public void bundleChanged(BundleEvent event) {
+        Bundle bundle = event.getBundle();
+        if (event.getType() == BundleEvent.LAZY_ACTIVATION) {
+            checkBundle(bundle);
+        } else if (event.getType() == BundleEvent.STARTED) {
+            BlueprintContainerImpl blueprintContainer = containers.get(bundle);
+            if (blueprintContainer == null) {
+                checkBundle(bundle);
+            }
+        } else if (event.getType() == BundleEvent.STOPPING) {
+            destroyContext(bundle);
+        }
+    }
+
+    private void destroyContext(Bundle bundle) {
+        BlueprintContainerImpl blueprintContainer = containers.remove(bundle);
+        if (blueprintContainer != null) {
+            LOGGER.debug("Destroying BlueprintContainer for bundle {}", bundle.getSymbolicName());
+            blueprintContainer.destroy();
+        }
+    }
+    
+    private void checkBundle(Bundle bundle) {
+        LOGGER.debug("Scanning bundle {} for blueprint application", bundle.getSymbolicName());
+        try {
+            List<Object> pathList = new ArrayList<Object>();
+            String blueprintHeader = (String) bundle.getHeaders().get(BlueprintConstants.BUNDLE_BLUEPRINT_HEADER);
+            if (blueprintHeader == null) {
+                blueprintHeader = "OSGI-INF/blueprint/";
+            } 
+            List<PathElement> paths = HeaderParser.parseHeader(blueprintHeader);
+            for (PathElement path : paths) {
+                String name = path.getName();
+                if (name.endsWith("/")) {
+                    addEntries(bundle, name, "*.xml", pathList);
+                } else {
+                    String baseName;
+                    String filePattern;
+                    int pos = name.lastIndexOf('/');
+                    if (pos < 0) {
+                        baseName = "/";
+                        filePattern = name;
+                    } else {
+                        baseName = name.substring(0, pos + 1);
+                        filePattern = name.substring(pos + 1);
+                    }
+                    if (hasWildcards(filePattern)) {
+                        addEntries(bundle, baseName, filePattern, pathList);
+                    } else {
+                        addEntry(bundle, name, pathList);
+                    }                    
+                }
+            }            
+            if (!pathList.isEmpty()) {
+                LOGGER.debug("Found blueprint application in bundle {} with paths: {}", bundle.getSymbolicName(), pathList);
+                // Check compatibility
+                // TODO: For lazy bundles, the class is either loaded from an imported package or not found, so it should
+                // not trigger the activation.  If it does, we need to use something else like package admin or
+                // ServiceReference, or just not do this check, which could be quite harmful.
+                boolean compatible = isCompatible(bundle);
+                if (compatible) {
+                    final BlueprintContainerImpl blueprintContainer = new BlueprintContainerImpl(bundle.getBundleContext(), context.getBundle(), eventDispatcher, handlers, executors, pathList);
+                    containers.put(bundle, blueprintContainer);
+                    blueprintContainer.schedule();
+                } else {
+                    LOGGER.info("Bundle {} is not compatible with this blueprint extender", bundle.getSymbolicName());
+                }
+
             } else {
-                throw Util.newIOException(se);
+                LOGGER.debug("No blueprint application found in bundle {}", bundle.getSymbolicName());
+            }
+        } catch (Throwable t) {
+            eventDispatcher.blueprintEvent(new BlueprintEvent(BlueprintEvent.FAILURE, bundle, context.getBundle(), t));
+        }
+    }
+    
+    private boolean isCompatible(Bundle bundle) {
+        // Check compatibility
+        boolean compatible;
+        if (bundle.getState() == Bundle.ACTIVE) {
+            try {
+                Class clazz = bundle.getBundleContext().getBundle().loadClass(BlueprintContainer.class.getName());
+                compatible = (clazz == BlueprintContainer.class);
+            } catch (ClassNotFoundException e) {
+                compatible = true;
+            }
+        } else {
+            // for lazy bundle, we can't load the class, so just assume it's ok
+            compatible = true;
+        }
+        return compatible;
+    }
+    
+    private boolean hasWildcards(String path) {
+        return path.indexOf("*") >= 0; 
+    }
+    
+    private String getFilePart(URL url) {
+        String path = url.getPath();
+        int index = path.lastIndexOf('/');
+        return path.substring(index + 1);
+    }
+    
+    private String cachePath(Bundle bundle, String filePath)
+    {
+      return bundle.getSymbolicName() + "/" + bundle.getVersion() + "/" + filePath;
+    }    
+    
+    private URL getOverrideURLForCachePath(String privatePath){
+        URL override = null;
+        File privateDataVersion = context.getDataFile(privatePath);
+        if (privateDataVersion != null
+                && privateDataVersion.exists()) {
+            try {
+                override = privateDataVersion.toURL();
+            } catch (MalformedURLException e) {
+                LOGGER.error("Unexpected URL Conversion Issue", e);
+            }
+        }
+        return override;
+    }
+    
+    private URL getOverrideURL(Bundle bundle, String path){
+        String cachePath = cachePath(bundle, path);
+        return getOverrideURLForCachePath(cachePath);
+    }
+    
+    private URL getOverrideURL(Bundle bundle, URL path, String basePath){
+        String cachePath = cachePath(bundle, basePath + getFilePart(path));
+        return getOverrideURLForCachePath(cachePath);
+    }    
+    
+    private void addEntry(Bundle bundle, String path, List<Object> pathList) {
+        URL override = getOverrideURL(bundle, path);
+        if(override == null) {
+            pathList.add(path);
+        } else {
+            pathList.add(override);
+        }
+    }
+    
+    private void addEntries(Bundle bundle, String path, String filePattern, List<Object> pathList) {
+        Enumeration e = bundle.findEntries(path, filePattern, false);
+        while (e != null && e.hasMoreElements()) {
+            URL u = (URL) e.nextElement();
+            URL override = getOverrideURL(bundle, u, path);
+            if(override == null) {
+                pathList.add(u);
+            } else {
+                pathList.add(override);
             }
         }
     }
+    
+    // blueprint bundle tracker calls bundleChanged to minimize changes.
+    private class BlueprintBundleTrackerCustomizer implements
+            BundleTrackerCustomizer {
 
-    /**
-     * Closes this input stream and releases any system resources associated
-     * with the stream.
-     *
-     * <p> The <code>close</code> method of <code>InputStream</code> does
-     * nothing.
-     *
-     * @exception IOException  if an I/O error occurs.
-     */
-    public void close() throws IOException {
-        closed = true;
-    }
-
-    /**
-     * Reads the next byte of data from the input stream. The value byte is
-     * returned as an <code>int</code> in the range <code>0</code> to
-     * <code>255</code>. If no byte is available because the end of the stream
-     * has been reached, the value <code>-1</code> is returned. This method
-     * blocks until input data is available, the end of the stream is detected,
-     * or an exception is thrown.
-     *
-     * <p> A subclass must provide an implementation of this method.
-     *
-     * @return the next byte of data, or <code>-1</code> if the end of the
-     *             stream is reached.
-     * @exception IOException  if an I/O error occurs.
-     */
-    public int read() throws IOException {
-        if (closed)
-            throw new IOException (
-                   MessageService.getTextMessage (SQLState.LANG_STREAM_CLOSED));
-        try {
-            int ret = control.read(pos);
-            if (ret != -1)
-                pos += 1;
-            return ret;
-        } catch (StandardException se) {
-            throw Util.newIOException(se);
+        public BlueprintBundleTrackerCustomizer() {
         }
-    }
 
-    /**
-     * Checks if underlying StreamControl has been updated.
-     * @return if stream is modified since created
-     */
-    boolean isObsolete () {
-        return updateCount != control.getUpdateCount();
-    }
-    
-    /**
-     * Reinitializes the stream and sets the current pointer to zero.
-     */
-    void reInitialize () {
-        updateCount = control.getUpdateCount();
-        pos = 0;
-    }
-    
-    /**
-     * Returns size of stream in bytes.
-     * @return size of stream.
-     */
-    long length () throws IOException {
-        return control.getLength();
-    }
-
-    // Implementation of the PositionedStream interface:
-    //   - asInputStream
-    //   - getPosition
-    //   - reposition
-
-    public InputStream asInputStream() {
-        return this;
-    }
-
-    /**
-     * Returns the current byte position.
-     *
-     * @return The current byte position.
-     */
-    public long getPosition() {
-        return pos;
-    }
-
-    /**
-     * Repositions the stream to the requested byte position.
-     *
-     * @param requestedPos the requested position, starting at {@code 0}
-     * @throws EOFException if the requested position is larger than the length
-     * @throws IOException if obtaining the stream length fails
-     */
-    public void reposition(long requestedPos)
-            throws IOException{
-        if (SanityManager.DEBUG) {
-            if (requestedPos < 0) {
-                SanityManager.THROWASSERT("Negative position: " + requestedPos);
+        public Object addingBundle(Bundle b, BundleEvent event) {
+            if (event == null) {
+                // existing bundles first added to the tracker with no event change
+                checkInitialBundle(b);
+            } else {
+                bundleChanged(event);
             }
+
+            return b;
         }
-        if (requestedPos > length()) {
-            pos = 0;
-            throw new EOFException();
+
+        public void modifiedBundle(Bundle b, BundleEvent event, Object arg2) {
+            if (event == null) {
+                // cannot think of why we would be interested in a modified bundle with no bundle event
+                return;
+            }
+
+            bundleChanged(event);
+
         }
-        pos = requestedPos;
+
+        // don't think we would be interested in removedBundle, as that is
+        // called when bundle is removed from the tracker
+        public void removedBundle(Bundle b, BundleEvent event, Object arg2) {
+        }
+    }
+    
+    // blueprint bundle tracker calls bundleChanged to minimize changes.
+    // this bundle tracker customizer handles bundles installed in the child framework as well
+    private class BlueprintMutilBundleTrackerCustomizer extends
+            AriesBundleTrackerCustomizer {
+
+        public BlueprintMutilBundleTrackerCustomizer() {
+        }
+
+        public Object addingBundle(Bundle b, BundleEvent event) {
+            
+            super.addingBundle(b, event);
+            
+            if (event == null) {
+                // existing bundles first added to the tracker with no event change
+                checkInitialBundle(b);
+            } else {        
+                bundleChanged(event);
+            }
+
+            return b;
+        }
+
+        public void modifiedBundle(Bundle b, BundleEvent event, Object arg2) {
+
+            super.modifiedBundle(b, event, arg2);
+            
+            if (event == null) {
+                // cannot think of why we would be interested in a modified bundle with no bundle event
+                return;
+            } else {
+                bundleChanged(event);
+            }
+
+        }
+
+        // don't think we would be interested in removedBundle, as that is
+        // called when bundle is removed from the tracker
+        public void removedBundle(Bundle b, BundleEvent event, Object arg2) {
+        }
     }
 }

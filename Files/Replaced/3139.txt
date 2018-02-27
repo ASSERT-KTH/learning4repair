@@ -1,6 +1,6 @@
-+ " found for dictionary: " + name + ".  Using WhitespaceAnalzyer.");
+if(queryShape.relate(cShape) == SpatialRelation.DISJOINT)
 
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -16,129 +16,181 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.solr.spelling;
+
+package org.apache.lucene.spatial.prefix;
+
+import com.spatial4j.core.shape.Shape;
+import com.spatial4j.core.shape.SpatialRelation;
+import org.apache.lucene.index.*;
+import org.apache.lucene.search.DocIdSet;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.search.Filter;
+import org.apache.lucene.spatial.prefix.tree.Node;
+import org.apache.lucene.spatial.prefix.tree.SpatialPrefixTree;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.OpenBitSet;
+import org.apache.lucene.util.StringHelper;
 
 import java.io.IOException;
-import java.io.InputStreamReader;
-import java.util.List;
-import java.util.logging.Level;
-import java.util.logging.Logger;
-
-import org.apache.lucene.analysis.WhitespaceAnalyzer;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.Field;
-import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.IndexWriter;
-import org.apache.lucene.search.IndexSearcher;
-import org.apache.lucene.search.spell.PlainTextDictionary;
-import org.apache.lucene.store.RAMDirectory;
-import org.apache.solr.common.util.NamedList;
-import org.apache.solr.core.SolrCore;
-import org.apache.solr.core.SolrResourceLoader;
-import org.apache.solr.schema.FieldType;
-import org.apache.solr.schema.IndexSchema;
-import org.apache.solr.util.HighFrequencyDictionary;
-
+import java.util.LinkedList;
 
 /**
- * <p>
- * A spell checker implementation which can load words from a text 
- * file (one word per line).
- * </p>
+ * Performs a spatial intersection filter against a field indexed with {@link SpatialPrefixTree}, a Trie.
+ * SPT yields terms (grids) at length 1 and at greater lengths corresponding to greater precisions.
+ * This filter recursively traverses each grid length and uses methods on {@link Shape} to efficiently know
+ * that all points at a prefix fit in the shape or not to either short-circuit unnecessary traversals or to efficiently
+ * load all enclosed points.
  *
- * @since solr 1.3
- **/
-public class FileBasedSpellChecker extends AbstractLuceneSpellChecker {
+ * @lucene.internal
+ */
+public class RecursivePrefixTreeFilter extends Filter {
 
-  private static final Logger log = Logger.getLogger(FileBasedSpellChecker.class.getName());
+  /* TODOs for future:
 
-  public static final String FIELD_TYPE = "fieldType";
+Can a polygon query shape be optimized / made-simpler at recursive depths (e.g. intersection of shape + cell box)
 
-  public static final String SOURCE_FILE_CHAR_ENCODING = "characterEncoding";
-
-  private String fieldTypeName;
-  private String characterEncoding;
-  public static final String WORD_FIELD_NAME = "word";
-
-  public String init(NamedList config, SolrResourceLoader loader) {
-    super.init(config, loader);
-    fieldTypeName = (String) config.get(FIELD_TYPE);
-    characterEncoding = (String) config.get(SOURCE_FILE_CHAR_ENCODING);
-    return name;
+RE "scan" threshold:
+  // IF configured to do so, we could use term.freq() as an estimate on the number of places at this depth.  OR, perhaps
+  //  make estimates based on the total known term count at this level?
+  if (!scan) {
+    //Make some estimations on how many points there are at this level and how few there would need to be to set
+    // !scan to false.
+    long termsThreshold = (long) estimateNumberIndexedTerms(cell.length(),queryShape.getDocFreqExpenseThreshold(cell));
+    long thisOrd = termsEnum.ord();
+    scan = (termsEnum.seek(thisOrd+termsThreshold+1) == TermsEnum.SeekStatus.END
+            || !cell.contains(termsEnum.term()));
+    termsEnum.seek(thisOrd);//return to last position
   }
 
-  public void build(SolrCore core) {
-    try {
-      loadExternalFileDictionary(core.getSchema(), core.getResourceLoader());
-      spellChecker.clearIndex();
-      spellChecker.indexDictionary(dictionary);
-    } catch (IOException e) {
-      throw new RuntimeException(e);
-    }
+  */
+
+  private final String fieldName;
+  private final SpatialPrefixTree grid;
+  private final Shape queryShape;
+  private final int prefixGridScanLevel;//at least one less than grid.getMaxLevels()
+  private final int detailLevel;
+
+  public RecursivePrefixTreeFilter(String fieldName, SpatialPrefixTree grid, Shape queryShape, int prefixGridScanLevel,
+                             int detailLevel) {
+    this.fieldName = fieldName;
+    this.grid = grid;
+    this.queryShape = queryShape;
+    this.prefixGridScanLevel = Math.max(1,Math.min(prefixGridScanLevel,grid.getMaxLevels()-1));
+    this.detailLevel = detailLevel;
+    assert detailLevel <= grid.getMaxLevels();
   }
 
-  /**
-   * Override to return null, since there is no reader associated with a file based index
-   */
   @Override
-  protected IndexReader determineReader(IndexReader reader) {
-    return null;
+  public DocIdSet getDocIdSet(AtomicReaderContext ctx, Bits acceptDocs) throws IOException {
+    AtomicReader reader = ctx.reader();
+    OpenBitSet bits = new OpenBitSet(reader.maxDoc());
+    Terms terms = reader.terms(fieldName);
+    if (terms == null)
+      return null;
+    TermsEnum termsEnum = terms.iterator(null);
+    DocsEnum docsEnum = null;//cached for termsEnum.docs() calls
+    Node scanCell = null;
+
+    //cells is treated like a stack. LinkedList conveniently has bulk add to beginning. It's in sorted order so that we
+    //  always advance forward through the termsEnum index.
+    LinkedList<Node> cells = new LinkedList<Node>(
+        grid.getWorldNode().getSubCells(queryShape) );
+
+    //This is a recursive algorithm that starts with one or more "big" cells, and then recursively dives down into the
+    // first such cell that intersects with the query shape.  It's a depth first traversal because we don't move onto
+    // the next big cell (breadth) until we're completely done considering all smaller cells beneath it. For a given
+    // cell, if it's *within* the query shape then we can conveniently short-circuit the depth traversal and
+    // grab all documents assigned to this cell/term.  For an intersection of the cell and query shape, we either
+    // recursively step down another grid level or we decide heuristically (via prefixGridScanLevel) that there aren't
+    // that many points, and so we scan through all terms within this cell (i.e. the term starts with the cell's term),
+    // seeing which ones are within the query shape.
+    while(!cells.isEmpty()) {
+      final Node cell = cells.removeFirst();
+      final BytesRef cellTerm = new BytesRef(cell.getTokenBytes());
+      TermsEnum.SeekStatus seekStat = termsEnum.seekCeil(cellTerm);
+      if (seekStat == TermsEnum.SeekStatus.END)
+        break;
+      if (seekStat == TermsEnum.SeekStatus.NOT_FOUND)
+        continue;
+      if (cell.getLevel() == detailLevel || cell.isLeaf()) {
+        docsEnum = termsEnum.docs(acceptDocs, docsEnum, 0);
+        addDocs(docsEnum,bits);
+      } else {//any other intersection
+        //If the next indexed term is the leaf marker, then add all of them
+        BytesRef nextCellTerm = termsEnum.next();
+        assert StringHelper.startsWith(nextCellTerm, cellTerm);
+        scanCell = grid.getNode(nextCellTerm.bytes, nextCellTerm.offset, nextCellTerm.length, scanCell);
+        if (scanCell.isLeaf()) {
+          docsEnum = termsEnum.docs(acceptDocs, docsEnum, 0);
+          addDocs(docsEnum,bits);
+          termsEnum.next();//move pointer to avoid potential redundant addDocs() below
+        }
+
+        //Decide whether to continue to divide & conquer, or whether it's time to scan through terms beneath this cell.
+        // Scanning is a performance optimization trade-off.
+        boolean scan = cell.getLevel() >= prefixGridScanLevel;//simple heuristic
+
+        if (!scan) {
+          //Divide & conquer
+          cells.addAll(0, cell.getSubCells(queryShape));//add to beginning
+        } else {
+          //Scan through all terms within this cell to see if they are within the queryShape. No seek()s.
+          for(BytesRef term = termsEnum.term(); term != null && StringHelper.startsWith(term,cellTerm); term = termsEnum.next()) {
+            scanCell = grid.getNode(term.bytes, term.offset, term.length, scanCell);
+            int termLevel = scanCell.getLevel();
+            if (termLevel > detailLevel)
+              continue;
+            if (termLevel == detailLevel || scanCell.isLeaf()) {
+              //TODO should put more thought into implications of box vs point
+              Shape cShape = termLevel == grid.getMaxLevels() ? scanCell.getCenter() : scanCell.getShape();
+              if(queryShape.relate(cShape, grid.getSpatialContext()) == SpatialRelation.DISJOINT)
+                continue;
+
+              docsEnum = termsEnum.docs(acceptDocs, docsEnum, 0);
+              addDocs(docsEnum,bits);
+            }
+          }//term loop
+        }
+      }
+    }//cell loop
+
+    return bits;
   }
 
-  @SuppressWarnings("unchecked")
-  private void loadExternalFileDictionary(IndexSchema schema, SolrResourceLoader loader) {
-    IndexSearcher searcher = null;
-    try {
-
-      // Get the field's analyzer
-      if (fieldTypeName != null
-              && schema.getFieldTypeNoEx(fieldTypeName) != null) {
-        FieldType fieldType = schema.getFieldTypes()
-                .get(fieldTypeName);
-        // Do index-time analysis using the given fieldType's analyzer
-        RAMDirectory ramDir = new RAMDirectory();
-        IndexWriter writer = new IndexWriter(ramDir, fieldType.getAnalyzer(),
-                true, IndexWriter.MaxFieldLength.UNLIMITED);
-        writer.setMergeFactor(300);
-        writer.setMaxBufferedDocs(150);
-
-        List<String> lines = loader.getLines(sourceLocation, characterEncoding);
-
-        for (String s : lines) {
-          Document d = new Document();
-          d.add(new Field(WORD_FIELD_NAME, s, Field.Store.NO, Field.Index.TOKENIZED));
-          writer.addDocument(d);
-        }
-        writer.optimize();
-        writer.close();
-
-        dictionary = new HighFrequencyDictionary(IndexReader.open(ramDir),
-                WORD_FIELD_NAME, 0.0f);
-        analyzer = fieldType.getQueryAnalyzer();
-      } else {
-        log.warning("No fieldType: " + fieldTypeName
-                + " found for dictionary: " + name);
-        analyzer = new WhitespaceAnalyzer();
-
-        // check if character encoding is defined
-        if (characterEncoding == null) {
-          dictionary = new PlainTextDictionary(loader.openResource(sourceLocation));
-        } else {
-          dictionary = new PlainTextDictionary(new InputStreamReader(loader.openResource(sourceLocation), characterEncoding));
-        }
-      }
-
-
-    } catch (IOException e) {
-      log.log(Level.SEVERE, "Unable to load spellings", e);
-    } finally {
-      try {
-        if (searcher != null)
-          searcher.close();
-      } catch (IOException e) {
-        // Ignore
-      }
+  private void addDocs(DocsEnum docsEnum, OpenBitSet bits) throws IOException {
+    int docid;
+    while ((docid = docsEnum.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+      bits.fastSet(docid);
     }
   }
-  
+
+  @Override
+  public String toString() {
+    return "GeoFilter{fieldName='" + fieldName + '\'' + ", shape=" + queryShape + '}';
+  }
+
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) return true;
+    if (o == null || getClass() != o.getClass()) return false;
+
+    RecursivePrefixTreeFilter that = (RecursivePrefixTreeFilter) o;
+
+    if (!fieldName.equals(that.fieldName)) return false;
+    //note that we don't need to look at grid since for the same field it should be the same
+    if (prefixGridScanLevel != that.prefixGridScanLevel) return false;
+    if (detailLevel != that.detailLevel) return false;
+    if (!queryShape.equals(that.queryShape)) return false;
+
+    return true;
+  }
+
+  @Override
+  public int hashCode() {
+    int result = fieldName.hashCode();
+    result = 31 * result + queryShape.hashCode();
+    result = 31 * result + detailLevel;
+    return result;
+  }
 }

@@ -1,13 +1,14 @@
-final Range range = StorageService.instance.getLocalPrimaryRange();
+Lucene45DocValuesFormat.VERSION_START,
 
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+package org.apache.lucene.codecs.lucene45;
+
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,673 +19,875 @@ final Range range = StorageService.instance.getLocalPrimaryRange();
  * limitations under the License.
  */
 
-package org.apache.cassandra.io;
+import static org.apache.lucene.codecs.lucene45.Lucene45DocValuesConsumer.BINARY_FIXED_UNCOMPRESSED;
+import static org.apache.lucene.codecs.lucene45.Lucene45DocValuesConsumer.BINARY_PREFIX_COMPRESSED;
+import static org.apache.lucene.codecs.lucene45.Lucene45DocValuesConsumer.BINARY_VARIABLE_UNCOMPRESSED;
+import static org.apache.lucene.codecs.lucene45.Lucene45DocValuesConsumer.DELTA_COMPRESSED;
+import static org.apache.lucene.codecs.lucene45.Lucene45DocValuesConsumer.GCD_COMPRESSED;
+import static org.apache.lucene.codecs.lucene45.Lucene45DocValuesConsumer.SORTED_SET_SINGLE_VALUED_SORTED;
+import static org.apache.lucene.codecs.lucene45.Lucene45DocValuesConsumer.SORTED_SET_WITH_ADDRESSES;
+import static org.apache.lucene.codecs.lucene45.Lucene45DocValuesConsumer.TABLE_COMPRESSED;
+import static org.apache.lucene.codecs.lucene45.Lucene45DocValuesFormat.VERSION_SORTED_SET_SINGLE_VALUE_OPTIMIZED;
 
-import java.io.*;
-import java.util.*;
-import java.lang.ref.ReferenceQueue;
-import java.lang.ref.PhantomReference;
-import java.lang.ref.Reference;
-import java.nio.channels.FileChannel;
-import java.nio.MappedByteBuffer;
+import java.io.Closeable; // javadocs
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
 
-import org.apache.log4j.Logger;
+import org.apache.lucene.codecs.CodecUtil;
+import org.apache.lucene.codecs.DocValuesProducer;
+import org.apache.lucene.index.BinaryDocValues;
+import org.apache.lucene.index.CorruptIndexException;
+import org.apache.lucene.index.DocsAndPositionsEnum;
+import org.apache.lucene.index.DocsEnum;
+import org.apache.lucene.index.FieldInfo;
+import org.apache.lucene.index.FieldInfos;
+import org.apache.lucene.index.IndexFileNames;
+import org.apache.lucene.index.NumericDocValues;
+import org.apache.lucene.index.SegmentReadState;
+import org.apache.lucene.index.SingletonSortedSetDocValues;
+import org.apache.lucene.index.SortedDocValues;
+import org.apache.lucene.index.SortedSetDocValues;
+import org.apache.lucene.index.TermsEnum;
+import org.apache.lucene.index.TermsEnum.SeekStatus;
+import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.IOUtils;
+import org.apache.lucene.util.packed.BlockPackedReader;
+import org.apache.lucene.util.packed.MonotonicBlockPackedReader;
+import org.apache.lucene.util.packed.PackedInts;
 
-import org.apache.commons.lang.StringUtils;
+/** reader for {@link Lucene45DocValuesFormat} */
+public class Lucene45DocValuesProducer extends DocValuesProducer implements Closeable {
+  private final Map<Integer,NumericEntry> numerics;
+  private final Map<Integer,BinaryEntry> binaries;
+  private final Map<Integer,SortedSetEntry> sortedSets;
+  private final Map<Integer,NumericEntry> ords;
+  private final Map<Integer,NumericEntry> ordIndexes;
+  private final IndexInput data;
+  private final int maxDoc;
+  private final int version;
 
-import org.apache.cassandra.dht.IPartitioner;
-import org.apache.cassandra.dht.Range;
-import org.apache.cassandra.utils.BloomFilter;
-import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.marshal.AbstractType;
-import org.apache.cassandra.io.util.BufferedRandomAccessFile;
-import org.apache.cassandra.io.util.FileDataInput;
-import org.apache.cassandra.io.util.MappedFileDataInput;
+  // memory-resident structures
+  private final Map<Integer,MonotonicBlockPackedReader> addressInstances = new HashMap<Integer,MonotonicBlockPackedReader>();
+  private final Map<Integer,MonotonicBlockPackedReader> ordIndexInstances = new HashMap<Integer,MonotonicBlockPackedReader>();
+  
+  /** expert: instantiates a new reader */
+  protected Lucene45DocValuesProducer(SegmentReadState state, String dataCodec, String dataExtension, String metaCodec, String metaExtension) throws IOException {
+    String metaName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, metaExtension);
+    // read in the entries from the metadata file.
+    IndexInput in = state.directory.openInput(metaName, state.context);
+    this.maxDoc = state.segmentInfo.getDocCount();
+    boolean success = false;
+    try {
+      version = CodecUtil.checkHeader(in, metaCodec, 
+                                      Lucene45DocValuesFormat.VERSION_CURRENT,
+                                      Lucene45DocValuesFormat.VERSION_CURRENT);
+      numerics = new HashMap<Integer,NumericEntry>();
+      ords = new HashMap<Integer,NumericEntry>();
+      ordIndexes = new HashMap<Integer,NumericEntry>();
+      binaries = new HashMap<Integer,BinaryEntry>();
+      sortedSets = new HashMap<Integer,SortedSetEntry>();
+      readFields(in, state.fieldInfos);
 
-import org.cliffc.high_scale_lib.NonBlockingHashMap;
-import com.google.common.base.Predicate;
-import com.google.common.base.Predicates;
-import com.reardencommerce.kernel.collections.shared.evictable.ConcurrentLinkedHashMap;
+      success = true;
+    } finally {
+      if (success) {
+        IOUtils.close(in);
+      } else {
+        IOUtils.closeWhileHandlingException(in);
+      }
+    }
 
-/**
- * SSTableReaders are open()ed by Table.onStart; after that they are created by SSTableWriter.renameAndOpen.
- * Do not re-call open() on existing SSTable files; use the references kept by ColumnFamilyStore post-start instead.
- */
-public class SSTableReader extends SSTable implements Comparable<SSTableReader>
-{
-    private static final Logger logger = Logger.getLogger(SSTableReader.class);
+    success = false;
+    try {
+      String dataName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, dataExtension);
+      data = state.directory.openInput(dataName, state.context);
+      final int version2 = CodecUtil.checkHeader(data, dataCodec, 
+                                                 Lucene45DocValuesFormat.VERSION_CURRENT,
+                                                 Lucene45DocValuesFormat.VERSION_CURRENT);
+      if (version != version2) {
+        throw new CorruptIndexException("Format versions mismatch");
+      }
 
-    private static final FileSSTableMap openedFiles = new FileSSTableMap();
+      success = true;
+    } finally {
+      if (!success) {
+        IOUtils.closeWhileHandlingException(this.data);
+      }
+    }
+  }
+
+  private void readSortedField(int fieldNumber, IndexInput meta, FieldInfos infos) throws IOException {
+    // sorted = binary + numeric
+    if (meta.readVInt() != fieldNumber) {
+      throw new CorruptIndexException("sorted entry for field: " + fieldNumber + " is corrupt (resource=" + meta + ")");
+    }
+    if (meta.readByte() != Lucene45DocValuesFormat.BINARY) {
+      throw new CorruptIndexException("sorted entry for field: " + fieldNumber + " is corrupt (resource=" + meta + ")");
+    }
+    BinaryEntry b = readBinaryEntry(meta);
+    binaries.put(fieldNumber, b);
     
-    // `finalizers` is required to keep the PhantomReferences alive after the enclosing SSTR is itself
-    // unreferenced.  otherwise they will never get enqueued.
-    private static final Set<Reference<SSTableReader>> finalizers = new HashSet<Reference<SSTableReader>>();
-    private static final ReferenceQueue<SSTableReader> finalizerQueue = new ReferenceQueue<SSTableReader>()
-    {{
-        Runnable runnable = new Runnable()
-        {
-            public void run()
-            {
-                while (true)
-                {
-                    FileDeletingReference r = null;
-                    try
-                    {
-                        r = (FileDeletingReference) finalizerQueue.remove();
-                        finalizers.remove(r);
-                    }
-                    catch (InterruptedException e)
-                    {
-                        throw new RuntimeException(e);
-                    }
-                    try
-                    {
-                        r.cleanup();
-                    }
-                    catch (IOException e)
-                    {
-                        logger.error("Error deleting " + r.path, e);
-                    }
-                }
-            }
+    if (meta.readVInt() != fieldNumber) {
+      throw new CorruptIndexException("sorted entry for field: " + fieldNumber + " is corrupt (resource=" + meta + ")");
+    }
+    if (meta.readByte() != Lucene45DocValuesFormat.NUMERIC) {
+      throw new CorruptIndexException("sorted entry for field: " + fieldNumber + " is corrupt (resource=" + meta + ")");
+    }
+    NumericEntry n = readNumericEntry(meta);
+    ords.put(fieldNumber, n);
+  }
+
+  private void readSortedSetFieldWithAddresses(int fieldNumber, IndexInput meta, FieldInfos infos) throws IOException {
+    // sortedset = binary + numeric (addresses) + ordIndex
+    if (meta.readVInt() != fieldNumber) {
+      throw new CorruptIndexException("sortedset entry for field: " + fieldNumber + " is corrupt (resource=" + meta + ")");
+    }
+    if (meta.readByte() != Lucene45DocValuesFormat.BINARY) {
+      throw new CorruptIndexException("sortedset entry for field: " + fieldNumber + " is corrupt (resource=" + meta + ")");
+    }
+    BinaryEntry b = readBinaryEntry(meta);
+    binaries.put(fieldNumber, b);
+
+    if (meta.readVInt() != fieldNumber) {
+      throw new CorruptIndexException("sortedset entry for field: " + fieldNumber + " is corrupt (resource=" + meta + ")");
+    }
+    if (meta.readByte() != Lucene45DocValuesFormat.NUMERIC) {
+      throw new CorruptIndexException("sortedset entry for field: " + fieldNumber + " is corrupt (resource=" + meta + ")");
+    }
+    NumericEntry n1 = readNumericEntry(meta);
+    ords.put(fieldNumber, n1);
+
+    if (meta.readVInt() != fieldNumber) {
+      throw new CorruptIndexException("sortedset entry for field: " + fieldNumber + " is corrupt (resource=" + meta + ")");
+    }
+    if (meta.readByte() != Lucene45DocValuesFormat.NUMERIC) {
+      throw new CorruptIndexException("sortedset entry for field: " + fieldNumber + " is corrupt (resource=" + meta + ")");
+    }
+    NumericEntry n2 = readNumericEntry(meta);
+    ordIndexes.put(fieldNumber, n2);
+  }
+
+  private void readFields(IndexInput meta, FieldInfos infos) throws IOException {
+    int fieldNumber = meta.readVInt();
+    while (fieldNumber != -1) {
+      byte type = meta.readByte();
+      if (type == Lucene45DocValuesFormat.NUMERIC) {
+        numerics.put(fieldNumber, readNumericEntry(meta));
+      } else if (type == Lucene45DocValuesFormat.BINARY) {
+        BinaryEntry b = readBinaryEntry(meta);
+        binaries.put(fieldNumber, b);
+      } else if (type == Lucene45DocValuesFormat.SORTED) {
+        readSortedField(fieldNumber, meta, infos);
+      } else if (type == Lucene45DocValuesFormat.SORTED_SET) {
+        SortedSetEntry ss = readSortedSetEntry(meta);
+        sortedSets.put(fieldNumber, ss);
+        if (ss.format == SORTED_SET_WITH_ADDRESSES) {
+          readSortedSetFieldWithAddresses(fieldNumber, meta, infos);
+        } else if (ss.format == SORTED_SET_SINGLE_VALUED_SORTED) {
+          if (meta.readVInt() != fieldNumber) {
+            throw new CorruptIndexException("sortedset entry for field: " + fieldNumber + " is corrupt (resource=" + meta + ")");
+          }
+          if (meta.readByte() != Lucene45DocValuesFormat.SORTED) {
+            throw new CorruptIndexException("sortedset entry for field: " + fieldNumber + " is corrupt (resource=" + meta + ")");
+          }
+          readSortedField(fieldNumber, meta, infos);
+        } else {
+          throw new AssertionError();
+        }
+      } else {
+        throw new CorruptIndexException("invalid type: " + type + ", resource=" + meta);
+      }
+      fieldNumber = meta.readVInt();
+    }
+  }
+  
+  static NumericEntry readNumericEntry(IndexInput meta) throws IOException {
+    NumericEntry entry = new NumericEntry();
+    entry.format = meta.readVInt();
+    entry.missingOffset = meta.readLong();
+    entry.packedIntsVersion = meta.readVInt();
+    entry.offset = meta.readLong();
+    entry.count = meta.readVLong();
+    entry.blockSize = meta.readVInt();
+    switch(entry.format) {
+      case GCD_COMPRESSED:
+        entry.minValue = meta.readLong();
+        entry.gcd = meta.readLong();
+        break;
+      case TABLE_COMPRESSED:
+        if (entry.count > Integer.MAX_VALUE) {
+          throw new CorruptIndexException("Cannot use TABLE_COMPRESSED with more than MAX_VALUE values, input=" + meta);
+        }
+        final int uniqueValues = meta.readVInt();
+        if (uniqueValues > 256) {
+          throw new CorruptIndexException("TABLE_COMPRESSED cannot have more than 256 distinct values, input=" + meta);
+        }
+        entry.table = new long[uniqueValues];
+        for (int i = 0; i < uniqueValues; ++i) {
+          entry.table[i] = meta.readLong();
+        }
+        break;
+      case DELTA_COMPRESSED:
+        break;
+      default:
+        throw new CorruptIndexException("Unknown format: " + entry.format + ", input=" + meta);
+    }
+    return entry;
+  }
+  
+  static BinaryEntry readBinaryEntry(IndexInput meta) throws IOException {
+    BinaryEntry entry = new BinaryEntry();
+    entry.format = meta.readVInt();
+    entry.missingOffset = meta.readLong();
+    entry.minLength = meta.readVInt();
+    entry.maxLength = meta.readVInt();
+    entry.count = meta.readVLong();
+    entry.offset = meta.readLong();
+    switch(entry.format) {
+      case BINARY_FIXED_UNCOMPRESSED:
+        break;
+      case BINARY_PREFIX_COMPRESSED:
+        entry.addressInterval = meta.readVInt();
+        entry.addressesOffset = meta.readLong();
+        entry.packedIntsVersion = meta.readVInt();
+        entry.blockSize = meta.readVInt();
+        break;
+      case BINARY_VARIABLE_UNCOMPRESSED:
+        entry.addressesOffset = meta.readLong();
+        entry.packedIntsVersion = meta.readVInt();
+        entry.blockSize = meta.readVInt();
+        break;
+      default:
+        throw new CorruptIndexException("Unknown format: " + entry.format + ", input=" + meta);
+    }
+    return entry;
+  }
+
+  SortedSetEntry readSortedSetEntry(IndexInput meta) throws IOException {
+    SortedSetEntry entry = new SortedSetEntry();
+    if (version >= VERSION_SORTED_SET_SINGLE_VALUE_OPTIMIZED) {
+      entry.format = meta.readVInt();
+    } else {
+      entry.format = SORTED_SET_WITH_ADDRESSES;
+    }
+    if (entry.format != SORTED_SET_SINGLE_VALUED_SORTED && entry.format != SORTED_SET_WITH_ADDRESSES) {
+      throw new CorruptIndexException("Unknown format: " + entry.format + ", input=" + meta);
+    }
+    return entry;
+  }
+
+  @Override
+  public NumericDocValues getNumeric(FieldInfo field) throws IOException {
+    NumericEntry entry = numerics.get(field.number);
+    return getNumeric(entry);
+  }
+  
+  @Override
+  public long ramBytesUsed() {
+    long sizeInBytes = 0;    
+    for(MonotonicBlockPackedReader monotonicBlockPackedReader: addressInstances.values()) {
+      sizeInBytes += Integer.SIZE + monotonicBlockPackedReader.ramBytesUsed();
+    }
+    for(MonotonicBlockPackedReader monotonicBlockPackedReader: ordIndexInstances.values()) {
+      sizeInBytes += Integer.SIZE + monotonicBlockPackedReader.ramBytesUsed();
+    }
+    return sizeInBytes;
+  }
+  
+  LongNumericDocValues getNumeric(NumericEntry entry) throws IOException {
+    final IndexInput data = this.data.clone();
+    data.seek(entry.offset);
+
+    switch (entry.format) {
+      case DELTA_COMPRESSED:
+        final BlockPackedReader reader = new BlockPackedReader(data, entry.packedIntsVersion, entry.blockSize, entry.count, true);
+        return new LongNumericDocValues() {
+          @Override
+          public long get(long id) {
+            return reader.get(id);
+          }
         };
-        new Thread(runnable, "SSTABLE-DELETER").start();
-    }};
-    private static final long BUFFER_SIZE = Integer.MAX_VALUE;
+      case GCD_COMPRESSED:
+        final long min = entry.minValue;
+        final long mult = entry.gcd;
+        final BlockPackedReader quotientReader = new BlockPackedReader(data, entry.packedIntsVersion, entry.blockSize, entry.count, true);
+        return new LongNumericDocValues() {
+          @Override
+          public long get(long id) {
+            return min + mult * quotientReader.get(id);
+          }
+        };
+      case TABLE_COMPRESSED:
+        final long table[] = entry.table;
+        final int bitsRequired = PackedInts.bitsRequired(table.length - 1);
+        final PackedInts.Reader ords = PackedInts.getDirectReaderNoHeader(data, PackedInts.Format.PACKED, entry.packedIntsVersion, (int) entry.count, bitsRequired);
+        return new LongNumericDocValues() {
+          @Override
+          public long get(long id) {
+            return table[(int) ords.get((int) id)];
+          }
+        };
+      default:
+        throw new AssertionError();
+    }
+  }
 
-    public static int indexInterval()
-    {
-        return INDEX_INTERVAL;
+  @Override
+  public BinaryDocValues getBinary(FieldInfo field) throws IOException {
+    BinaryEntry bytes = binaries.get(field.number);
+    switch(bytes.format) {
+      case BINARY_FIXED_UNCOMPRESSED:
+        return getFixedBinary(field, bytes);
+      case BINARY_VARIABLE_UNCOMPRESSED:
+        return getVariableBinary(field, bytes);
+      case BINARY_PREFIX_COMPRESSED:
+        return getCompressedBinary(field, bytes);
+      default:
+        throw new AssertionError();
+    }
+  }
+  
+  private BinaryDocValues getFixedBinary(FieldInfo field, final BinaryEntry bytes) {
+    final IndexInput data = this.data.clone();
+
+    return new LongBinaryDocValues() {
+      @Override
+      public void get(long id, BytesRef result) {
+        long address = bytes.offset + id * bytes.maxLength;
+        try {
+          data.seek(address);
+          // NOTE: we could have one buffer, but various consumers (e.g. FieldComparatorSource) 
+          // assume "they" own the bytes after calling this!
+          final byte[] buffer = new byte[bytes.maxLength];
+          data.readBytes(buffer, 0, buffer.length);
+          result.bytes = buffer;
+          result.offset = 0;
+          result.length = buffer.length;
+        } catch (IOException e) {
+          throw new RuntimeException(e);
+        }
+      }
+    };
+  }
+  
+  /** returns an address instance for variable-length binary values.
+   *  @lucene.internal */
+  protected MonotonicBlockPackedReader getAddressInstance(IndexInput data, FieldInfo field, BinaryEntry bytes) throws IOException {
+    final MonotonicBlockPackedReader addresses;
+    synchronized (addressInstances) {
+      MonotonicBlockPackedReader addrInstance = addressInstances.get(field.number);
+      if (addrInstance == null) {
+        data.seek(bytes.addressesOffset);
+        addrInstance = new MonotonicBlockPackedReader(data, bytes.packedIntsVersion, bytes.blockSize, bytes.count, false);
+        addressInstances.put(field.number, addrInstance);
+      }
+      addresses = addrInstance;
+    }
+    return addresses;
+  }
+  
+  private BinaryDocValues getVariableBinary(FieldInfo field, final BinaryEntry bytes) throws IOException {
+    final IndexInput data = this.data.clone();
+    
+    final MonotonicBlockPackedReader addresses = getAddressInstance(data, field, bytes);
+
+    return new LongBinaryDocValues() {
+      @Override
+      public void get(long id, BytesRef result) {
+        long startAddress = bytes.offset + (id == 0 ? 0 : addresses.get(id-1));
+        long endAddress = bytes.offset + addresses.get(id);
+        int length = (int) (endAddress - startAddress);
+        try {
+          data.seek(startAddress);
+          // NOTE: we could have one buffer, but various consumers (e.g. FieldComparatorSource) 
+          // assume "they" own the bytes after calling this!
+          final byte[] buffer = new byte[length];
+          data.readBytes(buffer, 0, buffer.length);
+          result.bytes = buffer;
+          result.offset = 0;
+          result.length = length;
+        } catch (IOException e) {
+          throw new RuntimeException(e);
+        }
+      }
+    };
+  }
+  
+  /** returns an address instance for prefix-compressed binary values. 
+   * @lucene.internal */
+  protected MonotonicBlockPackedReader getIntervalInstance(IndexInput data, FieldInfo field, BinaryEntry bytes) throws IOException {
+    final MonotonicBlockPackedReader addresses;
+    final long interval = bytes.addressInterval;
+    synchronized (addressInstances) {
+      MonotonicBlockPackedReader addrInstance = addressInstances.get(field.number);
+      if (addrInstance == null) {
+        data.seek(bytes.addressesOffset);
+        final long size;
+        if (bytes.count % interval == 0) {
+          size = bytes.count / interval;
+        } else {
+          size = 1L + bytes.count / interval;
+        }
+        addrInstance = new MonotonicBlockPackedReader(data, bytes.packedIntsVersion, bytes.blockSize, size, false);
+        addressInstances.put(field.number, addrInstance);
+      }
+      addresses = addrInstance;
+    }
+    return addresses;
+  }
+
+
+  private BinaryDocValues getCompressedBinary(FieldInfo field, final BinaryEntry bytes) throws IOException {
+    final IndexInput data = this.data.clone();
+
+    final MonotonicBlockPackedReader addresses = getIntervalInstance(data, field, bytes);
+    
+    return new CompressedBinaryDocValues(bytes, addresses, data);
+  }
+
+  @Override
+  public SortedDocValues getSorted(FieldInfo field) throws IOException {
+    final int valueCount = (int) binaries.get(field.number).count;
+    final BinaryDocValues binary = getBinary(field);
+    NumericEntry entry = ords.get(field.number);
+    IndexInput data = this.data.clone();
+    data.seek(entry.offset);
+    final BlockPackedReader ordinals = new BlockPackedReader(data, entry.packedIntsVersion, entry.blockSize, entry.count, true);
+    
+    return new SortedDocValues() {
+
+      @Override
+      public int getOrd(int docID) {
+        return (int) ordinals.get(docID);
+      }
+
+      @Override
+      public void lookupOrd(int ord, BytesRef result) {
+        binary.get(ord, result);
+      }
+
+      @Override
+      public int getValueCount() {
+        return valueCount;
+      }
+
+      @Override
+      public int lookupTerm(BytesRef key) {
+        if (binary instanceof CompressedBinaryDocValues) {
+          return (int) ((CompressedBinaryDocValues)binary).lookupTerm(key);
+        } else {
+        return super.lookupTerm(key);
+        }
+      }
+
+      @Override
+      public TermsEnum termsEnum() {
+        if (binary instanceof CompressedBinaryDocValues) {
+          return ((CompressedBinaryDocValues)binary).getTermsEnum();
+        } else {
+          return super.termsEnum();
+        }
+      }
+    };
+  }
+  
+  /** returns an address instance for sortedset ordinal lists
+   * @lucene.internal */
+  protected MonotonicBlockPackedReader getOrdIndexInstance(IndexInput data, FieldInfo field, NumericEntry entry) throws IOException {
+    final MonotonicBlockPackedReader ordIndex;
+    synchronized (ordIndexInstances) {
+      MonotonicBlockPackedReader ordIndexInstance = ordIndexInstances.get(field.number);
+      if (ordIndexInstance == null) {
+        data.seek(entry.offset);
+        ordIndexInstance = new MonotonicBlockPackedReader(data, entry.packedIntsVersion, entry.blockSize, entry.count, false);
+        ordIndexInstances.put(field.number, ordIndexInstance);
+      }
+      ordIndex = ordIndexInstance;
+    }
+    return ordIndex;
+  }
+
+  @Override
+  public SortedSetDocValues getSortedSet(FieldInfo field) throws IOException {
+    SortedSetEntry ss = sortedSets.get(field.number);
+    if (ss.format == SORTED_SET_SINGLE_VALUED_SORTED) {
+      final SortedDocValues values = getSorted(field);
+      return new SingletonSortedSetDocValues(values);
+    } else if (ss.format != SORTED_SET_WITH_ADDRESSES) {
+      throw new AssertionError();
     }
 
-    public static long getApproximateKeyCount()
-    {
-        return getApproximateKeyCount(openedFiles.values());
-    }
-
-    public static long getApproximateKeyCount(Iterable<SSTableReader> sstables)
-    {
-        long count = 0;
-
-        for (SSTableReader sstable : sstables)
-        {
-            int indexKeyCount = sstable.getIndexPositions().size();
-            count = count + (indexKeyCount + 1) * INDEX_INTERVAL;
-            if (logger.isDebugEnabled())
-                logger.debug("index size for bloom filter calc for file  : " + sstable.getFilename() + "   : " + count);
+    final IndexInput data = this.data.clone();
+    final long valueCount = binaries.get(field.number).count;
+    // we keep the byte[]s and list of ords on disk, these could be large
+    final LongBinaryDocValues binary = (LongBinaryDocValues) getBinary(field);
+    final LongNumericDocValues ordinals = getNumeric(ords.get(field.number));
+    // but the addresses to the ord stream are in RAM
+    final MonotonicBlockPackedReader ordIndex = getOrdIndexInstance(data, field, ordIndexes.get(field.number));
+    
+    return new SortedSetDocValues() {
+      long offset;
+      long endOffset;
+      
+      @Override
+      public long nextOrd() {
+        if (offset == endOffset) {
+          return NO_MORE_ORDS;
+        } else {
+          long ord = ordinals.get(offset);
+          offset++;
+          return ord;
         }
+      }
 
-        return count;
-    }
+      @Override
+      public void setDocument(int docID) {
+        offset = (docID == 0 ? 0 : ordIndex.get(docID-1));
+        endOffset = ordIndex.get(docID);
+      }
 
-    public static int estimatedKeys(String columnFamilyName)
-    {
-        int n = 0;
-        for (SSTableReader sstable : openedFiles.values())
-        {
-            if (sstable.getColumnFamilyName().equals(columnFamilyName))
-                n += sstable.getIndexPositions().size() * INDEX_INTERVAL;
+      @Override
+      public void lookupOrd(long ord, BytesRef result) {
+        binary.get(ord, result);
+      }
+
+      @Override
+      public long getValueCount() {
+        return valueCount;
+      }
+      
+      @Override
+      public long lookupTerm(BytesRef key) {
+        if (binary instanceof CompressedBinaryDocValues) {
+          return ((CompressedBinaryDocValues)binary).lookupTerm(key);
+        } else {
+          return super.lookupTerm(key);
         }
-        return n;
-    }
+      }
 
-    /**
-     * Get all indexed keys defined by the two predicates.
-     * @param cfpred A Predicate defining matching column families.
-     * @param dkpred A Predicate defining matching DecoratedKeys.
-     */
-    public static List<DecoratedKey> getIndexedDecoratedKeysFor(Predicate<SSTable> cfpred, Predicate<DecoratedKey> dkpred)
-    {
-        List<DecoratedKey> indexedKeys = new ArrayList<DecoratedKey>();
-        
-        for (SSTableReader sstable : openedFiles.values())
-        {
-            if (!cfpred.apply(sstable))
-                continue;
-            for (KeyPosition kp : sstable.getIndexPositions())
-            {
-                if (dkpred.apply(kp.key))
-                {
-                    indexedKeys.add(kp.key);
-                }
-            }
+      @Override
+      public TermsEnum termsEnum() {
+        if (binary instanceof CompressedBinaryDocValues) {
+          return ((CompressedBinaryDocValues)binary).getTermsEnum();
+        } else {
+          return super.termsEnum();
         }
-        Collections.sort(indexedKeys);
+      }
+    };
+  }
+  
+  private Bits getMissingBits(final long offset) throws IOException {
+    if (offset == -1) {
+      return new Bits.MatchAllBits(maxDoc);
+    } else {
+      final IndexInput in = data.clone();
+      return new Bits() {
 
-        return indexedKeys;
-    }
-
-    /**
-     * Get all indexed keys in any SSTable for our primary range.
-     */
-    public static List<DecoratedKey> getIndexedDecoratedKeys()
-    {
-        final Range range = StorageService.instance().getLocalPrimaryRange();
-
-        Predicate<SSTable> cfpred = Predicates.alwaysTrue();
-        return getIndexedDecoratedKeysFor(cfpred, new Predicate<DecoratedKey>()
-        {
-            public boolean apply(DecoratedKey dk)
-            {
-               return range.contains(dk.token);
-            }
-        });
-    }
-
-    public static SSTableReader open(String dataFileName) throws IOException
-    {
-        return open(dataFileName,
-                    StorageService.getPartitioner(),
-                    DatabaseDescriptor.getKeysCachedFraction(parseTableName(dataFileName), parseColumnFamilyName(dataFileName)));
-    }
-
-    public static SSTableReader open(String dataFileName, IPartitioner partitioner, double keysCacheFraction) throws IOException
-    {
-        assert partitioner != null;
-        assert openedFiles.get(dataFileName) == null;
-
-        long start = System.currentTimeMillis();
-        SSTableReader sstable = new SSTableReader(dataFileName, partitioner);
-        sstable.loadIndexFile();
-        sstable.loadBloomFilter();
-        if (keysCacheFraction > 0)
-        {
-            sstable.keyCache = createKeyCache((int)((sstable.getIndexPositions().size() + 1) * INDEX_INTERVAL * keysCacheFraction));
-        }
-        if (logger.isDebugEnabled())
-            logger.debug("INDEX LOAD TIME for "  + dataFileName + ": " + (System.currentTimeMillis() - start) + " ms.");
-
-        return sstable;
-    }
-
-    FileDeletingReference phantomReference;
-    // jvm can only map up to 2GB at a time, so we split index/data into segments of that size when using mmap i/o
-    private final MappedByteBuffer[] indexBuffers;
-    private final MappedByteBuffer[] buffers;
-
-
-    public static ConcurrentLinkedHashMap<DecoratedKey, PositionSize> createKeyCache(int size)
-    {
-        return ConcurrentLinkedHashMap.create(ConcurrentLinkedHashMap.EvictionPolicy.SECOND_CHANCE, size);
-    }
-
-    private ConcurrentLinkedHashMap<DecoratedKey, PositionSize> keyCache;
-
-    SSTableReader(String filename,
-                  IPartitioner partitioner,
-                  List<KeyPosition> indexPositions, Map<KeyPosition, PositionSize> spannedIndexDataPositions,
-                  BloomFilter bloomFilter,
-                  ConcurrentLinkedHashMap<DecoratedKey, PositionSize> keyCache)
-            throws IOException
-    {
-        super(filename, partitioner);
-
-        if (DatabaseDescriptor.getIndexAccessMode() == DatabaseDescriptor.DiskAccessMode.mmap)
-        {
-            long indexLength = new File(indexFilename()).length();
-            int bufferCount = 1 + (int) (indexLength / BUFFER_SIZE);
-            indexBuffers = new MappedByteBuffer[bufferCount];
-            long remaining = indexLength;
-            for (int i = 0; i < bufferCount; i++)
-            {
-                indexBuffers[i] = mmap(indexFilename(), i * BUFFER_SIZE, (int) Math.min(remaining, BUFFER_SIZE));
-                remaining -= BUFFER_SIZE;
-            }
-        }
-        else
-        {
-            assert DatabaseDescriptor.getIndexAccessMode() == DatabaseDescriptor.DiskAccessMode.standard;
-            indexBuffers = null;
-        }
-
-        if (DatabaseDescriptor.getDiskAccessMode() == DatabaseDescriptor.DiskAccessMode.mmap)
-        {
-            int bufferCount = 1 + (int) (new File(path).length() / BUFFER_SIZE);
-            buffers = new MappedByteBuffer[bufferCount];
-            long remaining = length();
-            for (int i = 0; i < bufferCount; i++)
-            {
-                buffers[i] = mmap(path, i * BUFFER_SIZE, (int) Math.min(remaining, BUFFER_SIZE));
-                remaining -= BUFFER_SIZE;
-            }
-        }
-        else
-        {
-            assert DatabaseDescriptor.getDiskAccessMode() == DatabaseDescriptor.DiskAccessMode.standard;
-            buffers = null;
-        }
-
-        this.indexPositions = indexPositions;
-        this.spannedIndexDataPositions = spannedIndexDataPositions;
-        this.bf = bloomFilter;
-        phantomReference = new FileDeletingReference(this, finalizerQueue);
-        finalizers.add(phantomReference);
-        openedFiles.put(filename, this);
-        this.keyCache = keyCache;
-    }
-
-    private static MappedByteBuffer mmap(String filename, long start, int size) throws IOException
-    {
-        RandomAccessFile raf;
-        try
-        {
-            raf = new RandomAccessFile(filename, "r");
-        }
-        catch (FileNotFoundException e)
-        {
-            throw new IOError(e);
-        }
-
-        try
-        {
-            return raf.getChannel().map(FileChannel.MapMode.READ_ONLY, start, size);
-        }
-        finally
-        {
-            raf.close();
-        }
-    }
-
-    private SSTableReader(String filename, IPartitioner partitioner) throws IOException
-    {
-        this(filename, partitioner, null, null, null, null);
-    }
-
-    public List<KeyPosition> getIndexPositions()
-    {
-        return indexPositions;
-    }
-
-    void loadBloomFilter() throws IOException
-    {
-        DataInputStream stream = new DataInputStream(new FileInputStream(filterFilename()));
-        try
-        {
-            bf = BloomFilter.serializer().deserialize(stream);
-        }
-        finally
-        {
-            stream.close();
-        }
-    }
-
-    void loadIndexFile() throws IOException
-    {
-        indexPositions = new ArrayList<KeyPosition>();
-        // we read the positions in a BRAF so we don't have to worry about an entry spanning a mmap boundary.
-        // any entries that do, we force into the in-memory sample so key lookup can always bsearch within
-        // a single mmapped segment.
-        BufferedRandomAccessFile input = new BufferedRandomAccessFile(indexFilename(), "r");
-        try
-        {
-            int i = 0;
-            long indexSize = input.length();
-            while (true)
-            {
-                long indexPosition = input.getFilePointer();
-                if (indexPosition == indexSize)
-                {
-                    break;
-                }
-                DecoratedKey decoratedKey = partitioner.convertFromDiskFormat(input.readUTF());
-                long dataPosition = input.readLong();
-                long nextIndexPosition = input.getFilePointer();
-                boolean spannedEntry = bufferIndex(indexPosition) != bufferIndex(nextIndexPosition);
-                if (i++ % INDEX_INTERVAL == 0 || spannedEntry)
-                {
-                    KeyPosition info;
-                    info = new KeyPosition(decoratedKey, indexPosition);
-                    indexPositions.add(info);
-
-                    if (spannedEntry)
-                    {
-                        if (spannedIndexDataPositions == null)
-                        {
-                            spannedIndexDataPositions = new HashMap<KeyPosition, PositionSize>();
-                        }
-                        // read the next index entry to see how big the row is corresponding to the current, mmap-segment-spanning one
-                        input.readUTF();
-                        long nextDataPosition = input.readLong();
-                        input.seek(nextIndexPosition);
-                        spannedIndexDataPositions.put(info, new PositionSize(dataPosition, nextDataPosition - dataPosition));
-                    }
-                }
-            }
-        }
-        finally
-        {
-            input.close();
-        }
-    }
-
-    /** get the position in the index file to start scanning to find the given key (at most indexInterval keys away) */
-    private KeyPosition getIndexScanPosition(DecoratedKey decoratedKey)
-    {
-        assert indexPositions != null && indexPositions.size() > 0;
-        int index = Collections.binarySearch(indexPositions, new KeyPosition(decoratedKey, -1));
-        if (index < 0)
-        {
-            // binary search gives us the first index _greater_ than the key searched for,
-            // i.e., its insertion position
-            int greaterThan = (index + 1) * -1;
-            if (greaterThan == 0)
-                return null;
-            return indexPositions.get(greaterThan - 1);
-        }
-        else
-        {
-            return indexPositions.get(index);
-        }
-    }
-
-    /**
-     * returns the position in the data file to find the given key, or -1 if the key is not present
-     */
-    public PositionSize getPosition(DecoratedKey decoratedKey) throws IOException
-    {
-        if (!bf.isPresent(partitioner.convertToDiskFormat(decoratedKey)))
-            return null;
-        if (keyCache != null)
-        {
-            PositionSize cachedPosition = keyCache.get(decoratedKey);
-            if (cachedPosition != null)
-            {
-                return cachedPosition;
-            }
-        }
-        KeyPosition sampledPosition = getIndexScanPosition(decoratedKey);
-        if (sampledPosition == null)
-        {
-            return null;
-        }
-        if (spannedIndexDataPositions != null)
-        {
-            PositionSize info = spannedIndexDataPositions.get(sampledPosition);
-            if (info != null)
-                return info;
-        }
-
-        long p = sampledPosition.position;
-        FileDataInput input;
-        if (indexBuffers == null)
-        {
-            input = new BufferedRandomAccessFile(indexFilename(), "r");
-            ((BufferedRandomAccessFile)input).seek(p);
-        }
-        else
-        {
-            input = new MappedFileDataInput(indexBuffers[bufferIndex(p)], indexFilename(), (int)(p % BUFFER_SIZE));
-        }
-        try
-        {
-            int i = 0;
-            do
-            {
-                DecoratedKey indexDecoratedKey;
-                try
-                {
-                    indexDecoratedKey = partitioner.convertFromDiskFormat(input.readUTF());
-                }
-                catch (EOFException e)
-                {
-                    return null;
-                }
-                long position = input.readLong();
-                int v = indexDecoratedKey.compareTo(decoratedKey);
-                if (v == 0)
-                {
-                    PositionSize info;
-                    if (!input.isEOF())
-                    {
-                        int utflen = input.readUnsignedShort();
-                        if (utflen != input.skipBytes(utflen))
-                            throw new EOFException();
-                        info = new PositionSize(position, input.readLong() - position);
-                    }
-                    else
-                    {
-                        info = new PositionSize(position, length() - position);
-                    }
-                    if (keyCache != null)
-                        keyCache.put(decoratedKey, info);
-                    return info;
-                }
-                if (v > 0)
-                    return null;
-            } while  (++i < INDEX_INTERVAL);
-        }
-        finally
-        {
-            input.close();
-        }
-        return null;
-    }
-
-    /** like getPosition, but if key is not found will return the location of the first key _greater_ than the desired one, or -1 if no such key exists. */
-    public long getNearestPosition(DecoratedKey decoratedKey) throws IOException
-    {
-        KeyPosition sampledPosition = getIndexScanPosition(decoratedKey);
-        if (sampledPosition == null)
-        {
-            return 0;
-        }
-
-        // can't use a MappedFileDataInput here, since we might cross a segment boundary while scanning
-        BufferedRandomAccessFile input = new BufferedRandomAccessFile(indexFilename(path), "r");
-        input.seek(sampledPosition.position);
-        try
-        {
-            while (true)
-            {
-                DecoratedKey indexDecoratedKey;
-                try
-                {
-                    indexDecoratedKey = partitioner.convertFromDiskFormat(input.readUTF());
-                }
-                catch (EOFException e)
-                {
-                    return -1;
-                }
-                long position = input.readLong();
-                int v = indexDecoratedKey.compareTo(decoratedKey);
-                if (v >= 0)
-                    return position;
-            }
-        }
-        finally
-        {
-            input.close();
-        }
-    }
-
-    public long length()
-    {
-        return new File(path).length();
-    }
-
-    public int compareTo(SSTableReader o)
-    {
-        return ColumnFamilyStore.getGenerationFromFileName(path) - ColumnFamilyStore.getGenerationFromFileName(o.path);
-    }
-
-    public void markCompacted() throws IOException
-    {
-        if (logger.isDebugEnabled())
-            logger.debug("Marking " + path + " compacted");
-        openedFiles.remove(path);
-        if (!new File(compactedFilename()).createNewFile())
-        {
-            throw new IOException("Unable to create compaction marker");
-        }
-        phantomReference.deleteOnCleanup();
-    }
-
-    /** obviously only for testing */
-    public void forceBloomFilterFailures()
-    {
-        bf = BloomFilter.alwaysMatchingBloomFilter();
-    }
-
-    static void reopenUnsafe() throws IOException // testing only
-    {
-        Collection<SSTableReader> sstables = new ArrayList<SSTableReader>(openedFiles.values());
-        openedFiles.clear();
-        for (SSTableReader sstable : sstables)
-        {
-            SSTableReader.open(sstable.path, sstable.partitioner, 0.01);
-        }
-    }
-
-    public IPartitioner getPartitioner()
-    {
-        return partitioner;
-    }
-
-    public SSTableScanner getScanner(int bufferSize) throws IOException
-    {
-        return new SSTableScanner(this, bufferSize);
-    }
-
-    public FileDataInput getFileDataInput(DecoratedKey decoratedKey, int bufferSize) throws IOException
-    {
-        PositionSize info = getPosition(decoratedKey);
-        if (info == null)
-            return null;
-
-        if (buffers == null || (bufferIndex(info.position) != bufferIndex(info.position + info.size)))
-        {
-            BufferedRandomAccessFile file = new BufferedRandomAccessFile(path, "r", bufferSize);
-            file.seek(info.position);
-            return file;
-        }
-        return new MappedFileDataInput(buffers[bufferIndex(info.position)], path, (int) (info.position % BUFFER_SIZE));
-    }
-
-    static int bufferIndex(long position)
-    {
-        return (int) (position / BUFFER_SIZE);
-    }
-
-    public AbstractType getColumnComparator()
-    {
-        return DatabaseDescriptor.getComparator(getTableName(), getColumnFamilyName());
-    }
-
-    public ColumnFamily makeColumnFamily()
-    {
-        return ColumnFamily.create(getTableName(), getColumnFamilyName());
-    }
-
-    public ICompactSerializer2<IColumn> getColumnSerializer()
-    {
-        return DatabaseDescriptor.getColumnFamilyType(getTableName(), getColumnFamilyName()).equals("Standard")
-               ? Column.serializer()
-               : SuperColumn.serializer(getColumnComparator());
-    }
-}
-
-class FileSSTableMap
-{
-    private final Map<String, SSTableReader> map = new NonBlockingHashMap<String, SSTableReader>();
-
-    public SSTableReader get(String filename)
-    {
-        try
-        {
-            return map.get(new File(filename).getCanonicalPath());
-        }
-        catch (IOException e)
-        {
+        @Override
+        public boolean get(int index) {
+          try {
+            in.seek(offset + (index >> 3));
+            return (in.readByte() & (1 << (index & 7))) != 0;
+          } catch (IOException e) {
             throw new RuntimeException(e);
+          }
         }
-    }
 
-    public SSTableReader put(String filename, SSTableReader value)
-    {
-        try
-        {
-            return map.put(new File(filename).getCanonicalPath(), value);
+        @Override
+        public int length() {
+          return maxDoc;
         }
-        catch (IOException e)
-        {
-            throw new RuntimeException(e);
-        }
+      };
     }
+  }
 
-    public Collection<SSTableReader> values()
-    {
-        return map.values();
+  @Override
+  public Bits getDocsWithField(FieldInfo field) throws IOException {
+    switch(field.getDocValuesType()) {
+      case SORTED_SET:
+        return new SortedSetDocsWithField(getSortedSet(field), maxDoc);
+      case SORTED:
+        return new SortedDocsWithField(getSorted(field), maxDoc);
+      case BINARY:
+        BinaryEntry be = binaries.get(field.number);
+        return getMissingBits(be.missingOffset);
+      case NUMERIC:
+        NumericEntry ne = numerics.get(field.number);
+        return getMissingBits(ne.missingOffset);
+      default:
+        throw new AssertionError();
     }
+  }
 
-    public void clear()
-    {
-        map.clear();
-    }
+  @Override
+  public void close() throws IOException {
+    data.close();
+  }
+  
+  /** metadata entry for a numeric docvalues field */
+  protected static class NumericEntry {
+    private NumericEntry() {}
+    /** offset to the bitset representing docsWithField, or -1 if no documents have missing values */
+    long missingOffset;
+    /** offset to the actual numeric values */
+    public long offset;
 
-    public void remove(String filename) throws IOException
-    {
-        map.remove(new File(filename).getCanonicalPath());
-    }
+    int format;
+    /** packed ints version used to encode these numerics */
+    public int packedIntsVersion;
+    /** count of values written */
+    public long count;
+    /** packed ints blocksize */
+    public int blockSize;
+    
+    long minValue;
+    long gcd;
+    long table[];
+  }
+  
+  /** metadata entry for a binary docvalues field */
+  protected static class BinaryEntry {
+    private BinaryEntry() {}
+    /** offset to the bitset representing docsWithField, or -1 if no documents have missing values */
+    long missingOffset;
+    /** offset to the actual binary values */
+    long offset;
 
+    int format;
+    /** count of values written */
+    public long count;
+    int minLength;
+    int maxLength;
+    /** offset to the addressing data that maps a value to its slice of the byte[] */
+    public long addressesOffset;
+    /** interval of shared prefix chunks (when using prefix-compressed binary) */
+    public long addressInterval;
+    /** packed ints version used to encode addressing information */
+    public int packedIntsVersion;
+    /** packed ints blocksize */
+    public int blockSize;
+  }
+
+  /** metadata entry for a sorted-set docvalues field */
+  protected static class SortedSetEntry {
+    private SortedSetEntry() {}
+    int format;
+  }
+
+  // internally we compose complex dv (sorted/sortedset) from other ones
+  static abstract class LongNumericDocValues extends NumericDocValues {
     @Override
-    public String toString()
-    {
-        return "FileSSTableMap {" + StringUtils.join(map.keySet(), ", ") + "}";
+    public final long get(int docID) {
+      return get((long) docID);
     }
-}
-
-class FileDeletingReference extends PhantomReference<SSTableReader>
-{
-    public final String path;
-    private boolean deleteOnCleanup;
-
-    FileDeletingReference(SSTableReader referent, ReferenceQueue<? super SSTableReader> q)
-    {
-        super(referent, q);
-        this.path = referent.path;
+    
+    abstract long get(long id);
+  }
+  
+  static abstract class LongBinaryDocValues extends BinaryDocValues {
+    @Override
+    public final void get(int docID, BytesRef result) {
+      get((long)docID, result);
     }
-
-    public void deleteOnCleanup()
-    {
-        deleteOnCleanup = true;
+    
+    abstract void get(long id, BytesRef Result);
+  }
+  
+  // in the compressed case, we add a few additional operations for
+  // more efficient reverse lookup and enumeration
+  static class CompressedBinaryDocValues extends LongBinaryDocValues {
+    final BinaryEntry bytes;
+    final long interval;
+    final long numValues;
+    final long numIndexValues;
+    final MonotonicBlockPackedReader addresses;
+    final IndexInput data;
+    final TermsEnum termsEnum;
+    
+    public CompressedBinaryDocValues(BinaryEntry bytes, MonotonicBlockPackedReader addresses, IndexInput data) throws IOException {
+      this.bytes = bytes;
+      this.interval = bytes.addressInterval;
+      this.addresses = addresses;
+      this.data = data;
+      this.numValues = bytes.count;
+      this.numIndexValues = addresses.size();
+      this.termsEnum = getTermsEnum(data);
     }
-
-    public void cleanup() throws IOException
-    {
-        if (deleteOnCleanup)
-        {
-            // this is tricky because the mmapping might not have been finalized yet,
-            // and delete will until it is.  additionally, we need to make sure to
-            // delete the data file first, so on restart the others will be recognized as GCable
-            // even if the compaction file deletion occurs next.
-            new Thread(new Runnable()
-            {
-                public void run()
-                {
-                    File datafile = new File(path);
-                    for (int i = 0; i < DeletionService.MAX_RETRIES; i++)
-                    {
-                        if (datafile.delete())
-                            break;
-                        try
-                        {
-                            Thread.sleep(10000);
-                        }
-                        catch (InterruptedException e)
-                        {
-                            throw new AssertionError(e);
-                        }
-                    }
-                    if (datafile.exists())
-                        throw new RuntimeException("Unable to delete " + path);
-                    SSTable.logger.info("Deleted " + path);
-                    DeletionService.submitDeleteWithRetry(SSTable.indexFilename(path));
-                    DeletionService.submitDeleteWithRetry(SSTable.filterFilename(path));
-                    DeletionService.submitDeleteWithRetry(SSTable.compactedFilename(path));
-                }
-            }, "Cleanup " + path).start();
+    
+    @Override
+    public void get(long id, BytesRef result) {
+      try {
+        termsEnum.seekExact(id);
+        BytesRef term = termsEnum.term();
+        result.bytes = term.bytes;
+        result.offset = term.offset;
+        result.length = term.length;
+      } catch (IOException e) {
+        throw new RuntimeException(e);
+      }
+    }
+    
+    long lookupTerm(BytesRef key) {
+      try {
+        SeekStatus status = termsEnum.seekCeil(key);
+        if (status == SeekStatus.END) {
+          return -numValues-1;
+        } else if (status == SeekStatus.FOUND) {
+          return termsEnum.ord();
+        } else {
+          return -termsEnum.ord()-1;
         }
+      } catch (IOException bogus) {
+        throw new RuntimeException(bogus);
+      }
     }
+    
+    TermsEnum getTermsEnum() {
+      try {
+        return getTermsEnum(data.clone());
+      } catch (IOException e) {
+        throw new RuntimeException(e);
+      }
+    }
+    
+    private TermsEnum getTermsEnum(final IndexInput input) throws IOException {
+      input.seek(bytes.offset);
+      
+      return new TermsEnum() {
+        private long currentOrd = -1;
+        // TODO: maxLength is negative when all terms are merged away...
+        private final BytesRef termBuffer = new BytesRef(bytes.maxLength < 0 ? 0 : bytes.maxLength);
+        private final BytesRef term = new BytesRef(); // TODO: paranoia?
+
+        @Override
+        public BytesRef next() throws IOException {
+          if (doNext() == null) {
+            return null;
+          } else {
+            setTerm();
+            return term;
+          }
+        }
+        
+        private BytesRef doNext() throws IOException {
+          if (++currentOrd >= numValues) {
+            return null;
+          } else {
+            int start = input.readVInt();
+            int suffix = input.readVInt();
+            input.readBytes(termBuffer.bytes, start, suffix);
+            termBuffer.length = start + suffix;
+            return termBuffer;
+          }
+        }
+
+        @Override
+        public SeekStatus seekCeil(BytesRef text) throws IOException {
+          // binary-search just the index values to find the block,
+          // then scan within the block
+          long low = 0;
+          long high = numIndexValues-1;
+
+          while (low <= high) {
+            long mid = (low + high) >>> 1;
+            doSeek(mid * interval);
+            int cmp = termBuffer.compareTo(text);
+
+            if (cmp < 0) {
+              low = mid + 1;
+            } else if (cmp > 0) {
+              high = mid - 1;
+            } else {
+              // we got lucky, found an indexed term
+              setTerm();
+              return SeekStatus.FOUND;
+            }
+          }
+          
+          if (numIndexValues == 0) {
+            return SeekStatus.END;
+          }
+          
+          // block before insertion point
+          long block = low-1;
+          doSeek(block < 0 ? -1 : block * interval);
+          
+          while (doNext() != null) {
+            int cmp = termBuffer.compareTo(text);
+            if (cmp == 0) {
+              setTerm();
+              return SeekStatus.FOUND;
+            } else if (cmp > 0) {
+              setTerm();
+              return SeekStatus.NOT_FOUND;
+            }
+          }
+          
+          return SeekStatus.END;
+        }
+
+        @Override
+        public void seekExact(long ord) throws IOException {
+          doSeek(ord);
+          setTerm();
+        }
+        
+        private void doSeek(long ord) throws IOException {
+          long block = ord / interval;
+
+          if (ord >= currentOrd && block == currentOrd / interval) {
+            // seek within current block
+          } else {
+            // position before start of block
+            currentOrd = ord - ord % interval - 1;
+            input.seek(bytes.offset + addresses.get(block));
+          }
+          
+          while (currentOrd < ord) {
+            doNext();
+          }
+        }
+        
+        private void setTerm() {
+          // TODO: is there a cleaner way
+          term.bytes = new byte[termBuffer.length];
+          term.offset = 0;
+          term.copyBytes(termBuffer);
+        }
+
+        @Override
+        public BytesRef term() throws IOException {
+          return term;
+        }
+
+        @Override
+        public long ord() throws IOException {
+          return currentOrd;
+        }
+
+        @Override
+        public int docFreq() throws IOException {
+          throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public long totalTermFreq() throws IOException {
+          return -1;
+        }
+
+        @Override
+        public DocsEnum docs(Bits liveDocs, DocsEnum reuse, int flags) throws IOException {
+          throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public DocsAndPositionsEnum docsAndPositions(Bits liveDocs, DocsAndPositionsEnum reuse, int flags) throws IOException {
+          throw new UnsupportedOperationException();
+        }
+      };
+    }
+  }
 }

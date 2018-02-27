@@ -1,8 +1,8 @@
-TBinaryProtocol binaryProtocol = new TBinaryProtocol(transport);
+public static class KeyPosition implements Comparable<KeyPosition>
 
-package org.apache.cassandra.hadoop;
-
-/**
+package org.apache.cassandra.io;
+/*
+ * 
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -10,215 +10,366 @@ package org.apache.cassandra.hadoop;
  * to you under the Apache License, Version 2.0 (the
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * 
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ * 
  */
 
-import java.io.IOError;
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Set;
 
-import org.apache.cassandra.EmbeddedServer;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.thrift.Cassandra;
-import org.apache.cassandra.thrift.CfDef;
-import org.apache.cassandra.thrift.ColumnOrSuperColumn;
-import org.apache.cassandra.thrift.ColumnParent;
-import org.apache.cassandra.thrift.ConsistencyLevel;
-import org.apache.cassandra.thrift.InvalidRequestException;
-import org.apache.cassandra.thrift.KeyRange;
-import org.apache.cassandra.thrift.KeySlice;
-import org.apache.cassandra.thrift.KsDef;
-import org.apache.cassandra.thrift.SlicePredicate;
-import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.io.IntWritable;
-import org.apache.hadoop.io.SequenceFile;
-import org.apache.hadoop.mapreduce.OutputFormat;
-import org.apache.hadoop.util.ToolRunner;
-import org.apache.thrift.TException;
-import org.apache.thrift.protocol.TBinaryProtocol;
-import org.apache.thrift.transport.TFramedTransport;
-import org.apache.thrift.transport.TSocket;
-import org.apache.thrift.transport.TTransport;
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Test;
+import java.io.File;
+import java.io.IOException;
+import java.util.List;
+import java.util.Arrays;
+import java.util.Map;
+import java.util.StringTokenizer;
+
+import org.apache.log4j.Logger;
+import org.apache.commons.lang.StringUtils;
+
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.utils.BloomFilter;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.db.DecoratedKey;
+
+import com.google.common.base.Objects;
 
 /**
- * A test case for the {@link ColumnFamilyOutputFormat}, which reads each
- * &lt;key, value&gt; pair from a sequence file, maps them to a &lt;key,
- * column&gt; pair, and then reduces it by aggregating the columns that
- * correspond to the same key. Finally, the output &lt;key, columns&gt; pairs
- * are written into the (Cassandra) column family associated with this
- * {@link OutputFormat}.
- * 
- * @author Karthick Sankarachary
- * 
+ * This class is built on top of the SequenceFile. It stores
+ * data on disk in sorted fashion. However the sorting is upto
+ * the application. This class expects keys to be handed to it
+ * in sorted order.
+ *
+ * A separate index file is maintained as well, containing the
+ * SSTable keys and the offset into the SSTable at which they are found.
+ * Every 1/indexInterval key is read into memory when the SSTable is opened.
+ *
+ * Finally, a bloom filter file is also kept for the keys in each SSTable.
  */
-
-public class ColumnFamilyOutputFormatTest extends EmbeddedServer
+public abstract class SSTable
 {
-    static final String KEYSPACE = "ColumnFamilyOutputFormatTestKeyspace";
-    static final String COLUMN_FAMILY = "outputColumnFamily";
+    static final Logger logger = Logger.getLogger(SSTable.class);
 
-    private static final String INPUT_FOLDER = "columnfamily.outputtest";
+    public static final int FILES_ON_DISK = 3; // data, index, and bloom filter
+    public static final String COMPONENT_DATA = "Data.db";
+    public static final String COMPONENT_INDEX = "Index.db";
+    public static final String COMPONENT_FILTER = "Filter.db";
 
-    private static final String INPUT_FILE = "rows.txt";
+    public static final String COMPONENT_COMPACTED = "Compacted";
 
-    private static final int NUMBER_OF_ROWS = 3;
-    private static final int NUMBER_OF_COLUMNS = 4;
+    protected Descriptor desc;
+    protected IPartitioner partitioner;
+    protected BloomFilter bf;
+    protected List<KeyPosition> indexPositions;
+    protected Map<KeyPosition, PositionSize> spannedIndexDataPositions; // map of index position, to data position, for index entries spanning mmap segments
 
-    List<Integer> rowKeys;
-    List<Integer> columnValues;
+    /* Every 128th index entry is loaded into memory so we know where to start looking for the actual key w/o seeking */
+    public static final int INDEX_INTERVAL = 128;/* Required extension for temporary files created during compactions. */
+    public static final String TEMPFILE_MARKER = "tmp";
 
-    private static FileSystem fs;
-
-    static
+    protected SSTable(String filename, IPartitioner partitioner)
     {
-        try
+        assert filename.endsWith("-" + COMPONENT_DATA);
+        this.desc = Descriptor.fromFilename(filename);
+        this.partitioner = partitioner;
+    }
+
+    public Descriptor getDescriptor()
+    {
+        return desc;
+    }
+
+    protected static String parseColumnFamilyName(String filename)
+    {
+        return new File(filename).getName().split("-")[0];
+    }
+
+    public static String indexFilename(String dataFile)
+    {
+        return Descriptor.fromFilename(dataFile).filenameFor(COMPONENT_INDEX);
+    }
+
+    public String indexFilename()
+    {
+        return desc.filenameFor(COMPONENT_INDEX);
+    }
+
+    protected static String compactedFilename(String dataFile)
+    {
+        return Descriptor.fromFilename(dataFile).filenameFor(COMPONENT_COMPACTED);
+    }
+
+    /**
+     * We use a ReferenceQueue to manage deleting files that have been compacted
+     * and for which no more SSTable references exist.  But this is not guaranteed
+     * to run for each such file because of the semantics of the JVM gc.  So,
+     * we write a marker to `compactedFilename` when a file is compacted;
+     * if such a marker exists on startup, the file should be removed.
+     *
+     * @return true if the file was deleted
+     */
+    public static boolean deleteIfCompacted(String dataFilename) throws IOException
+    {
+        if (new File(compactedFilename(dataFilename)).exists())
         {
-            fs = FileSystem.getLocal(new Configuration());
+            FileUtils.deleteWithConfirm(new File(dataFilename));
+            FileUtils.deleteWithConfirm(new File(SSTable.indexFilename(dataFilename)));
+            FileUtils.deleteWithConfirm(new File(SSTable.filterFilename(dataFilename)));
+            FileUtils.deleteWithConfirm(new File(SSTable.compactedFilename(dataFilename)));
+            logger.info("Deleted " + dataFilename);
+            return true;
         }
-        catch (IOException ioe)
+        return false;
+    }
+
+    protected String compactedFilename()
+    {
+        return desc.filenameFor(COMPONENT_COMPACTED);
+    }
+
+    protected static String filterFilename(String dataFile)
+    {
+        return Descriptor.fromFilename(dataFile).filenameFor(COMPONENT_FILTER);
+    }
+
+    public String filterFilename()
+    {
+        return desc.filenameFor(COMPONENT_FILTER);
+    }
+
+    public String getFilename()
+    {
+        return desc.filenameFor(COMPONENT_DATA);
+    }
+
+    /** @return component names for files associated w/ this SSTable */
+    public List<String> getAllComponents()
+    {
+        // TODO streaming relies on the -Data (getFilename) file to be last, this is clunky
+        return Arrays.asList(COMPONENT_FILTER, COMPONENT_INDEX, COMPONENT_DATA);
+    }
+
+    public String getColumnFamilyName()
+    {
+        return desc.cfname;
+    }
+
+    public String getTableName()
+    {
+        return desc.ksname;
+    }
+
+    public static String parseTableName(String filename)
+    {
+        return Descriptor.fromFilename(filename).ksname;        
+    }
+
+    public static long getTotalBytes(Iterable<SSTableReader> sstables)
+    {
+        long sum = 0;
+        for (SSTableReader sstable : sstables)
         {
-            throw new IOError(ioe);
+            sum += sstable.length();
+        }
+        return sum;
+    }
+
+    /**
+     * This is a simple container for the index Key and its corresponding position
+     * in the data file. Binary search is performed on a list of these objects
+     * to lookup keys within the SSTable data file.
+     */
+    public class KeyPosition implements Comparable<KeyPosition>
+    {
+        public final DecoratedKey key;
+        public final long position;
+
+        public KeyPosition(DecoratedKey key, long position)
+        {
+            this.key = key;
+            this.position = position;
+        }
+
+        public int compareTo(KeyPosition kp)
+        {
+            return key.compareTo(kp.key);
+        }
+
+        public String toString()
+        {
+            return key + ":" + position;
         }
     }
 
-    private Cassandra.Client thriftClient;
-
-    @Before
-    public void setup() throws Exception
+    public long bytesOnDisk()
     {
-        setupCassandra();
-        defineRows();
-        createInputFile();
-    }
-
-    @After
-    public void tearDown() throws Exception
-    {
-        deleteInputFile();
-        deleteRows();
-    }
-
-    private void deleteRows() throws InvalidRequestException, TException
-    {
-        thriftClient.system_drop_column_family(COLUMN_FAMILY);
-    }
-
-    private void deleteInputFile() throws IOException
-    {
-        inputdir = new Path(INPUT_FOLDER);
-        if (!fs.delete(inputdir, true))
-            throw new IOException("Delete failed to remove " + inputdir.toString());
-    }
-
-    private void setupCassandra() throws TException, InvalidRequestException
-    {
-        /* Establish a thrift connection to the cassandra instance */
-        TSocket socket = new TSocket(DatabaseDescriptor.getListenAddress().getHostName(), DatabaseDescriptor.getRpcPort());
-        TTransport transport = new TFramedTransport(socket);
-        TBinaryProtocol binaryProtocol = new TBinaryProtocol(transport, false, false);
-        Cassandra.Client cassandraClient = new Cassandra.Client(binaryProtocol);
-        transport.open();
-        thriftClient = cassandraClient;
-        Set<String> keyspaces = thriftClient.describe_keyspaces();
-        if (!keyspaces.contains(KEYSPACE))
+        long bytes = 0;
+        for (String cname : getAllComponents())
         {
-            List<CfDef> cfDefs = new ArrayList<CfDef>();
-            thriftClient.system_add_keyspace(new KsDef(KEYSPACE, "org.apache.cassandra.locator.RackUnawareStrategy", 1, cfDefs));
+            bytes += new File(desc.filenameFor(cname)).length();
         }
-        thriftClient.set_keyspace(KEYSPACE);
-
-        CfDef cfDef = new CfDef(KEYSPACE, COLUMN_FAMILY);
-        try
-        {
-            thriftClient.system_add_column_family(cfDef);
-        }
-        catch (InvalidRequestException e)
-        {
-            throw new RuntimeException(e);
-        }
-
+        return bytes;
     }
 
-    private void defineRows()
+    @Override
+    public String toString()
     {
-        rowKeys = new ArrayList<Integer>();
-        columnValues = new ArrayList<Integer>();
-        for (int key = 0; key < NUMBER_OF_ROWS; key++)
+        return getClass().getName() + "(" +
+               "path='" + getFilename() + '\'' +
+               ')';
+    }
+
+    public static class PositionSize
+    {
+        public final long position;
+        public final long size;
+
+        public PositionSize(long position, long size)
         {
-            for (int columnValue = 0; columnValue < NUMBER_OF_COLUMNS; columnValue++)
+            this.position = position;
+            this.size = size;
+        }
+    }
+
+    /**
+     * A SSTable is described by the keyspace and column family it contains data
+     * for, a generation (where higher generations contain more recent data) and
+     * an alphabetic version string.
+     *
+     * A descriptor can be marked as temporary, which influences generated filenames.
+     */
+    public static class Descriptor
+    {
+        public static final String LEGACY_VERSION = "a";
+        public static final String CURRENT_VERSION = "b";
+
+        public final File directory;
+        public final String version;
+        public final String ksname;
+        public final String cfname;
+        public final int generation;
+        public final boolean temporary;
+
+        /**
+         * A descriptor that assumes CURRENT_VERSION.
+         */
+        public Descriptor(File directory, String ksname, String cfname, int generation, boolean temp)
+        {
+            this(CURRENT_VERSION, directory, ksname, cfname, generation, temp);
+        }
+
+        public Descriptor(String version, File directory, String ksname, String cfname, int generation, boolean temp)
+        {
+            assert version != null && directory != null && ksname != null && cfname != null;
+            this.version = version;
+            this.directory = directory;
+            this.ksname = ksname;
+            this.cfname = cfname;
+            this.generation = generation;
+            temporary = temp;
+        }
+
+        /**
+         * @param suffix A component suffix, such as 'Data.db'/'Index.db'/etc
+         * @return A filename for this descriptor with the given suffix.
+         */
+        public String filenameFor(String suffix)
+        {
+            StringBuilder buff = new StringBuilder();
+            buff.append(directory).append(File.separatorChar);
+            buff.append(cfname).append("-");
+            if (temporary)
+                buff.append(TEMPFILE_MARKER).append("-");
+            if (!LEGACY_VERSION.equals(version))
+                buff.append(version).append("-");
+            buff.append(generation).append("-");
+            buff.append(suffix);
+            return buff.toString();
+        }
+
+        /**
+         * Filename of the form "<ksname>/<cfname>-[tmp-][<version>-]<gen>-*"
+         * @param name A full SSTable filename, including the directory.
+         * @return A SSTable.Descriptor for the filename. 
+         */
+        public static Descriptor fromFilename(String filename)
+        {
+            int separatorPos = filename.lastIndexOf(File.separatorChar);
+            assert separatorPos != -1 : "Filename must include parent directory.";
+            File directory = new File(filename.substring(0, separatorPos));
+            String name = filename.substring(separatorPos+1, filename.length());
+
+            // name of parent directory is keyspace name
+            String ksname = directory.getName();
+
+            // tokenize the filename
+            StringTokenizer st = new StringTokenizer(name, "-");
+            String nexttok = null;
+            
+            // all filenames must start with a column family
+            String cfname = st.nextToken();
+
+            // optional temporary marker
+            nexttok = st.nextToken();
+            boolean temporary = false;
+            if (nexttok.equals(TEMPFILE_MARKER))
             {
-                rowKeys.add(key);
-                columnValues.add(columnValue);
+                temporary = true;
+                nexttok = st.nextToken();
             }
+
+            // optional version string
+            String version = LEGACY_VERSION;
+            if (versionValidate(nexttok))
+            {
+                version = nexttok;
+                nexttok = st.nextToken();
+            }
+            int generation = Integer.parseInt(nexttok);
+
+            return new Descriptor(version, directory, ksname, cfname, generation, temporary);
         }
-    }
-
-    Path inputdir;
-
-    private void createInputFile() throws IOException
-    {
-        inputdir = new Path(INPUT_FOLDER);
-        if (!fs.mkdirs(inputdir))
+        
+        /**
+         * @return True if the given version string is not empty, and
+         * contains all lowercase letters, as defined by java.lang.Character.
+         */
+        private static boolean versionValidate(String ver)
         {
-            throw new IOException("Mkdirs failed to create " + inputdir.toString());
+            if (ver.length() < 1) return false;
+            for (char ch : ver.toCharArray())
+                if (!Character.isLetter(ch) || !Character.isLowerCase(ch))
+                    return false;
+            return true;
         }
 
-        Path inputRows = new Path(inputdir, INPUT_FILE);
-        SequenceFile.Writer writer = SequenceFile.createWriter(fs, fs.getConf(), inputRows, IntWritable.class, IntWritable.class);
-        // OutputStream os = fs.create(inputRows);
-        // Writer writer = new OutputStreamWriter(os);
-        for (int keyValuePair = 0; keyValuePair < NUMBER_OF_ROWS * NUMBER_OF_COLUMNS; keyValuePair++)
-            writer.append(new IntWritable(rowKeys.get(keyValuePair)), new IntWritable(columnValues.get(keyValuePair)));
-        writer.close();
-    }
-
-    @Test
-    public void testCopyCF() throws Exception
-    {
-        ToolRunner.run(new Configuration(), new SampleColumnFamilyOutputTool(inputdir, COLUMN_FAMILY), new String[] {});
-        verifyOutput();
-
-    }
-
-    public void verifyOutput() throws Exception
-    {
-        List<KeySlice> keySlices = thriftClient.get_range_slices(new ColumnParent().setColumn_family(COLUMN_FAMILY),
-                                                                 new SlicePredicate().setColumn_names(new ArrayList<byte[]>()),
-                                                                 new KeyRange().setStart_key("".getBytes()).setEnd_key("".getBytes()),
-                                                                 ConsistencyLevel.ONE);
-        for (KeySlice keySlice : keySlices)
+        @Override
+        public String toString()
         {
-            Integer key = Integer.parseInt(new String(keySlice.getKey()));
-            List<Integer> columnValues = new ArrayList<Integer>();
-            for (ColumnOrSuperColumn cosc : keySlice.getColumns())
-                columnValues.add(Integer.parseInt(new String(cosc.getColumn().getValue())));
-            verifyKeyValues(key, columnValues);
+            return this.filenameFor("<>");
         }
-    }
 
-    private void verifyKeyValues(Integer key, List<Integer> columnValues) throws Exception
-    {
-        List<Integer> outputColumnValues = new ArrayList<Integer>();
-        for (int i = 0; i < rowKeys.size(); i++)
+        @Override
+        public boolean equals(Object o)
         {
-            if (rowKeys.get(i).equals(key))
-                outputColumnValues.add(this.columnValues.get(i));
+            if (o == this)
+                return true;
+            if (!(o instanceof Descriptor))
+                return false;
+            Descriptor that = (Descriptor)o;
+            return that.directory.equals(this.directory) && that.generation == this.generation && that.ksname.equals(this.ksname) && that.cfname.equals(this.cfname);
         }
-        columnValues.removeAll(outputColumnValues);
-        assert columnValues.isEmpty() : "Some of the input columns could not be found in the column family";
+
+        @Override
+        public int hashCode()
+        {
+            return Objects.hashCode(directory, generation, ksname, cfname);
+        }
     }
 }

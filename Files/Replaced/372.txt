@@ -1,13 +1,13 @@
-if (++length >= maxFieldLength) {
-
-package org.apache.lucene.index;
+if (newPosition > (bufferOffset + validBufferBytes) || newPosition < bufferOffset)
 
 /**
- * Copyright 2004 The Apache Software Foundation
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -17,399 +17,450 @@ package org.apache.lucene.index;
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+package org.apache.cassandra.io.util;
 
-import org.apache.lucene.analysis.Analyzer;
-import org.apache.lucene.analysis.Token;
-import org.apache.lucene.analysis.TokenStream;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.Fieldable;
-import org.apache.lucene.search.Similarity;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.IndexOutput;
-
+import java.io.EOFException;
+import java.io.File;
 import java.io.IOException;
-import java.io.PrintStream;
-import java.io.Reader;
-import java.io.StringReader;
-import java.util.Arrays;
-import java.util.Enumeration;
-import java.util.Hashtable;
+import java.io.RandomAccessFile;
+import java.nio.ByteBuffer;
+import java.nio.channels.ClosedChannelException;
+import java.nio.channels.FileChannel;
 
-final class DocumentWriter {
-  private Analyzer analyzer;
-  private Directory directory;
-  private Similarity similarity;
-  private FieldInfos fieldInfos;
-  private int maxFieldLength;
-  private int termIndexInterval = IndexWriter.DEFAULT_TERM_INDEX_INTERVAL;
-  private PrintStream infoStream;
+import org.apache.cassandra.utils.CLibrary;
 
-  /** This ctor used by test code only.
-   *
-   * @param directory The directory to write the document information to
-   * @param analyzer The analyzer to use for the document
-   * @param similarity The Similarity function
-   * @param maxFieldLength The maximum number of tokens a field may have
-   */ 
-  DocumentWriter(Directory directory, Analyzer analyzer,
-                 Similarity similarity, int maxFieldLength) {
-    this.directory = directory;
-    this.analyzer = analyzer;
-    this.similarity = similarity;
-    this.maxFieldLength = maxFieldLength;
-  }
+/**
+ * A <code>BufferedRandomAccessFile</code> is like a
+ * <code>RandomAccessFile</code>, but it uses a private buffer so that most
+ * operations do not require a disk access.
+ * <P>
+ * 
+ * Note: The operations on this class are unmonitored. Also, the correct
+ * functioning of the <code>RandomAccessFile</code> methods that are not
+ * overridden here relies on the implementation of those methods in the
+ * superclass.
+ */
+public class BufferedRandomAccessFile extends RandomAccessFile implements FileDataInput
+{
+    private static final long MAX_BYTES_IN_PAGE_CACHE = (long) Math.pow(2, 27); // 128mb
+    
+    // absolute filesystem path to the file
+    private final String filePath;
 
-  DocumentWriter(Directory directory, Analyzer analyzer, IndexWriter writer) {
-    this.directory = directory;
-    this.analyzer = analyzer;
-    this.similarity = writer.getSimilarity();
-    this.maxFieldLength = writer.getMaxFieldLength();
-    this.termIndexInterval = writer.getTermIndexInterval();
-  }
+    // default buffer size, 64Kb
+    public static final int DEFAULT_BUFFER_SIZE = 65535;
 
-  final void addDocument(String segment, Document doc)
-          throws IOException {
-    // write field names
-    fieldInfos = new FieldInfos();
-    fieldInfos.add(doc);
-    fieldInfos.write(directory, segment + ".fnm");
+    // isDirty - true if this.buffer contains any un-synced bytes
+    private boolean isDirty, syncNeeded;
 
-    // write field values
-    FieldsWriter fieldsWriter =
-            new FieldsWriter(directory, segment, fieldInfos);
-    try {
-      fieldsWriter.addDocument(doc);
-    } finally {
-      fieldsWriter.close();
-    }
+    // buffer which will cache file blocks
+    private byte[] buffer;
 
-    // invert doc into postingTable
-    postingTable.clear();			  // clear postingTable
-    fieldLengths = new int[fieldInfos.size()];    // init fieldLengths
-    fieldPositions = new int[fieldInfos.size()];  // init fieldPositions
-    fieldOffsets = new int[fieldInfos.size()];    // init fieldOffsets
+    // `current` as current position in file
+    // `bufferOffset` is the offset of the beginning of the buffer
+    // `validBufferBytes` is the number of bytes in the buffer that are actually valid; this will be LESS than buffer capacity if buffer is not full!
+    private long bufferOffset, current = 0;
+    private int validBufferBytes = 0;
 
-    fieldBoosts = new float[fieldInfos.size()];	  // init fieldBoosts
-    Arrays.fill(fieldBoosts, doc.getBoost());
+    // constant, used for caching purpose, -1 if file is open in "rw" mode
+    // otherwise this will hold cached file length
+    private final long fileLength;
 
-    invertDocument(doc);
+    // channel liked with the file, used to retrieve data and force updates.
+    private final FileChannel channel;
 
-    // sort postingTable into an array
-    Posting[] postings = sortPostingTable();
+    private long markedPointer;
+
+    // file descriptor
+    private int fd;
+
+    // skip cache - used for commit log and sstable writing w/ posix_fadvise
+    private final boolean skipCache;
+
+    private long bytesSinceCacheFlush = 0;
+    private long minBufferOffset = Long.MAX_VALUE;
 
     /*
-    for (int i = 0; i < postings.length; i++) {
-      Posting posting = postings[i];
-      System.out.print(posting.term);
-      System.out.print(" freq=" + posting.freq);
-      System.out.print(" pos=");
-      System.out.print(posting.positions[0]);
-      for (int j = 1; j < posting.freq; j++)
-	System.out.print("," + posting.positions[j]);
-      System.out.println("");
+     * Open a new <code>BufferedRandomAccessFile</code> on the file named
+     * <code>name</code> in mode <code>mode</code>, which should be "r" for
+     * reading only, or "rw" for reading and writing.
+     */
+    public BufferedRandomAccessFile(String name, String mode) throws IOException
+    {
+        this(new File(name), mode, DEFAULT_BUFFER_SIZE);
     }
-    */
 
-    // write postings
-    writePostings(postings, segment);
+    public BufferedRandomAccessFile(String name, String mode, int bufferSize) throws IOException
+    {
+        this(new File(name), mode, bufferSize);
+    }
 
-    // write norms of indexed fields
-    writeNorms(segment);
+    /*
+     * Open a new <code>BufferedRandomAccessFile</code> on <code>file</code> in
+     * mode <code>mode</code>, which should be "r" for reading only, or "rw" for
+     * reading and writing.
+     */
+    public BufferedRandomAccessFile(File file, String mode) throws IOException
+    {
+        this(file, mode, DEFAULT_BUFFER_SIZE);
+    }
 
-  }
+    public BufferedRandomAccessFile(File file, String mode, int bufferSize) throws IOException
+    {
+        this(file, mode, bufferSize, false);
+    }
 
-  // Keys are Terms, values are Postings.
-  // Used to buffer a document before it is written to the index.
-  private final Hashtable postingTable = new Hashtable();
-  private int[] fieldLengths;
-  private int[] fieldPositions;
-  private int[] fieldOffsets;
-  private float[] fieldBoosts;
+    public BufferedRandomAccessFile(File file, String mode, int bufferSize, boolean skipCache) throws IOException
+    {
+        super(file, mode);
 
-  // Tokenizes the fields of a document into Postings.
-  private final void invertDocument(Document doc)
-          throws IOException {
-    Enumeration fields = doc.fields();
-    while (fields.hasMoreElements()) {
-      Fieldable field = (Fieldable) fields.nextElement();
-      String fieldName = field.name();
-      int fieldNumber = fieldInfos.fieldNumber(fieldName);
+        this.skipCache = skipCache;
 
-      int length = fieldLengths[fieldNumber];     // length of field
-      int position = fieldPositions[fieldNumber]; // position in field
-      if (length>0) position+=analyzer.getPositionIncrementGap(fieldName);
-      int offset = fieldOffsets[fieldNumber];       // offset field
+        channel = super.getChannel();
+        filePath = file.getAbsolutePath();
 
-      if (field.isIndexed()) {
-        if (!field.isTokenized()) {		  // un-tokenized field
-          String stringValue = field.stringValue();
-          if(field.isStoreOffsetWithTermVector())
-            addPosition(fieldName, stringValue, position++, new TermVectorOffsetInfo(offset, offset + stringValue.length()));
-          else
-            addPosition(fieldName, stringValue, position++, null);
-          offset += stringValue.length();
-          length++;
-        } else 
+        // allocating required size of the buffer
+        if (bufferSize <= 0)
+            throw new IllegalArgumentException("bufferSize must be positive");
+        buffer = new byte[bufferSize];
+        reBuffer();
+
+        // if in read-only mode, caching file size
+        fileLength = (mode.equals("r")) ? this.channel.size() : -1;
+        fd = CLibrary.getfd(this.getFD());
+    }
+
+    public void sync() throws IOException
+    {
+        if (syncNeeded)
         {
-          Reader reader;			  // find or make Reader
-          if (field.readerValue() != null)
-            reader = field.readerValue();
-          else if (field.stringValue() != null)
-            reader = new StringReader(field.stringValue());
-          else
-            throw new IllegalArgumentException
-                    ("field must have either String or Reader value");
+            flush();
 
-          // Tokenize field and add to postingTable
-          TokenStream stream = analyzer.tokenStream(fieldName, reader);
-          try {
-            Token lastToken = null;
-            for (Token t = stream.next(); t != null; t = stream.next()) {
-              position += (t.getPositionIncrement() - 1);
-              
-              if(field.isStoreOffsetWithTermVector())
-                addPosition(fieldName, t.termText(), position++, new TermVectorOffsetInfo(offset + t.startOffset(), offset + t.endOffset()));
-              else
-                addPosition(fieldName, t.termText(), position++, null);
-              
-              lastToken = t;
-              if (++length > maxFieldLength) {
-                if (infoStream != null)
-                  infoStream.println("maxFieldLength " +maxFieldLength+ " reached, ignoring following tokens");
+            channel.force(true); // true, because file length counts as
+                                 // "meta-data"
+
+            if (skipCache)
+            {
+                // clear entire file from page cache
+                CLibrary.trySkipCache(this.fd, 0, 0);
+
+                minBufferOffset = Long.MAX_VALUE;
+                bytesSinceCacheFlush = 0;
+            }
+
+            syncNeeded = false;
+        }
+    }
+
+    public void flush() throws IOException
+    {
+        if (isDirty)
+        {
+            if (channel.position() != bufferOffset)
+                channel.position(bufferOffset);
+
+            super.write(buffer, 0, validBufferBytes);
+
+            if (skipCache)
+            {
+
+                // we don't know when the data reaches disk since we aren't
+                // calling flush
+                // so we continue to clear pages we don't need from the first
+                // offset we see
+                // periodically we update this starting offset
+                bytesSinceCacheFlush += validBufferBytes;
+
+                if (bufferOffset < minBufferOffset)
+                    minBufferOffset = bufferOffset;
+
+                if (bytesSinceCacheFlush >= MAX_BYTES_IN_PAGE_CACHE)
+                {
+                    CLibrary.trySkipCache(this.fd, (int) minBufferOffset, 0);
+                    minBufferOffset = bufferOffset;
+                    bytesSinceCacheFlush = 0;
+                }
+
+            }
+
+            isDirty = false;
+        }
+    }
+
+    private void reBuffer() throws IOException
+    {
+        flush(); // synchronizing buffer and file on disk
+
+        bufferOffset = current;
+        if (bufferOffset >= channel.size())
+        {
+            validBufferBytes = 0;
+            return;
+        }
+
+        if (bufferOffset < minBufferOffset)
+            minBufferOffset = bufferOffset;
+
+        channel.position(bufferOffset); // setting channel position
+        int read = 0;
+        while (read < buffer.length)
+        {
+            int n = super.read(buffer, read, buffer.length - read);
+            if (n < 0)
                 break;
-              }
-            }
-            
-            if(lastToken != null)
-              offset += lastToken.endOffset() + 1;
-            
-          } finally {
-            stream.close();
-          }
+            read += n;
+        }
+        validBufferBytes = read;
+
+        bytesSinceCacheFlush += read;
+        if (skipCache && bytesSinceCacheFlush >= MAX_BYTES_IN_PAGE_CACHE)
+        {
+            CLibrary.trySkipCache(this.fd, (int) minBufferOffset, 0);
+            bytesSinceCacheFlush = 0;
+            minBufferOffset = Long.MAX_VALUE;
+        }
+    }
+
+    @Override
+    // -1 will be returned if there is nothing to read; higher-level methods like readInt
+    // or readFully (from RandomAccessFile) will throw EOFException but this should not
+    public int read() throws IOException
+    {
+        if (isEOF())
+            return -1; // required by RandomAccessFile
+
+        if (current >= bufferOffset + buffer.length)
+            reBuffer();
+        assert current >= bufferOffset && current < bufferOffset + validBufferBytes;
+
+        return ((int) buffer[(int) (current++ - bufferOffset)]) & 0xFF;
+    }
+
+    @Override
+    public int read(byte[] buffer) throws IOException
+    {
+        return read(buffer, 0, buffer.length);
+    }
+
+    @Override
+    // -1 will be returned if there is nothing to read; higher-level methods like readInt
+    // or readFully (from RandomAccessFile) will throw EOFException but this should not
+    public int read(byte[] buff, int offset, int length) throws IOException
+    {
+        if (length == 0)
+            return 0;
+
+        if (isEOF())
+            return -1;
+
+        if (current >= bufferOffset + buffer.length)
+            reBuffer();
+        assert current >= bufferOffset && current < bufferOffset + validBufferBytes;
+
+        int toCopy = Math.min(length, validBufferBytes - (int) (current - bufferOffset));
+        System.arraycopy(buffer, (int) (current - bufferOffset), buff, offset, toCopy);
+        current += toCopy;
+
+        return toCopy;
+    }
+
+    public ByteBuffer readBytes(int length) throws IOException
+    {
+        assert length >= 0 : "buffer length should not be negative: " + length;
+
+        byte[] buff = new byte[length];
+        readFully(buff); // reading data buffer
+
+        return ByteBuffer.wrap(buff);
+    }
+
+    private final byte[] singleByteBuffer = new byte[1]; // so we can use the write(byte[]) path w/o tons of new byte[] allocations
+    @Override
+    public void write(int val) throws IOException
+    {
+        singleByteBuffer[0] = (byte) val;
+        this.write(singleByteBuffer, 0, 1);
+    }
+
+    @Override
+    public void write(byte[] b) throws IOException
+    {
+        write(b, 0, b.length);
+    }
+
+    @Override
+    public void write(byte[] buff, int offset, int length) throws IOException
+    {
+        if (buffer == null)
+            throw new ClosedChannelException();
+
+        if (isReadOnly())
+            throw new IOException("Unable to write: file is in the read-only mode.");
+
+        while (length > 0)
+        {
+            int n = writeAtMost(buff, offset, length);
+            offset += n;
+            length -= n;
+            isDirty = true;
+            syncNeeded = true;
+        }
+    }
+
+    private boolean isReadOnly()
+    {
+        return fileLength != -1;
+    }
+
+    /*
+     * Write at most "length" bytes from "b" starting at position "offset", and
+     * return the number of bytes written. caller is responsible for setting
+     * isDirty.
+     */
+    private int writeAtMost(byte[] buff, int offset, int length) throws IOException
+    {
+        if (current >= bufferOffset + buffer.length)
+            reBuffer();
+        assert current < bufferOffset + buffer.length;
+
+        int positionWithinBuffer = (int) (current - bufferOffset);
+        int toCopy = Math.min(length, buffer.length - positionWithinBuffer);
+        System.arraycopy(buff, offset, buffer, positionWithinBuffer, toCopy);
+        current += toCopy;
+        validBufferBytes = Math.max(validBufferBytes, positionWithinBuffer + toCopy);
+        assert current <= bufferOffset + buffer.length;
+
+        return toCopy;
+    }
+
+    @Override
+    public void seek(long newPosition) throws IOException
+    {
+        if (newPosition < 0)
+            throw new IllegalArgumentException("new position should not be negative");
+
+        if (isReadOnly() && newPosition > fileLength)
+            throw new EOFException(String.format("unable to seek to position %d in %s (%d bytes) in read-only mode",
+                                                 newPosition, filePath, fileLength));
+
+        current = newPosition;
+
+        if (newPosition >= bufferOffset + validBufferBytes || newPosition < bufferOffset)
+            reBuffer(); // this will set bufferEnd for us
+    }
+
+    @Override
+    public int skipBytes(int count) throws IOException
+    {
+        if (count > 0)
+        {
+            long currentPos = getFilePointer(), eof = length();
+            int newCount = (int) ((currentPos + count > eof) ? eof - currentPos : count);
+
+            seek(currentPos + newCount);
+            return newCount;
         }
 
-        fieldLengths[fieldNumber] = length;	  // save field length
-        fieldPositions[fieldNumber] = position;	  // save field position
-        fieldBoosts[fieldNumber] *= field.getBoost();
-        fieldOffsets[fieldNumber] = offset;
-      }
-    }
-  }
-
-  private final Term termBuffer = new Term("", ""); // avoid consing
-
-  private final void addPosition(String field, String text, int position, TermVectorOffsetInfo offset) {
-    termBuffer.set(field, text);
-    //System.out.println("Offset: " + offset);
-    Posting ti = (Posting) postingTable.get(termBuffer);
-    if (ti != null) {				  // word seen before
-      int freq = ti.freq;
-      if (ti.positions.length == freq) {	  // positions array is full
-        int[] newPositions = new int[freq * 2];	  // double size
-        int[] positions = ti.positions;
-        for (int i = 0; i < freq; i++)		  // copy old positions to new
-          newPositions[i] = positions[i];
-        ti.positions = newPositions;
-      }
-      ti.positions[freq] = position;		  // add new position
-
-      if (offset != null) {
-        if (ti.offsets.length == freq){
-          TermVectorOffsetInfo [] newOffsets = new TermVectorOffsetInfo[freq*2];
-          TermVectorOffsetInfo [] offsets = ti.offsets;
-          for (int i = 0; i < freq; i++)
-          {
-            newOffsets[i] = offsets[i];
-          }
-          ti.offsets = newOffsets;
-        }
-        ti.offsets[freq] = offset;
-      }
-      ti.freq = freq + 1;			  // update frequency
-    } else {					  // word not seen before
-      Term term = new Term(field, text, false);
-      postingTable.put(term, new Posting(term, position, offset));
-    }
-  }
-
-  private final Posting[] sortPostingTable() {
-    // copy postingTable into an array
-    Posting[] array = new Posting[postingTable.size()];
-    Enumeration postings = postingTable.elements();
-    for (int i = 0; postings.hasMoreElements(); i++)
-      array[i] = (Posting) postings.nextElement();
-
-    // sort the array
-    quickSort(array, 0, array.length - 1);
-
-    return array;
-  }
-
-  private static final void quickSort(Posting[] postings, int lo, int hi) {
-    if (lo >= hi)
-      return;
-
-    int mid = (lo + hi) / 2;
-
-    if (postings[lo].term.compareTo(postings[mid].term) > 0) {
-      Posting tmp = postings[lo];
-      postings[lo] = postings[mid];
-      postings[mid] = tmp;
+        return 0;
     }
 
-    if (postings[mid].term.compareTo(postings[hi].term) > 0) {
-      Posting tmp = postings[mid];
-      postings[mid] = postings[hi];
-      postings[hi] = tmp;
-
-      if (postings[lo].term.compareTo(postings[mid].term) > 0) {
-        Posting tmp2 = postings[lo];
-        postings[lo] = postings[mid];
-        postings[mid] = tmp2;
-      }
+    public long length() throws IOException
+    {
+        return (fileLength == -1) ? Math.max(Math.max(current, channel.size()), bufferOffset + validBufferBytes) : fileLength;
     }
 
-    int left = lo + 1;
-    int right = hi - 1;
-
-    if (left >= right)
-      return;
-
-    Term partition = postings[mid].term;
-
-    for (; ;) {
-      while (postings[right].term.compareTo(partition) > 0)
-        --right;
-
-      while (left < right && postings[left].term.compareTo(partition) <= 0)
-        ++left;
-
-      if (left < right) {
-        Posting tmp = postings[left];
-        postings[left] = postings[right];
-        postings[right] = tmp;
-        --right;
-      } else {
-        break;
-      }
+    public long getFilePointer()
+    {
+        return current;
     }
 
-    quickSort(postings, lo, left);
-    quickSort(postings, left + 1, hi);
-  }
+    public String getPath()
+    {
+        return filePath;
+    }
 
-  private final void writePostings(Posting[] postings, String segment)
-          throws IOException {
-    IndexOutput freq = null, prox = null;
-    TermInfosWriter tis = null;
-    TermVectorsWriter termVectorWriter = null;
-    try {
-      //open files for inverse index storage
-      freq = directory.createOutput(segment + ".frq");
-      prox = directory.createOutput(segment + ".prx");
-      tis = new TermInfosWriter(directory, segment, fieldInfos,
-                                termIndexInterval);
-      TermInfo ti = new TermInfo();
-      String currentField = null;
+    /**
+     * @return true if there is no more data to read
+     */
+    public boolean isEOF() throws IOException
+    {
+        return getFilePointer() == length();
+    }
 
-      for (int i = 0; i < postings.length; i++) {
-        Posting posting = postings[i];
+    public long bytesRemaining() throws IOException
+    {
+        return length() - getFilePointer();
+    }
 
-        // add an entry to the dictionary with pointers to prox and freq files
-        ti.set(1, freq.getFilePointer(), prox.getFilePointer(), -1);
-        tis.add(posting.term, ti);
+    @Override
+    public void close() throws IOException
+    {
+        sync();
+        buffer = null;
 
-        // add an entry to the freq file
-        int postingFreq = posting.freq;
-        if (postingFreq == 1)				  // optimize freq=1
-          freq.writeVInt(1);			  // set low bit of doc num.
-        else {
-          freq.writeVInt(0);			  // the document number
-          freq.writeVInt(postingFreq);			  // frequency in doc
+        if (skipCache && bytesSinceCacheFlush > 0)
+        {
+            CLibrary.trySkipCache(this.fd, 0, 0);
         }
 
-        int lastPosition = 0;			  // write positions
-        int[] positions = posting.positions;
-        for (int j = 0; j < postingFreq; j++) {		  // use delta-encoding
-          int position = positions[j];
-          prox.writeVInt(position - lastPosition);
-          lastPosition = position;
-        }
-        // check to see if we switched to a new field
-        String termField = posting.term.field();
-        if (currentField != termField) {
-          // changing field - see if there is something to save
-          currentField = termField;
-          FieldInfo fi = fieldInfos.fieldInfo(currentField);
-          if (fi.storeTermVector) {
-            if (termVectorWriter == null) {
-              termVectorWriter =
-                new TermVectorsWriter(directory, segment, fieldInfos);
-              termVectorWriter.openDocument();
-            }
-            termVectorWriter.openField(currentField);
-
-          } else if (termVectorWriter != null) {
-            termVectorWriter.closeField();
-          }
-        }
-        if (termVectorWriter != null && termVectorWriter.isFieldOpen()) {
-            termVectorWriter.addTerm(posting.term.text(), postingFreq, posting.positions, posting.offsets);
-        }
-      }
-      if (termVectorWriter != null)
-        termVectorWriter.closeDocument();
-    } finally {
-      // make an effort to close all streams we can but remember and re-throw
-      // the first exception encountered in this process
-      IOException keep = null;
-      if (freq != null) try { freq.close(); } catch (IOException e) { if (keep == null) keep = e; }
-      if (prox != null) try { prox.close(); } catch (IOException e) { if (keep == null) keep = e; }
-      if (tis  != null) try {  tis.close(); } catch (IOException e) { if (keep == null) keep = e; }
-      if (termVectorWriter  != null) try {  termVectorWriter.close(); } catch (IOException e) { if (keep == null) keep = e; }
-      if (keep != null) throw (IOException) keep.fillInStackTrace();
+        super.close();
     }
-  }
 
-  private final void writeNorms(String segment) throws IOException { 
-    for(int n = 0; n < fieldInfos.size(); n++){
-      FieldInfo fi = fieldInfos.fieldInfo(n);
-      if(fi.isIndexed && !fi.omitNorms){
-        float norm = fieldBoosts[n] * similarity.lengthNorm(fi.name, fieldLengths[n]);
-        IndexOutput norms = directory.createOutput(segment + ".f" + n);
-        try {
-          norms.writeByte(Similarity.encodeNorm(norm));
-        } finally {
-          norms.close();
+    public void reset() throws IOException
+    {
+        seek(markedPointer);
+    }
+
+    public long bytesPastMark()
+    {
+        long bytes = getFilePointer() - markedPointer;
+        assert bytes >= 0;
+        return bytes;
+    }
+
+    public FileMark mark()
+    {
+        markedPointer = getFilePointer();
+        return new BufferedRandomAccessFileMark(markedPointer);
+    }
+
+    public void reset(FileMark mark) throws IOException
+    {
+        assert mark instanceof BufferedRandomAccessFileMark;
+        seek(((BufferedRandomAccessFileMark) mark).pointer);
+    }
+
+    public long bytesPastMark(FileMark mark)
+    {
+        assert mark instanceof BufferedRandomAccessFileMark;
+        long bytes = getFilePointer() - ((BufferedRandomAccessFileMark) mark).pointer;
+        assert bytes >= 0;
+        return bytes;
+    }
+
+    public static BufferedRandomAccessFile getUncachingReader(String filename) throws IOException
+    {
+        return new BufferedRandomAccessFile(new File(filename), "r", 8 * 1024 * 1024, true);
+    }
+
+    /**
+     * Class to hold a mark to the position of the file
+     */
+    protected static class BufferedRandomAccessFileMark implements FileMark
+    {
+        long pointer;
+
+        public BufferedRandomAccessFileMark(long pointer)
+        {
+            this.pointer = pointer;
         }
-      }
     }
-  }
-  
-  /** If non-null, a message will be printed to this if maxFieldLength is reached.
-   */
-  void setInfoStream(PrintStream infoStream) {
-    this.infoStream = infoStream;
-  }
 
-}
-
-final class Posting {				  // info about a Term in a doc
-  Term term;					  // the Term
-  int freq;					  // its frequency in doc
-  int[] positions;				  // positions it occurs at
-  TermVectorOffsetInfo [] offsets;
-
-  Posting(Term t, int position, TermVectorOffsetInfo offset) {
-    term = t;
-    freq = 1;
-    positions = new int[1];
-    positions[0] = position;
-    if(offset != null){
-    offsets = new TermVectorOffsetInfo[1];
-    offsets[0] = offset;
+    @Override
+    public String toString() {
+        return getClass().getSimpleName() + "(" +
+               "filePath='" + filePath + "'" +
+               ", length=" + fileLength +
+               ", skipCache=" + skipCache + ")";
     }
-    else
-      offsets = null;
-  }
 }

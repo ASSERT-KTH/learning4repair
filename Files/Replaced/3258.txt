@@ -1,6 +1,4 @@
-private void pushTop() {
-
-package org.apache.lucene.index;
+public boolean incrementToken() {
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -18,348 +16,475 @@ package org.apache.lucene.index;
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.List;
 
-import org.apache.lucene.index.DocValues.SortedSource;
-import org.apache.lucene.index.DocValues.Source;
-import org.apache.lucene.index.DocValues.Type;
-import org.apache.lucene.store.IndexOutput;
-import org.apache.lucene.util.ArrayUtil;
+package org.apache.solr.handler;
+
+import org.apache.lucene.analysis.Analyzer;
+import org.apache.lucene.analysis.CharReader;
+import org.apache.lucene.analysis.CharStream;
+import org.apache.lucene.analysis.TokenStream;
+import org.apache.lucene.analysis.tokenattributes.*;
+import org.apache.lucene.analysis.util.CharFilterFactory;
+import org.apache.lucene.analysis.util.TokenFilterFactory;
+import org.apache.lucene.analysis.util.TokenizerFactory;
 import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.PriorityQueue;
-import org.apache.lucene.util.packed.PackedInts;
+import org.apache.lucene.util.Attribute;
+import org.apache.lucene.util.AttributeImpl;
+import org.apache.lucene.util.AttributeSource;
+import org.apache.lucene.util.AttributeReflector;
+import org.apache.lucene.util.CharsRef;
+import org.apache.lucene.util.ArrayUtil;
+import org.apache.solr.analysis.TokenizerChain;
+import org.apache.solr.common.util.NamedList;
+import org.apache.solr.common.util.SimpleOrderedMap;
+import org.apache.solr.common.SolrException;
+import org.apache.solr.request.SolrQueryRequest;
+import org.apache.solr.response.SolrQueryResponse;
+import org.apache.solr.schema.FieldType;
+
+import java.io.IOException;
+import java.io.StringReader;
+import java.util.*;
+import org.apache.commons.lang.ArrayUtils;
 
 /**
- * @lucene.internal
+ * A base class for all analysis request handlers.
+ *
+ *
+ * @since solr 1.4
  */
-public final class SortedBytesMergeUtils {
+public abstract class AnalysisRequestHandlerBase extends RequestHandlerBase {
 
-  private SortedBytesMergeUtils() {
-    // no instance
+  public static final Set<BytesRef> EMPTY_BYTES_SET = Collections.emptySet();
+
+  @Override
+  public void handleRequestBody(SolrQueryRequest req, SolrQueryResponse rsp) throws Exception {
+    rsp.add("analysis", doAnalysis(req));
   }
 
-  public static MergeContext init(Type type, DocValues[] docValues,
-      Comparator<BytesRef> comp, int mergeDocCount) {
-    int size = -1;
-    if (type == Type.BYTES_FIXED_SORTED) {
-      for (DocValues indexDocValues : docValues) {
-        if (indexDocValues != null) {
-          size = indexDocValues.getValueSize();
-          break;
-        }
-      }
-      assert size >= 0;
-    }
-    return new MergeContext(comp, mergeDocCount, size, type);
-  }
-
-  public static final class MergeContext {
-    private final Comparator<BytesRef> comp;
-    private final BytesRef missingValue = new BytesRef();
-    public final int sizePerValues; // -1 if var length
-    final Type type;
-    public final int[] docToEntry;
-    public long[] offsets; // if non-null #mergeRecords collects byte offsets here
-
-    public MergeContext(Comparator<BytesRef> comp, int mergeDocCount,
-        int size, Type type) {
-      assert type == Type.BYTES_FIXED_SORTED || type == Type.BYTES_VAR_SORTED;
-      this.comp = comp;
-      this.sizePerValues = size;
-      this.type = type;
-      if (size > 0) {
-        missingValue.grow(size);
-        missingValue.length = size;
-      }
-      docToEntry = new int[mergeDocCount];
-    }
-    
-    public int getMergeDocCount() {
-      return docToEntry.length;
-    }
-  }
-
-  public static List<SortedSourceSlice> buildSlices(
-      int[] docBases, MergeState.DocMap[] docMaps,
-      DocValues[] docValues, MergeContext ctx) throws IOException {
-    final List<SortedSourceSlice> slices = new ArrayList<SortedSourceSlice>();
-    for (int i = 0; i < docValues.length; i++) {
-      final SortedSourceSlice nextSlice;
-      final Source directSource;
-      if (docValues[i] != null
-          && (directSource = docValues[i].getDirectSource()) != null) {
-        final SortedSourceSlice slice = new SortedSourceSlice(i, directSource
-            .asSortedSource(), docBases, ctx.getMergeDocCount(), ctx.docToEntry);
-        nextSlice = slice;
-      } else {
-        nextSlice = new SortedSourceSlice(i, new MissingValueSource(ctx),
-            docBases, ctx.getMergeDocCount(), ctx.docToEntry);
-      }
-      createOrdMapping(docBases, docMaps, nextSlice);
-      slices.add(nextSlice);
-    }
-    return Collections.unmodifiableList(slices);
-  }
-
-  /*
-   * In order to merge we need to map the ords used in each segment to the new
-   * global ords in the new segment. Additionally we need to drop values that
-   * are not referenced anymore due to deleted documents. This method walks all
-   * live documents and fetches their current ordinal. We store this ordinal per
-   * slice and (SortedSourceSlice#ordMapping) and remember the doc to ord
-   * mapping in docIDToRelativeOrd. After the merge SortedSourceSlice#ordMapping
-   * contains the new global ordinals for the relative index.
+  /**
+   * Performs the analysis based on the given solr request and returns the analysis result as a named list.
+   *
+   * @param req The solr request.
+   *
+   * @return The analysis result as a named list.
+   *
+   * @throws Exception When analysis fails.
    */
-  private static void createOrdMapping(int[] docBases, MergeState.DocMap[] docMaps,
-      SortedSourceSlice currentSlice) {
-    final int readerIdx = currentSlice.readerIdx;
-    final MergeState.DocMap currentDocMap = docMaps[readerIdx];
-    final int docBase = currentSlice.docToOrdStart;
-    assert docBase == docBases[readerIdx];
-    if (currentDocMap != null && currentDocMap.hasDeletions()) { // we have deletes
-      for (int i = 0; i < currentDocMap.maxDoc(); i++) {
-        final int doc = currentDocMap.get(i);
-        if (doc != -1) { // not deleted
-          final int ord = currentSlice.source.ord(i); // collect ords strictly
-                                                      // increasing
-          currentSlice.docIDToRelativeOrd[docBase + doc] = ord;
-          // use ord + 1 to identify unreferenced values (ie. == 0)
-          currentSlice.ordMapping[ord] = ord + 1;
-        }
+  protected abstract NamedList doAnalysis(SolrQueryRequest req) throws Exception;
+
+  /**
+   * Analyzes the given value using the given Analyzer.
+   *
+   * @param value   Value to analyze
+   * @param context The {@link AnalysisContext analysis context}.
+   *
+   * @return NamedList containing the tokens produced by analyzing the given value
+   */
+  protected NamedList<? extends Object> analyzeValue(String value, AnalysisContext context) {
+
+    Analyzer analyzer = context.getAnalyzer();
+
+    if (!TokenizerChain.class.isInstance(analyzer)) {
+
+      TokenStream tokenStream = null;
+      try {
+        tokenStream = analyzer.tokenStream(context.getFieldName(), new StringReader(value));
+      } catch (IOException e) {
+        throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, e);
       }
-    } else { // no deletes
-      final int numDocs = currentSlice.docToOrdEnd - currentSlice.docToOrdStart;
-      for (int doc = 0; doc < numDocs; doc++) {
-        final int ord = currentSlice.source.ord(doc);
-        currentSlice.docIDToRelativeOrd[docBase + doc] = ord;
-        // use ord + 1 to identify unreferenced values (ie. == 0)
-        currentSlice.ordMapping[ord] = ord + 1;
+      NamedList<List<NamedList>> namedList = new NamedList<List<NamedList>>();
+      namedList.add(tokenStream.getClass().getName(), convertTokensToNamedLists(analyzeTokenStream(tokenStream), context));
+      return namedList;
+    }
+
+    TokenizerChain tokenizerChain = (TokenizerChain) analyzer;
+    CharFilterFactory[] cfiltfacs = tokenizerChain.getCharFilterFactories();
+    TokenizerFactory tfac = tokenizerChain.getTokenizerFactory();
+    TokenFilterFactory[] filtfacs = tokenizerChain.getTokenFilterFactories();
+
+    NamedList<Object> namedList = new NamedList<Object>();
+
+    if( cfiltfacs != null ){
+      String source = value;
+      for(CharFilterFactory cfiltfac : cfiltfacs ){
+        CharStream reader = CharReader.get(new StringReader(source));
+        reader = cfiltfac.create(reader);
+        source = writeCharStream(namedList, reader);
       }
+    }
+
+    TokenStream tokenStream = tfac.create(tokenizerChain.initReader(null, new StringReader(value)));
+    List<AttributeSource> tokens = analyzeTokenStream(tokenStream);
+
+    namedList.add(tokenStream.getClass().getName(), convertTokensToNamedLists(tokens, context));
+
+    ListBasedTokenStream listBasedTokenStream = new ListBasedTokenStream(tokens);
+
+    for (TokenFilterFactory tokenFilterFactory : filtfacs) {
+      for (final AttributeSource tok : tokens) {
+        tok.getAttribute(TokenTrackingAttribute.class).freezeStage();
+      }
+      tokenStream = tokenFilterFactory.create(listBasedTokenStream);
+      tokens = analyzeTokenStream(tokenStream);
+      namedList.add(tokenStream.getClass().getName(), convertTokensToNamedLists(tokens, context));
+      listBasedTokenStream = new ListBasedTokenStream(tokens);
+    }
+
+    return namedList;
+  }
+
+  /**
+   * Analyzes the given text using the given analyzer and returns the produced tokens.
+   *
+   * @param query    The query to analyze.
+   * @param analyzer The analyzer to use.
+   */
+  protected Set<BytesRef> getQueryTokenSet(String query, Analyzer analyzer) {
+    try {
+      final Set<BytesRef> tokens = new HashSet<BytesRef>();
+      final TokenStream tokenStream = analyzer.tokenStream("", new StringReader(query));
+      final TermToBytesRefAttribute bytesAtt = tokenStream.getAttribute(TermToBytesRefAttribute.class);
+      final BytesRef bytes = bytesAtt.getBytesRef();
+
+      tokenStream.reset();
+
+      while (tokenStream.incrementToken()) {
+        bytesAtt.fillBytesRef();
+        tokens.add(BytesRef.deepCopyOf(bytes));
+      }
+
+      tokenStream.end();
+      tokenStream.close();
+      return tokens;
+    } catch (IOException ioe) {
+      throw new RuntimeException("Error occured while iterating over tokenstream", ioe);
     }
   }
 
-  public static int mergeRecords(MergeContext ctx, BytesRefConsumer consumer,
-      List<SortedSourceSlice> slices) throws IOException {
-    final RecordMerger merger = new RecordMerger(new MergeQueue(slices.size(),
-        ctx.comp), slices.toArray(new SortedSourceSlice[0]));
-    long[] offsets = ctx.offsets;
-    final boolean recordOffsets = offsets != null;
-    long offset = 0;
-    BytesRef currentMergedBytes;
-    merger.pushTop();
-    while (merger.queue.size() > 0) {
-      merger.pullTop();
-      currentMergedBytes = merger.current;
-      assert ctx.sizePerValues == -1 || ctx.sizePerValues == currentMergedBytes.length : "size: "
-          + ctx.sizePerValues + " spare: " + currentMergedBytes.length;
-      offset += currentMergedBytes.length;
-      if (recordOffsets) {
-        if (merger.currentOrd >= offsets.length) {
-          offsets = ArrayUtil.grow(offsets, merger.currentOrd + 1);
-        }
-        offsets[merger.currentOrd] = offset;
+  /**
+   * Analyzes the given TokenStream, collecting the Tokens it produces.
+   *
+   * @param tokenStream TokenStream to analyze
+   *
+   * @return List of tokens produced from the TokenStream
+   */
+  private List<AttributeSource> analyzeTokenStream(TokenStream tokenStream) {
+    final List<AttributeSource> tokens = new ArrayList<AttributeSource>();
+    final PositionIncrementAttribute posIncrAtt = tokenStream.addAttribute(PositionIncrementAttribute.class);
+    final TokenTrackingAttribute trackerAtt = tokenStream.addAttribute(TokenTrackingAttribute.class);
+    // for backwards compatibility, add all "common" attributes
+    tokenStream.addAttribute(OffsetAttribute.class);
+    tokenStream.addAttribute(TypeAttribute.class);
+    try {
+      tokenStream.reset();
+      int position = 0;
+      while (tokenStream.incrementToken()) {
+        position += posIncrAtt.getPositionIncrement();
+        trackerAtt.setActPosition(position);
+        tokens.add(tokenStream.cloneAttributes());
       }
-      consumer.consume(currentMergedBytes, merger.currentOrd, offset);
-      merger.pushTop();
+    } catch (IOException ioe) {
+      throw new RuntimeException("Error occured while iterating over tokenstream", ioe);
     }
-    ctx.offsets = offsets;
-    assert offsets == null || offsets[merger.currentOrd - 1] == offset;
-    return merger.currentOrd;
+
+    return tokens;
   }
-  
-  public static interface BytesRefConsumer {
-    public void consume(BytesRef ref, int ord, long offset) throws IOException;
-  }
-  
-  public static final class IndexOutputBytesRefConsumer implements BytesRefConsumer {
-    private final IndexOutput datOut;
+
+  // a static mapping of the reflected attribute keys to the names used in Solr 1.4
+  static Map<String,String> ATTRIBUTE_MAPPING = Collections.unmodifiableMap(new HashMap<String,String>() {{
+    put(OffsetAttribute.class.getName() + "#startOffset", "start");
+    put(OffsetAttribute.class.getName() + "#endOffset", "end");
+    put(TypeAttribute.class.getName() + "#type", "type");
+    put(TokenTrackingAttribute.class.getName() + "#position", "position");
+    put(TokenTrackingAttribute.class.getName() + "#positionHistory", "positionHistory");
+  }});
+
+  /**
+   * Converts the list of Tokens to a list of NamedLists representing the tokens.
+   *
+   * @param tokenList  Tokens to convert
+   * @param context The analysis context
+   *
+   * @return List of NamedLists containing the relevant information taken from the tokens
+   */
+  private List<NamedList> convertTokensToNamedLists(final List<AttributeSource> tokenList, AnalysisContext context) {
+    final List<NamedList> tokensNamedLists = new ArrayList<NamedList>();
+    final FieldType fieldType = context.getFieldType();
+    final AttributeSource[] tokens = tokenList.toArray(new AttributeSource[tokenList.size()]);
     
-    public IndexOutputBytesRefConsumer(IndexOutput datOut) {
-      this.datOut = datOut;
-    }
+    // sort the tokens by absoulte position
+    ArrayUtil.mergeSort(tokens, new Comparator<AttributeSource>() {
+      public int compare(AttributeSource a, AttributeSource b) {
+        return arrayCompare(
+          a.getAttribute(TokenTrackingAttribute.class).getPositions(),
+          b.getAttribute(TokenTrackingAttribute.class).getPositions()
+        );
+      }
+      
+      private int arrayCompare(int[] a, int[] b) {
+        int p = 0;
+        final int stop = Math.min(a.length, b.length);
+        while(p < stop) {
+          int diff = a[p] - b[p];
+          if (diff != 0) return diff;
+          p++;
+        }
+        // One is a prefix of the other, or, they are equal:
+        return a.length - b.length;
+      }
+    });
 
-    @Override
-    public void consume(BytesRef currentMergedBytes, int ord, long offset) throws IOException {
-      datOut.writeBytes(currentMergedBytes.bytes, currentMergedBytes.offset,
-          currentMergedBytes.length);      
-    }
-  }
-
-  private static final class RecordMerger {
-    private final MergeQueue queue;
-    private final SortedSourceSlice[] top;
-    private int numTop;
-    BytesRef current;
-    int currentOrd = -1;
-
-    RecordMerger(MergeQueue queue, SortedSourceSlice[] top) {
-      super();
-      this.queue = queue;
-      this.top = top;
-      this.numTop = top.length;
-    }
-
-    private void pullTop() {
-      // extract all subs from the queue that have the same
-      // top record
-      assert numTop == 0;
-      assert currentOrd >= 0;
-      while (true) {
-        final SortedSourceSlice popped = top[numTop++] = queue.pop();
-        // use ord + 1 to identify unreferenced values (ie. == 0)
-        popped.ordMapping[popped.relativeOrd] = currentOrd + 1;
-        if (queue.size() == 0
-            || !(queue.top()).current.bytesEquals(top[0].current)) {
-          break;
+    for (int i = 0; i < tokens.length; i++) {
+      AttributeSource token = tokens[i];
+      final NamedList<Object> tokenNamedList = new SimpleOrderedMap<Object>();
+      final TermToBytesRefAttribute termAtt = token.getAttribute(TermToBytesRefAttribute.class);
+      BytesRef rawBytes = termAtt.getBytesRef();
+      termAtt.fillBytesRef();
+      final String text = fieldType.indexedToReadable(rawBytes, new CharsRef(rawBytes.length)).toString();
+      tokenNamedList.add("text", text);
+      
+      if (token.hasAttribute(CharTermAttribute.class)) {
+        final String rawText = token.getAttribute(CharTermAttribute.class).toString();
+        if (!rawText.equals(text)) {
+          tokenNamedList.add("raw_text", rawText);
         }
       }
-      current = top[0].current;
+
+      tokenNamedList.add("raw_bytes", rawBytes.toString());
+
+      if (context.getTermsToMatch().contains(rawBytes)) {
+        tokenNamedList.add("match", true);
+      }
+
+      token.reflectWith(new AttributeReflector() {
+        public void reflect(Class<? extends Attribute> attClass, String key, Object value) {
+          // leave out position and bytes term
+          if (TermToBytesRefAttribute.class.isAssignableFrom(attClass))
+            return;
+          if (CharTermAttribute.class.isAssignableFrom(attClass))
+            return;
+          if (PositionIncrementAttribute.class.isAssignableFrom(attClass))
+            return;
+          
+          String k = attClass.getName() + '#' + key;
+          
+          // map keys for "standard attributes":
+          if (ATTRIBUTE_MAPPING.containsKey(k)) {
+            k = ATTRIBUTE_MAPPING.get(k);
+          }
+          
+          if (value instanceof BytesRef) {
+            final BytesRef p = (BytesRef) value;
+            value = p.toString();
+          }
+
+          tokenNamedList.add(k, value);
+        }
+      });
+
+      tokensNamedLists.add(tokenNamedList);
     }
 
-    private void pushTop() throws IOException {
-      // call next() on each top, and put back into queue
-      for (int i = 0; i < numTop; i++) {
-        top[i].current = top[i].next();
-        if (top[i].current != null) {
-          queue.add(top[i]);
-        }
+    return tokensNamedLists;
+  }
+  
+  private String writeCharStream(NamedList<Object> out, CharStream input ){
+    final int BUFFER_SIZE = 1024;
+    char[] buf = new char[BUFFER_SIZE];
+    int len = 0;
+    StringBuilder sb = new StringBuilder();
+    do {
+      try {
+        len = input.read( buf, 0, BUFFER_SIZE );
+      } catch (IOException e) {
+        throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, e);
       }
-      currentOrd++;
-      numTop = 0;
-    }
+      if( len > 0 )
+        sb.append(buf, 0, len);
+    } while( len == BUFFER_SIZE );
+    out.add( input.getClass().getName(), sb.toString());
+    return sb.toString();
   }
 
-  public static class SortedSourceSlice {
-    final SortedSource source;
-    final int readerIdx;
-    /* global array indexed by docID containg the relative ord for the doc */
-    final int[] docIDToRelativeOrd;
-    /*
-     * maps relative ords to merged global ords - index is relative ord value
-     * new global ord this map gets updates as we merge ords. later we use the
-     * docIDtoRelativeOrd to get the previous relative ord to get the new ord
-     * from the relative ord map.
+  // ================================================= Inner classes =================================================
+
+  /**
+   * TokenStream that iterates over a list of pre-existing Tokens
+   * @lucene.internal
+   */
+  protected final static class ListBasedTokenStream extends TokenStream {
+    private final List<AttributeSource> tokens;
+    private Iterator<AttributeSource> tokenIterator;
+
+    /**
+     * Creates a new ListBasedTokenStream which uses the given tokens as its token source.
+     *
+     * @param tokens Source of tokens to be used
      */
-    final int[] ordMapping;
-
-    /* start index into docIDToRelativeOrd */
-    final int docToOrdStart;
-    /* end index into docIDToRelativeOrd */
-    final int docToOrdEnd;
-    BytesRef current = new BytesRef();
-    /* the currently merged relative ordinal */
-    int relativeOrd = -1;
-
-    SortedSourceSlice(int readerIdx, SortedSource source, int[] docBase, int mergeDocCount,
-        int[] docToOrd) {
-      super();
-      this.readerIdx = readerIdx;
-      this.source = source;
-      this.docIDToRelativeOrd = docToOrd;
-      this.ordMapping = new int[source.getValueCount()];
-      this.docToOrdStart = docBase[readerIdx];
-      this.docToOrdEnd = this.docToOrdStart + numDocs(docBase, mergeDocCount, readerIdx);
+    ListBasedTokenStream(List<AttributeSource> tokens) {
+      this.tokens = tokens;
+      tokenIterator = tokens.iterator();
     }
 
-    private static int numDocs(int[] docBase, int mergedDocCount, int readerIndex) {
-      if (readerIndex == docBase.length - 1) {
-        return mergedDocCount - docBase[readerIndex];
+    @Override
+    public boolean incrementToken() throws IOException {
+      if (tokenIterator.hasNext()) {
+        clearAttributes();
+        AttributeSource next = tokenIterator.next();
+        Iterator<Class<? extends Attribute>> atts = next.getAttributeClassesIterator();
+        while (atts.hasNext()) // make sure all att impls in the token exist here
+          addAttribute(atts.next());
+        next.copyTo(this);
+        return true;
+      } else {
+        return false;
       }
-      return docBase[readerIndex + 1] - docBase[readerIndex];
     }
 
-    BytesRef next() {
-      for (int i = relativeOrd + 1; i < ordMapping.length; i++) {
-        if (ordMapping[i] != 0) { // skip ords that are not referenced anymore
-          source.getByOrd(i, current);
-          relativeOrd = i;
-          return current;
-        }
-      }
-      return null;
+    @Override
+    public void reset() throws IOException {
+      super.reset();
+      tokenIterator = tokens.iterator();
+    }
+  }
+
+  /** This is an {@link Attribute} used to track the positions of tokens
+   * in the analysis chain.
+   * @lucene.internal This class is only public for usage by the {@link AttributeSource} API.
+   */
+  public interface TokenTrackingAttribute extends Attribute {
+    void freezeStage();
+    void setActPosition(int pos);
+    int[] getPositions();
+    void reset(int[] basePositions, int position);
+  }
+
+  /** Implementation of {@link TokenTrackingAttribute}.
+   * @lucene.internal This class is only public for usage by the {@link AttributeSource} API.
+   */
+  public static final class TokenTrackingAttributeImpl extends AttributeImpl implements TokenTrackingAttribute {
+    private int[] basePositions = new int[0];
+    private int position = 0;
+    private transient int[] cachedPositions = null;
+
+    public void freezeStage() {
+      this.basePositions = getPositions();
+      this.position = 0;
+      this.cachedPositions = null;
     }
     
-    public int[] toAbsolutOrds(int[] docToOrd) {
-      for (int i = docToOrdStart; i < docToOrdEnd; i++) {
-        final int mappedOrd = docIDToRelativeOrd[i];
-        assert mappedOrd < ordMapping.length;
-        assert ordMapping[mappedOrd] > 0 : "illegal mapping ord maps to an unreferenced value";
-        docToOrd[i] = ordMapping[mappedOrd] -1;
+    public void setActPosition(int pos) {
+      this.position = pos;
+      this.cachedPositions = null;
+    }
+    
+    public int[] getPositions() {
+      if (cachedPositions == null) {
+        cachedPositions = ArrayUtils.add(basePositions, position);
       }
-      return docToOrd;
+      return cachedPositions;
+    }
+    
+    public void reset(int[] basePositions, int position) {
+      this.basePositions = basePositions;
+      this.position = position;
+      this.cachedPositions = null;
+    }
+    
+    @Override
+    public void clear() {
+      // we do nothing here, as all attribute values are controlled externally by consumer
+    }
+    
+    @Override
+    public void reflectWith(AttributeReflector reflector) {
+      reflector.reflect(TokenTrackingAttribute.class, "position", position);
+      // convert to Integer[] array, as only such one can be serialized by ResponseWriters
+      reflector.reflect(TokenTrackingAttribute.class, "positionHistory", ArrayUtils.toObject(getPositions()));
     }
 
-    public void writeOrds(PackedInts.Writer writer) throws IOException {
-      for (int i = docToOrdStart; i < docToOrdEnd; i++) {
-        final int mappedOrd = docIDToRelativeOrd[i];
-        assert mappedOrd < ordMapping.length;
-        assert ordMapping[mappedOrd] > 0 : "illegal mapping ord maps to an unreferenced value";
-        writer.add(ordMapping[mappedOrd] - 1);
-      }
+    @Override
+    public void copyTo(AttributeImpl target) {
+      final TokenTrackingAttribute t = (TokenTrackingAttribute) target;
+      t.reset(basePositions, position);
     }
   }
 
-  /*
-   * if a segment has no values at all we use this source to fill in the missing
-   * value in the right place (depending on the comparator used)
+  /**
+   * Serves as the context of an analysis process. This context contains the following constructs
    */
-  private static final class MissingValueSource extends SortedSource {
+  protected static class AnalysisContext {
 
-    private BytesRef missingValue;
+    private final String fieldName;
+    private final FieldType fieldType;
+    private final Analyzer analyzer;
+    private final Set<BytesRef> termsToMatch;
 
-    public MissingValueSource(MergeContext ctx) {
-      super(ctx.type, ctx.comp);
-      this.missingValue = ctx.missingValue;
+    /**
+     * Constructs a new AnalysisContext with a given field tpe, analyzer and 
+     * termsToMatch. By default the field name in this context will be 
+     * {@code null}. During the analysis processs, The produced tokens will 
+     * be compaired to the terms in the {@code termsToMatch} set. When found, 
+     * these tokens will be marked as a match.
+     *
+     * @param fieldType    The type of the field the analysis is performed on.
+     * @param analyzer     The analyzer to be used.
+     * @param termsToMatch Holds all the terms that should match during the 
+     *                     analysis process.
+     */
+    public AnalysisContext(FieldType fieldType, Analyzer analyzer, Set<BytesRef> termsToMatch) {
+      this(null, fieldType, analyzer, termsToMatch);
     }
 
-    @Override
-    public int ord(int docID) {
-      return 0;
+    /**
+     * Constructs an AnalysisContext with a given field name, field type 
+     * and analyzer. By default this context will hold no terms to match
+     *
+     * @param fieldName The name of the field the analysis is performed on 
+     *                  (may be {@code null}).
+     * @param fieldType The type of the field the analysis is performed on.
+     * @param analyzer  The analyzer to be used during the analysis process.
+     *
+     */
+    public AnalysisContext(String fieldName, FieldType fieldType, Analyzer analyzer) {
+      this(fieldName, fieldType, analyzer, EMPTY_BYTES_SET);
     }
 
-    @Override
-    public BytesRef getByOrd(int ord, BytesRef bytesRef) {
-      bytesRef.copyBytes(missingValue);
-      return bytesRef;
+    /**
+     * Constructs a new AnalysisContext with a given field tpe, analyzer and
+     * termsToMatch. During the analysis processs, The produced tokens will be 
+     * compaired to the termes in the {@code termsToMatch} set. When found, 
+     * these tokens will be marked as a match.
+     *
+     * @param fieldName    The name of the field the analysis is performed on 
+     *                     (may be {@code null}).
+     * @param fieldType    The type of the field the analysis is performed on.
+     * @param analyzer     The analyzer to be used.
+     * @param termsToMatch Holds all the terms that should match during the 
+     *                     analysis process.
+     */
+    public AnalysisContext(String fieldName, FieldType fieldType, Analyzer analyzer, Set<BytesRef> termsToMatch) {
+      this.fieldName = fieldName;
+      this.fieldType = fieldType;
+      this.analyzer = analyzer;
+      this.termsToMatch = termsToMatch;
     }
 
-    @Override
-    public PackedInts.Reader getDocToOrd() {
-      return null;
+    public String getFieldName() {
+      return fieldName;
     }
 
-    @Override
-    public int getValueCount() {
-      return 1;
+    public FieldType getFieldType() {
+      return fieldType;
     }
 
-  }
-
-  /*
-   * merge queue
-   */
-  private static final class MergeQueue extends
-      PriorityQueue<SortedSourceSlice> {
-    final Comparator<BytesRef> comp;
-
-    public MergeQueue(int maxSize, Comparator<BytesRef> comp) {
-      super(maxSize);
-      this.comp = comp;
+    public Analyzer getAnalyzer() {
+      return analyzer;
     }
 
-    @Override
-    protected boolean lessThan(SortedSourceSlice a, SortedSourceSlice b) {
-      int cmp = comp.compare(a.current, b.current);
-      if (cmp != 0) {
-        return cmp < 0;
-      } else { // just a tie-breaker
-        return a.docToOrdStart < b.docToOrdStart;
-      }
+    public Set<BytesRef> getTermsToMatch() {
+      return termsToMatch;
     }
-
   }
 }

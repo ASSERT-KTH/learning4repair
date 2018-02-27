@@ -1,10 +1,10 @@
-public final static String propertyKey_connectionAttributes = "connectionAttributes";
+ensureLength (4); // verify space for length bytes and code point
 
 /*
 
-   Derby - Class org.apache.derby.jdbc.ClientBaseDataSource
+   Derby - Class org.apache.derby.impl.drda.DDMWriter
 
-   Copyright (c) 2001, 2005 The Apache Software Foundation or its licensors, where applicable.
+   Copyright 2001, 2004 The Apache Software Foundation or its licensors, as applicable.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -18,897 +18,1952 @@ public final static String propertyKey_connectionAttributes = "connectionAttribu
    See the License for the specific language governing permissions and
    limitations under the License.
 
-*/
+ */
 
-package org.apache.derby.jdbc;
+package org.apache.derby.impl.drda;
 
-import java.io.Serializable;
-import java.io.PrintWriter;
-import java.util.Properties;
-import java.util.StringTokenizer;
-import java.util.NoSuchElementException;
-import java.lang.reflect.Field;
-import java.lang.reflect.Modifier;
-import java.security.AccessController;
-import java.security.PrivilegedActionException;
+import java.io.OutputStream;
+import org.apache.derby.iapi.services.sanity.SanityManager;
 import java.sql.SQLException;
-import javax.naming.Referenceable;
-import javax.naming.Reference;
-import javax.naming.NamingException;
-import javax.naming.StringRefAddr;
-import javax.naming.RefAddr;
-
-import org.apache.derby.client.am.Configuration;
-import org.apache.derby.client.am.LogWriter;
-import org.apache.derby.client.am.SqlException;
-import org.apache.derby.client.am.SetAccessibleAction;
-import org.apache.derby.client.am.Connection;
-import org.apache.derby.client.net.NetConfiguration;
-import org.apache.derby.client.net.NetLogWriter;
-import org.apache.derby.client.ClientDataSourceFactory;
+import java.sql.DataTruncation;
+import java.math.BigDecimal;
+import org.apache.derby.iapi.error.ExceptionSeverity;
+import java.util.Arrays;
 
 /**
- * Base class for client-side DataSource implementations.
- */
-public abstract class ClientBaseDataSource implements Serializable, Referenceable {
-    private static final long serialVersionUID = -7660172643035173692L;
+	The DDMWriter is used to write DRDA protocol.   The DRDA Protocol is
+	described in the DDMReader class.
+	For more details, see DRDA Volume 3 (Distributed Data Management(DDM)
+		Architecture (DDS definition)
+*/
+class DDMWriter
+{
 
-    // The loginTimeout jdbc 2 data source property is not supported as a jdbc 1 connection property,
-    // because loginTimeout is set by the jdbc 1 api via java.sql.DriverManager.setLoginTimeout().
-    // The databaseName, serverName, and portNumber data source properties are also not supported as connection properties
-    // because they are extracted from the jdbc 1 database url passed on the connection request.
-    // However, all other data source properties should probably also be supported as connection properties.
+	// number of nesting levels for collections.  We need to mark the length
+	// location of the collection so that we can update it as we add more stuff
+	// to the collection
+	private final static int MAX_MARKS_NESTING = 10;
 
-    //---------------------contructors/finalizers---------------------------------
+	// Default buffer size
+	private final static int DEFAULT_BUFFER_SIZE = 32767;
 
-    // This class is abstract, hide the default constructor
-    ClientBaseDataSource() {
-    }
 
-    // ---------------------------- loginTimeout -----------------------------------
-    //
-    // was serialized in 1.0 release
+	static final BigDecimal ZERO = BigDecimal.valueOf(0L);
+
+	// output buffer
+	private byte[] bytes;
+
+	// offset into output buffer
+	private int offset;
+
+	// A saved mark in the stream is saved temporarily to revisit the location.
+	private int[] markStack = new int[MAX_MARKS_NESTING];
+
+	// top of the stack
+	private int top;
+
+	// CCSID manager for translation of strings in the protocol to EBCDIC
+	private CcsidManager ccsidManager;
+
+	// DRDA connection thread for this writer
+	private DRDAConnThread agent;
+
+	//	This Object tracks the location of the current
+	//	Dss header length bytes.	This is done so
+	//	the length bytes can be automatically
+	//	updated as information is added to this stream.
+	private int dssLengthLocation;
+
+	// Current correlation ID
+	private	int correlationID;
+
+	// Next correlation ID
+	private int nextCorrelationID;
+
+	// is this DRDA protocol or CMD protocol
+	private boolean isDRDAProtocol;
+	// trace object of the associated session
+	private DssTrace dssTrace;
+
+	// Location within the "bytes" array of the start of the header
+	// of the DSS most recently written to the buffer.
+	private int prevHdrLocation;
+
+	// Correlation id of the last DSS that was written to buffer.
+	private int previousCorrId;
+
+	// Chaining bit of the last DSS that was written to buffer.
+	private byte previousChainByte;
+
+	// Whether or not the current DSS is a continuation DSS.
+	private boolean isContinuationDss;
+
+	// In situations where we want to "mark" a buffer location so that
+	// we can "back-out" of a write to handle errors, this holds the
+	// location within the "bytes" array of the start of the header
+	// that immediately precedes the mark.
+	private int lastDSSBeforeMark;
+
+	// Constructors
+	DDMWriter (int minSize, CcsidManager ccsidManager, DRDAConnThread agent, DssTrace dssTrace)
+	{
+		this.bytes = new byte[minSize];
+		this.ccsidManager = ccsidManager;
+		this.agent = agent;
+		this.prevHdrLocation = -1;
+		this.previousCorrId = DssConstants.CORRELATION_ID_UNKNOWN;
+		this.previousChainByte = DssConstants.DSS_NOCHAIN;
+		this.isContinuationDss = false;
+		this.lastDSSBeforeMark = -1;
+		reset(dssTrace);
+	}
+
+	DDMWriter (CcsidManager ccsidManager, DRDAConnThread agent, DssTrace dssTrace)
+	{
+		this.bytes = new byte[DEFAULT_BUFFER_SIZE];
+		this.ccsidManager = ccsidManager;
+		this.agent = agent;
+		this.prevHdrLocation = -1;
+		this.previousCorrId = DssConstants.CORRELATION_ID_UNKNOWN;
+		this.previousChainByte = DssConstants.DSS_NOCHAIN;
+		this.isContinuationDss = false;
+		this.lastDSSBeforeMark = -1;
+		reset(dssTrace);
+	}
+
+	/**
+	 * reset values for sending next message
+	 *
+	 */
+	protected void reset(DssTrace dssTrace)
+	{
+		offset = 0;
+		top = 0;
+		dssLengthLocation = 0;
+		nextCorrelationID = 1;
+		correlationID = DssConstants.CORRELATION_ID_UNKNOWN;
+		isDRDAProtocol = true;
+		this.dssTrace = dssTrace;
+	}
+
+	/**
+	 * set protocol to CMD protocol
+	 */
+	protected void setCMDProtocol()
+	{
+		isDRDAProtocol = false;
+	}
+
+	/**
+	 * Create DSS reply object
+	 */
+	protected void createDssReply()
+	{
+		beginDss(DssConstants.DSSFMT_RPYDSS, true);
+	}
+
+	/**
+	 * Create DSS request object
+	 * NOTE: This is _ONLY_ used for testing the protocol
+	 * (via the TestProto.java file in this package)!
+	 * We should never create a DSS request in normal
+	 * DRDA processing (we should only create DSS replies
+	 * and DSS objects).
+	 */
+	protected void createDssRequest()
+	{
+		beginDss(DssConstants.DSSFMT_RQSDSS, true);
+	}
+
+	/**
+	 * Create DSS data object
+	 */
+	protected void createDssObject()
+	{
+		beginDss(DssConstants.DSSFMT_OBJDSS, true);
+	}
+
+	/**
+	 * Mark the DSS that we're currently writing as
+	 * a continued DSS, which is done by setting
+	 * the high-order bit to "1", per DDM spec.
+	 * This means:
+	 *
+	 *	1. One or more continuation DSSes will immediately
+	 * 		follow the current (continued) DSS.
+	 *	2. All continuation DSSes will have a 2-byte
+	 * 		continuation header, followed by data; in
+	 * 		other words, chaining state, correlation
+	 *		id, dss format info, and code point will
+	 * 		NOT be included.  All of that info is 
+	 * 		present ONLY in the FIRST DSS in the
+	 *		list of continued DSSes.
+	 *
+	 *	NOTE: A DSS can be a "continuation" DSS _and_
+	 * 	a "continued" DSS at the same time.  However,
+	 * 	the FIRST DSS to be continued canNOT be
+	 *	a continuation DSS.
+	 */
+	private void markDssAsContinued(boolean forLob)
+	{
+
+		if (!forLob) {
+		// continuation bit defaults to '1' for lobs, so
+		// we only have to switch it if we're not writing
+		// lobs.
+			bytes[dssLengthLocation] |= 0x80;
+		}
+
+		// We need to set the chaining state, but ONLY
+		// IF this is the FIRST DSS in the continuation
+		// list (only the first one has chaining state
+		// in it's header; the others do not).
+		if (!isContinuationDss)
+			endDss(!forLob);
+
+	}
+
+	/**
+	 * End DSS header by writing the length in the length location
+	 * and setting the chain bit.  Unlike the other two endDss
+	 * methods, this one overrides the default chaining byte
+	 * (which is set in beginDss) with the chaining byte that
+	 * is passed in.  NOTE: This method is only used in
+	 * association with createDssRequest, and thus is for
+	 * TESTING purposes only (via TestProto.java).  No calls
+	 * should be made to this method in normal DRDA processing
+	 * (because for normal processing, chaining must be
+	 * determined automatically based on DSS requests).
+	 */
+	protected void endDss(byte chainByte)
+	{
+
+		// Do regular endDss processing.
+		endDss(true);
+
+		// Now override default chain state.
+		bytes[dssLengthLocation + 3] &= 0x0F;	// Zero out default
+		bytes[dssLengthLocation + 3] |= chainByte;
+		previousChainByte = chainByte;
+
+	}
+
+	/**
+	 * End DSS header by writing the length in the length location
+	 * and setting the chain bit.
+	 */
+	protected void endDss() {
+		endDss(true);
+	}
+
+	/**
+	 * End DSS header by writing the length in the length location
+	 * and setting the chain bit.
+	 */
+	private void endDss (boolean finalizeLength)
+	{
+
+		if (finalizeLength)
+			finalizeDssLength();
+
+		if (isContinuationDss) {
+		// no chaining information for this DSS; so we're done.
+			isContinuationDss = false;
+			return;
+		}
+
+		previousCorrId = correlationID;
+		prevHdrLocation = dssLengthLocation;
+		previousChainByte = DssConstants.DSSCHAIN_SAME_ID;
+
+	}
+
+	/**
+	 * End final DDM and DSS header by writing the length in the length location
+	 *
+	 */
+	protected void endDdmAndDss ()
+	{
+		endDdm();	// updates last DDM object
+		endDss();
+	}
+	/**
+	 * Copy Data to End
+	 * Create a buffer and copy from the position given to the end of data
+	 *
+	 * Note that the position given is treated as relative to the
+	 * current DSS, for there may be other DSS blocks (chained, presumably)
+	 * which are sitting unwritten in the buffer. The caller doesn't
+	 * know this, though, and works only with the current DSS.
+	 *
+	 * getDSSLength, copyDSSDataToEnd, and truncateDSS work together to
+	 * provide a sub-protocol for DRDAConnThread to use in its
+	 * implementation of the LMTBLKPRC protocol. They enable the caller
+	 * to determine when it has written too much data into the current
+	 * DSS, to reclaim the extra data that won't fit, and to truncate
+	 * that extra data once it has been reclaimed and stored elsewhere.
+	 * Note that this support only works for the current DSS. Earlier,
+	 * chained DSS blocks cannot be accessed using these methods. For
+	 * additional background information, the interested reader should
+	 * investigate bugs DERBY-491 and 492 at:
+	 * http://issues.apache.org/jira/browse/DERBY-491 and
+	 * http://issues.apache.org/jira/browse/DERBY-492
+	 *
+	 * @param start
+	 */
+	protected byte [] copyDSSDataToEnd(int start)
+	{
+		start = start + dssLengthLocation;
+		int length = offset - start;
+		byte [] temp = new byte[length];
+		System.arraycopy(bytes,start,temp,0,length);
+		return temp;
+	}
+
+	// Collection methods
+
+	/**
+	 * Mark the location of the length bytes for the collection so they
+	 * can be updated later
+	 *
+	 */
+	protected void startDdm (int codePoint)
+	{
+		// save the location of the beginning of the collection so
+		// that we can come back and fill in the length bytes
+		markStack[top++] = offset;
+		offset += 2; // move past the length bytes before writing the code point
+		bytes[offset] = (byte) ((codePoint >>> 8) & 0xff);
+		bytes[offset + 1] = (byte) (codePoint & 0xff);
+		offset += 2;
+	}
+
+	/**
+	 * Erase all writes for the current ddm and reset the
+	 * top
+	 */
+	protected void clearDdm ()
+	{
+		offset = markStack[top--];
+	}
+
+	/**
+	 * Clear the entire send buffer
+	 *
+	 */
+	protected void clearBuffer()
+	{
+		offset = 0;
+		top = 0;
+		dssLengthLocation = 0;
+		correlationID = DssConstants.CORRELATION_ID_UNKNOWN;
+		nextCorrelationID = 1;
+		isDRDAProtocol = true;
+	}
+
+	/**
+	 * End the current DDM
+	 *
+	 */
+	protected void endDdm ()
+	{
+		// remove the top length location offset from the mark stack
+		// calculate the length based on the marked location and end of data.
+		int lengthLocation = markStack[--top];
+		int length = offset - lengthLocation;
+
+		// determine if any extended length bytes are needed.	the value returned
+		// from calculateExtendedLengthByteCount is the number of extended length
+		// bytes required. 0 indicates no exteneded length.
+		int extendedLengthByteCount = calculateExtendedLengthByteCount (length);
+		if (extendedLengthByteCount != 0)
+		{
+			// ensure there is enough room in the buffer for the extended length bytes.
+			ensureLength (extendedLengthByteCount);
+
+			// calculate the length to be placed in the extended length bytes.
+			// this length does not include the 4 byte llcp.
+			int extendedLength = length - 4;
+
+			// shift the data to the right by the number of extended
+			// length bytes needed.
+			int extendedLengthLocation = lengthLocation + 4;
+			System.arraycopy (bytes,
+					              extendedLengthLocation,
+					              bytes,
+					              extendedLengthLocation + extendedLengthByteCount,
+					              extendedLength);
+
+			// write the extended length
+			int shiftSize = (extendedLengthByteCount -1) * 8;
+			for (int i = 0; i < extendedLengthByteCount; i++)
+			{
+				bytes[extendedLengthLocation++] =
+					(byte) ((extendedLength >>> shiftSize ) & 0xff);
+				shiftSize -= 8;
+			}
+
+			// adjust the offset to account for the shift and insert
+			offset += extendedLengthByteCount;
+
+			// the two byte length field before the codepoint contains the length
+			// of itself, the length of the codepoint, and the number of bytes used
+			// to hold the extended length.	the 2 byte length field also has the first
+			// bit on to indicate extended length bytes were used.
+			length = extendedLengthByteCount + 4;
+			length |= DssConstants.CONTINUATION_BIT;
+		}
+
+		// write the 2 byte length field (2 bytes before codepoint).
+		bytes[lengthLocation] = (byte) ((length >>> 8) & 0xff);
+		bytes[lengthLocation+1] = (byte) (length & 0xff);
+
+	}
+
     /**
-     * The time in seconds to wait for a connection request on this data source. The default value of zero indicates
-     * that either the system time out be used or no timeout limit.
+     * Get the length of the current DSS block we're working on. This is
+     * used by the LMTBLKPRC protocol, which does its own conversational
+     * blocking protocol above the layer of the DRDA blocking. The LMTBLKPRC
+     * implementation (in DRDAConnThread) needs to be able to truncate a
+     * DSS block when splitting a QRYDTA response.
      *
-     * @serial
-     */
-    protected int loginTimeout = propertyDefault_loginTimeout;
-    public final static String propertyKey_loginTimeout = "loginTimeout";
-    public static final int propertyDefault_loginTimeout = 0;
-
-    public synchronized void setLoginTimeout(int seconds) {
-        this.loginTimeout = seconds;
+     * @return current DSS block length
+    */
+    protected int getDSSLength()
+    {
+        return offset - dssLengthLocation;
     }
-
-    public int getLoginTimeout() {
-        return this.loginTimeout;
-    }
-
-    // ---------------------------- logWriter -----------------------------------
-    //
+ 
     /**
-     * The log writer is declared transient, and is not serialized or stored under JNDI.
+     * Truncate the current DSS. Before making this call, you should ensure
+     * that you have copied the data to be truncated somewhere else, by
+     * calling copyDSSDataToEnd
      *
-     * @see #traceLevel
-     */
-    private transient PrintWriter logWriter;
-
-    public synchronized void setLogWriter(PrintWriter logWriter) {
-        this.logWriter = logWriter;
-    }
-
-    public PrintWriter getLogWriter() {
-        return this.logWriter;
-    }
-
-    // ---------------------------- databaseName -----------------------------------
-    //
-    // Stores the relational database name, RDBNAME.
-    // The length of the database name may be limited to 18 bytes
-    // and therefore may throw an SQLException.
-    //
-    //
-    protected String databaseName;
-    public final static String propertyKey_databaseName = "databaseName";
-
-    // databaseName is not permitted in a properties object
-
-
-    // ---------------------------- description ------------------------------
-    // A description of this data source.
-    protected String description;
-    public final static String propertyKey_description = "description";
-
-    // ---------------------------- dataSourceName -----------------------------------
-    //
-    // A data source name;
-    // used to name an underlying XADataSource,
-    // or ConnectionPoolDataSource when pooling of connections is done.
-    //
-    protected String dataSourceName;
-    public final static String propertyKey_dataSourceName = "dataSourceName";
-
-    // ---------------------------- portNumber -----------------------------------
-    //
-    protected int portNumber = propertyDefault_portNumber;
-    public final static int propertyDefault_portNumber = 1527;
-    public final static String propertyKey_portNumber = "portNumber";
-
-    // ---------------------------- serverName -----------------------------------
-    //
-    // Derby-410 fix.
-    protected String serverName = propertyDefault_serverName;
-    public final static String propertyDefault_serverName = "localhost";
-    public final static String propertyKey_serverName = "serverName";
-
-    // serverName is not permitted in a properties object
-
-    // ---------------------------- user -----------------------------------
-    //
-    // This property can be overwritten by specifing the
-    // username parameter on the DataSource.getConnection() method
-    // call.  If user is specified, then password must also be
-    // specified, either in the data source object or provided on
-    // the DataSource.getConnection() call.
-    //
-    // Each data source implementation subclass will maintain it's own <code>password</code> property.
-    // This password property may or may not be declared transient, and therefore may be serialized
-    // to a file in clear-text, care must taken by the user to prevent security breaches.
-    // Derby-406 fix
-    protected String user = propertyDefault_user;
-    public final static String propertyKey_user = "user";
-    public final static String propertyDefault_user = "APP";
-
-    public static String getUser(Properties properties) {
-        String userString = properties.getProperty(propertyKey_user);
-        return parseString(userString, propertyDefault_user);
-    }
-
-    public final static int HOLD_CURSORS_OVER_COMMIT = 1; // this matches jdbc 3 ResultSet.HOLD_CURSORS_OVER_COMMIT
-    public final static int CLOSE_CURSORS_AT_COMMIT = 2;  // this matches jdbc 3 ResultSet.CLOSE_CURSORS_AT_COMMIT
-
-
-    // ---------------------------- securityMechanism -----------------------------------
-    //
-    // The source security mechanism to use when connecting to this data source.
-    // <p>
-    // Security mechanism options are:
-    // <ul>
-    // <li> USER_ONLY_SECURITY
-    // <li> CLEAR_TEXT_PASSWORD_SECURITY
-    // <li> ENCRYPTED_PASSWORD_SECURITY
-    // <li> ENCRYPTED_USER_AND_PASSWORD_SECURITY - both password and user are encrypted
-    // </ul>
-    // The default security mechanism is USER_ONLY_SECURITY.
-    // <p>
-    // If the application specifies a security
-    // mechanism then it will be the only one attempted.
-    // If the specified security mechanism is not supported by the conversation
-    // then an exception will be thrown and there will be no additional retries.
-    // <p>
-    // This property is currently only available for the  DNC driver.
-    // <p>
-    // Both user and password need to be set for all security mechanism except USER_ONLY_SECURITY
-    // When using USER_ONLY_SECURITY, only the user property needs to be specified.
-    //
-    protected short securityMechanism = propertyDefault_securityMechanism;
-    // TODO default  should be  USER_ONLY_SECURITY. Change when working on
-    // Network Server
-    //  public final static short propertyDefault_securityMechanism = (short)
-    //  org.apache.derby.client.net.NetConfiguration.SECMEC_USRIDONL;
-    public final static short propertyDefault_securityMechanism = (short) NetConfiguration.SECMEC_USRIDONL;
-    public final static String propertyKey_securityMechanism = "securityMechanism";
-
-
-    // We use the NET layer constants to avoid a mapping for the NET driver.
-    public static short getSecurityMechanism(Properties properties) {
-        String securityMechanismString = properties.getProperty(propertyKey_securityMechanism);
-        String passwordString = properties.getProperty(propertyKey_password);
-        short setSecurityMechanism = parseShort(securityMechanismString, propertyDefault_securityMechanism);
-        return getUpgradedSecurityMechanism(setSecurityMechanism, passwordString);
+     * @param value DSS length
+    */
+    protected void truncateDSS(int value)
+    {
+        offset = dssLengthLocation + value;
     }
 
 
-    /**
-     * Upgrade the security mechansim to USRIDPWD if it is set to USRIDONL but we have a password.
-     */
-    public static short getUpgradedSecurityMechanism(short securityMechanism, String password) {
-        // if securityMechanism is USER_ONLY (the default) we may need
-        // to change it to CLEAR_TEXT_PASSWORD in order to send the password.
-        if ((password != null) && (securityMechanism == NetConfiguration.SECMEC_USRIDONL)) {
-            return (short) NetConfiguration.SECMEC_USRIDPWD;
-        } else {
-            return securityMechanism;
+	// Write routines
+
+	/**
+	 * Write byte
+	 *
+	 * @param 	value	byte to be written
+	 */
+	protected void writeByte (int value)
+	{
+		if (SanityManager.DEBUG)
+		{
+			if (value > 255)
+				SanityManager.THROWASSERT(
+									   "writeByte value: " + value +
+									   " may not be > 255");
+		}
+
+		ensureLength (1);
+		bytes[offset++] = (byte) (value & 0xff);
+	}
+
+
+	/**
+	 * Write network short
+	 *
+	 * @param 	value	value to be written
+	 */
+	protected void writeNetworkShort (int value)
+	{
+		ensureLength (2);
+		bytes[offset] = (byte) ((value >>> 8) & 0xff);
+		bytes[offset + 1] = (byte) (value & 0xff);
+		offset += 2;
+	}
+
+	/**
+	 * Write network int
+	 *
+	 * @param 	value	value to be written
+	 */
+	protected void writeNetworkInt (int value)
+	{
+		ensureLength (4);
+		bytes[offset] = (byte) ((value >>> 24) & 0xff);
+		bytes[offset + 1] = (byte) ((value >>> 16) & 0xff);
+		bytes[offset + 2] = (byte) ((value >>> 8) & 0xff);
+		bytes[offset + 3] = (byte) (value & 0xff);
+		offset += 4;
+	}
+
+
+	/**
+	 * Write byte array
+	 *
+	 * @param 	buf	byte array to be written
+	 * @param	length  - length to write
+	 */
+	protected void writeBytes (byte[] buf, int length)
+	{
+		writeBytes(buf, 0,length);
+	}
+
+
+
+	/**
+	 * Write byte array
+	 *
+	 * @param 	buf	byte array to be written
+	 * @param	start  - starting position
+	 * @param	length  - length to write
+	 */
+	protected void writeBytes (byte[] buf, int start, int length)
+	{
+
+		if (SanityManager.DEBUG)
+		{
+			if (buf == null && length > 0)
+		    	SanityManager.THROWASSERT("Buf is null");
+			if (length + start - 1 > buf.length)
+		    	SanityManager.THROWASSERT("Not enough bytes in buffer");
+
+		}
+		ensureLength (length);
+		System.arraycopy(buf,start,bytes,offset,length);
+		offset += length;
+	}
+	/**
+	 * Write byte array
+	 *
+	 * @param 	buf	byte array to be written
+	 **/
+	protected void writeBytes (byte[] buf)
+	{
+		writeBytes(buf,buf.length);
+	}
+
+
+
+	protected void writeLDBytes(byte[] buf)
+	{
+		writeLDBytes(buf, 0);
+	}
+
+	protected void writeLDBytes(byte[] buf, int index)
+	{
+
+		int length = buf.length;
+		int writeLen =  buf.length;
+
+		writeShort(writeLen);
+
+		writeBytes(buf,0,writeLen);
+	}
+
+
+	/**
+	 * Write code point and 4 bytes
+	 *
+	 * @param 	codePoint - code point to write
+	 * @param	value  - value to write after code point
+	 */
+	void writeCodePoint4Bytes (int codePoint, int value)
+	{
+		ensureLength (4);
+		bytes[offset] = (byte) ((codePoint >>> 8) & 0xff);
+		bytes[offset + 1] = (byte) (codePoint & 0xff);
+		bytes[offset + 2] = (byte) ((value >>> 8) & 0xff);
+		bytes[offset + 3] = (byte) (value & 0xff);
+		offset += 4;
+	}
+
+	/**
+	 * Write scalar 1 byte object includes length, codepoint and value
+	 *
+	 * @param 	codePoint - code point to write
+	 * @param	value  - value to write after code point
+	 */
+	void writeScalar1Byte (int codePoint, int value)
+	{
+		ensureLength (5);
+		bytes[offset] = 0x00;
+		bytes[offset + 1] = 0x05;
+		bytes[offset + 2] = (byte) ((codePoint >>> 8) & 0xff);
+		bytes[offset + 3] = (byte) (codePoint & 0xff);
+		bytes[offset + 4] = (byte) (value & 0xff);
+		offset += 5;
+	}
+
+	/**
+	 * Write scalar 2 byte object includes length, codepoint and value
+	 *
+	 * @param 	codePoint - code point to write
+	 * @param	value  - value to write after code point
+	 */
+	protected void writeScalar2Bytes (int codePoint, int value)
+	{
+		ensureLength (6);
+		bytes[offset] = 0x00;
+		bytes[offset + 1] = 0x06;
+		bytes[offset + 2] = (byte) ((codePoint >>> 8) & 0xff);
+		bytes[offset + 3] = (byte) (codePoint & 0xff);
+		bytes[offset + 4] = (byte) ((value >>> 8) & 0xff);
+		bytes[offset + 5] = (byte) (value & 0xff);
+		offset += 6;
+	}
+
+	protected void writeScalar2Bytes ( int value)
+	{
+		ensureLength (2);
+		bytes[offset] = (byte) ((value >>> 8) & 0xff);
+		bytes[offset + 1] = (byte) (value & 0xff);
+		offset += 2;
+	}
+
+	/**
+	 * Write length and codepoint
+	 *
+	 * @param 	length - length of object
+	 * @param 	codePoint - code point to write
+	 */
+	protected void startDdm (int length, int codePoint)
+	{
+		ensureLength (4);
+		bytes[offset] = (byte) ((length >>> 8) & 0xff);
+		bytes[offset + 1] = (byte) (length & 0xff);
+		bytes[offset + 2] = (byte) ((codePoint >>> 8) & 0xff);
+		bytes[offset + 3] = (byte) (codePoint & 0xff);
+		offset += 4;
+	}
+
+	/**
+	 * Write scalar byte array object includes length, codepoint and value
+	 *
+	 * @param 	codePoint - code point to write
+	 * @param	buf  - value to write after code point
+	 * @param	length - number of bytes to write
+	 */
+	protected void writeScalarBytes (int codePoint, byte[] buf, int length)
+	{
+		if (SanityManager.DEBUG)
+		{
+			if (buf == null && length > 0)
+		    	SanityManager.THROWASSERT("Buf is null");
+			if (length > buf.length)
+		    	SanityManager.THROWASSERT("Not enough bytes in buffer");
+		}
+		ensureLength (length + 4);
+		bytes[offset] = (byte) (((length+4) >>> 8) & 0xff);
+		bytes[offset + 1] = (byte) ((length+4) & 0xff);
+		bytes[offset + 2] = (byte) ((codePoint >>> 8) & 0xff);
+		bytes[offset + 3] = (byte) (codePoint & 0xff);
+		System.arraycopy(buf,0,bytes,offset + 4, length);
+		offset += length + 4;
+	}
+
+
+	// TODO: Rewrite writeScalarStream to avoid passing a length.
+	// The length is never written and not required by the DRDA spec.
+	// Also looks like on IOException we just pad out the stream instead
+	// of actually sending an exception.  Similar code is in client, so 
+	// should be fixed in both places.
+	protected int  writeScalarStream (boolean chainedWithSameCorrelator,
+									  int codePoint,
+									  int length,
+									  java.io.InputStream in,
+									  boolean writeNullByte) 
+		throws DRDAProtocolException
+	{
+
+		// Stream equivalent of "beginDss"...
+		int leftToRead = length;
+		int bytesToRead = prepScalarStream (chainedWithSameCorrelator,
+											codePoint,
+											writeNullByte,
+											leftToRead);
+
+		if (length == 0)
+			return 0;
+
+		// write the data
+		int bytesRead = 0;
+		int totalBytesRead = 0;
+		do {
+			do {
+				try {
+					bytesRead = in.read (bytes, offset, bytesToRead);
+					totalBytesRead += bytesRead;
+				}
+				catch (java.io.IOException e) {
+					padScalarStreamForError (leftToRead, bytesToRead);
+					return totalBytesRead;
+				}
+				if (bytesRead == -1) {
+					padScalarStreamForError (leftToRead, bytesToRead);
+					return totalBytesRead;
+				}
+				else {
+					bytesToRead -= bytesRead;
+					offset += bytesRead;
+					leftToRead -= bytesRead;
+				}
+			} while (bytesToRead > 0);
+
+			bytesToRead = flushScalarStreamSegment (leftToRead, bytesToRead);
+		} while (leftToRead > 0);
+		// check to make sure that the specified length wasn't too small
+		try {
+			if (in.read() != -1) {
+				totalBytesRead += 1;
+			}
+		}
+		catch (java.io.IOException e) {
+			// Encountered error in stream length verification for 
+			// InputStream, parameter #" + parameterIndex + ".  
+			// Don't think we need to error for this condition
+		}
+		return totalBytesRead;
+	}
+	
+	/**
+	 * Begins a DSS stream (for writing LOB data).
+	 */
+	private void beginDss (boolean chainedToNextStructure,
+						   int dssType)
+	{
+		beginDss(dssType, false);	// false => don't ensure length.
+
+		// always turn on continuation flags... this is helpful for lobs...
+		// these bytes will get rest if dss lengths are finalized.
+  		bytes[dssLengthLocation] = (byte) 0xFF;
+  		bytes[dssLengthLocation + 1] = (byte) 0xFF;
+
+		// Set whether or not this DSS should be chained to
+		// the next one.  If it's chained, it has to be chained
+		// with same id (that's the nature of EXTDTA chaining).
+		if (chainedToNextStructure) {
+			dssType |= DssConstants.GDSCHAIN_SAME_ID;
+		}
+
+		bytes[dssLengthLocation + 3] = (byte) (dssType & 0xff);
+	}
+
+
+  // prepScalarStream does the following prep for writing stream data:
+  // 1.  Flushes an existing DSS segment, if necessary
+  // 2.  Determines if extended length bytes are needed
+  // 3.  Creates a new DSS/DDM header and a null byte indicator, if applicable
+  protected int prepScalarStream  (boolean chainedWithSameCorrelator,
+                                   int codePoint,
+                                   boolean writeNullByte,
+                                   int leftToRead) throws DRDAProtocolException
+  {
+    int extendedLengthByteCount;
+
+    int nullIndicatorSize = 0;
+    if (writeNullByte) 
+		nullIndicatorSize = 1;
+	extendedLengthByteCount = calculateExtendedLengthByteCount (leftToRead + 4 + nullIndicatorSize);
+
+    // flush the existing DSS segment if this stream will not fit in the send buffer
+    if (10 + extendedLengthByteCount + nullIndicatorSize + leftToRead + offset > DssConstants.MAX_DSS_LENGTH) {
+      try {
+	    // The existing DSS segment was finalized by endDss; all
+	    // we have to do is send it across the wire.
+        sendBytes(agent.getOutputStream());
+      }
+      catch (java.io.IOException e) {
+         agent.markCommunicationsFailure ("DDMWriter.writeScalarStream()",
+                                              "OutputStream.flush()",
+                                              e.getMessage(),"*");
+      }
+    }
+
+    // buildStreamDss should not call ensure length.
+	beginDss(chainedWithSameCorrelator, DssConstants.GDSFMT_OBJDSS);
+
+    if (extendedLengthByteCount > 0) {
+      // method should never ensure length
+      writeLengthCodePoint (0x8004 + extendedLengthByteCount, codePoint);
+
+      if (writeNullByte)
+        writeExtendedLengthBytes (extendedLengthByteCount, leftToRead + 1);
+      else
+        writeExtendedLengthBytes (extendedLengthByteCount, leftToRead);
+    }
+    else {
+      if (writeNullByte)
+        writeLengthCodePoint (leftToRead + 4 + 1, codePoint);
+      else
+        writeLengthCodePoint (leftToRead + 4, codePoint);
+    }
+
+    // write the null byte, if necessary
+    if (writeNullByte)
+      writeByte(0x0);
+
+    int bytesToRead;
+
+    if (writeNullByte)
+      bytesToRead = Math.min (leftToRead, DssConstants.MAX_DSS_LENGTH - 6 - 4 - 1 - extendedLengthByteCount);
+    else
+      bytesToRead = Math.min (leftToRead, DssConstants.MAX_DSS_LENGTH - 6 - 4 - extendedLengthByteCount);
+
+    return bytesToRead;
+  }
+
+
+  // method to determine if any data is in the request.
+  // this indicates there is a dss object already in the buffer.
+	protected boolean doesRequestContainData()
+	{
+		return offset != 0;
+	}
+
+
+	// Writes out a scalar stream DSS segment, along with DSS continuation
+	// headers if necessary.
+	protected int flushScalarStreamSegment (int leftToRead,
+											int bytesToRead)
+		throws DRDAProtocolException
+	{
+		int newBytesToRead = bytesToRead;
+
+		// either at end of data, end of dss segment, or both.
+		if (leftToRead != 0) {
+		// 32k segment filled and not at end of data.
+
+			if ((Math.min (2 + leftToRead, 32767)) > (bytes.length - offset)) {
+				try {
+				// Mark current DSS as continued, set its chaining state,
+				// then send the data across.
+					markDssAsContinued(true); 	// true => for lobs
+					sendBytes (agent.getOutputStream());
+				}
+				catch (java.io.IOException ioe) {
+					agent.markCommunicationsFailure ("DDMWriter.flushScalarStreamSegment()",
+                                               "",
+                                               ioe.getMessage(),
+                                               "*");
+				}
+			}
+			else {
+			// DSS is full, but we still have space in the buffer.  So
+			// end the DSS, then start the next DSS right after it.
+				endDss(false);		// false => don't finalize length.
+			}
+
+			// Prepare a DSS continuation header for next DSS.
+			dssLengthLocation = offset;
+			bytes[offset++] = (byte) (0xff);
+			bytes[offset++] = (byte) (0xff);
+			newBytesToRead = Math.min (leftToRead,32765);
+			isContinuationDss = true;
+  		}
+		else {
+		// we're done writing the data, so end the DSS.
+			endDss();
+		}
+
+		return newBytesToRead;
+
+	}
+
+  // the offset must not be updated when an error is encountered
+  // note valid data may be overwritten
+  protected void padScalarStreamForError (int leftToRead, int bytesToRead) throws DRDAProtocolException
+  {
+    do {
+      do {
+        bytes[offset++] = (byte)(0x0); // use 0x0 as the padding byte
+        bytesToRead--;
+        leftToRead--;
+      } while (bytesToRead > 0);
+
+      bytesToRead = flushScalarStreamSegment (leftToRead, bytesToRead);
+    } while(leftToRead > 0);
+  }
+
+
+
+	private void writeExtendedLengthBytes (int extendedLengthByteCount, long length)
+	{
+	int shiftSize = (extendedLengthByteCount -1) * 8;
+    for (int i = 0; i < extendedLengthByteCount; i++) {
+      bytes[offset + i] = (byte) ((length >>> shiftSize) & 0xff);
+      shiftSize -= 8;
+    }
+	offset += extendedLengthByteCount;
+  }
+
+
+  // insert a 4 byte length/codepoint pair into the buffer.
+  // total of 4 bytes inserted in buffer.
+  // Note: the length value inserted in the buffer is the same as the value
+  // passed in as an argument (this value is NOT incremented by 4 before being
+  // inserted).
+  void writeLengthCodePoint (int length, int codePoint)
+  {
+    ensureLength (4);
+    bytes[offset] = (byte) ((length >>> 8) & 0xff);
+    bytes[offset + 1] = (byte) (length & 0xff);
+    bytes[offset + 2] = (byte) ((codePoint >>> 8) & 0xff);
+    bytes[offset + 3] = (byte) (codePoint & 0xff);
+	offset +=4;
+  }
+
+	/**
+	 * Write scalar object header includes length and codepoint
+	 *
+	 * @param 	codePoint - code point to write
+	 * @param	dataLength - length of object data
+	 */
+	protected void writeScalarHeader (int codePoint, int dataLength)
+	{
+		ensureLength (dataLength + 4);
+		bytes[offset] = (byte) (((dataLength+4) >>> 8) & 0xff);
+		bytes[offset + 1] = (byte) ((dataLength+4) & 0xff);
+		bytes[offset + 2] = (byte) ((codePoint >>> 8) & 0xff);
+		bytes[offset + 3] = (byte) (codePoint & 0xff);
+		offset += 4;
+	}
+
+	/**
+	 * Write scalar string object includes length, codepoint and value
+	 * the string is converted into the appropriate codeset (EBCDIC)
+	 *
+	 * @param 	codePoint - code point to write
+	 * @param	string - string to be written
+	 */
+	void writeScalarString (int codePoint, String string)
+	{
+		int stringLength = string.length();
+		ensureLength ((stringLength * 2)  + 4);
+		bytes[offset] = (byte) (((stringLength+4) >>> 8) & 0xff);
+		bytes[offset + 1] = (byte) ((stringLength+4) & 0xff);
+		bytes[offset + 2] = (byte) ((codePoint >>> 8) & 0xff);
+		bytes[offset + 3] = (byte) (codePoint & 0xff);
+		offset = ccsidManager.convertFromUCS2 (string, bytes, offset + 4);
+	}
+
+	/**
+	 * Write padded scalar string object includes length, codepoint and value
+	 * the string is converted into the appropriate codeset (EBCDIC)
+	 *
+	 * @param 	codePoint - code point to write
+	 * @param	string - string to be written
+	 * @param 	paddedLength - length to pad string to
+	 */
+	void writeScalarPaddedString (int codePoint, String string, int paddedLength)
+	{
+		int stringLength = string.length();
+		int fillLength = paddedLength - stringLength;
+		ensureLength (paddedLength + 4);
+		bytes[offset] = (byte) (((paddedLength+4) >>> 8) & 0xff);
+		bytes[offset + 1] = (byte) ((paddedLength+4) & 0xff);
+		bytes[offset + 2] = (byte) ((codePoint >>> 8) & 0xff);
+		bytes[offset + 3] = (byte) (codePoint & 0xff);
+		offset = ccsidManager.convertFromUCS2 (string, bytes, offset + 4);
+		Arrays.fill(bytes,offset, offset + fillLength,ccsidManager.space);
+		offset += fillLength;
+	}
+
+	/**
+	 * Write padded scalar string object value
+	 * the string is converted into the appropriate codeset (EBCDIC)
+	 *
+	 * @param	string - string to be written
+	 * @param 	paddedLength - length to pad string to
+	 */
+	protected void writeScalarPaddedString (String string, int paddedLength)
+	{
+		int stringLength = string.length();
+
+		int fillLength = paddedLength -stringLength;
+		ensureLength (paddedLength);
+		offset = ccsidManager.convertFromUCS2 (string, bytes, offset);
+		Arrays.fill(bytes,offset, offset + fillLength,ccsidManager.space);
+		offset += fillLength;
+	}
+
+	/**
+	 * Write padded scalar <code>DRDAString</code> object value. The
+	 * string is converted into the appropriate codeset.
+	 *
+	 * @param drdaString string to be written
+	 * @param paddedLength length to pad string to
+	 */
+	protected void writeScalarPaddedString (DRDAString drdaString, int paddedLength)
+	{
+		int stringLength = drdaString.length();
+		int fillLength = paddedLength - stringLength;
+		ensureLength(paddedLength);
+		System.arraycopy(drdaString.getBytes(), 0, bytes, offset, stringLength);
+		offset += stringLength;
+		Arrays.fill(bytes, offset, offset + fillLength, ccsidManager.space);
+		offset += fillLength;
+	}
+
+	/**
+	 * Write padded scalar byte array object includes length, codepoint and value
+	 *
+	 * @param 	codePoint - code point to write
+	 * @param	buf - byte array to be written
+	 * @param 	paddedLength - length to pad string to
+	 * @param	padByte - byte to be used for padding
+	 */
+	protected void writeScalarPaddedBytes (int codePoint, byte[] buf, int paddedLength, byte padByte)
+	{
+		int bufLength = buf.length;
+		ensureLength (paddedLength + 4);
+		bytes[offset] = (byte) (((paddedLength+4) >>> 8) & 0xff);
+		bytes[offset + 1] = (byte) ((paddedLength+4) & 0xff);
+		bytes[offset + 2] = (byte) ((codePoint >>> 8) & 0xff);
+		bytes[offset + 3] = (byte) (codePoint & 0xff);
+		offset += 4;
+		System.arraycopy(buf,0,bytes,offset,bufLength);
+		offset += bufLength;
+		int fillLength = paddedLength - bufLength;
+		Arrays.fill(bytes,offset,offset + fillLength,padByte);
+		offset += fillLength;
+	}
+
+	/**
+	 * Write padded scalar byte array object  value
+	 *
+	 * @param	buf - byte array to be written
+	 * @param 	paddedLength - length to pad string to
+	 * @param	padByte - byte to be used for padding
+	 */
+	protected void writeScalarPaddedBytes (byte[] buf, int paddedLength, byte padByte)
+	{
+		int bufLength = buf.length;
+		int fillLength = paddedLength - bufLength;
+		ensureLength (paddedLength);
+		System.arraycopy(buf,0,bytes,offset,bufLength);
+		offset +=bufLength;
+		Arrays.fill(bytes,offset,offset + fillLength,padByte);
+		offset += fillLength;
+	}
+
+	/**
+	 * Write scalar byte array object includes length, codepoint and value
+	 *
+	 * @param 	codePoint - code point to write
+	 * @param	buf - byte array to be written
+	 */
+	protected void writeScalarBytes (int codePoint, byte[] buf)
+	{
+		int bufLength = buf.length;
+		ensureLength (bufLength + 4);
+		bytes[offset] = (byte) (((bufLength+4) >>> 8) & 0xff);
+		bytes[offset + 1] = (byte) ((bufLength+4) & 0xff);
+		bytes[offset + 2] = (byte) ((codePoint >>> 8) & 0xff);
+		bytes[offset + 3] = (byte) (codePoint & 0xff);
+		System.arraycopy(buf,0,bytes,offset + 4,bufLength);
+		offset += bufLength + 4;
+	}
+
+	/**
+	 * Write scalar byte array object includes length, codepoint and value
+	 *
+	 * @param 	codePoint - code point to write
+	 * @param	buf - byte array to be written
+	 * @param	start - starting point
+	 * @param 	length - length to write
+	 */
+	protected void writeScalarBytes (int codePoint, byte[] buf, int start, int length)
+	{
+		if (SanityManager.DEBUG)
+		{
+			if (buf == null && length > start)
+		    	SanityManager.THROWASSERT("Buf is null");
+			if (length - start > buf.length)
+				SanityManager.THROWASSERT("Not enough bytes in buffer");
+		}
+		int numBytes = length - start;
+		ensureLength (numBytes + 4);
+		bytes[offset] = (byte) (((numBytes+4) >>> 8) & 0xff);
+		bytes[offset + 1] = (byte) ((numBytes+4) & 0xff);
+		bytes[offset + 2] = (byte) ((codePoint >>> 8) & 0xff);
+		bytes[offset + 3] = (byte) (codePoint & 0xff);
+		offset += 4;
+		System.arraycopy(buf,start,bytes,offset,numBytes);
+		offset += numBytes;
+	}
+	// The following methods write data in the platform format
+	// The platform format was indicated during connection time as ASC since
+	// JCC doesn't read JVM platform (yet)
+
+	/**
+	 * Write platform short
+	 *
+	 * @param 	v	value to be written
+	 */
+	protected void writeShort (int v)
+	{
+		writeNetworkShort(v);
+	}
+
+	/**
+	 * Write boolean as short
+	 * @param b boolean value true = 1 false = 0
+	 *
+	 */
+	protected void writeShort(boolean b)
+	{
+		writeNetworkShort(b ? 1 : 0);
+	}
+
+	/**
+	 * Write platform int
+	 *
+	 * @param 	v	value to be written
+	 */
+	protected void writeInt (int v)
+	{
+		writeNetworkInt(v);
+	}
+
+	/**
+	 * Write platform long
+	 *
+	 * @param 	v	value to be written
+	 */
+	protected void writeLong (long v)
+	{
+		ensureLength (8);
+		bytes[offset] =	(byte) ((v >>> 56) & 0xff);
+		bytes[offset + 1] =	(byte) ((v >>> 48) & 0xff);
+		bytes[offset + 2] =	(byte) ((v >>> 40) & 0xff);
+		bytes[offset + 3] =	(byte) ((v >>> 32) & 0xff);
+		bytes[offset + 4] =	(byte) ((v >>> 24) & 0xff);
+		bytes[offset + 5] =	(byte) ((v >>> 16) & 0xff);
+		bytes[offset + 6] =	(byte) ((v >>>  8) & 0xff);
+		bytes[offset + 7] =	(byte) ((v >>>  0) & 0xff);
+		offset += 8;
+	}
+
+	/**
+	 * Write platform float
+	 *
+	 * @param 	v	value to be written
+	 */
+	protected void writeFloat (float v)
+	{
+		writeInt (Float.floatToIntBits (v));
+	}
+
+	/**
+	 * Write platform double
+	 *
+	 * @param 	v	value to be written
+	 */
+	protected void writeDouble (double v)
+	{
+		writeLong (Double.doubleToLongBits (v));
+	}
+
+	/**
+	 * Write big decimal to buffer
+	 *
+	 * @param v value to write
+	 * @param precision Precison of decimal or numeric type
+	 * @param scale declared scale
+	 * @exception SQLException thrown if number of digits > 31
+	 */
+	protected void writeBigDecimal (java.math.BigDecimal v, int precision, int scale)
+		throws SQLException
+	{
+		int length = precision / 2 + 1;
+		ensureLength (offset + length);
+		bigDecimalToPackedDecimalBytes (v,precision, scale);
+		offset += length;
+	}
+
+	/**
+	 * Write platform boolean
+	 *
+	 * @param 	v	value to be written
+	 */
+	protected void writeBoolean (boolean v)
+	{
+		ensureLength (1);
+		bytes[offset++] = (byte) ((v ? 1 : 0) & 0xff);
+	}
+
+	/**
+	 * Write length delimited string
+	 *
+	 * @param s value to be written with integer
+	 *
+	 * @exception DRDAProtocolException
+	 */
+	protected void writeLDString(String s) throws DRDAProtocolException
+	{
+		writeLDString(s,0);
+	}
+
+
+	/**
+	 * Write length delimited string
+	 *
+	 * @param s              value to be written with integer
+	 * @param index          column index to put in warning
+	 * @exception DRDAProtocolException
+	 */
+	protected void writeLDString(String s, int index) throws DRDAProtocolException
+	{
+		try {
+			byte [] byteval = s.getBytes(NetworkServerControlImpl.DEFAULT_ENCODING);
+			int origLen = byteval.length;
+			boolean multiByteTrunc = false;
+			int writeLen =
+				java.lang.Math.min(FdocaConstants.LONGVARCHAR_MAX_LEN,
+								   origLen);
+			/*
+			Need to make sure we truncate on character boundaries.
+			We are assuming
+			http://www.sun.com/developers/gadc/technicalpublications/articles/utf8.html
+			To find the beginning of a multibyte character:
+			1) Does the current byte start with the bit pattern 10xxxxxx?
+			2) If yes, move left and go to step #1.
+			3) Finished
+			We assume that NetworkServerControlImpl.DEFAULT_ENCODING remains UTF-8
+			*/
+
+			if (SanityManager.DEBUG)
+			{
+				if (!(NetworkServerControlImpl.DEFAULT_ENCODING.equals("UTF8")))
+					SanityManager.THROWASSERT("Encoding assumed to be UTF8, but is actually" + NetworkServerControlImpl.DEFAULT_ENCODING);
+			}
+
+			if (writeLen != origLen)
+				// first position on the first byte of the multibyte char
+				while ((byteval[writeLen -1] & 0xC0) == 0x80)
+				{
+					multiByteTrunc = true;
+					writeLen--;
+					// Then subtract one more to get to the end of the
+					// previous character
+					if (multiByteTrunc == true)
+					{
+						writeLen = writeLen -1;
+					}
+				}
+
+			writeShort(writeLen);
+			writeBytes(byteval,writeLen);
+		}
+		catch (Exception e) {
+			//this should never happen
+			agent.agentError("Encoding " + NetworkServerControlImpl.DEFAULT_ENCODING + " not supported");
+		}
+	}
+
+	/**
+	 * Write string with default encoding
+	 *
+	 * @param s value to be written
+	 *
+	 * @exception DRDAProtocolException
+	 */
+	protected void writeString(String s) throws DRDAProtocolException
+	{
+		try {
+			writeBytes(s.getBytes(NetworkServerControlImpl.DEFAULT_ENCODING));
+		} catch (Exception e) {
+			//this should never happen
+			agent.agentError("Encoding " + NetworkServerControlImpl.DEFAULT_ENCODING + " not supported");
+		}
+	}
+
+	/**
+	 * Write string with default encoding and specified length
+	 *
+	 * @param s value to be written
+	 * @param length number of bytes to be written
+	 *
+	 * @exception DRDAProtocolException
+	 */
+	protected void writeString(String s, int length) throws DRDAProtocolException
+	{
+		byte[] bs = null;
+		try {
+			bs = s.getBytes(NetworkServerControlImpl.DEFAULT_ENCODING);
+		} catch (Exception e) {
+			//this should never happen
+			agent.agentError("Encoding " + NetworkServerControlImpl.DEFAULT_ENCODING + " not supported");
+		}
+		int len = bs.length;
+		if (len >= length)
+			writeBytes(bs, length);
+		else
+		{
+			writeBytes(bs);
+			padBytes(NetworkServerControlImpl.SPACE_CHAR, length-len);
+		}
+	}
+
+	/**
+	 * Write pad bytes using spaceChar
+	 *
+	 * @param   val	value to be written
+	 * @param	length		length to be written
+	 */
+	protected void padBytes (byte val, int length)
+	{
+		Arrays.fill(bytes,offset, offset + length,val);
+		offset += length;
+	}
+
+	/**
+	 * Flush buffer to outputstream
+	 *
+	 *
+	 * @exception IOException
+	 */
+	protected void flush () throws java.io.IOException
+	{
+		flush(agent.getOutputStream());
+	}
+
+	/**
+	 * Flush buffer to specified stream
+	 *
+	 * @param socketOutputStream
+	 *
+	 * @exception IOException
+	 */
+	protected void flush(OutputStream socketOutputStream)
+		throws java.io.IOException
+	{
+		try {
+			socketOutputStream.write (bytes, 0, offset);
+			socketOutputStream.flush();
+		}
+		finally {
+			if ((dssTrace != null) && dssTrace.isComBufferTraceOn()) {
+			  dssTrace.writeComBufferData (bytes,
+			                               0,
+			                               offset,
+			                               DssTrace.TYPE_TRACE_SEND,
+			                               "Reply",
+			                               "flush",
+			                               5);
+			}
+			reset(dssTrace);
+		}
+	}
+
+	// private methods
+
+	/**
+	 * Write DSS header
+	 * DSS Header format is
+	 * 	2 bytes	- length
+	 *	1 byte	- 'D0'	- indicates DDM data
+	 * 	1 byte	- DSS format
+	 *		|---|---------|----------|
+	 *		| 0	|	flags |	type     |
+	 *		|---|---------|----------|
+	 *		| 0 | 1	2	3 | 4 5 6 7	 |
+	 *		|---|---------|----------|
+	 *		bit 0 - '0'
+	 *		bit 1 - '0' - unchained, '1' - chained
+	 *		bit 2 - '0'	- do not continue on error, '1' - continue on error
+	 *		bit 3 - '0' - next DSS has different correlator, '1' - next DSS has
+	 *						same correlator
+	 *		type - 1 - Request DSS
+	 *			 - 2 - Reply DSS
+	 *			 - 3 - Object DSS
+	 *			 - 4 - Communications DSS
+	 *			 - 5 - Request DSS where no reply is expected
+	 */
+	private void beginDss (int dssType, boolean ensureLen)
+	{
+
+		// save length position, the length will be written at the end
+		dssLengthLocation = offset;
+
+		// Should this really only be for non-stream DSSes?
+		if (ensureLen)
+			ensureLength(6);
+
+		// Skip past length; we'll come back and set it later.
+		offset += 2;
+
+		// write gds info
+		bytes[offset] = (byte) 0xD0;
+
+		// Write DSS type, and default chain bit to be 
+		// DssConstants.DSSCHAIN_SAME_ID.  This default
+		// will be overridden by calls to "finalizeChain()"
+		// and/or calls to "beginDss(boolean, int)" for
+		// writing LOB data.
+		bytes[offset + 1] = (byte) dssType;
+		bytes[offset + 1] |= DssConstants.DSSCHAIN_SAME_ID;
+
+		// save correlationID for use in error messages while processing
+		// this DSS
+		correlationID = getCorrelationID();
+
+		// write the reply correlation id
+		bytes[offset + 2] = (byte) ((correlationID >>> 8) & 0xff);
+		bytes[offset + 3] = (byte) (correlationID & 0xff);
+		offset += 4;
+	}
+
+	/**
+     * Finish a DSS Layer A object.
+	 * The length of dss object will be calculated based on the difference between the
+	 * start of the dss, saved on the beginDss call, and the current
+	 * offset into the buffer which marks the end of the data.	In the event
+	 * the length requires the use of continuation Dss headers, one for each 32k
+	 * chunk of data, the data will be shifted and the continuation headers
+	 * will be inserted with the correct values as needed.
+	 */
+	private void finalizeDssLength ()
+	{
+		// calculate the total size of the dss and the number of bytes which would
+		// require continuation dss headers.	The total length already includes the
+		// the 6 byte dss header located at the beginning of the dss.	It does not
+		// include the length of any continuation headers.
+		int totalSize = offset - dssLengthLocation;
+		int bytesRequiringContDssHeader = totalSize - DssConstants.MAX_DSS_LENGTH;
+
+		// determine if continuation headers are needed
+		if (bytesRequiringContDssHeader > 0)
+		{
+			// the continuation headers are needed, so calculate how many.
+			// after the first 32767 worth of data, a continuation header is
+			// needed for every 32765 bytes (32765 bytes of data + 2 bytes of
+			// continuation header = 32767 Dss Max Size).
+			int contDssHeaderCount = bytesRequiringContDssHeader / 32765;
+			if (bytesRequiringContDssHeader % 32765 != 0)
+				contDssHeaderCount++;
+
+			// right now the code will shift to the right.	In the future we may want
+			// to try something fancier to help reduce the copying (maybe keep
+			// space in the beginning of the buffer??).
+			// the offset points to the next available offset in the buffer to place
+			// a piece of data, so the last dataByte is at offset -1.
+			// various bytes will need to be shifted by different amounts
+			// depending on how many dss headers to insert so the amount to shift
+			// will be calculated and adjusted as needed.	ensure there is enough room
+			// for all the conutinuation headers and adjust the offset to point to the
+			// new end of the data.
+			int dataByte = offset - 1;
+			int shiftSize = contDssHeaderCount * 2;
+			ensureLength (shiftSize);
+			offset += shiftSize;
+
+			// Notes on the behavior of the Layer B segmenting loop below:
+			//
+			// We start with the right most chunk. For a 3-segment object we'd
+			// shift 2 segments: shift the first (rightmost) one 4 bytes and 
+			// the second one 2. Note that by 'first' we mean 'first time
+			// through the loop', but that is actually the last segment
+			// of data since we are moving right-to-left. For an object
+			// of K segments we will pass through this loop K-1 times.
+			// The 0th (leftmost) segment is not shifted, as it is
+			// already in the right place. When we are done, we will
+			// have made room in each segment for an additional
+			// 2 bytes for the continuation header. Thus, each
+			// segment K is shifted K*2 bytes to the right.
+			//
+			// Each time through the loop, "dataByte" points to the
+			// last byte in the segment; "dataToShift" is the amount of
+			// data that we need to shift, and "shiftSize" is the
+			// distance that we need to shift it. Since dataByte points
+			// at the last byte, not one byte beyond it (as with the
+			// "offset" variable used elsewhere in DDMWriter), the start
+			// of the segement is actually at (dataByte-dataToShift+1).
+			//
+			// After we have shifted the segment, we move back to the
+			// start of the segment and set the value of the 2-byte DSS
+			// continuation header, which needs to hold the length of
+			// this segment's data, together with the continuation flag
+			// if this is not the rightmost (passOne) segment.
+			//
+			// In general, each segment except the rightmost will contain
+			// 32765 bytes of data, plus the 2-byte header, and its
+			// continuation flag will be set, so the header value will
+			// be 0xFFFF. The rightmost segment will not have the
+			// continuation flag set, so its value may be anything from
+			// 0x0001 to 0x7FFF, depending on the amount of data in that
+			// segment.
+			//
+			// Note that the 0th (leftmost) segment also has a 2-byte
+			// DSS header, which needs to have its continuation flag set.
+			// This is done by resetting the "totalSize" variable below,
+			// at which point that variable no longer holds the total size
+			// of the object, but rather just the length of segment 0. The
+			// total size of the object was written using extended length
+			// bytes by the endDdm() method earlier.
+			//
+			// Additional information about this routine is available in the
+			// bug notes for DERBY-125:
+			// http://issues.apache.org/jira/browse/DERBY-125
+			
+			// mark passOne to help with calculating the length of the final (first or
+			// rightmost) continuation header.
+			boolean passOne = true;
+			do {
+				// calculate chunk of data to shift
+				int dataToShift = bytesRequiringContDssHeader % 32765;
+				if (dataToShift == 0)
+					dataToShift = 32765;
+				int startOfCopyData = dataByte - dataToShift + 1;
+				System.arraycopy(bytes,startOfCopyData, bytes, 
+								 startOfCopyData + shiftSize, dataToShift);
+				dataByte -= dataToShift;
+
+
+				// calculate the value the value of the 2 byte continuation dss
+				// header which includes the length of itself.  On the first pass,
+				// if the length is 32767
+				// we do not want to set the continuation dss header flag.
+				int twoByteContDssHeader = dataToShift + 2;
+				if (passOne)
+					passOne = false;
+				else
+				{
+					if (twoByteContDssHeader == DssConstants.MAX_DSS_LENGTH)
+					twoByteContDssHeader = (twoByteContDssHeader |
+						DssConstants.CONTINUATION_BIT);
+
+				}
+
+				// insert the header's length bytes
+				bytes[dataByte + shiftSize - 1] = (byte)
+					((twoByteContDssHeader >>> 8) & 0xff);
+				bytes[dataByte + shiftSize] = (byte)
+					(twoByteContDssHeader & 0xff);
+
+				// adjust the bytesRequiringContDssHeader and the amount to shift for
+				// data in upstream headers.
+				bytesRequiringContDssHeader -= dataToShift;
+				shiftSize -= 2;
+
+				// shift and insert another header for more data.
+			}
+			while (bytesRequiringContDssHeader > 0);
+
+			// set the continuation dss header flag on for the first header
+			totalSize = (DssConstants.MAX_DSS_LENGTH |
+					DssConstants.CONTINUATION_BIT);
+
+
+		}
+
+		// insert the length bytes in the 6 byte dss header.
+		bytes[dssLengthLocation] = (byte) ((totalSize >>> 8) & 0xff);
+		bytes[dssLengthLocation + 1] = (byte) (totalSize & 0xff);
+	}
+
+	protected void writeExtendedLength(long size)
+	{
+		int numbytes = calculateExtendedLengthByteCount(size);
+		if (size > 0)
+			writeInt(0x8000 | numbytes);
+		else
+			writeInt(numbytes);
+	}
+
+
+	/**
+	 * Calculate extended length byte count which follows the DSS header
+	 * for extended DDM.
+	 *
+	 * @param ddmSize - size of DDM command
+	 * @return minimum number of extended length bytes needed. 0 indicates no
+	 * 	extended length needed.
+	 */
+	private int calculateExtendedLengthByteCount (long ddmSize)
+	{
+		if (ddmSize <= 0x7fff)
+			return 0;
+		// JCC does not support 2 at this time, so we always send
+		// at least 4
+		//		else if (ddmSize <= 0xffff)
+		//	return 2;
+		else if (ddmSize <= 0xffffffffL)
+			return 4;
+		else if (ddmSize <= 0xffffffffffffL)
+			return 6;
+		else if (ddmSize <= 0x7fffffffffffffffL)
+			return 8;
+		else
+			// shouldn't happen
+			// XXX - add sanity debug stuff here
+			return 0;
+	}
+
+	/**
+	 * Ensure that there is space in the buffer
+	 *
+	 * @param length space required
+	 */
+	private void ensureLength (int length)
+	{
+		length += offset;
+		if (length > bytes.length) {
+			if (SanityManager.DEBUG)
+			{
+				agent.trace("DANGER - Expensive expansion of  buffer");
+			}
+			byte newBytes[] = new byte[Math.max (bytes.length << 1, length)];
+			System.arraycopy (bytes, 0, newBytes, 0, offset);
+			bytes = newBytes;
+		}
+	}
+
+
+	/**
+	 * Write a Java <code>java.math.BigDecimal</code> to packed decimal bytes.
+	 *
+	 * @param b BigDecimal to write
+	 * @param precision Precision of decimal or numeric type
+	 * @return length written.
+	 *
+	 * @exception SQLException Thrown if # digits > 31
+	 */
+	private int bigDecimalToPackedDecimalBytes (java.math.BigDecimal b,
+												int precision, int scale)
+	throws SQLException
+	{
+		int declaredPrecision = precision;
+		int declaredScale = scale;
+
+		// packed decimal may only be up to 31 digits.
+		if (declaredPrecision > 31) // this is a bugcheck only !!!
+		{
+			clearDdm ();
+			throw new java.sql.SQLException ("Packed decimal may only be up to 31 digits!");
+		}
+
+		// get absolute unscaled value of the BigDecimal as a String.
+		String unscaledStr = b.unscaledValue().abs().toString();
+
+		// get precision of the BigDecimal.
+  	    int bigPrecision = unscaledStr.length();
+
+		if (bigPrecision > 31)
+		{
+			clearDdm ();
+  		    throw new SQLException ("The numeric literal \"" +
+                             b.toString() +
+                             "\" is not valid because its value is out of range.",
+                             "42820",
+                             -405);
+		}
+    	int bigScale = b.scale();
+  	    int bigWholeIntegerLength = bigPrecision - bigScale;
+	    if ( (bigWholeIntegerLength > 0) && (!unscaledStr.equals ("0")) ) {
+            // if whole integer part exists, check if overflow.
+            int declaredWholeIntegerLength = declaredPrecision - declaredScale;
+            if (bigWholeIntegerLength > declaredWholeIntegerLength)
+			{
+				clearDdm ();
+                throw new SQLException ("Overflow occurred during numeric data type conversion of \"" +
+                                       b.toString() +
+                                       "\".",
+                                       "22003",
+                                       -413);
+			}
         }
-    }
 
-    // ---------------------------- getServerMessageTextOnGetMessage -----------------------------------
-    //
-    protected boolean retrieveMessageText = propertyDefault_retrieveMessageText;
-    public final static boolean propertyDefault_retrieveMessageText = true;
-    public final static String propertyKey_retrieveMessageText = "retrieveMessageText";
+        // convert the unscaled value to a packed decimal bytes.
 
+        // get unicode '0' value.
+        int zeroBase = '0';
 
-    public static boolean getRetrieveMessageText(Properties properties) {
-        String retrieveMessageTextString = properties.getProperty(propertyKey_retrieveMessageText);
-        return parseBoolean(retrieveMessageTextString, propertyDefault_retrieveMessageText);
-    }
+        // start index in target packed decimal.
+        int packedIndex = declaredPrecision-1;
 
-    // ---------------------------- traceFile -----------------------------------
-    //
-    protected String traceFile;
-    public final static String propertyKey_traceFile = "traceFile";
+        // start index in source big decimal.
+        int bigIndex;
 
-    public static String getTraceFile(Properties properties) {
-        return properties.getProperty(propertyKey_traceFile);
-    }
+        if (bigScale >= declaredScale) {
+          // If target scale is less than source scale,
+          // discard excessive fraction.
 
-    // ---------------------------- traceDirectory -----------------------------------
-    // For the suffix of the trace file when traceDirectory is enabled.
-    private transient int traceFileSuffixIndex_ = 0;
-    //
-    protected String traceDirectory;
-    public final static String propertyKey_traceDirectory = "traceDirectory";
+          // set start index in source big decimal to ignore excessive fraction.
+          bigIndex = bigPrecision-1-(bigScale-declaredScale);
 
-    public static String getTraceDirectory(Properties properties) {
-        return properties.getProperty(propertyKey_traceDirectory);
-    }
-
-    // ---------------------------- traceFileAppend -----------------------------------
-    //
-    protected boolean traceFileAppend = propertyDefault_traceFileAppend;
-    public final static boolean propertyDefault_traceFileAppend = false;
-    public final static String propertyKey_traceFileAppend = "traceFileAppend";
-
-    public static boolean getTraceFileAppend(Properties properties) {
-        String traceFileAppendString = properties.getProperty(propertyKey_traceFileAppend);
-        return parseBoolean(traceFileAppendString, propertyDefault_traceFileAppend);
-    }
-
-    // ---------------------------- password -----------------------------------
-    //
-    // The password property is defined in subclasses, but the method
-    // getPassword (java.util.Properties properties) is in this class to eliminate
-    // dependencies on j2ee for connections that go thru the driver manager.
-    public final static String propertyKey_password = "password";
-
-    public static String getPassword(Properties properties) {
-        return properties.getProperty("password");
-    }
-
-    protected String password;
-
-    synchronized public final void setPassword(String password) {
-        this.password = password;
-    }
-    
-    public final String getPassword() {
-    	return password;
-    }
-
-    //------------------------ interface methods ---------------------------------
-
-    public Reference getReference() throws NamingException {
-        // This method creates a new Reference object to represent this data source.
-        // The class name of the data source object is saved in the Reference,
-        // so that an object factory will know that it should create an instance
-        // of that class when a lookup operation is performed. The class
-        // name of the object factory, org.apache.derby.client.ClientBaseDataSourceFactory,
-        // is also stored in the reference.
-        // This is not required by JNDI, but is recommend in practice.
-        // JNDI will always use the object factory class specified in the reference when
-        // reconstructing an object, if a class name has been specified.
-        // See the JNDI SPI documentation
-        // for further details on this topic, and for a complete description of the Reference
-        // and StringRefAddr classes.
-        //
-        // This ClientBaseDataSource class provides several standard JDBC properties.
-        // The names and values of the data source properties are also stored
-        // in the reference using the StringRefAddr class.
-        // This is all the information needed to reconstruct a ClientBaseDataSource object.
-
-        Reference ref = new Reference(this.getClass().getName(), ClientDataSourceFactory.class.getName(), null);
-
-        Class clz = getClass();
-        Field[] fields = clz.getFields();
-        for (int i = 0; i < fields.length; i++) {
-            String name = fields[i].getName();
-            if (name.startsWith("propertyKey_")) {
-                if (Modifier.isTransient(fields[i].getModifiers())) {
-                    continue; // if it is transient, then skip this propertyKey.
-                }
-                try {
-                    String propertyKey = fields[i].get(this).toString();
-                    // search for property field.
-                    Field propertyField;
-                    clz = getClass(); // start from current class.
-                    while (true) {
-                        try {
-                            propertyField = clz.getDeclaredField(name.substring(12));
-                            break; // found the property field, so break the while loop.
-                        } catch (NoSuchFieldException nsfe) {
-                            // property field is not found at current level of class, so continue to super class.
-                            clz = clz.getSuperclass();
-                            if (clz == Object.class) {
-                                throw new NamingException("bug check: corresponding property field does not exist");
-                            }
-                            continue;
-                        }
-                    }
-
-                    if (!Modifier.isTransient(propertyField.getModifiers())) {
-                        // if the property is not transient:
-                        // get the property.
-                        AccessController.doPrivileged(new SetAccessibleAction(propertyField, true));
-                        //propertyField.setAccessible (true);
-                        Object propertyObj = propertyField.get(this);
-                        String property = (propertyObj == null) ? null : String.valueOf(propertyObj);
-                        // add into reference.
-                        ref.add(new StringRefAddr(propertyKey, property));
-                    }
-                } catch (IllegalAccessException e) {
-                    throw new NamingException("bug check: property cannot be accessed");
-                } catch (PrivilegedActionException e) {
-                    throw new NamingException("Privileged action exception occurred.");
-                }
-            }
+          if (bigIndex < 0) {
+            // all digits are discarded, so only process the sign nybble.
+            bytes[offset+(packedIndex+1)/2] =
+              (byte) ( (b.signum()>=0)?12:13 ); // sign nybble
+          }
+          else {
+            // process the last nybble together with the sign nybble.
+            bytes[offset+(packedIndex+1)/2] =
+              (byte) ( ( (unscaledStr.charAt(bigIndex)-zeroBase) << 4 ) + // last nybble
+                     ( (b.signum()>=0)?12:13 ) ); // sign nybble
+          }
+          packedIndex-=2;
+          bigIndex-=2;
         }
-        return ref;
-    }
+        else {
+          // If target scale is greater than source scale,
+          // pad the fraction with zero.
 
-    /**
-     * Not an external.  Do not document in pubs. Populates member data for this data source given a JNDI reference.
-     */
-    public void hydrateFromReference(Reference ref) throws SQLException {
-    	
-        RefAddr address;
+          // set start index in source big decimal to pad fraction with zero.
+          bigIndex = declaredScale-bigScale-1;
 
-        Class clz = getClass();
-        Field[] fields = clz.getFields();
-        for (int i = 0; i < fields.length; i++) {
-            String name = fields[i].getName();
-            if (name.startsWith("propertyKey_")) {
-                if (Modifier.isTransient(fields[i].getModifiers())) {
-                    continue; // if it is transient, then skip this propertyKey.
-                }
-                try {
-                    String propertyKey = fields[i].get(this).toString();
-                    // search for property field.
-                    Field propertyField;
-                    clz = getClass(); // start from current class.
-                    while (true) {
-                        try {
-                            propertyField = clz.getDeclaredField(name.substring(12));
-                            break; // found the property field, so break the while loop.
-                        } catch (NoSuchFieldException nsfe) {
-                            // property field is not found at current level of class, so continue to super class.
-                            clz = clz.getSuperclass();
-                            if (clz == Object.class) {
-                                throw new SqlException(new LogWriter(logWriter, traceLevel), "bug check: corresponding property field does not exist");
-                            }
-                            continue;
-                        }
-                    }
+          // process the sign nybble.
+          bytes[offset+(packedIndex+1)/2] =
+            (byte) ( (b.signum()>=0)?12:13 ); // sign nybble
 
-                    if (!Modifier.isTransient(propertyField.getModifiers())) {
-                        // if the property is not transient:
-                        // set the property.
-                        address = ref.get(propertyKey);
-                        if (address != null) {
-                            propertyField.setAccessible(true);
-                            String type = propertyField.getType().toString();
-                            if (type.equals("boolean")) {
-                                boolean value = ((String) address.getContent()).equalsIgnoreCase("true");
-                                propertyField.setBoolean(this, value);
-                            } else if (type.equals("byte")) {
-                                byte value = Byte.parseByte((String) address.getContent());
-                                propertyField.setByte(this, value);
-                            } else if (type.equals("short")) {
-                                short value = Short.parseShort((String) address.getContent());
-                                propertyField.setShort(this, value);
-                            } else if (type.equals("int")) {
-                                int value = Integer.parseInt((String) address.getContent());
-                                propertyField.setInt(this, value);
-                            } else if (type.equals("long")) {
-                                long value = Long.parseLong((String) address.getContent());
-                                propertyField.setLong(this, value);
-                            } else if (type.equals("float")) {
-                                float value = Float.parseFloat((String) address.getContent());
-                                propertyField.setFloat(this, value);
-                            } else if (type.equals("double")) {
-                                double value = Double.parseDouble((String) address.getContent());
-                                propertyField.setDouble(this, value);
-                            } else if (type.equals("char")) {
-                                char value = ((String) address.getContent()).charAt(0);
-                                propertyField.setChar(this, value);
-                            } else {
-                                propertyField.set(this, address.getContent());
-                            }
-                        }
-                    }
-                } catch (IllegalAccessException e) {
-                    throw new SqlException(new LogWriter(this.logWriter, this.traceLevel), "bug check: property cannot be accessed");
-                }
-            }
-        }
-    }
+          for (packedIndex-=2, bigIndex-=2; bigIndex>=0; packedIndex-=2, bigIndex-=2)
+            bytes[offset+(packedIndex+1)/2] = (byte) 0;
 
-    // ----------------------supplemental methods---------------------------------
-    /**
-     * Not an external.  Do not document in pubs. Returns all non-transient properties of a ClientBaseDataSource.
-     */
-    public Properties getProperties() throws SQLException {
-        Properties properties = new Properties();
+          if (bigIndex == -1) {
+            bytes[offset+(packedIndex+1)/2] =
+              (byte) ( (unscaledStr.charAt(bigPrecision-1)-zeroBase) << 4 ); // high nybble
 
-        Class clz = getClass();
-        Field[] fields = clz.getFields();
-        for (int i = 0; i < fields.length; i++) {
-            String name = fields[i].getName();
-            if (name.startsWith("propertyKey_")) {
-                if (Modifier.isTransient(fields[i].getModifiers())) {
-                    continue; // if it is transient, then skip this propertyKey.
-                }
-                try {
-                    String propertyKey = fields[i].get(this).toString();
-                    // search for property field.
-                    Field propertyField;
-                    clz = getClass(); // start from current class.
-                    while (true) {
-                        try {
-                            propertyField = clz.getDeclaredField(name.substring(12));
-                            break; // found the property field, so break the while loop.
-                        } catch (NoSuchFieldException nsfe) {
-                            // property field is not found at current level of class, so continue to super class.
-                            clz = clz.getSuperclass();
-                            if (clz == Object.class) {
-                                throw new SqlException(new LogWriter(logWriter, traceLevel), "bug check: corresponding property field does not exist");
-                            }
-                            continue;
-                        }
-                    }
-
-                    if (!Modifier.isTransient(propertyField.getModifiers())) {
-                        // if the property is not transient:
-                        // get the property.
-                        propertyField.setAccessible(true);
-                        Object propertyObj = propertyField.get(this);
-                        String property = String.valueOf(propertyObj); // don't use toString becuase it may be null.
-                        if ("password".equals(propertyKey)) {
-                            StringBuffer sb = new StringBuffer(property);
-                            for (int j = 0; j < property.length(); j++) {
-                                sb.setCharAt(j, '*');
-                            }
-                            property = sb.toString();
-                        }
-                        // add into prperties.
-                        properties.setProperty(propertyKey, property);
-                    }
-                } catch (IllegalAccessException e) {
-                    throw new SqlException(new LogWriter(this.logWriter, this.traceLevel), "bug check: property cannot be accessed");
-                }
-            }
+            packedIndex-=2;
+            bigIndex = bigPrecision-3;
+          }
+          else {
+            bigIndex = bigPrecision-2;
+          }
         }
 
-        return properties;
-    }
-
-    //---------------------- helper methods --------------------------------------
-
-    // The java.io.PrintWriter overrides the traceFile setting.
-    // If neither traceFile nor jdbc logWriter are set, then null is returned.
-    // logWriterInUseSuffix used only for trace directories to indicate whether
-    // log writer is use is from xads, cpds, sds, ds, driver, config, reset.
-    LogWriter computeDncLogWriterForNewConnection(String logWriterInUseSuffix) throws SqlException {
-        return computeDncLogWriterForNewConnection(logWriter, traceDirectory, traceFile, traceFileAppend, traceLevel, logWriterInUseSuffix, traceFileSuffixIndex_++);
-    }
-
-    // Called on for connection requests.
-    // The java.io.PrintWriter overrides the traceFile setting.
-    // If neither traceFile, nor logWriter, nor traceDirectory are set, then null is returned.
-    static LogWriter computeDncLogWriterForNewConnection(PrintWriter logWriter, String traceDirectory, String traceFile, boolean traceFileAppend, int traceLevel, String logWriterInUseSuffix, int traceFileSuffixIndex) throws SqlException {
-        int globaltraceFileSuffixIndex = Configuration.traceFileSuffixIndex__++;
-
-        // compute regular dnc log writer if there is any
-        LogWriter dncLogWriter = computeDncLogWriter(logWriter, traceDirectory, traceFile, traceFileAppend, logWriterInUseSuffix, traceFileSuffixIndex, traceLevel);
-        if (dncLogWriter != null) {
-            return dncLogWriter;
-        }
-        // compute global default dnc log writer if there is any
-        dncLogWriter = computeDncLogWriter(null, Configuration.traceDirectory__, Configuration.traceFile__, Configuration.traceFileAppend__, "_global", globaltraceFileSuffixIndex, Configuration.traceLevel__);
-        return dncLogWriter;
-    }
-
-    // Compute a DNC log writer before a connection is created.
-    static LogWriter computeDncLogWriter(PrintWriter logWriter, String traceDirectory, String traceFile, boolean traceFileAppend, String logWriterInUseSuffix, int traceFileSuffixIndex, int traceLevel) throws SqlException {
-        // Otherwise, the trace file will still be created even TRACE_NONE.
-        if (traceLevel == TRACE_NONE) {
-            return null;
+        // process the rest.
+        for (; bigIndex>=0; packedIndex-=2, bigIndex-=2) {
+          bytes[offset+(packedIndex+1)/2] =
+            (byte) ( ( (unscaledStr.charAt(bigIndex)-zeroBase) << 4 ) + // high nybble
+                   ( unscaledStr.charAt(bigIndex+1)-zeroBase ) ); // low nybble
         }
 
-        PrintWriter printWriter = computePrintWriter(logWriter, traceDirectory, traceFile, traceFileAppend, logWriterInUseSuffix, traceFileSuffixIndex);
-        if (printWriter == null) {
-            return null;
+        // process the first nybble when there is one left.
+        if (bigIndex == -1) {
+          bytes[offset+(packedIndex+1)/2] =
+            (byte) (unscaledStr.charAt(0) - zeroBase);
+
+          packedIndex-=2;
         }
 
-        LogWriter dncLogWriter = new NetLogWriter(printWriter, traceLevel);
-        if (printWriter != logWriter && traceDirectory != null)
-        // When printWriter is an internal trace file and
-        // traceDirectory is not null, each connection has
-        // its own trace file and the trace file is not cached,
-        // so we can close it when DNC log writer is closed.
-        {
-            dncLogWriter.printWriterNeedsToBeClosed_ = true;
-        }
-        return dncLogWriter;
+        // pad zero in front of the big decimal if necessary.
+        for (; packedIndex>=-1; packedIndex-=2)
+          bytes[offset+(packedIndex+1)/2] = (byte) 0;
+
+        return declaredPrecision/2 + 1;
+	}
+
+
+	/***
+	 * Prepend zeros to numeric string
+	 *
+	 * @param s string
+	 * @param precision - length of padded string
+ 	 *
+	 * @return zero padded string
+	 */
+	public static String zeroPadString(String s, int precision)
+	{
+
+		if (s == null)
+			return s;
+
+		int slen = s.length();
+		if (precision == slen)
+			return s;
+		else if (precision > slen)
+		{
+			char[] ca  = new char[precision - slen];
+			Arrays.fill(ca,0,precision - slen,'0');
+			return new String(ca) + s;
+		}
+		else
+		{
+			// Shouldn't happen but just in case 
+			// truncate
+			return s.substring(0,precision);
+		}
+
+	}
+
+
+
+  private void sendBytes (java.io.OutputStream socketOutputStream) throws java.io.IOException
+  {
+	resetChainState();
+    try {
+      socketOutputStream.write (bytes, 0, offset);
+      socketOutputStream.flush();
     }
-
-    // Compute a DNC log writer after a connection is created.
-    // Declared public for use by am.Connection.  Not a public external.
-    public static LogWriter computeDncLogWriter(Connection connection, PrintWriter logWriter, String traceDirectory, String traceFile, boolean traceFileAppend, String logWriterInUseSuffix, int traceFileSuffixIndex, int traceLevel) throws SqlException {
-        // Otherwise, the trace file will still be created even TRACE_NONE.
-        if (traceLevel == TRACE_NONE) {
-            return null;
-        }
-
-        PrintWriter printWriter = computePrintWriter(logWriter, traceDirectory, traceFile, traceFileAppend, logWriterInUseSuffix, traceFileSuffixIndex);
-        if (printWriter == null) {
-            return null;
-        }
-
-        LogWriter dncLogWriter = connection.agent_.newLogWriter_(printWriter, traceLevel);
-        if (printWriter != logWriter && traceDirectory != null)
-        // When printWriter is an internal trace file and
-        // traceDirectory is not null, each connection has
-        // its own trace file and the trace file is not cached,
-        // so we can close it when DNC log writer is closed.
-        {
-            dncLogWriter.printWriterNeedsToBeClosed_ = true;
-        }
-        return dncLogWriter;
+    finally {
+		if ((dssTrace != null) && dssTrace.isComBufferTraceOn()) {
+			dssTrace.writeComBufferData (bytes,
+			                               0,
+			                               offset,
+			                               DssTrace.TYPE_TRACE_SEND,
+			                               "Reply",
+			                               "flush",
+			                               5);
+      }
+      clearBuffer();
     }
-
-    // This method handles all the override semantics.
-    // The logWriter overrides the traceFile, and traceDirectory settings.
-    // If neither traceFile, nor logWriter, nor traceDirectory are set, then null is returned.
-    static PrintWriter computePrintWriter(PrintWriter logWriter, String traceDirectory, String traceFile, boolean traceFileAppend, String logWriterInUseSuffix, int traceFileSuffixIndex) throws SqlException {
-        if (logWriter != null)  // java.io.PrintWriter is specified
-        {
-            return logWriter;
-        } else { // check trace file setting.
-            if (traceDirectory != null) {
-                String fileName;
-                if (traceFile == null) {
-                    fileName = traceDirectory + "/" + logWriterInUseSuffix + "_" + traceFileSuffixIndex;
-                } else {
-                    fileName = traceDirectory + "/" + traceFile + logWriterInUseSuffix + "_" + traceFileSuffixIndex;
-                }
-                return LogWriter.getPrintWriter(fileName, true); // no file append and not enable caching.
-            } else if (traceFile != null) {
-                return LogWriter.getPrintWriter(traceFile, traceFileAppend);
-            }
-        }
-        return null;
-    }
-
-    private static boolean parseBoolean(String boolString, boolean defaultBool) {
-        if (boolString != null) {
-            return (boolString.equalsIgnoreCase("true") || boolString.equalsIgnoreCase("yes"));
-        }
-        return defaultBool;
-    }
-
-    private static String parseString(String string, String defaultString) {
-        if (string != null) {
-            return string;
-        }
-        return defaultString;
-    }
-
-    private static short parseShort(String shortString, short defaultShort) {
-        if (shortString != null) {
-            return Short.parseShort(shortString);
-        }
-        return defaultShort;
-    }
-
-    private static int parseInt(String intString, int defaultInt) {
-        if (intString != null) {
-            return Integer.parseInt(intString);
-        }
-        return defaultInt;
-    }
-
-    // tokenize "property=value;property=value..." and returns new properties object
-    //This method is used both by ClientDriver to parse the url and
-    // ClientDataSource.setConnectionAttributes
-    static Properties tokenizeAttributes(String attributeString, Properties properties) throws SqlException {
-        Properties augmentedProperties;
-
-        if (attributeString == null) {
-            return properties;
-        }
-
-        if (properties != null) {
-            augmentedProperties = (Properties) properties.clone();
-        } else {
-            augmentedProperties = new Properties();
-        }
-        try {
-            StringTokenizer attrTokenizer = new StringTokenizer(attributeString, ";");
-            while (attrTokenizer.hasMoreTokens()) {
-                String v = attrTokenizer.nextToken();
-
-                int eqPos = v.indexOf('=');
-                if (eqPos == -1) {
-                    throw new SqlException(null, "Invalid attribute syntax: " + attributeString);
-                }
-
-                augmentedProperties.setProperty((v.substring(0, eqPos)).trim(), (v.substring(eqPos + 1)).trim());
-            }
-        } catch (NoSuchElementException e) {
-            // A null log writer is passed, because jdbc 1 sqlexceptions are automatically traced
-            throw new SqlException(null, e, "Invalid attribute syntax: " + attributeString);
-        }
-        checkBoolean(augmentedProperties, propertyKey_retrieveMessageText);
-        return augmentedProperties;
-
-    }
-
-    private static void checkBoolean(Properties set, String attribute) throws SqlException {
-        final String[] booleanChoices = {"true", "false"};
-        checkEnumeration(set, attribute, booleanChoices);
-    }
-
-
-    private static void checkEnumeration(Properties set, String attribute, String[] choices) throws SqlException {
-        String value = set.getProperty(attribute);
-        if (value == null) {
-            return;
-        }
-
-        for (int i = 0; i < choices.length; i++) {
-            if (value.toUpperCase(java.util.Locale.ENGLISH).equals(choices[i].toUpperCase(java.util.Locale.ENGLISH))) {
-                return;
-            }
-        }
-
-// The attribute value is invalid. Construct a string giving the choices for
-// display in the error message.
-        String choicesStr = "{";
-        for (int i = 0; i < choices.length; i++) {
-            if (i > 0) {
-                choicesStr += "|";
-            }
-            choicesStr += choices[i];
-        }
-
-        throw new SqlException(null, "JDBC attribute " + attribute +
-                "has an invalid value " + value +
-                " Valid values are " + choicesStr);
-    }
-
-    /*
-     * Properties to be seen by Bean - access thru reflection.
-     */
-
-    // -- Stardard JDBC DataSource Properties
-
-    public synchronized void setDatabaseName(String databaseName) {
-        this.databaseName = databaseName;
-    }
-
-    public String getDatabaseName() {
-        return this.databaseName;
-    }
-
-
-    public synchronized void setDataSourceName(String dataSourceName) {
-        this.dataSourceName = dataSourceName;
-    }
-
-    public String getDataSourceName() {
-        return this.dataSourceName;
-    }
-
-    public synchronized void setDescription(String description) {
-        this.description = description;
-    }
-
-    public String getDescription() {
-        return this.description;
-    }
-
-
-    public synchronized void setPortNumber(int portNumber) {
-        this.portNumber = portNumber;
-    }
-
-    public int getPortNumber() {
-        return this.portNumber;
-    }
-
-    public synchronized void setServerName(String serverName) {
-        this.serverName = serverName;
-    }
-
-    public String getServerName() {
-        return this.serverName;
-    }
-
-
-    public synchronized void setUser(String user) {
-        this.user = user;
-    }
-
-    public String getUser() {
-        return this.user;
-    }
-
-    synchronized public void setRetrieveMessageText(boolean retrieveMessageText) {
-        this.retrieveMessageText = retrieveMessageText;
-    }
-
-    public boolean getRetrieveMessageText() {
-        return this.retrieveMessageText;
-    }
-
-    // ---------------------------- securityMechanism -----------------------------------
-    /**
-     * The source security mechanism to use when connecting to this data source.
-     * <p/>
-     * Security mechanism options are: <ul> <li> USER_ONLY_SECURITY <li> CLEAR_TEXT_PASSWORD_SECURITY <li>
-     * ENCRYPTED_PASSWORD_SECURITY <li> ENCRYPTED_USER_AND_PASSWORD_SECURITY - both password and user are encrypted
-     * </ul> The default security mechanism is USER_ONLY SECURITY
-     * <p/>
-     * If the application specifies a security mechanism then it will be the only one attempted. If the specified
-     * security mechanism is not supported by the conversation then an exception will be thrown and there will be no
-     * additional retries.
-     * <p/>
-     * This property is currently only available for the  DNC driver.
-     * <p/>
-     * Both user and password need to be set for all security mechanism except USER_ONLY_SECURITY
-     */
-    // We use the NET layer constants to avoid a mapping for the NET driver.
-    public final static short USER_ONLY_SECURITY = (short) NetConfiguration.SECMEC_USRIDONL;
-    public final static short CLEAR_TEXT_PASSWORD_SECURITY = (short) NetConfiguration.SECMEC_USRIDPWD;
-    public final static short ENCRYPTED_PASSWORD_SECURITY = (short) NetConfiguration.SECMEC_USRENCPWD;
-    public final static short ENCRYPTED_USER_AND_PASSWORD_SECURITY = (short) NetConfiguration.SECMEC_EUSRIDPWD;
-
-    synchronized public void setSecurityMechanism(short securityMechanism) {
-        this.securityMechanism = securityMechanism;
-    }
-
-    public short getSecurityMechanism() {
-        return getUpgradedSecurityMechanism(securityMechanism, password);
-    }
-
-    protected String connectionAttributes = null;
-
-    /**
-     * Set this property to pass in more Derby specific connection URL attributes.
-     * <BR>
-     * Any attributes that can be set using a property of this DataSource implementation
-     * (e.g user, password) should not be set in connectionAttributes. Conflicting
-     * settings in connectionAttributes and properties of the DataSource will lead to
-     * unexpected behaviour. 
-     *
-     * @param prop set to the list of Cloudscape connection attributes separated by semi-colons.   E.g., to specify an
-     *             encryption bootPassword of "x8hhk2adf", and set upgrade to true, do the following: <PRE>
-     *             ds.setConnectionAttributes("bootPassword=x8hhk2adf;upgrade=true"); </PRE> See Derby documentation for
-     *             complete list.
-     */
-    public final void setConnectionAttributes(String prop) {
-        connectionAttributes = prop;
-    }
-
-    /**
-     * @return Derby specific connection URL attributes
-     */
-    public final String getConnectionAttributes() {
-        return connectionAttributes;
-    }
-
-
-    // ---------------------------- traceLevel -----------------------------------
-    //
-
-    public final static int TRACE_NONE = 0x0;
-    public final static int TRACE_CONNECTION_CALLS = 0x1;
-    public final static int TRACE_STATEMENT_CALLS = 0x2;
-    public final static int TRACE_RESULT_SET_CALLS = 0x4;
-    public final static int TRACE_DRIVER_CONFIGURATION = 0x10;
-    public final static int TRACE_CONNECTS = 0x20;
-    public final static int TRACE_PROTOCOL_FLOWS = 0x40;
-    public final static int TRACE_RESULT_SET_META_DATA = 0x80;
-    public final static int TRACE_PARAMETER_META_DATA = 0x100;
-    public final static int TRACE_DIAGNOSTICS = 0x200;
-    public final static int TRACE_XA_CALLS = 0x800;
-    public final static int TRACE_ALL = 0xFFFFFFFF;
-
-    public final static int propertyDefault_traceLevel = TRACE_ALL;
-    public final static String propertyKey_traceLevel = "traceLevel";
-
-    protected int traceLevel = propertyDefault_traceLevel;
-
-    public static int getTraceLevel(Properties properties) {
-        String traceLevelString = properties.getProperty(propertyKey_traceLevel);
-        return parseInt(traceLevelString, propertyDefault_traceLevel);
-    }
-
-    synchronized public void setTraceLevel(int traceLevel) {
-        this.traceLevel = traceLevel;
-    }
-
-    public int getTraceLevel() {
-        return this.traceLevel;
-    }
-
-
-    public synchronized void setTraceFile(String traceFile) {
-        this.traceFile = traceFile;
-    }
-
-    public String getTraceFile() {
-        return this.traceFile;
-    }
-
-
-    public synchronized void setTraceDirectory(String traceDirectory) {
-        this.traceDirectory = traceDirectory;
-    }
-
-    public String getTraceDirectory() {
-        return this.traceDirectory;
-    }
-
-    synchronized public void setTraceFileAppend(boolean traceFileAppend) {
-        this.traceFileAppend = traceFileAppend;
-    }
-
-    public boolean getTraceFileAppend() {
-        return this.traceFileAppend;
-    }
-
-
-
-
-    // --- private helper methods
-
-
-    /**
-     * The dataSource keeps individual fields for the values that are relevant to the client. These need to be updated
-     * when set connection attributes is called.
-     */
-    void updateDataSourceValues(Properties prop) {
-        if (prop == null) {
-            return;
-        }
-        
-        if (prop.containsKey(propertyKey_user)) {
-            setUser(getUser(prop));
-        }
-        if (prop.containsKey(propertyKey_securityMechanism)) {
-            setSecurityMechanism(getSecurityMechanism(prop));
-        }
-        if (prop.containsKey(propertyKey_traceFile)) {
-            setTraceFile(getTraceFile(prop));
-        }
-        if (prop.containsKey(propertyKey_traceDirectory)) {
-            setTraceDirectory(getTraceDirectory(prop));
-        }
-        if (prop.containsKey(propertyKey_traceFileAppend)) {
-            setTraceFileAppend(getTraceFileAppend(prop));
-        }
-        if (prop.containsKey(propertyKey_securityMechanism)) {
-            setSecurityMechanism(getSecurityMechanism(prop));
-        }
-        if (prop.containsKey(propertyKey_retrieveMessageText)) {
-            setRetrieveMessageText(getRetrieveMessageText(prop));
-        }
-    }
-
+  }
+
+	protected String toDebugString(String indent)
+	{
+		String s = indent + "***** DDMWriter toDebugString ******\n";
+		int byteslen = 0;
+		if ( bytes != null)
+			byteslen = bytes.length;
+		s += indent + "byte array length  = " + bytes.length + "\n";
+		return s;
+	}
+
+	/**
+	 * Reset any chaining state that needs to be reset
+	 * at time of the send
+	 */
+	protected void resetChainState()
+	{
+		prevHdrLocation = -1;
+	}
+
+	/**
+	 * Looks at chaining info for previous DSS written, and use
+	 * that to figure out what the correlation id for the current
+	 * DSS should be.  Return that correlation id.
+	 */
+	private int getCorrelationID() {
+
+		int cId;
+		if (previousCorrId != DssConstants.CORRELATION_ID_UNKNOWN) {
+			if (previousChainByte == DssConstants.DSSCHAIN_SAME_ID)
+			// then we have to use the last correlation id we sent.
+				cId = previousCorrId;
+			else
+			// get correlation id as normal.
+				cId = nextCorrelationID++;
+		}
+		else {
+		// must be the case that this is the first DSS we're
+		// writing for this connection (because we haven't
+		// called "endDss" yet).  So, get the corr id as
+		// normal.
+			cId = nextCorrelationID++;
+		}
+
+		return cId;
+
+	}
+
+	/**
+	 * Finalize the current DSS chain and send it if
+	 * needed.
+	 *
+	 * Updates the chaining state of the most recently-written-
+	 * to-buffer DSS to correspond to the most recently-read-
+	 * from-client request.  If that chaining state indicates
+	 * we've reached the end of a chain, then we go ahead
+	 * and send the buffer across the wire.
+	 * @param socketOutputStream Output stream to which we're flushing.
+	 */
+	protected void finalizeChain(byte currChainByte,
+		OutputStream socketOutputStream) throws DRDAProtocolException
+	{
+
+		// Go back to previous DSS and override the default
+		// chain state (WITH_SAME_ID) with whatever the last
+		// request dictates.
+
+		if (prevHdrLocation != -1) {
+		// Note: == -1 => the previous DSS was already sent; this
+		// should only happen in cases where the buffer filled up
+		// and we had to send it (which means we were probably
+		// writing EXTDTA).  In such cases, proper chaining
+		// should already have been handled @ time of send.
+			bytes[prevHdrLocation + 3] &= 0x0F;	// Zero out old chain value.
+			bytes[prevHdrLocation + 3] |= currChainByte;
+		}
+
+		// previousChainByte needs to match what we just did.
+		previousChainByte = currChainByte;
+
+		if (currChainByte != DssConstants.DSS_NOCHAIN)
+		// then we're still inside a chain, so don't send.
+			return;
+
+		// Else, we just ended the chain, so send it across.
+
+		if ((SanityManager.DEBUG) && (agent != null))
+			agent.trace("Sending data");
+
+		resetChainState();
+		if (doesRequestContainData()) {
+			try {
+				flush(socketOutputStream);
+			} catch (java.io.IOException e) {
+				agent.markCommunicationsFailure(
+					"DDMWriter.finalizeChain()",
+					"OutputStream.flush()",
+					e.getMessage(),"*");
+			}
+		}
+
+	}
+
+	/**
+	 * Takes note of the location of the most recently completed
+	 * DSS in the buffer, and then returns the current offset.
+	 * This method is used in conjunction with "clearDSSesBackToMark"
+	 * to allow for DRDAConnThread to "back-out" DSSes in the
+	 * event of errors.
+	 */
+	protected int markDSSClearPoint()
+	{
+
+		lastDSSBeforeMark = prevHdrLocation;
+		return offset;
+
+	}
+
+	/**
+	 * Does a logical "clear" of everything written to the buffer after
+	 * the received mark.  It's assumed that this method will be used
+	 * in error cases when we've started writing one or more DSSes,
+	 * but then hit an error and need to back out.  After backing out,
+	 * we'll always need to write _something_ back to the client to
+	 * indicate an error (typically, we just write an SQLCARD) but what
+	 * exactly gets written is handled in DRDAConnThread.  Here, we
+	 * just do the necessary prep so that whatever comes next will
+	 * succeed.
+	 */
+	protected void clearDSSesBackToMark(int mark)
+	{
+
+		// Logical clear.
+		offset = mark;
+
+		// Because we've just cleared out the most recently-
+		// written DSSes, we have to make sure the next thing
+		// we write will have the correct correlation id.  We
+		// do this by setting the value of 'nextCorrelationID'
+		// based on the chaining byte from the last remaining
+		// DSS (where "remaining" means that it still exists
+		// in the buffer after the clear).
+		if (lastDSSBeforeMark == -1)
+		// we cleared out the entire buffer; reset corr id.
+			nextCorrelationID = 1;
+		else {
+		// last remaining DSS had chaining, so we set "nextCorrelationID"
+		// to be 1 greater than whatever the last remaining DSS had as
+		// its correlation id.
+ 			nextCorrelationID = 1 + (int)
+				(((bytes[lastDSSBeforeMark + 4] & 0xff) << 8) +
+				(bytes[lastDSSBeforeMark + 5] & 0xff));
+		}
+
+	}
 
 }
-

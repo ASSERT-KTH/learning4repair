@@ -1,8 +1,6 @@
-throw new FileNotFoundException("no segments* file found in " + directory + ": files: " + Arrays.toString(files));
+if (runner == null || scheduler.isTerminated())
 
-package org.apache.lucene.index;
-
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -19,940 +17,448 @@ package org.apache.lucene.index;
  * limitations under the License.
  */
 
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.IndexInput;
-import org.apache.lucene.store.IndexOutput;
-import org.apache.lucene.store.ChecksumIndexOutput;
-import org.apache.lucene.store.ChecksumIndexInput;
-import org.apache.lucene.store.NoSuchDirectoryException;
-import org.apache.lucene.index.codecs.CodecProvider;
-import org.apache.lucene.util.ThreadInterruptedException;
+package org.apache.solr.client.solrj.impl;
 
-import java.io.FileNotFoundException;
 import java.io.IOException;
-import java.io.PrintStream;
-import java.util.Vector;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.HashMap;
-import java.util.Map;
+import java.io.OutputStream;
+import java.util.LinkedList;
+import java.util.Locale;
+import java.util.Queue;
+import java.util.Set;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+
+import org.apache.http.HttpResponse;
+import org.apache.http.HttpStatus;
+import org.apache.http.client.HttpClient;
+import org.apache.http.client.methods.HttpPost;
+import org.apache.http.entity.ContentProducer;
+import org.apache.http.entity.EntityTemplate;
+import org.apache.solr.client.solrj.ResponseParser;
+import org.apache.solr.client.solrj.SolrRequest;
+import org.apache.solr.client.solrj.SolrServer;
+import org.apache.solr.client.solrj.SolrServerException;
+import org.apache.solr.client.solrj.request.RequestWriter;
+import org.apache.solr.client.solrj.request.UpdateRequest;
+import org.apache.solr.client.solrj.util.ClientUtils;
+import org.apache.solr.common.SolrException;
+import org.apache.solr.common.SolrException.ErrorCode;
+import org.apache.solr.common.params.CommonParams;
+import org.apache.solr.common.params.ModifiableSolrParams;
+import org.apache.solr.common.params.SolrParams;
+import org.apache.solr.common.params.UpdateParams;
+import org.apache.solr.common.util.NamedList;
+import org.apache.solr.common.util.SolrjNamedThreadFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
- * A collection of segmentInfo objects with methods for operating on
- * those segments in relation to the file system.
+ * ConcurrentUpdateSolrServer buffers all added documents and writes
+ * them into open HTTP connections. This class is thread safe.
  * 
- * @lucene.experimental
+ * Params from {@link UpdateRequest} are converted to http request
+ * parameters. When params change between UpdateRequests a new HTTP
+ * request is started.
+ * 
+ * Although any SolrServer request can be made with this implementation, it is
+ * only recommended to use ConcurrentUpdateSolrServer with /update
+ * requests. The class {@link HttpSolrServer} is better suited for the
+ * query interface.
  */
-public final class SegmentInfos extends Vector<SegmentInfo> {
-
-  /** The file format version, a negative number. */
-  /* Works since counter, the old 1st entry, is always >= 0 */
-  public static final int FORMAT = -1;
-
-  /** This format adds details used for lockless commits.  It differs
-   * slightly from the previous format in that file names
-   * are never re-used (write once).  Instead, each file is
-   * written to the next generation.  For example,
-   * segments_1, segments_2, etc.  This allows us to not use
-   * a commit lock.  See <a
-   * href="http://lucene.apache.org/java/docs/fileformats.html">file
-   * formats</a> for details.
-   */
-  public static final int FORMAT_LOCKLESS = -2;
-
-  /** This format adds a "hasSingleNormFile" flag into each segment info.
-   * See <a href="http://issues.apache.org/jira/browse/LUCENE-756">LUCENE-756</a>
-   * for details.
-   */
-  public static final int FORMAT_SINGLE_NORM_FILE = -3;
-
-  /** This format allows multiple segments to share a single
-   * vectors and stored fields file. */
-  public static final int FORMAT_SHARED_DOC_STORE = -4;
-
-  /** This format adds a checksum at the end of the file to
-   *  ensure all bytes were successfully written. */
-  public static final int FORMAT_CHECKSUM = -5;
-
-  /** This format adds the deletion count for each segment.
-   *  This way IndexWriter can efficiently report numDocs(). */
-  public static final int FORMAT_DEL_COUNT = -6;
-
-  /** This format adds the boolean hasProx to record if any
-   *  fields in the segment store prox information (ie, have
-   *  omitTermFreqAndPositions==false) */
-  public static final int FORMAT_HAS_PROX = -7;
-
-  /** This format adds optional commit userData (String) storage. */
-  public static final int FORMAT_USER_DATA = -8;
-
-  /** This format adds optional per-segment String
-   *  diagnostics storage, and switches userData to Map */
-  public static final int FORMAT_DIAGNOSTICS = -9;
-  
-  /** Each segment records whether its postings are written
-   *  in the new flex format */
-  public static final int FORMAT_FLEX_POSTINGS = -10;
-
-  /* This must always point to the most recent file format. */
-  static final int CURRENT_FORMAT = FORMAT_FLEX_POSTINGS;
-  
-  public int counter = 0;    // used to name new segments
-  /**
-   * counts how often the index has been changed by adding or deleting docs.
-   * starting with the current time in milliseconds forces to create unique version numbers.
-   */
-  private long version = System.currentTimeMillis();
-
-  private long generation = 0;     // generation of the "segments_N" for the next commit
-  private long lastGeneration = 0; // generation of the "segments_N" file we last successfully read
-                                   // or wrote; this is normally the same as generation except if
-                                   // there was an IOException that had interrupted a commit
-
-  private Map<String,String> userData = Collections.<String,String>emptyMap();       // Opaque Map<String, String> that user can specify during IndexWriter.commit
+public class ConcurrentUpdateSolrServer extends SolrServer {
+  private static final long serialVersionUID = 1L;
+  static final Logger log = LoggerFactory
+      .getLogger(ConcurrentUpdateSolrServer.class);
+  private HttpSolrServer server;
+  final BlockingQueue<UpdateRequest> queue;
+  final ExecutorService scheduler;
+  final Queue<Runner> runners;
+  volatile CountDownLatch lock = null; // used to block everything
+  final int threadCount;
+  boolean shutdownExecutor = false;
+  int pollQueueTime = 250;
+  private final boolean streamDeletes;
 
   /**
-   * If non-null, information about loading segments_N files
-   * will be printed here.  @see #setInfoStream.
+   * Uses an internally managed HttpClient instance.
+   * 
+   * @param solrServerUrl
+   *          The Solr server URL
+   * @param queueSize
+   *          The buffer size before the documents are sent to the server
+   * @param threadCount
+   *          The number of background threads used to empty the queue
    */
-  private static PrintStream infoStream;
-
-  public final SegmentInfo info(int i) {
-    return get(i);
-  }
-
-  /**
-   * Get the generation (N) of the current segments_N file
-   * from a list of files.
-   *
-   * @param files -- array of file names to check
-   */
-  public static long getCurrentSegmentGeneration(String[] files) {
-    if (files == null) {
-      return -1;
-    }
-    long max = -1;
-    for (int i = 0; i < files.length; i++) {
-      String file = files[i];
-      if (file.startsWith(IndexFileNames.SEGMENTS) && !file.equals(IndexFileNames.SEGMENTS_GEN)) {
-        long gen = generationFromSegmentsFileName(file);
-        if (gen > max) {
-          max = gen;
-        }
-      }
-    }
-    return max;
-  }
-
-  /**
-   * Get the generation (N) of the current segments_N file
-   * in the directory.
-   *
-   * @param directory -- directory to search for the latest segments_N file
-   */
-  public static long getCurrentSegmentGeneration(Directory directory) throws IOException {
-    try {
-      return getCurrentSegmentGeneration(directory.listAll());
-    } catch (NoSuchDirectoryException nsde) {
-      return -1;
-    }
-  }
-
-  /**
-   * Get the filename of the current segments_N file
-   * from a list of files.
-   *
-   * @param files -- array of file names to check
-   */
-
-  public static String getCurrentSegmentFileName(String[] files) throws IOException {
-    return IndexFileNames.fileNameFromGeneration(IndexFileNames.SEGMENTS,
-                                                 "",
-                                                 getCurrentSegmentGeneration(files));
-  }
-
-  /**
-   * Get the filename of the current segments_N file
-   * in the directory.
-   *
-   * @param directory -- directory to search for the latest segments_N file
-   */
-  public static String getCurrentSegmentFileName(Directory directory) throws IOException {
-    return IndexFileNames.fileNameFromGeneration(IndexFileNames.SEGMENTS,
-                                                 "",
-                                                 getCurrentSegmentGeneration(directory));
-  }
-
-  /**
-   * Get the segments_N filename in use by this segment infos.
-   */
-  public String getCurrentSegmentFileName() {
-    return IndexFileNames.fileNameFromGeneration(IndexFileNames.SEGMENTS,
-                                                 "",
-                                                 lastGeneration);
-  }
-
-  /**
-   * Parse the generation off the segments file name and
-   * return it.
-   */
-  public static long generationFromSegmentsFileName(String fileName) {
-    if (fileName.equals(IndexFileNames.SEGMENTS)) {
-      return 0;
-    } else if (fileName.startsWith(IndexFileNames.SEGMENTS)) {
-      return Long.parseLong(fileName.substring(1+IndexFileNames.SEGMENTS.length()),
-                            Character.MAX_RADIX);
-    } else {
-      throw new IllegalArgumentException("fileName \"" + fileName + "\" is not a segments file");
-    }
-  }
-
-
-  /**
-   * Get the next segments_N filename that will be written.
-   */
-  public String getNextSegmentFileName() {
-    long nextGeneration;
-
-    if (generation == -1) {
-      nextGeneration = 1;
-    } else {
-      nextGeneration = generation+1;
-    }
-    return IndexFileNames.fileNameFromGeneration(IndexFileNames.SEGMENTS,
-                                                 "",
-                                                 nextGeneration);
-  }
-
-  /**
-   * Read a particular segmentFileName.  Note that this may
-   * throw an IOException if a commit is in process.
-   *
-   * @param directory -- directory containing the segments file
-   * @param segmentFileName -- segment file to load
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   */
-  public final void read(Directory directory, String segmentFileName, 
-                         CodecProvider codecs) throws CorruptIndexException, IOException {
-    boolean success = false;
-
-    // Clear any previous segments:
-    clear();
-
-    ChecksumIndexInput input = new ChecksumIndexInput(directory.openInput(segmentFileName));
-
-    generation = generationFromSegmentsFileName(segmentFileName);
-
-    lastGeneration = generation;
-
-    try {
-      int format = input.readInt();
-      if(format < 0){     // file contains explicit format info
-        // check that it is a format we can understand
-        if (format < CURRENT_FORMAT)
-          throw new CorruptIndexException("Unknown format version: " + format);
-        version = input.readLong(); // read version
-        counter = input.readInt(); // read counter
-      }
-      else{     // file is in old format without explicit format info
-        counter = format;
-      }
-      
-      for (int i = input.readInt(); i > 0; i--) { // read segmentInfos
-        add(new SegmentInfo(directory, format, input, codecs));
-      }
-      
-      if(format >= 0){    // in old format the version number may be at the end of the file
-        if (input.getFilePointer() >= input.length())
-          version = System.currentTimeMillis(); // old file format without version number
-        else
-          version = input.readLong(); // read version
-      }
-
-      if (format <= FORMAT_USER_DATA) {
-        if (format <= FORMAT_DIAGNOSTICS) {
-          userData = input.readStringStringMap();
-        } else if (0 != input.readByte()) {
-          userData = Collections.singletonMap("userData", input.readString());
-        } else {
-          userData = Collections.<String,String>emptyMap();
-        }
-      } else {
-        userData = Collections.<String,String>emptyMap();
-      }
-
-      if (format <= FORMAT_CHECKSUM) {
-        final long checksumNow = input.getChecksum();
-        final long checksumThen = input.readLong();
-        if (checksumNow != checksumThen)
-          throw new CorruptIndexException("checksum mismatch in segments file");
-      }
-      success = true;
-    }
-    finally {
-      input.close();
-      if (!success) {
-        // Clear any segment infos we had loaded so we
-        // have a clean slate on retry:
-        clear();
-      }
-    }
-  }
-
-  /**
-   * This version of read uses the retry logic (for lock-less
-   * commits) to find the right segments file to load.
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   */
-  public final void read(Directory directory) throws CorruptIndexException, IOException {
-    read(directory, CodecProvider.getDefault());
+  public ConcurrentUpdateSolrServer(String solrServerUrl, int queueSize,
+      int threadCount) {
+    this(solrServerUrl, null, queueSize, threadCount);
+    shutdownExecutor = true;
   }
   
-  public final void read(Directory directory, final CodecProvider codecs) throws CorruptIndexException, IOException {
-    generation = lastGeneration = -1;
-
-    new FindSegmentsFile(directory) {
-
-      @Override
-      protected Object doBody(String segmentFileName) throws CorruptIndexException, IOException {
-        read(directory, segmentFileName, codecs);
-        return null;
-      }
-    }.run();
-  }
-
-  // Only non-null after prepareCommit has been called and
-  // before finishCommit is called
-  ChecksumIndexOutput pendingSegnOutput;
-
-  private final void write(Directory directory) throws IOException {
-
-    String segmentFileName = getNextSegmentFileName();
-
-    // Always advance the generation on write:
-    if (generation == -1) {
-      generation = 1;
-    } else {
-      generation++;
-    }
-
-    ChecksumIndexOutput segnOutput = new ChecksumIndexOutput(directory.createOutput(segmentFileName));
-
-    boolean success = false;
-
-    try {
-      segnOutput.writeInt(CURRENT_FORMAT); // write FORMAT
-      segnOutput.writeLong(++version); // every write changes
-                                   // the index
-      segnOutput.writeInt(counter); // write counter
-      segnOutput.writeInt(size()); // write infos
-      for (int i = 0; i < size(); i++) {
-        info(i).write(segnOutput);
-      }
-      segnOutput.writeStringStringMap(userData);
-      segnOutput.prepareCommit();
-      success = true;
-      pendingSegnOutput = segnOutput;
-    } finally {
-      if (!success) {
-        // We hit an exception above; try to close the file
-        // but suppress any exception:
-        try {
-          segnOutput.close();
-        } catch (Throwable t) {
-          // Suppress so we keep throwing the original exception
-        }
-        try {
-          // Try not to leave a truncated segments_N file in
-          // the index:
-          directory.deleteFile(segmentFileName);
-        } catch (Throwable t) {
-          // Suppress so we keep throwing the original exception
-        }
-      }
-    }
+  public ConcurrentUpdateSolrServer(String solrServerUrl,
+      HttpClient client, int queueSize, int threadCount) {
+    this(solrServerUrl, null, queueSize, threadCount, Executors.newCachedThreadPool(
+        new SolrjNamedThreadFactory("concurrentUpdateScheduler")));
+    shutdownExecutor = true;
   }
 
   /**
-   * Returns a copy of this instance, also copying each
-   * SegmentInfo.
+   * Uses the supplied HttpClient to send documents to the Solr server.
    */
+  public ConcurrentUpdateSolrServer(String solrServerUrl,
+      HttpClient client, int queueSize, int threadCount, ExecutorService es) {
+    this(solrServerUrl, client, queueSize, threadCount, es, false);
+  }
   
-  @Override
-  public Object clone() {
-    SegmentInfos sis = (SegmentInfos) super.clone();
-    for(int i=0;i<sis.size();i++) {
-      final SegmentInfo info = sis.info(i);
-      assert info.getCodec() != null;
-      sis.set(i, (SegmentInfo) info.clone());
-    }
-    sis.userData = new HashMap<String,String>(userData);
-    return sis;
+  /**
+   * Uses the supplied HttpClient to send documents to the Solr server.
+   */
+  public ConcurrentUpdateSolrServer(String solrServerUrl,
+      HttpClient client, int queueSize, int threadCount, ExecutorService es, boolean streamDeletes) {
+    this.server = new HttpSolrServer(solrServerUrl, client);
+    this.server.setFollowRedirects(false);
+    queue = new LinkedBlockingQueue<UpdateRequest>(queueSize);
+    this.threadCount = threadCount;
+    runners = new LinkedList<Runner>();
+    scheduler = es;
+    this.streamDeletes = streamDeletes;
+  }
+
+  public Set<String> getQueryParams() {
+    return this.server.getQueryParams();
   }
 
   /**
-   * version number when this SegmentInfos was generated.
+   * Expert Method.
+   * @param queryParams set of param keys to only send via the query string
    */
-  public long getVersion() {
-    return version;
+  public void setQueryParams(Set<String> queryParams) {
+    this.server.setQueryParams(queryParams);
   }
-  public long getGeneration() {
-    return generation;
-  }
-  public long getLastGeneration() {
-    return lastGeneration;
-  }
-
+  
   /**
-   * Current version number from segments file.
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
+   * Opens a connection and sends everything...
    */
-  public static long readCurrentVersion(Directory directory, final CodecProvider codecs)
-    throws CorruptIndexException, IOException {
+  class Runner implements Runnable {
+    final Lock runnerLock = new ReentrantLock();
 
-    // Fully read the segments file: this ensures that it's
-    // completely written so that if
-    // IndexWriter.prepareCommit has been called (but not
-    // yet commit), then the reader will still see itself as
-    // current:
-    SegmentInfos sis = new SegmentInfos();
-    sis.read(directory);
-    return sis.version;
-  }
+    @Override
+    public void run() {
+      runnerLock.lock();
 
-  /**
-   * Returns userData from latest segments file
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   */
-  public static Map<String,String> readCurrentUserData(Directory directory, CodecProvider codecs)
-    throws CorruptIndexException, IOException {
-    SegmentInfos sis = new SegmentInfos();
-    sis.read(directory, codecs);
-    return sis.getUserData();
-  }
-
-  /** If non-null, information about retries when loading
-   * the segments file will be printed to this.
-   */
-  public static void setInfoStream(PrintStream infoStream) {
-    SegmentInfos.infoStream = infoStream;
-  }
-
-  /* Advanced configuration of retry logic in loading
-     segments_N file */
-  private static int defaultGenFileRetryCount = 10;
-  private static int defaultGenFileRetryPauseMsec = 50;
-  private static int defaultGenLookaheadCount = 10;
-
-  /**
-   * Advanced: set how many times to try loading the
-   * segments.gen file contents to determine current segment
-   * generation.  This file is only referenced when the
-   * primary method (listing the directory) fails.
-   */
-  public static void setDefaultGenFileRetryCount(int count) {
-    defaultGenFileRetryCount = count;
-  }
-
-  /**
-   * @see #setDefaultGenFileRetryCount
-   */
-  public static int getDefaultGenFileRetryCount() {
-    return defaultGenFileRetryCount;
-  }
-
-  /**
-   * Advanced: set how many milliseconds to pause in between
-   * attempts to load the segments.gen file.
-   */
-  public static void setDefaultGenFileRetryPauseMsec(int msec) {
-    defaultGenFileRetryPauseMsec = msec;
-  }
-
-  /**
-   * @see #setDefaultGenFileRetryPauseMsec
-   */
-  public static int getDefaultGenFileRetryPauseMsec() {
-    return defaultGenFileRetryPauseMsec;
-  }
-
-  /**
-   * Advanced: set how many times to try incrementing the
-   * gen when loading the segments file.  This only runs if
-   * the primary (listing directory) and secondary (opening
-   * segments.gen file) methods fail to find the segments
-   * file.
-   */
-  public static void setDefaultGenLookaheadCount(int count) {
-    defaultGenLookaheadCount = count;
-  }
-  /**
-   * @see #setDefaultGenLookaheadCount
-   */
-  public static int getDefaultGenLookahedCount() {
-    return defaultGenLookaheadCount;
-  }
-
-  /**
-   * @see #setInfoStream
-   */
-  public static PrintStream getInfoStream() {
-    return infoStream;
-  }
-
-  /**
-   * Prints the given message to the infoStream. Note, this method does not
-   * check for null infoStream. It assumes this check has been performed by the
-   * caller, which is recommended to avoid the (usually) expensive message
-   * creation.
-   */
-  private static void message(String message) {
-    infoStream.println("SIS [" + Thread.currentThread().getName() + "]: " + message);
-  }
-
-  /**
-   * Utility class for executing code that needs to do
-   * something with the current segments file.  This is
-   * necessary with lock-less commits because from the time
-   * you locate the current segments file name, until you
-   * actually open it, read its contents, or check modified
-   * time, etc., it could have been deleted due to a writer
-   * commit finishing.
-   */
-  public abstract static class FindSegmentsFile {
-    
-    final Directory directory;
-
-    public FindSegmentsFile(Directory directory) {
-      this.directory = directory;
-    }
-
-    public Object run() throws CorruptIndexException, IOException {
-      return run(null);
-    }
-    
-    public Object run(IndexCommit commit) throws CorruptIndexException, IOException {
-      if (commit != null) {
-        if (directory != commit.getDirectory())
-          throw new IOException("the specified commit does not match the specified Directory");
-        return doBody(commit.getSegmentsFileName());
-      }
-
-      String segmentFileName = null;
-      long lastGen = -1;
-      long gen = 0;
-      int genLookaheadCount = 0;
-      IOException exc = null;
-      boolean retry = false;
-
-      int method = 0;
-
-      // Loop until we succeed in calling doBody() without
-      // hitting an IOException.  An IOException most likely
-      // means a commit was in process and has finished, in
-      // the time it took us to load the now-old infos files
-      // (and segments files).  It's also possible it's a
-      // true error (corrupt index).  To distinguish these,
-      // on each retry we must see "forward progress" on
-      // which generation we are trying to load.  If we
-      // don't, then the original error is real and we throw
-      // it.
-      
-      // We have three methods for determining the current
-      // generation.  We try the first two in parallel, and
-      // fall back to the third when necessary.
-
-      while(true) {
-
-        if (0 == method) {
-
-          // Method 1: list the directory and use the highest
-          // segments_N file.  This method works well as long
-          // as there is no stale caching on the directory
-          // contents (NOTE: NFS clients often have such stale
-          // caching):
-          String[] files = null;
-
-          long genA = -1;
-
-          files = directory.listAll();
-          
-          if (files != null)
-            genA = getCurrentSegmentGeneration(files);
-
-          if (infoStream != null) {
-            message("directory listing genA=" + genA);
-          }
-
-          // Method 2: open segments.gen and read its
-          // contents.  Then we take the larger of the two
-          // gen's.  This way, if either approach is hitting
-          // a stale cache (NFS) we have a better chance of
-          // getting the right generation.
-          long genB = -1;
-          for(int i=0;i<defaultGenFileRetryCount;i++) {
-            IndexInput genInput = null;
-            try {
-              genInput = directory.openInput(IndexFileNames.SEGMENTS_GEN);
-            } catch (FileNotFoundException e) {
-              if (infoStream != null) {
-                message("segments.gen open: FileNotFoundException " + e);
-              }
+      log.debug("starting runner: {}", this);
+      HttpPost method = null;
+      HttpResponse response = null;
+      try {
+        while (!queue.isEmpty()) {
+          try {
+            final UpdateRequest updateRequest = queue.poll(250,
+                TimeUnit.MILLISECONDS);
+            if (updateRequest == null)
               break;
-            } catch (IOException e) {
-              if (infoStream != null) {
-                message("segments.gen open: IOException " + e);
-              }
-            }
-  
-            if (genInput != null) {
-              try {
-                int version = genInput.readInt();
-                if (version == FORMAT_LOCKLESS) {
-                  long gen0 = genInput.readLong();
-                  long gen1 = genInput.readLong();
-                  if (infoStream != null) {
-                    message("fallback check: " + gen0 + "; " + gen1);
+
+            String contentType = server.requestWriter.getUpdateContentType();
+            final boolean isXml = ClientUtils.TEXT_XML.equals(contentType);
+
+            final ModifiableSolrParams origParams = new ModifiableSolrParams(updateRequest.getParams());
+
+            EntityTemplate template = new EntityTemplate(new ContentProducer() {
+
+              @Override
+              public void writeTo(OutputStream out) throws IOException {
+                try {
+                  if (isXml) {
+                    out.write("<stream>".getBytes("UTF-8")); // can be anything
                   }
-                  if (gen0 == gen1) {
-                    // The file is consistent.
-                    genB = gen0;
-                    break;
+                  UpdateRequest req = updateRequest;
+                  while (req != null) {
+                    SolrParams currentParams = new ModifiableSolrParams(req.getParams());
+                    if (!origParams.toNamedList().equals(currentParams.toNamedList())) {
+                      queue.add(req); // params are different, push back to queue
+                      break;
+                    }
+                    
+                    server.requestWriter.write(req, out);
+                    if (isXml) {
+                      // check for commit or optimize
+                      SolrParams params = req.getParams();
+                      if (params != null) {
+                        String fmt = null;
+                        if (params.getBool(UpdateParams.OPTIMIZE, false)) {
+                          fmt = "<optimize waitSearcher=\"%s\" />";
+                        } else if (params.getBool(UpdateParams.COMMIT, false)) {
+                          fmt = "<commit waitSearcher=\"%s\" />";
+                        }
+                        if (fmt != null) {
+                          byte[] content = String.format(Locale.ROOT,
+                              fmt,
+                              params.getBool(UpdateParams.WAIT_SEARCHER, false)
+                                  + "").getBytes("UTF-8");
+                          out.write(content);
+                        }
+                      }
+                    }
+                    out.flush();
+                    req = queue.poll(pollQueueTime, TimeUnit.MILLISECONDS);
                   }
+                  if (isXml) {
+                    out.write("</stream>".getBytes("UTF-8"));
+                  }
+
+                } catch (InterruptedException e) {
+                  Thread.currentThread().interrupt();
+                  log.warn("", e);
                 }
-              } catch (IOException err2) {
-                // will retry
-              } finally {
-                genInput.close();
               }
+            });
+            
+            // The parser 'wt=' and 'version=' params are used instead of the
+            // original params
+            ModifiableSolrParams requestParams = new ModifiableSolrParams(origParams);
+            requestParams.set(CommonParams.WT, server.parser.getWriterType());
+            requestParams.set(CommonParams.VERSION, server.parser.getVersion());
+
+            method = new HttpPost(server.getBaseURL() + "/update"
+                + ClientUtils.toQueryString(requestParams, false));
+            method.setEntity(template);
+            method.addHeader("User-Agent", HttpSolrServer.AGENT);
+            method.addHeader("Content-Type", contentType);
+            
+            
+            response = server.getHttpClient().execute(method);
+            int statusCode = response.getStatusLine().getStatusCode();
+            if (statusCode != HttpStatus.SC_OK) {
+              StringBuilder msg = new StringBuilder();
+              msg.append(response.getStatusLine().getReasonPhrase());
+              msg.append("\n\n");
+              msg.append("\n\n");
+              msg.append("request: ").append(method.getURI());
+              handleError(new SolrException(ErrorCode.getErrorCode(statusCode), msg.toString()));
             }
+          } finally {
             try {
-              Thread.sleep(defaultGenFileRetryPauseMsec);
-            } catch (InterruptedException ie) {
-              throw new ThreadInterruptedException(ie);
-            }
-          }
-
-          if (infoStream != null) {
-            message(IndexFileNames.SEGMENTS_GEN + " check: genB=" + genB);
-          }
-
-          // Pick the larger of the two gen's:
-          if (genA > genB)
-            gen = genA;
-          else
-            gen = genB;
-          
-          if (gen == -1) {
-            // Neither approach found a generation
-            throw new IndexNotFoundException("no segments* file found in " + directory + ": files: " + Arrays.toString(files));
-          }
-        }
-
-        // Third method (fallback if first & second methods
-        // are not reliable): since both directory cache and
-        // file contents cache seem to be stale, just
-        // advance the generation.
-        if (1 == method || (0 == method && lastGen == gen && retry)) {
-
-          method = 1;
-
-          if (genLookaheadCount < defaultGenLookaheadCount) {
-            gen++;
-            genLookaheadCount++;
-            if (infoStream != null) {
-              message("look ahead increment gen to " + gen);
+              if (response != null) {
+                response.getEntity().getContent().close();
+              }
+            } catch (Exception ex) {
+              log.warn("", ex);
             }
           }
         }
+      } catch (Throwable e) {
+        handleError(e);
+      } finally {
 
-        if (lastGen == gen) {
-
-          // This means we're about to try the same
-          // segments_N last tried.  This is allowed,
-          // exactly once, because writer could have been in
-          // the process of writing segments_N last time.
-
-          if (retry) {
-            // OK, we've tried the same segments_N file
-            // twice in a row, so this must be a real
-            // error.  We throw the original exception we
-            // got.
-            throw exc;
+        // remove it from the list of running things unless we are the last
+        // runner and the queue is full...
+        // in which case, the next queue.put() would block and there would be no
+        // runners to handle it.
+        // This case has been further handled by using offer instead of put, and
+        // using a retry loop
+        // to avoid blocking forever (see request()).
+        synchronized (runners) {
+          if (runners.size() == 1 && queue.remainingCapacity() == 0) {
+            // keep this runner alive
+            scheduler.execute(this);
           } else {
-            retry = true;
-          }
-
-        } else if (0 == method) {
-          // Segment file has advanced since our last loop, so
-          // reset retry:
-          retry = false;
-        }
-
-        lastGen = gen;
-
-        segmentFileName = IndexFileNames.fileNameFromGeneration(IndexFileNames.SEGMENTS,
-                                                                "",
-                                                                gen);
-
-        try {
-          Object v = doBody(segmentFileName);
-          if (exc != null && infoStream != null) {
-            message("success on " + segmentFileName);
-          }
-          return v;
-        } catch (IOException err) {
-
-          // Save the original root cause:
-          if (exc == null) {
-            exc = err;
-          }
-
-          if (infoStream != null) {
-            message("primary Exception on '" + segmentFileName + "': " + err + "'; will retry: retry=" + retry + "; gen = " + gen);
-          }
-
-          if (!retry && gen > 1) {
-
-            // This is our first time trying this segments
-            // file (because retry is false), and, there is
-            // possibly a segments_(N-1) (because gen > 1).
-            // So, check if the segments_(N-1) exists and
-            // try it if so:
-            String prevSegmentFileName = IndexFileNames.fileNameFromGeneration(IndexFileNames.SEGMENTS,
-                                                                               "",
-                                                                               gen-1);
-
-            final boolean prevExists;
-            prevExists = directory.fileExists(prevSegmentFileName);
-
-            if (prevExists) {
-              if (infoStream != null) {
-                message("fallback to prior segment file '" + prevSegmentFileName + "'");
-              }
-              try {
-                Object v = doBody(prevSegmentFileName);
-                if (infoStream != null) {
-                  message("success on fallback " + prevSegmentFileName);
-                }
-                return v;
-              } catch (IOException err2) {
-                if (infoStream != null) {
-                  message("secondary Exception on '" + prevSegmentFileName + "': " + err2 + "'; will retry");
-                }
-              }
-            }
+            runners.remove(this);
           }
         }
+
+        log.debug("finished: {}", this);
+        runnerLock.unlock();
+      }
+    }
+  }
+
+  @Override
+  public NamedList<Object> request(final SolrRequest request)
+      throws SolrServerException, IOException {
+    if (!(request instanceof UpdateRequest)) {
+      return server.request(request);
+    }
+    UpdateRequest req = (UpdateRequest) request;
+
+    // this happens for commit...
+    if (streamDeletes) {
+      if ((req.getDocuments() == null || req.getDocuments().isEmpty())
+          && (req.getDeleteById() == null || req.getDeleteById().isEmpty())
+          && (req.getDeleteByIdMap() == null || req.getDeleteByIdMap().isEmpty())) {
+        blockUntilFinished();
+        if (req.getDeleteQuery() == null) {
+          return server.request(request);
+        }
+      }
+    } else {
+      if ((req.getDocuments() == null || req.getDocuments().isEmpty())) {
+        blockUntilFinished();
+        return server.request(request);
       }
     }
 
-    /**
-     * Subclass must implement this.  The assumption is an
-     * IOException will be thrown if something goes wrong
-     * during the processing that could have been caused by
-     * a writer committing.
-     */
-    protected abstract Object doBody(String segmentFileName) throws CorruptIndexException, IOException;
+
+    SolrParams params = req.getParams();
+    if (params != null) {
+      // check if it is waiting for the searcher
+      if (params.getBool(UpdateParams.WAIT_SEARCHER, false)) {
+        log.info("blocking for commit/optimize");
+        blockUntilFinished(); // empty the queue
+        return server.request(request);
+      }
+    }
+
+    try {
+      CountDownLatch tmpLock = lock;
+      if (tmpLock != null) {
+        tmpLock.await();
+      }
+
+      boolean success = queue.offer(req);
+
+      for (;;) {
+        synchronized (runners) {
+          if (runners.isEmpty() || (queue.remainingCapacity() < queue.size() // queue
+                                                                             // is
+                                                                             // half
+                                                                             // full
+                                                                             // and
+                                                                             // we
+                                                                             // can
+                                                                             // add
+                                                                             // more
+                                                                             // runners
+              && runners.size() < threadCount)) {
+            // We need more runners, so start a new one.
+            Runner r = new Runner();
+            runners.add(r);
+            scheduler.execute(r);
+          } else {
+            // break out of the retry loop if we added the element to the queue
+            // successfully, *and*
+            // while we are still holding the runners lock to prevent race
+            // conditions.
+            // race conditions.
+            if (success)
+              break;
+          }
+        }
+
+        // Retry to add to the queue w/o the runners lock held (else we risk
+        // temporary deadlock)
+        // This retry could also fail because
+        // 1) existing runners were not able to take off any new elements in the
+        // queue
+        // 2) the queue was filled back up since our last try
+        // If we succeed, the queue may have been completely emptied, and all
+        // runners stopped.
+        // In all cases, we should loop back to the top to see if we need to
+        // start more runners.
+        //
+        if (!success) {
+          success = queue.offer(req, 100, TimeUnit.MILLISECONDS);
+        }
+
+      }
+
+    } catch (InterruptedException e) {
+      log.error("interrupted", e);
+      throw new IOException(e.getLocalizedMessage());
+    }
+
+    // RETURN A DUMMY result
+    NamedList<Object> dummy = new NamedList<Object>();
+    dummy.add("NOTE", "the request is processed in a background stream");
+    return dummy;
+  }
+
+  public synchronized void blockUntilFinished() {
+    lock = new CountDownLatch(1);
+    try {
+      // Wait until no runners are running
+      for (;;) {
+        Runner runner;
+        synchronized (runners) {
+          runner = runners.peek();
+        }
+        if (runner == null)
+          break;
+        runner.runnerLock.lock();
+        runner.runnerLock.unlock();
+      }
+    } finally {
+      lock.countDown();
+      lock = null;
+    }
+  }
+
+  public void handleError(Throwable ex) {
+    log.error("error", ex);
+  }
+
+  @Override
+  public void shutdown() {
+    server.shutdown();
+    if (shutdownExecutor) {
+      scheduler.shutdown();
+      try {
+        if (!scheduler.awaitTermination(60, TimeUnit.SECONDS)) {
+          scheduler.shutdownNow();
+          if (!scheduler.awaitTermination(60, TimeUnit.SECONDS)) log
+              .error("ExecutorService did not terminate");
+        }
+      } catch (InterruptedException ie) {
+        scheduler.shutdownNow();
+        Thread.currentThread().interrupt();
+      }
+    }
+  }
+  
+  public void setConnectionTimeout(int timeout) {
+    HttpClientUtil.setConnectionTimeout(server.getHttpClient(), timeout);
   }
 
   /**
-   * Returns a new SegmentInfos containing the SegmentInfo
-   * instances in the specified range first (inclusive) to
-   * last (exclusive), so total number of segments returned
-   * is last-first.
+   * set soTimeout (read timeout) on the underlying HttpConnectionManager. This is desirable for queries, but probably
+   * not for indexing.
    */
-  public SegmentInfos range(int first, int last) {
-    SegmentInfos infos = new SegmentInfos();
-    infos.addAll(super.subList(first, last));
-    return infos;
+  public void setSoTimeout(int timeout) {
+    HttpClientUtil.setSoTimeout(server.getHttpClient(), timeout);
   }
 
-  // Carry over generation numbers from another SegmentInfos
-  void updateGeneration(SegmentInfos other) {
-    lastGeneration = other.lastGeneration;
-    generation = other.generation;
-    version = other.version;
-  }
-
-  final void rollbackCommit(Directory dir) throws IOException {
-    if (pendingSegnOutput != null) {
+  public void shutdownNow() {
+    server.shutdown();
+    if (shutdownExecutor) {
+      scheduler.shutdownNow(); // Cancel currently executing tasks
       try {
-        pendingSegnOutput.close();
-      } catch (Throwable t) {
-        // Suppress so we keep throwing the original exception
-        // in our caller
-      }
-
-      // Must carefully compute fileName from "generation"
-      // since lastGeneration isn't incremented:
-      try {
-        final String segmentFileName = IndexFileNames.fileNameFromGeneration(IndexFileNames.SEGMENTS,
-                                                                             "",
-                                                                             generation);
-        dir.deleteFile(segmentFileName);
-      } catch (Throwable t) {
-        // Suppress so we keep throwing the original exception
-        // in our caller
-      }
-      pendingSegnOutput = null;
-    }
-  }
-
-  /** Call this to start a commit.  This writes the new
-   *  segments file, but writes an invalid checksum at the
-   *  end, so that it is not visible to readers.  Once this
-   *  is called you must call {@link #finishCommit} to complete
-   *  the commit or {@link #rollbackCommit} to abort it. */
-  final void prepareCommit(Directory dir) throws IOException {
-    if (pendingSegnOutput != null)
-      throw new IllegalStateException("prepareCommit was already called");
-    write(dir);
-  }
-
-  /** Returns all file names referenced by SegmentInfo
-   *  instances matching the provided Directory (ie files
-   *  associated with any "external" segments are skipped).
-   *  The returned collection is recomputed on each
-   *  invocation.  */
-  public Collection<String> files(Directory dir, boolean includeSegmentsFile) throws IOException {
-    HashSet<String> files = new HashSet<String>();
-    if (includeSegmentsFile) {
-      files.add(getCurrentSegmentFileName());
-    }
-    final int size = size();
-    for(int i=0;i<size;i++) {
-      final SegmentInfo info = info(i);
-      if (info.dir == dir) {
-        files.addAll(info(i).files());
+        if (!scheduler.awaitTermination(30, TimeUnit.SECONDS)) log
+            .error("ExecutorService did not terminate");
+      } catch (InterruptedException ie) {
+        scheduler.shutdownNow();
+        Thread.currentThread().interrupt();
       }
     }
-    return files;
   }
 
-  final void finishCommit(Directory dir) throws IOException {
-    if (pendingSegnOutput == null)
-      throw new IllegalStateException("prepareCommit was not called");
-    boolean success = false;
-    try {
-      pendingSegnOutput.finishCommit();
-      pendingSegnOutput.close();
-      pendingSegnOutput = null;
-      success = true;
-    } finally {
-      if (!success)
-        rollbackCommit(dir);
-    }
-
-    // NOTE: if we crash here, we have left a segments_N
-    // file in the directory in a possibly corrupt state (if
-    // some bytes made it to stable storage and others
-    // didn't).  But, the segments_N file includes checksum
-    // at the end, which should catch this case.  So when a
-    // reader tries to read it, it will throw a
-    // CorruptIndexException, which should cause the retry
-    // logic in SegmentInfos to kick in and load the last
-    // good (previous) segments_N-1 file.
-
-    final String fileName = IndexFileNames.fileNameFromGeneration(IndexFileNames.SEGMENTS,
-                                                                  "",
-                                                                  generation);
-    success = false;
-    try {
-      dir.sync(Collections.singleton(fileName));
-      success = true;
-    } finally {
-      if (!success) {
-        try {
-          dir.deleteFile(fileName);
-        } catch (Throwable t) {
-          // Suppress so we keep throwing the original exception
-        }
-      }
-    }
-
-    lastGeneration = generation;
-
-    try {
-      IndexOutput genOutput = dir.createOutput(IndexFileNames.SEGMENTS_GEN);
-      try {
-        genOutput.writeInt(FORMAT_LOCKLESS);
-        genOutput.writeLong(generation);
-        genOutput.writeLong(generation);
-      } finally {
-        genOutput.close();
-      }
-    } catch (Throwable t) {
-      // It's OK if we fail to write this file since it's
-      // used only as one of the retry fallbacks.
-    }
+  public void setParser(ResponseParser responseParser) {
+    server.setParser(responseParser);
   }
-
-  /** Writes & syncs to the Directory dir, taking care to
-   *  remove the segments file on exception */
-  final void commit(Directory dir) throws IOException {
-    prepareCommit(dir);
-    finishCommit(dir);
-  }
-
-  public synchronized String toString(Directory directory) {
-    StringBuilder buffer = new StringBuilder();
-    buffer.append(getCurrentSegmentFileName()).append(": ");
-    final int count = size();
-    for(int i = 0; i < count; i++) {
-      if (i > 0) {
-        buffer.append(' ');
-      }
-      final SegmentInfo info = info(i);
-      buffer.append(info.toString(directory, 0));
-    }
-    return buffer.toString();
-  }
-
-  public Map<String,String> getUserData() {
-    return userData;
-  }
-
-  void setUserData(Map<String,String> data) {
-    if (data == null) {
-      userData = Collections.<String,String>emptyMap();
-    } else {
-      userData = data;
-    }
-  }
-
-  /** Replaces all segments in this instance, but keeps
-   *  generation, version, counter so that future commits
-   *  remain write once.
+  
+  
+  /**
+   * @param pollQueueTime time for an open connection to wait for updates when
+   * the queue is empty. 
    */
-  void replace(SegmentInfos other) {
-    clear();
-    addAll(other);
-    lastGeneration = other.lastGeneration;
+  public void setPollQueueTime(int pollQueueTime) {
+    this.pollQueueTime = pollQueueTime;
   }
 
-  // Used only for testing
-  public boolean hasExternalSegments(Directory dir) {
-    final int numSegments = size();
-    for(int i=0;i<numSegments;i++)
-      if (info(i).dir != dir)
-        return true;
-    return false;
-  }
-
-  /** Returns sum of all segment's docCounts.  Note that
-   *  this does not include deletions */
-  public int totalDocCount() {
-    int count = 0;
-    for(SegmentInfo info : this) {
-      count += info.docCount;
-    }
-    return count;
+  public void setRequestWriter(RequestWriter requestWriter) {
+    server.setRequestWriter(requestWriter);
   }
 }

@@ -1,13 +1,14 @@
-for (int j = array.position()+array.arrayOffset(); j < array.limit()+array.arrayOffset(); ++j) {
+int mid = (lo + hi) >>> 1;
+
+package org.apache.lucene.index;
 
 /**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -18,113 +19,94 @@ for (int j = array.position()+array.arrayOffset(); j < array.limit()+array.array
  * limitations under the License.
  */
 
-package org.apache.cassandra.utils;
+/** Remaps docIDs after a merge has completed, where the
+ *  merged segments had at least one deletion.  This is used
+ *  to renumber the buffered deletes in IndexWriter when a
+ *  merge of segments with deletions commits. */
 
-import java.net.InetAddress;
-import java.net.UnknownHostException;
-import java.nio.ByteBuffer;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
-import java.security.SecureRandom;
-import java.util.Random;
+final class MergeDocIDRemapper {
+  int[] starts;                                 // used for binary search of mapped docID
+  int[] newStarts;                              // starts, minus the deletes
+  int[][] docMaps;                              // maps docIDs in the merged set
+  int minDocID;                                 // minimum docID that needs renumbering
+  int maxDocID;                                 // 1+ the max docID that needs renumbering
+  int docShift;                                 // total # deleted docs that were compacted by this merge
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-public class GuidGenerator {
-    private static Logger logger_ = LoggerFactory.getLogger(GuidGenerator.class);
-    private static Random myRand;
-    private static SecureRandom mySecureRand;
-    private static String s_id;
-    private static SafeMessageDigest md5 = null;
-
-    static {
-        if (System.getProperty("java.security.egd") == null) {
-            System.setProperty("java.security.egd", "file:/dev/urandom");
-        }
-        mySecureRand = new SecureRandom();
-        long secureInitializer = mySecureRand.nextLong();
-        myRand = new Random(secureInitializer);
-        try {
-            s_id = InetAddress.getLocalHost().toString();
-        }
-        catch (UnknownHostException e) {
-            throw new AssertionError(e);
-        }
-
-        try {
-            MessageDigest myMd5 = MessageDigest.getInstance("MD5");
-            md5 = new SafeMessageDigest(myMd5);
-        }
-        catch (NoSuchAlgorithmException e) {
-            throw new AssertionError(e);
-        }
+  public MergeDocIDRemapper(SegmentInfos infos, int[][] docMaps, int[] delCounts, MergePolicy.OneMerge merge, int mergedDocCount) {
+    this.docMaps = docMaps;
+    SegmentInfo firstSegment = merge.segments.info(0);
+    int i = 0;
+    while(true) {
+      SegmentInfo info = infos.info(i);
+      if (info.equals(firstSegment))
+        break;
+      minDocID += info.docCount;
+      i++;
     }
 
+    int numDocs = 0;
+    for(int j=0;j<docMaps.length;i++,j++) {
+      numDocs += infos.info(i).docCount;
+      assert infos.info(i).equals(merge.segments.info(j));
+    }
+    maxDocID = minDocID + numDocs;
 
-    public static String guid() {
-        ByteBuffer array = guidAsBytes();
-        
-        StringBuilder sb = new StringBuilder();
-        for (int j = array.position()+array.arrayOffset(); j < array.limit(); ++j) {
-            int b = array.array()[j] & 0xFF;
-            if (b < 0x10) sb.append('0');
-            sb.append(Integer.toHexString(b));
+    starts = new int[docMaps.length];
+    newStarts = new int[docMaps.length];
+
+    starts[0] = minDocID;
+    newStarts[0] = minDocID;
+    for(i=1;i<docMaps.length;i++) {
+      final int lastDocCount = merge.segments.info(i-1).docCount;
+      starts[i] = starts[i-1] + lastDocCount;
+      newStarts[i] = newStarts[i-1] + lastDocCount - delCounts[i-1];
+    }
+    docShift = numDocs - mergedDocCount;
+
+    // There are rare cases when docShift is 0.  It happens
+    // if you try to delete a docID that's out of bounds,
+    // because the SegmentReader still allocates deletedDocs
+    // and pretends it has deletions ... so we can't make
+    // this assert here
+    // assert docShift > 0;
+
+    // Make sure it all adds up:
+    assert docShift == maxDocID - (newStarts[docMaps.length-1] + merge.segments.info(docMaps.length-1).docCount - delCounts[docMaps.length-1]);
+  }
+
+  public int remap(int oldDocID) {
+    if (oldDocID < minDocID)
+      // Unaffected by merge
+      return oldDocID;
+    else if (oldDocID >= maxDocID)
+      // This doc was "after" the merge, so simple shift
+      return oldDocID - docShift;
+    else {
+      // Binary search to locate this document & find its new docID
+      int lo = 0;                                      // search starts array
+      int hi = docMaps.length - 1;                  // for first element less
+
+      while (hi >= lo) {
+        int mid = (lo + hi) >> 1;
+        int midValue = starts[mid];
+        if (oldDocID < midValue)
+          hi = mid - 1;
+        else if (oldDocID > midValue)
+          lo = mid + 1;
+        else {                                      // found a match
+          while (mid+1 < docMaps.length && starts[mid+1] == midValue) {
+            mid++;                                  // scan to last match
+          }
+          if (docMaps[mid] != null)
+            return newStarts[mid] + docMaps[mid][oldDocID-starts[mid]];
+          else
+            return newStarts[mid] + oldDocID-starts[mid];
         }
-
-        return convertToStandardFormat( sb.toString() );
+      }
+      if (docMaps[hi] != null)
+        return newStarts[hi] + docMaps[hi][oldDocID-starts[hi]];
+      else
+        return newStarts[hi] + oldDocID-starts[hi];
     }
-    
-    public static String guidToString(byte[] bytes)
-    {
-        StringBuilder sb = new StringBuilder();
-        for (int j = 0; j < bytes.length; ++j) {
-            int b = bytes[j] & 0xFF;
-            if (b < 0x10) sb.append('0');
-            sb.append(Integer.toHexString(b));
-        }
-
-        return convertToStandardFormat( sb.toString() );
-    }
-    
-    public static ByteBuffer guidAsBytes()
-    {
-        StringBuilder sbValueBeforeMD5 = new StringBuilder();
-        long time = System.currentTimeMillis();
-        long rand = 0;
-        rand = myRand.nextLong();
-        sbValueBeforeMD5.append(s_id)
-        				.append(":")
-        				.append(Long.toString(time))
-        				.append(":")
-        				.append(Long.toString(rand));
-
-        String valueBeforeMD5 = sbValueBeforeMD5.toString();
-        return ByteBuffer.wrap(md5.digest(valueBeforeMD5.getBytes()));
-    }
-
-    /*
-        * Convert to the standard format for GUID
-        * Example: C2FEEEAC-CFCD-11D1-8B05-00600806D9B6
-    */
-
-    private static String convertToStandardFormat(String valueAfterMD5) {
-        String raw = valueAfterMD5.toUpperCase();
-        StringBuilder sb = new StringBuilder();
-        sb.append(raw.substring(0, 8))
-          .append("-")
-          .append(raw.substring(8, 12))
-          .append("-")
-          .append(raw.substring(12, 16))
-          .append("-")
-          .append(raw.substring(16, 20))
-          .append("-")
-          .append(raw.substring(20));
-        return sb.toString();
-    }
+  }
 }
-
-
-
-
-

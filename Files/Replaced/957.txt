@@ -1,7 +1,8 @@
-} catch (Exception th) {
++ ManagementFactory.getRuntimeMXBean().getName().replaceAll("[^a-zA-Z0-9]+","") + "-"
 
-package org.apache.solr.handler.component;
-/*
+package org.apache.lucene.store;
+
+/**
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -18,395 +19,358 @@ package org.apache.solr.handler.component;
  * limitations under the License.
  */
 
-import org.apache.http.client.HttpClient;
-import org.apache.solr.client.solrj.SolrRequest;
-import org.apache.solr.client.solrj.SolrResponse;
-import org.apache.solr.client.solrj.SolrServer;
-import org.apache.solr.client.solrj.impl.HttpSolrServer;
-import org.apache.solr.client.solrj.impl.LBHttpSolrServer;
-import org.apache.solr.client.solrj.request.QueryRequest;
-import org.apache.solr.client.solrj.util.ClientUtils;
-import org.apache.solr.cloud.CloudDescriptor;
-import org.apache.solr.cloud.ZkController;
-import org.apache.solr.common.SolrException;
-import org.apache.solr.common.cloud.ClusterState;
-import org.apache.solr.common.cloud.DocCollection;
-import org.apache.solr.common.cloud.Replica;
-import org.apache.solr.common.cloud.Slice;
-import org.apache.solr.common.cloud.ZkCoreNodeProps;
-import org.apache.solr.common.cloud.ZkStateReader;
-import org.apache.solr.common.params.CommonParams;
-import org.apache.solr.common.params.ModifiableSolrParams;
-import org.apache.solr.common.params.ShardParams;
-import org.apache.solr.common.params.SolrParams;
-import org.apache.solr.common.util.NamedList;
-import org.apache.solr.common.util.StrUtils;
-import org.apache.solr.core.CoreDescriptor;
-import org.apache.solr.request.SolrQueryRequest;
-
-import java.net.ConnectException;
-import java.util.Collection;
-import java.util.HashMap;
+import java.lang.management.ManagementFactory;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.io.File;
+import java.io.RandomAccessFile;
+import java.io.IOException;
 import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.Callable;
-import java.util.concurrent.CompletionService;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Future;
+import java.util.Random;
 
-public class HttpShardHandler extends ShardHandler {
+/**
+ * <p>Implements {@link LockFactory} using native OS file
+ * locks.  Note that because this LockFactory relies on
+ * java.nio.* APIs for locking, any problems with those APIs
+ * will cause locking to fail.  Specifically, on certain NFS
+ * environments the java.nio.* locks will fail (the lock can
+ * incorrectly be double acquired) whereas {@link
+ * SimpleFSLockFactory} worked perfectly in those same
+ * environments.  For NFS based access to an index, it's
+ * recommended that you try {@link SimpleFSLockFactory}
+ * first and work around the one limitation that a lock file
+ * could be left when the JVM exits abnormally.</p>
+ *
+ * <p>The primary benefit of {@link NativeFSLockFactory} is
+ * that lock files will be properly removed (by the OS) if
+ * the JVM has an abnormal exit.</p>
+ * 
+ * <p>Note that, unlike {@link SimpleFSLockFactory}, the existence of
+ * leftover lock files in the filesystem on exiting the JVM
+ * is fine because the OS will free the locks held against
+ * these files even though the files still remain.</p>
+ *
+ * <p>If you suspect that this or any other LockFactory is
+ * not working properly in your environment, you can easily
+ * test it by using {@link VerifyingLockFactory}, {@link
+ * LockVerifyServer} and {@link LockStressTest}.</p>
+ *
+ * @see LockFactory
+ */
 
-  private HttpShardHandlerFactory httpShardHandlerFactory;
-  private CompletionService<ShardResponse> completionService;
-  private Set<Future<ShardResponse>> pending;
-  private Map<String,List<String>> shardToURLs;
-  private HttpClient httpClient;
+public class NativeFSLockFactory extends FSLockFactory {
 
+  private volatile boolean tested = false;
 
-  public HttpShardHandler(HttpShardHandlerFactory httpShardHandlerFactory, HttpClient httpClient) {
-    this.httpClient = httpClient;
-    this.httpShardHandlerFactory = httpShardHandlerFactory;
-    completionService = httpShardHandlerFactory.newCompletionService();
-    pending = new HashSet<Future<ShardResponse>>();
-
-    // maps "localhost:8983|localhost:7574" to a shuffled List("http://localhost:8983","http://localhost:7574")
-    // This is primarily to keep track of what order we should use to query the replicas of a shard
-    // so that we use the same replica for all phases of a distributed request.
-    shardToURLs = new HashMap<String,List<String>>();
-
-  }
-
-
-  private static class SimpleSolrResponse extends SolrResponse {
-    long elapsedTime;
-    NamedList<Object> nl;
-
-    @Override
-    public long getElapsedTime() {
-      return elapsedTime;
+  // Simple test to verify locking system is "working".  On
+  // NFS, if it's misconfigured, you can hit long (35
+  // second) timeouts which cause Lock.obtain to take far
+  // too long (it assumes the obtain() call takes zero
+  // time). 
+  private synchronized void acquireTestLock() {
+    if (tested) return;
+    tested = true;
+    
+    // Ensure that lockDir exists and is a directory.
+    if (!lockDir.exists()) {
+      if (!lockDir.mkdirs())
+        throw new RuntimeException("Cannot create directory: " +
+                              lockDir.getAbsolutePath());
+    } else if (!lockDir.isDirectory()) {
+      throw new RuntimeException("Found regular file where directory expected: " + 
+                            lockDir.getAbsolutePath());
     }
 
-    @Override
-    public NamedList<Object> getResponse() {
-      return nl;
-    }
-
-    @Override
-    public void setResponse(NamedList<Object> rsp) {
-      nl = rsp;
-    }
-  }
-
-
-  // Not thread safe... don't use in Callable.
-  // Don't modify the returned URL list.
-  private List<String> getURLs(String shard) {
-    List<String> urls = shardToURLs.get(shard);
-    if (urls == null) {
-      urls = httpShardHandlerFactory.makeURLList(shard);
-      shardToURLs.put(shard, urls);
-    }
-    return urls;
-  }
-
-
-  @Override
-  public void submit(final ShardRequest sreq, final String shard, final ModifiableSolrParams params) {
-    // do this outside of the callable for thread safety reasons
-    final List<String> urls = getURLs(shard);
-
-    Callable<ShardResponse> task = new Callable<ShardResponse>() {
-      @Override
-      public ShardResponse call() throws Exception {
-
-        ShardResponse srsp = new ShardResponse();
-        if (sreq.nodeName != null) {
-          srsp.setNodeName(sreq.nodeName);
-        }
-        srsp.setShardRequest(sreq);
-        srsp.setShard(shard);
-        SimpleSolrResponse ssr = new SimpleSolrResponse();
-        srsp.setSolrResponse(ssr);
-        long startTime = System.currentTimeMillis();
-
-        try {
-          params.remove(CommonParams.WT); // use default (currently javabin)
-          params.remove(CommonParams.VERSION);
-
-          // SolrRequest req = new QueryRequest(SolrRequest.METHOD.POST, "/select");
-          // use generic request to avoid extra processing of queries
-          QueryRequest req = new QueryRequest(params);
-          req.setMethod(SolrRequest.METHOD.POST);
-
-          // no need to set the response parser as binary is the default
-          // req.setResponseParser(new BinaryResponseParser());
-
-          // if there are no shards available for a slice, urls.size()==0
-          if (urls.size()==0) {
-            // TODO: what's the right error code here? We should use the same thing when
-            // all of the servers for a shard are down.
-            throw new SolrException(SolrException.ErrorCode.SERVICE_UNAVAILABLE, "no servers hosting shard: " + shard);
-          }
-
-          if (urls.size() <= 1) {
-            String url = urls.get(0);
-            srsp.setShardAddress(url);
-            SolrServer server = new HttpSolrServer(url, httpClient);
-            try {
-              ssr.nl = server.request(req);
-            } finally {
-              server.shutdown();
-            }
-          } else {
-            LBHttpSolrServer.Rsp rsp = httpShardHandlerFactory.makeLoadBalancedRequest(req, urls);
-            ssr.nl = rsp.getResponse();
-            srsp.setShardAddress(rsp.getServer());
-          }
-        }
-        catch( ConnectException cex ) {
-          srsp.setException(cex); //????
-        } catch (Throwable th) {
-          srsp.setException(th);
-          if (th instanceof SolrException) {
-            srsp.setResponseCode(((SolrException)th).code());
-          } else {
-            srsp.setResponseCode(-1);
-          }
-        }
-
-        ssr.elapsedTime = System.currentTimeMillis() - startTime;
-
-        return srsp;
+    // add the RuntimeMXBean's name to the lock file, to reduce the chance for
+    // name collisions when this code is invoked by multiple JVMs (such as in
+    // our tests). On most systems, the name includes the process Id.
+    // Also, remove any non-alphanumeric characters, so that the lock file will
+    // be created for sure on all systems.
+    String randomLockName = "lucene-"
+        + ManagementFactory.getRuntimeMXBean().getName().replaceAll("[^a..zA..Z0..9]+","") + "-"
+        + Long.toString(new Random().nextInt(), Character.MAX_RADIX)
+        + "-test.lock";
+    
+    Lock l = makeLock(randomLockName);
+    try {
+      l.obtain();
+      l.release();
+      // If the test lock failed to delete after all the attempts, attempt a
+      // delete when the JVM exits.
+      File lockFile = new File(lockDir, randomLockName);
+      if (lockFile.exists()) {
+        lockFile.deleteOnExit();
       }
-    };
-
-    pending.add( completionService.submit(task) );
+    } catch (IOException e) {
+      RuntimeException e2 = new RuntimeException("Failed to acquire random test lock; please verify filesystem for lock directory '" + lockDir + "' supports locking");
+      e2.initCause(e);
+      throw e2;
+    }    
   }
 
-  /** returns a ShardResponse of the last response correlated with a ShardRequest.  This won't 
-   * return early if it runs into an error.  
-   **/
-  @Override
-  public ShardResponse takeCompletedIncludingErrors() {
-    return take(false);
-  }
-
-
-  /** returns a ShardResponse of the last response correlated with a ShardRequest,
-   * or immediately returns a ShardResponse if there was an error detected
+  /**
+   * Create a NativeFSLockFactory instance, with null (unset)
+   * lock directory. When you pass this factory to a {@link FSDirectory}
+   * subclass, the lock directory is automatically set to the
+   * directory itsself. Be sure to create one instance for each directory
+   * your create!
    */
-  @Override
-  public ShardResponse takeCompletedOrError() {
-    return take(true);
+  public NativeFSLockFactory() throws IOException {
+    this((File) null);
   }
-  
-  private ShardResponse take(boolean bailOnError) {
-    
-    while (pending.size() > 0) {
-      try {
-        Future<ShardResponse> future = completionService.take();
-        pending.remove(future);
-        ShardResponse rsp = future.get();
-        if (bailOnError && rsp.getException() != null) return rsp; // if exception, return immediately
-        // add response to the response list... we do this after the take() and
-        // not after the completion of "call" so we know when the last response
-        // for a request was received.  Otherwise we might return the same
-        // request more than once.
-        rsp.getShardRequest().responses.add(rsp);
-        if (rsp.getShardRequest().responses.size() == rsp.getShardRequest().actualShards.length) {
-          return rsp;
-        }
-      } catch (InterruptedException e) {
-        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, e);
-      } catch (ExecutionException e) {
-        // should be impossible... the problem with catching the exception
-        // at this level is we don't know what ShardRequest it applied to
-        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, "Impossible Exception",e);
+
+  /**
+   * Create a NativeFSLockFactory instance, storing lock
+   * files into the specified lockDirName:
+   *
+   * @param lockDirName where lock files are created.
+   */
+  public NativeFSLockFactory(String lockDirName) throws IOException {
+    this(new File(lockDirName));
+  }
+
+  /**
+   * Create a NativeFSLockFactory instance, storing lock
+   * files into the specified lockDir:
+   * 
+   * @param lockDir where lock files are created.
+   */
+  public NativeFSLockFactory(File lockDir) throws IOException {
+    setLockDir(lockDir);
+  }
+
+  @Override
+  public synchronized Lock makeLock(String lockName) {
+    acquireTestLock();
+    if (lockPrefix != null)
+      lockName = lockPrefix + "-" + lockName;
+    return new NativeFSLock(lockDir, lockName);
+  }
+
+  @Override
+  public void clearLock(String lockName) throws IOException {
+    // Note that this isn't strictly required anymore
+    // because the existence of these files does not mean
+    // they are locked, but, still do this in case people
+    // really want to see the files go away:
+    if (lockDir.exists()) {
+      if (lockPrefix != null) {
+        lockName = lockPrefix + "-" + lockName;
+      }
+      File lockFile = new File(lockDir, lockName);
+      if (lockFile.exists() && !lockFile.delete()) {
+        throw new IOException("Cannot delete " + lockFile);
       }
     }
-    return null;
+  }
+}
+
+class NativeFSLock extends Lock {
+
+  private RandomAccessFile f;
+  private FileChannel channel;
+  private FileLock lock;
+  private File path;
+  private File lockDir;
+
+  /*
+   * The javadocs for FileChannel state that you should have
+   * a single instance of a FileChannel (per JVM) for all
+   * locking against a given file (locks are tracked per 
+   * FileChannel instance in Java 1.4/1.5). Even using the same 
+   * FileChannel instance is not completely thread-safe with Java 
+   * 1.4/1.5 though. To work around this, we have a single (static) 
+   * HashSet that contains the file paths of all currently 
+   * locked locks.  This protects against possible cases 
+   * where different Directory instances in one JVM (each 
+   * with their own NativeFSLockFactory instance) have set 
+   * the same lock dir and lock prefix. However, this will not 
+   * work when LockFactorys are created by different 
+   * classloaders (eg multiple webapps). 
+   * 
+   * TODO: Java 1.6 tracks system wide locks in a thread safe manner 
+   * (same FileChannel instance or not), so we may want to 
+   * change this when Lucene moves to Java 1.6.
+   */
+  private static HashSet<String> LOCK_HELD = new HashSet<String>();
+
+  public NativeFSLock(File lockDir, String lockFileName) {
+    this.lockDir = lockDir;
+    path = new File(lockDir, lockFileName);
   }
 
+  private synchronized boolean lockExists() {
+    return lock != null;
+  }
 
   @Override
-  public void cancelAll() {
-    for (Future<ShardResponse> future : pending) {
-      // TODO: any issues with interrupting?  shouldn't be if
-      // there are finally blocks to release connections.
-      future.cancel(true);
+  public synchronized boolean obtain() throws IOException {
+
+    if (lockExists()) {
+      // Our instance is already locked:
+      return false;
     }
-  }
 
-  @Override
-  public void checkDistributed(ResponseBuilder rb) {
-    SolrQueryRequest req = rb.req;
-    SolrParams params = req.getParams();
+    // Ensure that lockDir exists and is a directory.
+    if (!lockDir.exists()) {
+      if (!lockDir.mkdirs())
+        throw new IOException("Cannot create directory: " +
+                              lockDir.getAbsolutePath());
+    } else if (!lockDir.isDirectory()) {
+      throw new IOException("Found regular file where directory expected: " + 
+                            lockDir.getAbsolutePath());
+    }
 
-    rb.isDistrib = params.getBool("distrib", req.getCore().getCoreDescriptor()
-        .getCoreContainer().isZooKeeperAware());
-    String shards = params.get(ShardParams.SHARDS);
+    String canonicalPath = path.getCanonicalPath();
 
-    // for back compat, a shards param with URLs like localhost:8983/solr will mean that this
-    // search is distributed.
-    boolean hasShardURL = shards != null && shards.indexOf('/') > 0;
-    rb.isDistrib = hasShardURL | rb.isDistrib;
-    
-    if (rb.isDistrib) {
-      // since the cost of grabbing cloud state is still up in the air, we grab it only
-      // if we need it.
-      ClusterState clusterState = null;
-      Map<String,Slice> slices = null;
-      CoreDescriptor coreDescriptor = req.getCore().getCoreDescriptor();
-      CloudDescriptor cloudDescriptor = coreDescriptor.getCloudDescriptor();
-      ZkController zkController = coreDescriptor.getCoreContainer().getZkController();
+    boolean markedHeld = false;
 
+    try {
 
-      if (shards != null) {
-        List<String> lst = StrUtils.splitSmart(shards, ",", true);
-        rb.shards = lst.toArray(new String[lst.size()]);
-        rb.slices = new String[rb.shards.length];
+      // Make sure nobody else in-process has this lock held
+      // already, and, mark it held if not:
 
-        if (zkController != null) {
-          // figure out which shards are slices
-          for (int i=0; i<rb.shards.length; i++) {
-            if (rb.shards[i].indexOf('/') < 0) {
-              // this is a logical shard
-              rb.slices[i] = rb.shards[i];
-              rb.shards[i] = null;
-            }
-          }
-        }
-      } else if (zkController != null) {
-        // we weren't provided with an explicit list of slices to query via "shards", so use the cluster state
-
-        clusterState =  zkController.getClusterState();
-        String shardKeys =  params.get(ShardParams._ROUTE_);
-        if(shardKeys == null) shardKeys = params.get(ShardParams.SHARD_KEYS);//eprecated
-
-        // This will be the complete list of slices we need to query for this request.
-        slices = new HashMap<String,Slice>();
-
-        // we need to find out what collections this request is for.
-
-        // A comma-separated list of specified collections.
-        // Eg: "collection1,collection2,collection3"
-        String collections = params.get("collection");
-        if (collections != null) {
-          // If there were one or more collections specified in the query, split
-          // each parameter and store as a separate member of a List.
-          List<String> collectionList = StrUtils.splitSmart(collections, ",",
-              true);
-          // In turn, retrieve the slices that cover each collection from the
-          // cloud state and add them to the Map 'slices'.
-          for (String collectionName : collectionList) {
-            // The original code produced <collection-name>_<shard-name> when the collections
-            // parameter was specified (see ClientUtils.appendMap)
-            // Is this necessary if ony one collection is specified?
-            // i.e. should we change multiCollection to collectionList.size() > 1?
-            addSlices(slices, clusterState, params, collectionName,  shardKeys, true);
-          }
+      synchronized(LOCK_HELD) {
+        if (LOCK_HELD.contains(canonicalPath)) {
+          // Someone else in this JVM already has the lock:
+          return false;
         } else {
-          // just this collection
-          String collectionName = cloudDescriptor.getCollectionName();
-          addSlices(slices, clusterState, params, collectionName,  shardKeys, false);
+          // This "reserves" the fact that we are the one
+          // thread trying to obtain this lock, so we own
+          // the only instance of a channel against this
+          // file:
+          LOCK_HELD.add(canonicalPath);
+          markedHeld = true;
         }
-
-        
-        // Store the logical slices in the ResponseBuilder and create a new
-        // String array to hold the physical shards (which will be mapped
-        // later).
-        rb.slices = slices.keySet().toArray(new String[slices.size()]);
-        rb.shards = new String[rb.slices.length];
       }
 
-      //
-      // Map slices to shards
-      //
-      if (zkController != null) {
+      try {
+        f = new RandomAccessFile(path, "rw");
+      } catch (IOException e) {
+        // On Windows, we can get intermittent "Access
+        // Denied" here.  So, we treat this as failure to
+        // acquire the lock, but, store the reason in case
+        // there is in fact a real error case.
+        failureReason = e;
+        f = null;
+      }
 
-        // Are we hosting the shard that this request is for, and are we active? If so, then handle it ourselves
-        // and make it a non-distributed request.
-        String ourSlice = cloudDescriptor.getShardId();
-        String ourCollection = cloudDescriptor.getCollectionName();
-        if (rb.slices.length == 1 && rb.slices[0] != null
-            && ( rb.slices[0].equals(ourSlice) || rb.slices[0].equals(ourCollection + "_" + ourSlice) )  // handle the <collection>_<slice> format
-            && ZkStateReader.ACTIVE.equals(cloudDescriptor.getLastPublished()) )
-        {
-          boolean shortCircuit = params.getBool("shortCircuit", true);       // currently just a debugging parameter to check distrib search on a single node
-
-          String targetHandler = params.get(ShardParams.SHARDS_QT);
-          shortCircuit = shortCircuit && targetHandler == null;             // if a different handler is specified, don't short-circuit
-
-          if (shortCircuit) {
-            rb.isDistrib = false;
-            return;
-          }
-          // We shouldn't need to do anything to handle "shard.rows" since it was previously meant to be an optimization?
-        }
-
-
-        for (int i=0; i<rb.shards.length; i++) {
-          if (rb.shards[i] == null) {
-            if (clusterState == null) {
-              clusterState =  zkController.getClusterState();
-              slices = clusterState.getSlicesMap(cloudDescriptor.getCollectionName());
-            }
-            String sliceName = rb.slices[i];
-
-            Slice slice = slices.get(sliceName);
-
-            if (slice==null) {
-              // Treat this the same as "all servers down" for a slice, and let things continue
-              // if partial results are acceptable
-              rb.shards[i] = "";
-              continue;
-              // throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, "no such shard: " + sliceName);
-            }
-
-            Map<String, Replica> sliceShards = slice.getReplicasMap();
-
-            // For now, recreate the | delimited list of equivalent servers
-            StringBuilder sliceShardsStr = new StringBuilder();
-            boolean first = true;
-            for (Replica replica : sliceShards.values()) {
-              if (!clusterState.liveNodesContain(replica.getNodeName())
-                  || !replica.getStr(ZkStateReader.STATE_PROP).equals(
-                      ZkStateReader.ACTIVE)) continue;
-              if (first) {
-                first = false;
-              } else {
-                sliceShardsStr.append('|');
+      if (f != null) {
+        try {
+          channel = f.getChannel();
+          try {
+            lock = channel.tryLock();
+          } catch (IOException e) {
+            // At least on OS X, we will sometimes get an
+            // intermittent "Permission Denied" IOException,
+            // which seems to simply mean "you failed to get
+            // the lock".  But other IOExceptions could be
+            // "permanent" (eg, locking is not supported via
+            // the filesystem).  So, we record the failure
+            // reason here; the timeout obtain (usually the
+            // one calling us) will use this as "root cause"
+            // if it fails to get the lock.
+            failureReason = e;
+          } finally {
+            if (lock == null) {
+              try {
+                channel.close();
+              } finally {
+                channel = null;
               }
-              String url = ZkCoreNodeProps.getCoreUrl(replica);
-              if (url.startsWith("http://"))
-                url = url.substring(7);
-              sliceShardsStr.append(url);
             }
+          }
+        } finally {
+          if (channel == null) {
+            try {
+              f.close();
+            } finally {
+              f = null;
+            }
+          }
+        }
+      }
 
-            rb.shards[i] = sliceShardsStr.toString();
+    } finally {
+      if (markedHeld && !lockExists()) {
+        synchronized(LOCK_HELD) {
+          if (LOCK_HELD.contains(canonicalPath)) {
+            LOCK_HELD.remove(canonicalPath);
           }
         }
       }
     }
-    String shards_rows = params.get(ShardParams.SHARDS_ROWS);
-    if(shards_rows != null) {
-      rb.shards_rows = Integer.parseInt(shards_rows);
-    }
-    String shards_start = params.get(ShardParams.SHARDS_START);
-    if(shards_start != null) {
-      rb.shards_start = Integer.parseInt(shards_start);
+    return lockExists();
+  }
+
+  @Override
+  public synchronized void release() throws IOException {
+    if (lockExists()) {
+      try {
+        lock.release();
+      } finally {
+        lock = null;
+        try {
+          channel.close();
+        } finally {
+          channel = null;
+          try {
+            f.close();
+          } finally {
+            f = null;
+            synchronized(LOCK_HELD) {
+              LOCK_HELD.remove(path.getCanonicalPath());
+            }
+          }
+        }
+      }
+      // LUCENE-2421: we don't care anymore if the file cannot be deleted
+      // because it's held up by another process (e.g. AntiVirus). NativeFSLock
+      // does not depend on the existence/absence of the lock file
+      path.delete();
+    } else {
+      // if we don't hold the lock, and somebody still called release(), for
+      // example as a result of calling IndexWriter.unlock(), we should attempt
+      // to obtain the lock and release it. If the obtain fails, it means the
+      // lock cannot be released, and we should throw a proper exception rather
+      // than silently failing/not doing anything.
+      boolean obtained = false;
+      try {
+        if (!(obtained = obtain())) {
+          throw new LockReleaseFailedException(
+              "Cannot forcefully unlock a NativeFSLock which is held by another indexer component: "
+                  + path);
+        }
+      } finally {
+        if (obtained) {
+          release();
+        }
+      }
     }
   }
 
-
-  private void addSlices(Map<String,Slice> target, ClusterState state, SolrParams params, String collectionName, String shardKeys, boolean multiCollection) {
-    DocCollection coll = state.getCollection(collectionName);
-    Collection<Slice> slices = coll.getRouter().getSearchSlices(shardKeys, params , coll);
-    ClientUtils.addSlices(target, collectionName, slices, multiCollection);
+  @Override
+  public synchronized boolean isLocked() {
+    // The test for is isLocked is not directly possible with native file locks:
+    
+    // First a shortcut, if a lock reference in this instance is available
+    if (lockExists()) return true;
+    
+    // Look if lock file is present; if not, there can definitely be no lock!
+    if (!path.exists()) return false;
+    
+    // Try to obtain and release (if was locked) the lock
+    try {
+      boolean obtained = obtain();
+      if (obtained) release();
+      return !obtained;
+    } catch (IOException ioe) {
+      return false;
+    }    
   }
 
-
-
+  @Override
+  public String toString() {
+    return "NativeFSLock@" + path;
+  }
 }

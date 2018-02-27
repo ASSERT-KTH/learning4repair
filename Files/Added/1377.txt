@@ -20,398 +20,371 @@ package org.apache.lucene.index;
  */
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
 
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.MergeInfo;
-import org.apache.lucene.util.SetOnce.AlreadySetException;
-import org.apache.lucene.util.SetOnce;
+import org.apache.lucene.codecs.Codec;
+import org.apache.lucene.codecs.DocValuesConsumer;
+import org.apache.lucene.codecs.FieldInfosWriter;
+import org.apache.lucene.codecs.PerDocConsumer;
+import org.apache.lucene.document.FieldType;
+import org.apache.lucene.index.DocumentsWriterPerThread.DocState;
+import org.apache.lucene.index.TypePromoter.TypeCompatibility;
+import org.apache.lucene.store.IOContext;
+import org.apache.lucene.util.ArrayUtil;
+import org.apache.lucene.util.IOUtils;
+
 
 /**
- * <p>Expert: a MergePolicy determines the sequence of
- * primitive merge operations.</p>
- * 
- * <p>Whenever the segments in an index have been altered by
- * {@link IndexWriter}, either the addition of a newly
- * flushed segment, addition of many segments from
- * addIndexes* calls, or a previous merge that may now need
- * to cascade, {@link IndexWriter} invokes {@link
- * #findMerges} to give the MergePolicy a chance to pick
- * merges that are now required.  This method returns a
- * {@link MergeSpecification} instance describing the set of
- * merges that should be done, or null if no merges are
- * necessary.  When IndexWriter.forceMerge is called, it calls
- * {@link #findForcedMerges(SegmentInfos,int,Map)} and the MergePolicy should
- * then return the necessary merges.</p>
- *
- * <p>Note that the policy can return more than one merge at
- * a time.  In this case, if the writer is using {@link
- * SerialMergeScheduler}, the merges will be run
- * sequentially but if it is using {@link
- * ConcurrentMergeScheduler} they will be run concurrently.</p>
- * 
- * <p>The default MergePolicy is {@link
- * TieredMergePolicy}.</p>
- *
- * @lucene.experimental
+ * This is a DocConsumer that gathers all fields under the
+ * same name, and calls per-field consumers to process field
+ * by field.  This class doesn't doesn't do any "real" work
+ * of its own: it just forwards the fields to a
+ * DocFieldConsumer.
  */
 
-public abstract class MergePolicy implements java.io.Closeable, Cloneable {
-  
-  /** OneMerge provides the information necessary to perform
-   *  an individual primitive merge operation, resulting in
-   *  a single new segment.  The merge spec includes the
-   *  subset of segments to be merged as well as whether the
-   *  new segment should use the compound file format. */
+final class DocFieldProcessor extends DocConsumer {
 
-  public static class OneMerge {
+  final DocFieldConsumer consumer;
+  final StoredFieldsConsumer fieldsWriter;
+  final Codec codec;
 
-    SegmentInfoPerCommit info;      // used by IndexWriter
-    boolean registerDone;           // used by IndexWriter
-    long mergeGen;                  // used by IndexWriter
-    boolean isExternal;             // used by IndexWriter
-    int maxNumSegments = -1;        // used by IndexWriter
+  // Holds all fields seen in current doc
+  DocFieldProcessorPerField[] fields = new DocFieldProcessorPerField[1];
+  int fieldCount;
 
-    /** Estimated size in bytes of the merged segment. */
-    public long estimatedMergeBytes;       // used by IndexWriter
-    List<SegmentReader> readers;        // used by IndexWriter
+  // Hash table for all fields ever seen
+  DocFieldProcessorPerField[] fieldHash = new DocFieldProcessorPerField[2];
+  int hashMask = 1;
+  int totalFieldCount;
 
-    /** Segments to be merged. */
-    public final List<SegmentInfoPerCommit> segments;
+  int fieldGen;
+  final DocumentsWriterPerThread.DocState docState;
 
-    /** Number of documents in the merged segment. */
-    public final int totalDocCount;
-    boolean aborted;
-    Throwable error;
-    boolean paused;
-
-    /** Sole constructor.
-     * @param segments List of {@link SegmentInfoPerCommit}s
-     *        to be merged. */
-    public OneMerge(List<SegmentInfoPerCommit> segments) {
-      if (0 == segments.size())
-        throw new RuntimeException("segments must include at least one segment");
-      // clone the list, as the in list may be based off original SegmentInfos and may be modified
-      this.segments = new ArrayList<SegmentInfoPerCommit>(segments);
-      int count = 0;
-      for(SegmentInfoPerCommit info : segments) {
-        count += info.info.getDocCount();
-      }
-      totalDocCount = count;
-    }
-
-    /** Record that an exception occurred while executing
-     *  this merge */
-    synchronized void setException(Throwable error) {
-      this.error = error;
-    }
-
-    /** Retrieve previous exception set by {@link
-     *  #setException}. */
-    synchronized Throwable getException() {
-      return error;
-    }
-
-    /** Mark this merge as aborted.  If this is called
-     *  before the merge is committed then the merge will
-     *  not be committed. */
-    synchronized void abort() {
-      aborted = true;
-      notifyAll();
-    }
-
-    /** Returns true if this merge was aborted. */
-    synchronized boolean isAborted() {
-      return aborted;
-    }
-
-    /** Called periodically by {@link IndexWriter} while
-     *  merging to see if the merge is aborted. */
-    public synchronized void checkAborted(Directory dir) throws MergeAbortedException {
-      if (aborted) {
-        throw new MergeAbortedException("merge is aborted: " + segString(dir));
-      }
-
-      while (paused) {
-        try {
-          // In theory we could wait() indefinitely, but we
-          // do 1000 msec, defensively
-          wait(1000);
-        } catch (InterruptedException ie) {
-          throw new RuntimeException(ie);
-        }
-        if (aborted) {
-          throw new MergeAbortedException("merge is aborted: " + segString(dir));
-        }
-      }
-    }
-
-    /** Set or clear whether this merge is paused paused (for example
-     *  {@link ConcurrentMergeScheduler} will pause merges
-     *  if too many are running). */
-    synchronized public void setPause(boolean paused) {
-      this.paused = paused;
-      if (!paused) {
-        // Wakeup merge thread, if it's waiting
-        notifyAll();
-      }
-    }
-
-    /** Returns true if this merge is paused.
-     *
-     *  @see #setPause(boolean) */
-    synchronized public boolean getPause() {
-      return paused;
-    }
-
-    /** Returns a readable description of the current merge
-     *  state. */
-    public String segString(Directory dir) {
-      StringBuilder b = new StringBuilder();
-      final int numSegments = segments.size();
-      for(int i=0;i<numSegments;i++) {
-        if (i > 0) b.append(' ');
-        b.append(segments.get(i).toString(dir, 0));
-      }
-      if (info != null) {
-        b.append(" into ").append(info.info.name);
-      }
-      if (maxNumSegments != -1)
-        b.append(" [maxNumSegments=" + maxNumSegments + "]");
-      if (aborted) {
-        b.append(" [ABORTED]");
-      }
-      return b.toString();
-    }
-    
-    /**
-     * Returns the total size in bytes of this merge. Note that this does not
-     * indicate the size of the merged segment, but the input total size.
-     * */
-    public long totalBytesSize() throws IOException {
-      long total = 0;
-      for (SegmentInfoPerCommit info : segments) {
-        total += info.info.sizeInBytes();
-      }
-      return total;
-    }
-
-    /**
-     * Returns the total number of documents that are included with this merge.
-     * Note that this does not indicate the number of documents after the merge.
-     * */
-    public int totalNumDocs() throws IOException {
-      int total = 0;
-      for (SegmentInfoPerCommit info : segments) {
-        total += info.info.getDocCount();
-      }
-      return total;
-    }
-
-    /** Return {@link MergeInfo} describing this merge. */
-    public MergeInfo getMergeInfo() {
-      return new MergeInfo(totalDocCount, estimatedMergeBytes, isExternal, maxNumSegments);
-    }    
+  public DocFieldProcessor(DocumentsWriterPerThread docWriter, DocFieldConsumer consumer) {
+    this.docState = docWriter.docState;
+    this.codec = docWriter.codec;
+    this.consumer = consumer;
+    fieldsWriter = new StoredFieldsConsumer(docWriter);
   }
-
-  /**
-   * A MergeSpecification instance provides the information
-   * necessary to perform multiple merges.  It simply
-   * contains a list of {@link OneMerge} instances.
-   */
-
-  public static class MergeSpecification {
-
-    /**
-     * The subset of segments to be included in the primitive merge.
-     */
-
-    public final List<OneMerge> merges = new ArrayList<OneMerge>();
-
-    /** Sole constructor.  Use {@link
-     *  #add(MergePolicy.OneMerge)} to add merges. */
-    public MergeSpecification() {
-    }
-
-    /** Adds the provided {@link OneMerge} to this
-     *  specification. */
-    public void add(OneMerge merge) {
-      merges.add(merge);
-    }
-
-    /** Returns a description of the merges in this
-    *  specification. */
-    public String segString(Directory dir) {
-      StringBuilder b = new StringBuilder();
-      b.append("MergeSpec:\n");
-      final int count = merges.size();
-      for(int i=0;i<count;i++)
-        b.append("  ").append(1 + i).append(": ").append(merges.get(i).segString(dir));
-      return b.toString();
-    }
-  }
-
-  /** Exception thrown if there are any problems while
-   *  executing a merge. */
-  public static class MergeException extends RuntimeException {
-    private Directory dir;
-
-    /** Create a {@code MergeException}. */
-    public MergeException(String message, Directory dir) {
-      super(message);
-      this.dir = dir;
-    }
-
-    /** Create a {@code MergeException}. */
-    public MergeException(Throwable exc, Directory dir) {
-      super(exc);
-      this.dir = dir;
-    }
-
-    /** Returns the {@link Directory} of the index that hit
-     *  the exception. */
-    public Directory getDirectory() {
-      return dir;
-    }
-  }
-
-  /** Thrown when a merge was explicity aborted because
-   *  {@link IndexWriter#close(boolean)} was called with
-   *  <code>false</code>.  Normally this exception is
-   *  privately caught and suppresed by {@link IndexWriter}.  */
-  public static class MergeAbortedException extends IOException {
-    /** Create a {@link MergeAbortedException}. */
-    public MergeAbortedException() {
-      super("merge is aborted");
-    }
-
-    /** Create a {@link MergeAbortedException} with a
-     *  specified message. */
-    public MergeAbortedException(String message) {
-      super(message);
-    }
-  }
-
-  /** {@link IndexWriter} that contains this instance. */
-  protected SetOnce<IndexWriter> writer;
 
   @Override
-  public MergePolicy clone() {
-    MergePolicy clone;
-    try {
-      clone = (MergePolicy) super.clone();
-    } catch (CloneNotSupportedException e) {
-      // should not happen
-      throw new RuntimeException(e);
+  public void flush(SegmentWriteState state) throws IOException {
+
+    Map<String,DocFieldConsumerPerField> childFields = new HashMap<String,DocFieldConsumerPerField>();
+    Collection<DocFieldConsumerPerField> fields = fields();
+    for (DocFieldConsumerPerField f : fields) {
+      childFields.put(f.getFieldInfo().name, f);
     }
-    clone.writer = new SetOnce<IndexWriter>();
-    return clone;
-  }
 
-  /**
-   * Creates a new merge policy instance. Note that if you intend to use it
-   * without passing it to {@link IndexWriter}, you should call
-   * {@link #setIndexWriter(IndexWriter)}.
-   */
-  public MergePolicy() {
-    writer = new SetOnce<IndexWriter>();
-  }
+    fieldsWriter.flush(state);
+    consumer.flush(childFields, state);
 
-  /**
-   * Sets the {@link IndexWriter} to use by this merge policy. This method is
-   * allowed to be called only once, and is usually set by IndexWriter. If it is
-   * called more than once, {@link AlreadySetException} is thrown.
-   * 
-   * @see SetOnce
-   */
-  public void setIndexWriter(IndexWriter writer) {
-    this.writer.set(writer);
-  }
-  
-  /**
-   * Determine what set of merge operations are now necessary on the index.
-   * {@link IndexWriter} calls this whenever there is a change to the segments.
-   * This call is always synchronized on the {@link IndexWriter} instance so
-   * only one thread at a time will call this method.
-   * @param mergeTrigger the event that triggered the merge
-   * @param segmentInfos
-   *          the total set of segments in the index
-   */
-  public abstract MergeSpecification findMerges(MergeTrigger mergeTrigger, SegmentInfos segmentInfos)
-      throws IOException;
-
-  /**
-   * Determine what set of merge operations is necessary in
-   * order to merge to <= the specified segment count. {@link IndexWriter} calls this when its
-   * {@link IndexWriter#forceMerge} method is called. This call is always
-   * synchronized on the {@link IndexWriter} instance so only one thread at a
-   * time will call this method.
-   * 
-   * @param segmentInfos
-   *          the total set of segments in the index
-   * @param maxSegmentCount
-   *          requested maximum number of segments in the index (currently this
-   *          is always 1)
-   * @param segmentsToMerge
-   *          contains the specific SegmentInfo instances that must be merged
-   *          away. This may be a subset of all
-   *          SegmentInfos.  If the value is True for a
-   *          given SegmentInfo, that means this segment was
-   *          an original segment present in the
-   *          to-be-merged index; else, it was a segment
-   *          produced by a cascaded merge.
-   */
-  public abstract MergeSpecification findForcedMerges(
-          SegmentInfos segmentInfos, int maxSegmentCount, Map<SegmentInfoPerCommit,Boolean> segmentsToMerge)
-      throws IOException;
-
-  /**
-   * Determine what set of merge operations is necessary in order to expunge all
-   * deletes from the index.
-   * 
-   * @param segmentInfos
-   *          the total set of segments in the index
-   */
-  public abstract MergeSpecification findForcedDeletesMerges(
-      SegmentInfos segmentInfos) throws IOException;
-
-  /**
-   * Release all resources for the policy.
-   */
-  public abstract void close();
-  
-  
-  /**
-   * Returns true if a new segment (regardless of its origin) should use the compound file format.
-   */
-  public abstract boolean useCompoundFile(SegmentInfos segments, SegmentInfoPerCommit newSegment) throws IOException;
-  
-  /**
-   * MergeTrigger is passed to
-   * {@link MergePolicy#findMerges(MergeTrigger, SegmentInfos)} to indicate the
-   * event that triggered the merge.
-   */
-  public static enum MergeTrigger {
-    /**
-     * Merge was triggered by a segment flush.
-     */
-    SEGMENT_FLUSH, 
-    /**
-     * Merge was triggered by a full flush. Full flushes
-     * can be caused by a commit, NRT reader reopen or a close call on the index writer.
-     */
-    FULL_FLUSH,
-    /**
-     * Merge has been triggered explicitly by the user.
-     */
-    EXPLICIT,
+    for (DocValuesConsumerHolder consumer : docValues.values()) {
+      consumer.docValuesConsumer.finish(state.segmentInfo.getDocCount());
+    }
     
-    /**
-     * Merge was triggered by a successfully finished merge.
-     */
-    MERGE_FINISHED,
+    // close perDocConsumer during flush to ensure all files are flushed due to PerCodec CFS
+    IOUtils.close(perDocConsumer);
+
+    // Important to save after asking consumer to flush so
+    // consumer can alter the FieldInfo* if necessary.  EG,
+    // FreqProxTermsWriter does this with
+    // FieldInfo.storePayload.
+    FieldInfosWriter infosWriter = codec.fieldInfosFormat().getFieldInfosWriter();
+    infosWriter.write(state.directory, state.segmentInfo.name, state.fieldInfos, IOContext.DEFAULT);
   }
+
+  @Override
+  public void abort() {
+    Throwable th = null;
+    
+    for (DocFieldProcessorPerField field : fieldHash) {
+      while (field != null) {
+        final DocFieldProcessorPerField next = field.next;
+        try {
+          field.abort();
+        } catch (Throwable t) {
+          if (th == null) {
+            th = t;
+          }
+        }
+        field = next;
+      }
+    }
+    IOUtils.closeWhileHandlingException(perDocConsumer);
+    // TODO add abort to PerDocConsumer!
+    
+    try {
+      fieldsWriter.abort();
+    } catch (Throwable t) {
+      if (th == null) {
+        th = t;
+      }
+    }
+    
+    try {
+      consumer.abort();
+    } catch (Throwable t) {
+      if (th == null) {
+        th = t;
+      }
+    }
+    
+    try {
+      if (perDocConsumer != null) {
+        perDocConsumer.abort();  
+      }
+    } catch (Throwable t) {
+      if (th == null) {
+        th = t;
+      }
+    }
+    
+    // If any errors occured, throw it.
+    if (th != null) {
+      if (th instanceof RuntimeException) throw (RuntimeException) th;
+      if (th instanceof Error) throw (Error) th;
+      // defensive code - we should not hit unchecked exceptions
+      throw new RuntimeException(th);
+    }
+  }
+
+  @Override
+  public boolean freeRAM() {
+    return consumer.freeRAM();
+  }
+
+  public Collection<DocFieldConsumerPerField> fields() {
+    Collection<DocFieldConsumerPerField> fields = new HashSet<DocFieldConsumerPerField>();
+    for(int i=0;i<fieldHash.length;i++) {
+      DocFieldProcessorPerField field = fieldHash[i];
+      while(field != null) {
+        fields.add(field.consumer);
+        field = field.next;
+      }
+    }
+    assert fields.size() == totalFieldCount;
+    return fields;
+  }
+
+  /** In flush we reset the fieldHash to not maintain per-field state
+   *  across segments */
+  @Override
+  void doAfterFlush() {
+    fieldHash = new DocFieldProcessorPerField[2];
+    hashMask = 1;
+    totalFieldCount = 0;
+    perDocConsumer = null;
+    docValues.clear();
+  }
+
+  private void rehash() {
+    final int newHashSize = (fieldHash.length*2);
+    assert newHashSize > fieldHash.length;
+
+    final DocFieldProcessorPerField newHashArray[] = new DocFieldProcessorPerField[newHashSize];
+
+    // Rehash
+    int newHashMask = newHashSize-1;
+    for(int j=0;j<fieldHash.length;j++) {
+      DocFieldProcessorPerField fp0 = fieldHash[j];
+      while(fp0 != null) {
+        final int hashPos2 = fp0.fieldInfo.name.hashCode() & newHashMask;
+        DocFieldProcessorPerField nextFP0 = fp0.next;
+        fp0.next = newHashArray[hashPos2];
+        newHashArray[hashPos2] = fp0;
+        fp0 = nextFP0;
+      }
+    }
+
+    fieldHash = newHashArray;
+    hashMask = newHashMask;
+  }
+
+  @Override
+  public void processDocument(FieldInfos.Builder fieldInfos) throws IOException {
+
+    consumer.startDocument();
+    fieldsWriter.startDocument();
+
+    fieldCount = 0;
+
+    final int thisFieldGen = fieldGen++;
+
+    // Absorb any new fields first seen in this document.
+    // Also absorb any changes to fields we had already
+    // seen before (eg suddenly turning on norms or
+    // vectors, etc.):
+
+    for(IndexableField field : docState.doc.indexableFields()) {
+      final String fieldName = field.name();
+      IndexableFieldType ft = field.fieldType();
+
+      DocFieldProcessorPerField fp = processField(fieldInfos, thisFieldGen, fieldName, ft);
+
+      fp.addField(field);
+    }
+    for (StorableField field: docState.doc.storableFields()) {
+      final String fieldName = field.name();
+      IndexableFieldType ft = field.fieldType();
+
+      DocFieldProcessorPerField fp = processField(fieldInfos, thisFieldGen, fieldName, ft);
+      if (ft.stored()) {
+        fieldsWriter.addField(field, fp.fieldInfo);
+      }
+      
+      final DocValues.Type dvType = ft.docValueType();
+      if (dvType != null) {
+        DocValuesConsumerHolder docValuesConsumer = docValuesConsumer(dvType,
+            docState, fp.fieldInfo);
+        DocValuesConsumer consumer = docValuesConsumer.docValuesConsumer;
+        if (docValuesConsumer.compatibility == null) {
+          consumer.add(docState.docID, field);
+          docValuesConsumer.compatibility = new TypeCompatibility(dvType,
+              consumer.getValueSize());
+        } else if (docValuesConsumer.compatibility.isCompatible(dvType,
+            TypePromoter.getValueSize(dvType, field.binaryValue()))) {
+          consumer.add(docState.docID, field);
+        } else {
+          docValuesConsumer.compatibility.isCompatible(dvType,
+              TypePromoter.getValueSize(dvType, field.binaryValue()));
+          TypeCompatibility compatibility = docValuesConsumer.compatibility;
+          throw new IllegalArgumentException("Incompatible DocValues type: "
+              + dvType.name() + " size: "
+              + TypePromoter.getValueSize(dvType, field.binaryValue())
+              + " expected: " + " type: " + compatibility.getBaseType()
+              + " size: " + compatibility.getBaseSize());
+        }
+      }
+    }
+
+    // If we are writing vectors then we must visit
+    // fields in sorted order so they are written in
+    // sorted order.  TODO: we actually only need to
+    // sort the subset of fields that have vectors
+    // enabled; we could save [small amount of] CPU
+    // here.
+    ArrayUtil.quickSort(fields, 0, fieldCount, fieldsComp);
+    for(int i=0;i<fieldCount;i++) {
+      final DocFieldProcessorPerField perField = fields[i];
+      perField.consumer.processFields(perField.fields, perField.fieldCount);
+    }
+
+    if (docState.maxTermPrefix != null && docState.infoStream.isEnabled("IW")) {
+      docState.infoStream.message("IW", "WARNING: document contains at least one immense term (whose UTF8 encoding is longer than the max length " + DocumentsWriterPerThread.MAX_TERM_LENGTH_UTF8 + "), all of which were skipped.  Please correct the analyzer to not produce such terms.  The prefix of the first immense term is: '" + docState.maxTermPrefix + "...'");
+      docState.maxTermPrefix = null;
+    }
+  }
+
+  private DocFieldProcessorPerField processField(FieldInfos.Builder fieldInfos,
+      final int thisFieldGen, final String fieldName, IndexableFieldType ft) {
+    // Make sure we have a PerField allocated
+    final int hashPos = fieldName.hashCode() & hashMask;
+    DocFieldProcessorPerField fp = fieldHash[hashPos];
+    while(fp != null && !fp.fieldInfo.name.equals(fieldName)) {
+      fp = fp.next;
+    }
+
+    if (fp == null) {
+
+      // TODO FI: we need to genericize the "flags" that a
+      // field holds, and, how these flags are merged; it
+      // needs to be more "pluggable" such that if I want
+      // to have a new "thing" my Fields can do, I can
+      // easily add it
+      FieldInfo fi = fieldInfos.addOrUpdate(fieldName, ft);
+
+      fp = new DocFieldProcessorPerField(this, fi);
+      fp.next = fieldHash[hashPos];
+      fieldHash[hashPos] = fp;
+      totalFieldCount++;
+
+      if (totalFieldCount >= fieldHash.length/2) {
+        rehash();
+      }
+    } else {
+      fieldInfos.addOrUpdate(fp.fieldInfo.name, ft);
+    }
+
+    if (thisFieldGen != fp.lastGen) {
+
+      // First time we're seeing this field for this doc
+      fp.fieldCount = 0;
+
+      if (fieldCount == fields.length) {
+        final int newSize = fields.length*2;
+        DocFieldProcessorPerField newArray[] = new DocFieldProcessorPerField[newSize];
+        System.arraycopy(fields, 0, newArray, 0, fieldCount);
+        fields = newArray;
+      }
+
+      fields[fieldCount++] = fp;
+      fp.lastGen = thisFieldGen;
+    }
+    return fp;
+  }
+
+  private static final Comparator<DocFieldProcessorPerField> fieldsComp = new Comparator<DocFieldProcessorPerField>() {
+    public int compare(DocFieldProcessorPerField o1, DocFieldProcessorPerField o2) {
+      return o1.fieldInfo.name.compareTo(o2.fieldInfo.name);
+    }
+  };
+  
+  @Override
+  void finishDocument() throws IOException {
+    try {
+      fieldsWriter.finishDocument();
+    } finally {
+      consumer.finishDocument();
+    }
+  }
+
+  private static class DocValuesConsumerHolder {
+    // Only used to enforce that same DV field name is never
+    // added more than once per doc:
+    int docID;
+    final DocValuesConsumer docValuesConsumer;
+    TypeCompatibility compatibility;
+
+    public DocValuesConsumerHolder(DocValuesConsumer docValuesConsumer) {
+      this.docValuesConsumer = docValuesConsumer;
+    }
+  }
+
+  final private Map<String, DocValuesConsumerHolder> docValues = new HashMap<String, DocValuesConsumerHolder>();
+  private PerDocConsumer perDocConsumer;
+
+  DocValuesConsumerHolder docValuesConsumer(DocValues.Type valueType, DocState docState, FieldInfo fieldInfo) 
+      throws IOException {
+    DocValuesConsumerHolder docValuesConsumerAndDocID = docValues.get(fieldInfo.name);
+    if (docValuesConsumerAndDocID != null) {
+      if (docState.docID == docValuesConsumerAndDocID.docID) {
+        throw new IllegalArgumentException("DocValuesField \"" + fieldInfo.name + "\" appears more than once in this document (only one value is allowed, per field)");
+      }
+      assert docValuesConsumerAndDocID.docID < docState.docID;
+      docValuesConsumerAndDocID.docID = docState.docID;
+      return docValuesConsumerAndDocID;
+    }
+
+    if (perDocConsumer == null) {
+      PerDocWriteState perDocWriteState = docState.docWriter.newPerDocWriteState("");
+      perDocConsumer = docState.docWriter.codec.docValuesFormat().docsConsumer(perDocWriteState);
+      if (perDocConsumer == null) {
+        throw new IllegalStateException("codec=" +  docState.docWriter.codec + " does not support docValues: from docValuesFormat().docsConsumer(...) returned null; field=" + fieldInfo.name);
+      }
+    }
+    DocValuesConsumer docValuesConsumer = perDocConsumer.addValuesField(valueType, fieldInfo);
+    assert fieldInfo.getDocValuesType() == null || fieldInfo.getDocValuesType() == valueType;
+    fieldInfo.setDocValuesType(valueType);
+
+    docValuesConsumerAndDocID = new DocValuesConsumerHolder(docValuesConsumer);
+    docValuesConsumerAndDocID.docID = docState.docID;
+    docValues.put(fieldInfo.name, docValuesConsumerAndDocID);
+    return docValuesConsumerAndDocID;
+  }
+  
 }

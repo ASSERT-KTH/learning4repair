@@ -1,6 +1,6 @@
 @Override
 
-package org.apache.lucene.index;
+package org.apache.lucene.store;
 
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -19,315 +19,344 @@ package org.apache.lucene.index;
  * limitations under the License.
  */
 
+import java.io.Closeable;
+import java.io.FileNotFoundException;
 import java.io.IOException;
-import java.io.Reader;
-import java.util.Arrays;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedList;
+import java.util.Map;
+import java.util.Queue;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 
-import org.apache.lucene.analysis.*;
-import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
-import org.apache.lucene.analysis.tokenattributes.OffsetAttribute;
-import org.apache.lucene.analysis.tokenattributes.PositionIncrementAttribute;
-import org.apache.lucene.codecs.Codec;
-import org.apache.lucene.codecs.TermVectorsReader;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.Field;
-import org.apache.lucene.document.FieldType;
-import org.apache.lucene.document.TextField;
-import org.apache.lucene.search.DocIdSetIterator;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.LuceneTestCase;
-import org.apache.lucene.util._TestUtil;
+import org.apache.lucene.codecs.CodecUtil;
+import org.apache.lucene.index.IndexFileNames;
+import org.apache.lucene.util.IOUtils;
 
-public class TestTermVectorsReader extends LuceneTestCase {
-  //Must be lexicographically sorted, will do in setup, versus trying to maintain here
-  private String[] testFields = {"f1", "f2", "f3", "f4"};
-  private boolean[] testFieldsStorePos = {true, false, true, false};
-  private boolean[] testFieldsStoreOff = {true, false, false, true};
-  private String[] testTerms = {"this", "is", "a", "test"};
-  private int[][] positions = new int[testTerms.length][];
-  private Directory dir;
-  private SegmentInfoPerCommit seg;
-  private FieldInfos fieldInfos = new FieldInfos(new FieldInfo[0]);
-  private static int TERM_FREQ = 3;
+/**
+ * Combines multiple files into a single compound file.
+ * 
+ * @see CompoundFileDirectory
+ * @lucene.internal
+ */
+final class CompoundFileWriter implements Closeable{
 
-  private class TestToken implements Comparable<TestToken> {
-    String text;
-    int pos;
-    int startOffset;
-    int endOffset;
-    public int compareTo(TestToken other) {
-      return pos - other.pos;
-    }
+  private static final class FileEntry {
+    /** source file */
+    String file;
+    long length;
+    /** temporary holder for the start of this file's data section */
+    long offset;
+    /** the directory which contains the file. */
+    Directory dir;
   }
 
-  TestToken[] tokens = new TestToken[testTerms.length * TERM_FREQ];
+  // Before versioning started.
+  static final int FORMAT_PRE_VERSION = 0;
 
-  @Override
-  public void setUp() throws Exception {
-    super.setUp();
-    /*
-    for (int i = 0; i < testFields.length; i++) {
-      fieldInfos.add(testFields[i], true, true, testFieldsStorePos[i], testFieldsStoreOff[i]);
-    }
-    */
+  // Segment name is not written in the file names.
+  static final int FORMAT_NO_SEGMENT_PREFIX = -1;
+  
+  // versioning for the .cfs file
+  static final String DATA_CODEC = "CompoundFileWriterData";
+  static final int VERSION_START = 0;
+  static final int VERSION_CURRENT = VERSION_START;
 
-    Arrays.sort(testTerms);
-    int tokenUpto = 0;
-    for (int i = 0; i < testTerms.length; i++) {
-      positions[i] = new int[TERM_FREQ];
-      // first position must be 0
-      for (int j = 0; j < TERM_FREQ; j++) {
-        // positions are always sorted in increasing order
-        positions[i][j] = (int) (j * 10 + Math.random() * 10);
-        TestToken token = tokens[tokenUpto++] = new TestToken();
-        token.text = testTerms[i];
-        token.pos = positions[i][j];
-        token.startOffset = j * 10;
-        token.endOffset = j * 10 + testTerms[i].length();
-      }
-    }
-    Arrays.sort(tokens);
+  // versioning for the .cfe file
+  static final String ENTRY_CODEC = "CompoundFileWriterEntries";
 
-    dir = newDirectory();
-    IndexWriter writer = new IndexWriter(
-        dir,
-        newIndexWriterConfig(TEST_VERSION_CURRENT, new MyAnalyzer()).
-            setMaxBufferedDocs(-1).
-            setMergePolicy(newLogMergePolicy(false, 10))
-    );
+  private final Directory directory;
+  private final Map<String, FileEntry> entries = new HashMap<String, FileEntry>();
+  private final Set<String> seenIDs = new HashSet<String>();
+  // all entries that are written to a sep. file but not yet moved into CFS
+  private final Queue<FileEntry> pendingEntries = new LinkedList<FileEntry>();
+  private boolean closed = false;
+  private IndexOutput dataOut;
+  private final AtomicBoolean outputTaken = new AtomicBoolean(false);
+  final String entryTableName;
+  final String dataFileName;
 
-    Document doc = new Document();
-    for(int i=0;i<testFields.length;i++) {
-      FieldType customType = new FieldType(TextField.TYPE_NOT_STORED);
-      if (testFieldsStorePos[i] && testFieldsStoreOff[i]) {
-        customType.setStoreTermVectors(true);
-        customType.setStoreTermVectorPositions(true);
-        customType.setStoreTermVectorOffsets(true);
-      }
-      else if (testFieldsStorePos[i] && !testFieldsStoreOff[i]) {
-        customType.setStoreTermVectors(true);
-        customType.setStoreTermVectorPositions(true);
-      }
-      else if (!testFieldsStorePos[i] && testFieldsStoreOff[i]) {
-        customType.setStoreTermVectors(true);
-        customType.setStoreTermVectorOffsets(true);
-      }
-      else {
-        customType.setStoreTermVectors(true);
-      }
-      doc.add(new Field(testFields[i], "", customType));
-    }
-
-    //Create 5 documents for testing, they all have the same
-    //terms
-    for(int j=0;j<5;j++) {
-      writer.addDocument(doc);
-    }
-    writer.commit();
-    seg = writer.newestSegment();
-    writer.close();
-
-    fieldInfos = _TestUtil.getFieldInfos(seg.info);
+  /**
+   * Create the compound stream in the specified file. The file name is the
+   * entire name (no extensions are added).
+   * 
+   * @throws NullPointerException
+   *           if <code>dir</code> or <code>name</code> is null
+   */
+  CompoundFileWriter(Directory dir, String name) {
+    if (dir == null)
+      throw new NullPointerException("directory cannot be null");
+    if (name == null)
+      throw new NullPointerException("name cannot be null");
+    directory = dir;
+    entryTableName = IndexFileNames.segmentFileName(
+        IndexFileNames.stripExtension(name), "",
+        IndexFileNames.COMPOUND_FILE_ENTRIES_EXTENSION);
+    dataFileName = name;
+    
   }
   
-  @Override
-  public void tearDown() throws Exception {
-    dir.close();
-    super.tearDown();
-  }
-
-  private class MyTokenizer extends Tokenizer {
-    private int tokenUpto;
-    
-    private final CharTermAttribute termAtt;
-    private final PositionIncrementAttribute posIncrAtt;
-    private final OffsetAttribute offsetAtt;
-    
-    public MyTokenizer(Reader reader) {
-      super(reader);
-      termAtt = addAttribute(CharTermAttribute.class);
-      posIncrAtt = addAttribute(PositionIncrementAttribute.class);
-      offsetAtt = addAttribute(OffsetAttribute.class);
-    }
-    
-    @Override
-    public boolean incrementToken() {
-      if (tokenUpto >= tokens.length) {
-        return false;
-      } else {
-        final TestToken testToken = tokens[tokenUpto++];
-        clearAttributes();
-        termAtt.append(testToken.text);
-        offsetAtt.setOffset(testToken.startOffset, testToken.endOffset);
-        if (tokenUpto > 1) {
-          posIncrAtt.setPositionIncrement(testToken.pos - tokens[tokenUpto-2].pos);
-        } else {
-          posIncrAtt.setPositionIncrement(testToken.pos+1);
+  private synchronized IndexOutput getOutput() throws IOException {
+    if (dataOut == null) {
+      boolean success = false;
+      try {
+        dataOut = directory.createOutput(dataFileName, IOContext.DEFAULT);
+        CodecUtil.writeHeader(dataOut, DATA_CODEC, VERSION_CURRENT);
+        success = true;
+      } finally {
+        if (!success) {
+          IOUtils.closeWhileHandlingException(dataOut);
         }
-        return true;
+      }
+    } 
+    return dataOut;
+  }
+
+  /** Returns the directory of the compound file. */
+  Directory getDirectory() {
+    return directory;
+  }
+
+  /** Returns the name of the compound file. */
+  String getName() {
+    return dataFileName;
+  }
+
+  /**
+   * Closes all resources and writes the entry table
+   * 
+   * @throws IllegalStateException
+   *           if close() had been called before or if no file has been added to
+   *           this object
+   */
+  public void close() throws IOException {
+    if (closed) {
+      return;
+    }
+    IOException priorException = null;
+    IndexOutput entryTableOut = null;
+    // TODO this code should clean up after itself
+    // (remove partial .cfs/.cfe)
+    try {
+      if (!pendingEntries.isEmpty() || outputTaken.get()) {
+        throw new IllegalStateException("CFS has pending open files");
+      }
+      closed = true;
+      // open the compound stream
+      getOutput();
+      assert dataOut != null;
+    } catch (IOException e) {
+      priorException = e;
+    } finally {
+      IOUtils.closeWhileHandlingException(priorException, dataOut);
+    }
+    try {
+      entryTableOut = directory.createOutput(entryTableName, IOContext.DEFAULT);
+      writeEntryTable(entries.values(), entryTableOut);
+    } catch (IOException e) {
+      priorException = e;
+    } finally {
+      IOUtils.closeWhileHandlingException(priorException, entryTableOut);
+    }
+  }
+
+  private final void ensureOpen() {
+    if (closed) {
+      throw new AlreadyClosedException("CFS Directory is already closed");
+    }
+  }
+
+  /**
+   * Copy the contents of the file with specified extension into the provided
+   * output stream.
+   */
+  private final long copyFileEntry(IndexOutput dataOut, FileEntry fileEntry)
+      throws IOException {
+    final IndexInput is = fileEntry.dir.openInput(fileEntry.file, IOContext.READONCE);
+    boolean success = false;
+    try {
+      final long startPtr = dataOut.getFilePointer();
+      final long length = fileEntry.length;
+      dataOut.copyBytes(is, length);
+      // Verify that the output length diff is equal to original file
+      long endPtr = dataOut.getFilePointer();
+      long diff = endPtr - startPtr;
+      if (diff != length)
+        throw new IOException("Difference in the output file offsets " + diff
+            + " does not match the original file length " + length);
+      fileEntry.offset = startPtr;
+      success = true;
+      return length;
+    } finally {
+      if (success) {
+        IOUtils.close(is);
+        // copy successful - delete file
+        fileEntry.dir.deleteFile(fileEntry.file);
+      } else {
+        IOUtils.closeWhileHandlingException(is);
+      }
+    }
+  }
+
+  protected void writeEntryTable(Collection<FileEntry> entries,
+      IndexOutput entryOut) throws IOException {
+    CodecUtil.writeHeader(entryOut, ENTRY_CODEC, VERSION_CURRENT);
+    entryOut.writeVInt(entries.size());
+    for (FileEntry fe : entries) {
+      entryOut.writeString(IndexFileNames.stripSegmentName(fe.file));
+      entryOut.writeLong(fe.offset);
+      entryOut.writeLong(fe.length);
+    }
+  }
+
+  IndexOutput createOutput(String name, IOContext context) throws IOException {
+    ensureOpen();
+    boolean success = false;
+    boolean outputLocked = false;
+    try {
+      assert name != null : "name must not be null";
+      if (entries.containsKey(name)) {
+        throw new IllegalArgumentException("File " + name + " already exists");
+      }
+      final FileEntry entry = new FileEntry();
+      entry.file = name;
+      entries.put(name, entry);
+      final String id = IndexFileNames.stripSegmentName(name);
+      assert !seenIDs.contains(id): "file=\"" + name + "\" maps to id=\"" + id + "\", which was already written";
+      seenIDs.add(id);
+      final DirectCFSIndexOutput out;
+      if ((outputLocked = outputTaken.compareAndSet(false, true))) {
+        out = new DirectCFSIndexOutput(getOutput(), entry, false);
+      } else {
+        entry.dir = this.directory;
+        if (directory.fileExists(name)) {
+          throw new IllegalArgumentException("File " + name + " already exists");
+        }
+        out = new DirectCFSIndexOutput(directory.createOutput(name, context), entry,
+            true);
+      }
+      success = true;
+      return out;
+    } finally {
+      if (!success) {
+        entries.remove(name);
+        if (outputLocked) { // release the output lock if not successful
+          assert outputTaken.get();
+          releaseOutputLock();
+        }
+      }
+    }
+  }
+
+  final void releaseOutputLock() {
+    outputTaken.compareAndSet(true, false);
+  }
+
+  private final void prunePendingEntries() throws IOException {
+    // claim the output and copy all pending files in
+    if (outputTaken.compareAndSet(false, true)) {
+      try {
+        while (!pendingEntries.isEmpty()) {
+          FileEntry entry = pendingEntries.poll();
+          copyFileEntry(getOutput(), entry);
+          entries.put(entry.file, entry);
+        }
+      } finally {
+        final boolean compareAndSet = outputTaken.compareAndSet(true, false);
+        assert compareAndSet;
+      }
+    }
+  }
+
+  long fileLength(String name) throws IOException {
+    FileEntry fileEntry = entries.get(name);
+    if (fileEntry == null) {
+      throw new FileNotFoundException(name + " does not exist");
+    }
+    return fileEntry.length;
+  }
+
+  boolean fileExists(String name) {
+    return entries.containsKey(name);
+  }
+
+  String[] listAll() {
+    return entries.keySet().toArray(new String[0]);
+  }
+
+  private final class DirectCFSIndexOutput extends IndexOutput {
+    private final IndexOutput delegate;
+    private final long offset;
+    private boolean closed;
+    private FileEntry entry;
+    private long writtenBytes;
+    private final boolean isSeparate;
+
+    DirectCFSIndexOutput(IndexOutput delegate, FileEntry entry,
+        boolean isSeparate) {
+      super();
+      this.delegate = delegate;
+      this.entry = entry;
+      entry.offset = offset = delegate.getFilePointer();
+      this.isSeparate = isSeparate;
+
+    }
+
+    @Override
+    public void flush() throws IOException {
+      delegate.flush();
+    }
+
+    @Override
+    public void close() throws IOException {
+      if (!closed) {
+        closed = true;
+        entry.length = writtenBytes;
+        if (isSeparate) {
+          delegate.close();
+          // we are a separate file - push into the pending entries
+          pendingEntries.add(entry);
+        } else {
+          // we have been written into the CFS directly - release the lock
+          releaseOutputLock();
+        }
+        // now prune all pending entries and push them into the CFS
+        prunePendingEntries();
       }
     }
 
     @Override
-    public void reset() throws IOException {
-      super.reset();
-      this.tokenUpto = 0;
+    public long getFilePointer() {
+      return delegate.getFilePointer() - offset;
     }
-  }
 
-  private class MyAnalyzer extends Analyzer {
     @Override
-    public TokenStreamComponents createComponents(String fieldName, Reader reader) {
-      return new TokenStreamComponents(new MyTokenizer(reader));
+    public void seek(long pos) throws IOException {
+      assert !closed;
+      delegate.seek(offset + pos);
+    }
+
+    @Override
+    public long length() throws IOException {
+      assert !closed;
+      return delegate.length() - offset;
+    }
+
+    @Override
+    public void writeByte(byte b) throws IOException {
+      assert !closed;
+      writtenBytes++;
+      delegate.writeByte(b);
+    }
+
+    @Override
+    public void writeBytes(byte[] b, int offset, int length) throws IOException {
+      assert !closed;
+      writtenBytes += length;
+      delegate.writeBytes(b, offset, length);
     }
   }
 
-  public void test() throws IOException {
-    //Check to see the files were created properly in setup
-    DirectoryReader reader = DirectoryReader.open(dir);
-    for (AtomicReaderContext ctx : reader.leaves()) {
-      SegmentReader sr = (SegmentReader) ctx.reader();
-      assertTrue(sr.getFieldInfos().hasVectors());
-    }
-    reader.close();
-  }
-
-  public void testReader() throws IOException {
-    TermVectorsReader reader = Codec.getDefault().termVectorsFormat().vectorsReader(dir, seg.info, fieldInfos, newIOContext(random()));
-    for (int j = 0; j < 5; j++) {
-      Terms vector = reader.get(j).terms(testFields[0]);
-      assertNotNull(vector);
-      assertEquals(testTerms.length, vector.size());
-      TermsEnum termsEnum = vector.iterator(null);
-      for (int i = 0; i < testTerms.length; i++) {
-        final BytesRef text = termsEnum.next();
-        assertNotNull(text);
-        String term = text.utf8ToString();
-        //System.out.println("Term: " + term);
-        assertEquals(testTerms[i], term);
-      }
-      assertNull(termsEnum.next());
-    }
-    reader.close();
-  }
-  
-  public void testDocsEnum() throws IOException {
-    TermVectorsReader reader = Codec.getDefault().termVectorsFormat().vectorsReader(dir, seg.info, fieldInfos, newIOContext(random()));
-    for (int j = 0; j < 5; j++) {
-      Terms vector = reader.get(j).terms(testFields[0]);
-      assertNotNull(vector);
-      assertEquals(testTerms.length, vector.size());
-      TermsEnum termsEnum = vector.iterator(null);
-      DocsEnum docsEnum = null;
-      for (int i = 0; i < testTerms.length; i++) {
-        final BytesRef text = termsEnum.next();
-        assertNotNull(text);
-        String term = text.utf8ToString();
-        //System.out.println("Term: " + term);
-        assertEquals(testTerms[i], term);
-        
-        docsEnum = _TestUtil.docs(random(), termsEnum, null, docsEnum, DocsEnum.FLAG_NONE);
-        assertNotNull(docsEnum);
-        int doc = docsEnum.docID();
-        assertTrue(doc == -1 || doc == DocIdSetIterator.NO_MORE_DOCS);
-        assertTrue(docsEnum.nextDoc() != DocIdSetIterator.NO_MORE_DOCS);
-        assertEquals(DocIdSetIterator.NO_MORE_DOCS, docsEnum.nextDoc());
-      }
-      assertNull(termsEnum.next());
-    }
-    reader.close();
-  }
-
-  public void testPositionReader() throws IOException {
-    TermVectorsReader reader = Codec.getDefault().termVectorsFormat().vectorsReader(dir, seg.info, fieldInfos, newIOContext(random()));
-    BytesRef[] terms;
-    Terms vector = reader.get(0).terms(testFields[0]);
-    assertNotNull(vector);
-    assertEquals(testTerms.length, vector.size());
-    TermsEnum termsEnum = vector.iterator(null);
-    DocsAndPositionsEnum dpEnum = null;
-    for (int i = 0; i < testTerms.length; i++) {
-      final BytesRef text = termsEnum.next();
-      assertNotNull(text);
-      String term = text.utf8ToString();
-      //System.out.println("Term: " + term);
-      assertEquals(testTerms[i], term);
-
-      dpEnum = termsEnum.docsAndPositions(null, dpEnum);
-      assertNotNull(dpEnum);
-      int doc = dpEnum.docID();
-      assertTrue(doc == -1 || doc == DocIdSetIterator.NO_MORE_DOCS);
-      assertTrue(dpEnum.nextDoc() != DocIdSetIterator.NO_MORE_DOCS);
-      assertEquals(dpEnum.freq(), positions[i].length);
-      for (int j = 0; j < positions[i].length; j++) {
-        assertEquals(positions[i][j], dpEnum.nextPosition());
-      }
-      assertEquals(DocIdSetIterator.NO_MORE_DOCS, dpEnum.nextDoc());
-
-      dpEnum = termsEnum.docsAndPositions(null, dpEnum);
-      doc = dpEnum.docID();
-      assertTrue(doc == -1 || doc == DocIdSetIterator.NO_MORE_DOCS);
-      assertTrue(dpEnum.nextDoc() != DocIdSetIterator.NO_MORE_DOCS);
-      assertNotNull(dpEnum);
-      assertEquals(dpEnum.freq(), positions[i].length);
-      for (int j = 0; j < positions[i].length; j++) {
-        assertEquals(positions[i][j], dpEnum.nextPosition());
-        assertEquals(j*10, dpEnum.startOffset());
-        assertEquals(j*10 + testTerms[i].length(), dpEnum.endOffset());
-      }
-      assertEquals(DocIdSetIterator.NO_MORE_DOCS, dpEnum.nextDoc());
-    }
-
-    Terms freqVector = reader.get(0).terms(testFields[1]); //no pos, no offset
-    assertNotNull(freqVector);
-    assertEquals(testTerms.length, freqVector.size());
-    termsEnum = freqVector.iterator(null);
-    assertNotNull(termsEnum);
-    for (int i = 0; i < testTerms.length; i++) {
-      final BytesRef text = termsEnum.next();
-      assertNotNull(text);
-      String term = text.utf8ToString();
-      //System.out.println("Term: " + term);
-      assertEquals(testTerms[i], term);
-    }
-    reader.close();
-  }
-
-  public void testOffsetReader() throws IOException {
-    TermVectorsReader reader = Codec.getDefault().termVectorsFormat().vectorsReader(dir, seg.info, fieldInfos, newIOContext(random()));
-    Terms vector = reader.get(0).terms(testFields[0]);
-    assertNotNull(vector);
-    TermsEnum termsEnum = vector.iterator(null);
-    assertNotNull(termsEnum);
-    assertEquals(testTerms.length, vector.size());
-    DocsAndPositionsEnum dpEnum = null;
-    for (int i = 0; i < testTerms.length; i++) {
-      final BytesRef text = termsEnum.next();
-      assertNotNull(text);
-      String term = text.utf8ToString();
-      assertEquals(testTerms[i], term);
-
-      dpEnum = termsEnum.docsAndPositions(null, dpEnum);
-      assertNotNull(dpEnum);
-      assertTrue(dpEnum.nextDoc() != DocIdSetIterator.NO_MORE_DOCS);
-      assertEquals(dpEnum.freq(), positions[i].length);
-      for (int j = 0; j < positions[i].length; j++) {
-        assertEquals(positions[i][j], dpEnum.nextPosition());
-      }
-      assertEquals(DocIdSetIterator.NO_MORE_DOCS, dpEnum.nextDoc());
-
-      dpEnum = termsEnum.docsAndPositions(null, dpEnum);
-      assertTrue(dpEnum.nextDoc() != DocIdSetIterator.NO_MORE_DOCS);
-      assertNotNull(dpEnum);
-      assertEquals(dpEnum.freq(), positions[i].length);
-      for (int j = 0; j < positions[i].length; j++) {
-        assertEquals(positions[i][j], dpEnum.nextPosition());
-        assertEquals(j*10, dpEnum.startOffset());
-        assertEquals(j*10 + testTerms[i].length(), dpEnum.endOffset());
-      }
-      assertEquals(DocIdSetIterator.NO_MORE_DOCS, dpEnum.nextDoc());
-    }
-    reader.close();
-  }
 }

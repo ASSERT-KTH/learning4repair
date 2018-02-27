@@ -1,6 +1,6 @@
-pendingDeleteCount = 0;
+cachedScorer.doc = curDocs[curUpto];
 
-package org.apache.lucene.index;
+package org.apache.lucene.search;
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -21,1095 +21,406 @@ package org.apache.lucene.index;
 
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Iterator;
 import java.util.List;
-import java.util.Map;
-import java.util.Set;
 
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.FieldSelector;
-import org.apache.lucene.search.DefaultSimilarity;
-import org.apache.lucene.store.BufferedIndexInput;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.IndexInput;
-import org.apache.lucene.store.IndexOutput;
-import org.apache.lucene.util.BitVector;
-import org.apache.lucene.util.CloseableThreadLocal;
+import org.apache.lucene.index.IndexReader.AtomicReaderContext;
+import org.apache.lucene.util.RamUsageEstimator;
 
 /**
- * @version $Id$
+ * Caches all docs, and optionally also scores, coming from
+ * a search, and is then able to replay them to another
+ * collector.  You specify the max RAM this class may use.
+ * Once the collection is done, call {@link #isCached}.  If
+ * this returns true, you can use {@link #replay} against a
+ * new collector.  If it returns false, this means too much
+ * RAM was required and you must instead re-run the original
+ * search.
+ *
+ * <p><b>NOTE</b>: this class consumes 4 (or 8 bytes, if
+ * scoring is cached) per collected document.  If the result
+ * set is large this can easily be a very substantial amount
+ * of RAM!
+ * 
+ * <p><b>NOTE</b>: this class caches at least 128 documents
+ * before checking RAM limits.
+ * 
+ * <p>See the Lucene <tt>modules/grouping</tt> module for more
+ * details including a full code example.</p>
+ *
+ * @lucene.experimental
  */
-class SegmentReader extends DirectoryIndexReader {
-  private String segment;
-  private SegmentInfo si;
-  private int readBufferSize;
-
-  FieldInfos fieldInfos;
-  private FieldsReader fieldsReader;
-
-  TermInfosReader tis;
-  TermVectorsReader termVectorsReaderOrig = null;
-  CloseableThreadLocal termVectorsLocal = new CloseableThreadLocal();
-
-  BitVector deletedDocs = null;
-  private boolean deletedDocsDirty = false;
-  private boolean normsDirty = false;
-  private boolean undeleteAll = false;
-  private int pendingDeleteCount;
-
-  private boolean rollbackDeletedDocsDirty = false;
-  private boolean rollbackNormsDirty = false;
-  private boolean rollbackUndeleteAll = false;
-  private int rollbackPendingDeleteCount;
-  private boolean readOnly;
-
-  IndexInput freqStream;
-  IndexInput proxStream;
-
-  // optionally used for the .nrm file shared by multiple norms
-  private IndexInput singleNormStream;
-
-  // Compound File Reader when based on a compound file segment
-  CompoundFileReader cfsReader = null;
-  CompoundFileReader storeCFSReader = null;
+public abstract class CachingCollector extends Collector {
   
-  // indicates the SegmentReader with which the resources are being shared,
-  // in case this is a re-opened reader
-  private SegmentReader referencedSegmentReader = null;
+  // Max out at 512K arrays
+  private static final int MAX_ARRAY_SIZE = 512 * 1024;
+  private static final int INITIAL_ARRAY_SIZE = 128;
+  private final static int[] EMPTY_INT_ARRAY = new int[0];
+
+  private static class SegStart {
+    public final AtomicReaderContext readerContext;
+    public final int end;
+
+    public SegStart(AtomicReaderContext readerContext, int end) {
+      this.readerContext = readerContext;
+      this.end = end;
+    }
+  }
   
-  private class Norm {
-    volatile int refCount;
-    boolean useSingleNormStream;
+  private static final class CachedScorer extends Scorer {
     
-    public synchronized void incRef() {
-      assert refCount > 0;
-      refCount++;
-    }
-
-    public synchronized void decRef() throws IOException {
-      assert refCount > 0;
-      if (refCount == 1) {
-        close();
-      }
-      refCount--;
-
-    }
+    // NOTE: these members are package-private b/c that way accessing them from
+    // the outer class does not incur access check by the JVM. The same
+    // situation would be if they were defined in the outer class as private
+    // members.
+    int doc;
+    float score;
     
-    public Norm(IndexInput in, boolean useSingleNormStream, int number, long normSeek)
-    {
-      refCount = 1;
-      this.in = in;
-      this.number = number;
-      this.normSeek = normSeek;
-      this.useSingleNormStream = useSingleNormStream;
+    private CachedScorer() { super(null); }
+
+    @Override
+    public final float score() { return score; }
+    
+    @Override
+    public final int advance(int target) { throw new UnsupportedOperationException(); }
+    
+    @Override
+    public final int docID() { return doc; }
+    
+    @Override
+    public final float freq() { throw new UnsupportedOperationException(); }
+    
+    @Override
+    public final int nextDoc() { throw new UnsupportedOperationException(); }
     }
 
-    private IndexInput in;
-    private byte[] bytes;
-    private boolean dirty;
-    private int number;
-    private long normSeek;
-    private boolean rollbackDirty;
+  // A CachingCollector which caches scores
+  private static final class ScoreCachingCollector extends CachingCollector {
 
-    private void reWrite(SegmentInfo si) throws IOException {
-      // NOTE: norms are re-written in regular directory, not cfs
-      si.advanceNormGen(this.number);
-      IndexOutput out = directory().createOutput(si.getNormFileName(this.number));
-      try {
-        out.writeBytes(bytes, maxDoc());
-      } finally {
-        out.close();
-      }
-      this.dirty = false;
+    private final CachedScorer cachedScorer;
+    private final List<float[]> cachedScores;
+
+    private Scorer scorer;
+    private float[] curScores;
+
+    ScoreCachingCollector(Collector other, double maxRAMMB) {
+      super(other, maxRAMMB, true);
+
+      cachedScorer = new CachedScorer();
+      cachedScores = new ArrayList<float[]>();
+      curScores = new float[128];
+      cachedScores.add(curScores);
     }
     
-    /** Closes the underlying IndexInput for this norm.
-     * It is still valid to access all other norm properties after close is called.
-     * @throws IOException
-     */
-    private synchronized void close() throws IOException {
-      if (in != null && !useSingleNormStream) {
-        in.close();
-      }
-      in = null;
-    }
-  }
-  
-  /**
-   * Increments the RC of this reader, as well as
-   * of all norms this reader is using
-   */
-  public synchronized void incRef() {
-    super.incRef();
-    Iterator it = norms.values().iterator();
-    while (it.hasNext()) {
-      Norm norm = (Norm) it.next();
-      norm.incRef();
-    }
-  }
-  
-  /**
-   * only increments the RC of this reader, not tof 
-   * he norms. This is important whenever a reopen()
-   * creates a new SegmentReader that doesn't share
-   * the norms with this one 
-   */
-  private synchronized void incRefReaderNotNorms() {
-    super.incRef();
-  }
-
-  public synchronized void decRef() throws IOException {
-    super.decRef();
-    Iterator it = norms.values().iterator();
-    while (it.hasNext()) {
-      Norm norm = (Norm) it.next();
-      norm.decRef();
-    }
-  }
-  
-  private synchronized void decRefReaderNotNorms() throws IOException {
-    super.decRef();
-  }
-  
-  Map norms = new HashMap();
-  
-  /** The class which implements SegmentReader. */
-  private static Class IMPL;
-  static {
-    try {
-      String name =
-        System.getProperty("org.apache.lucene.SegmentReader.class",
-                           SegmentReader.class.getName());
-      IMPL = Class.forName(name);
-    } catch (ClassNotFoundException e) {
-      throw new RuntimeException("cannot load SegmentReader class: " + e, e);
-    } catch (SecurityException se) {
-      try {
-        IMPL = Class.forName(SegmentReader.class.getName());
-      } catch (ClassNotFoundException e) {
-        throw new RuntimeException("cannot load default SegmentReader class: " + e, e);
-      }
-    }
-  }
-
-  private static Class READONLY_IMPL;
-  static {
-    try {
-      String name =
-        System.getProperty("org.apache.lucene.ReadOnlySegmentReader.class",
-                           ReadOnlySegmentReader.class.getName());
-      READONLY_IMPL = Class.forName(name);
-    } catch (ClassNotFoundException e) {
-      throw new RuntimeException("cannot load ReadOnlySegmentReader class: " + e, e);
-    } catch (SecurityException se) {
-      try {
-        READONLY_IMPL = Class.forName(ReadOnlySegmentReader.class.getName());
-      } catch (ClassNotFoundException e) {
-        throw new RuntimeException("cannot load default ReadOnlySegmentReader class: " + e, e);
-      }
-    }
-  }
-
-  /**
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   */
-  public static SegmentReader get(SegmentInfo si) throws CorruptIndexException, IOException {
-    return get(READ_ONLY_DEFAULT, si.dir, si, null, false, false, BufferedIndexInput.BUFFER_SIZE, true);
-  }
-
-  /**
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   */
-  public static SegmentReader get(boolean readOnly, SegmentInfo si) throws CorruptIndexException, IOException {
-    return get(readOnly, si.dir, si, null, false, false, BufferedIndexInput.BUFFER_SIZE, true);
-  }
-
-  /**
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   */
-  static SegmentReader get(SegmentInfo si, boolean doOpenStores) throws CorruptIndexException, IOException {
-    return get(READ_ONLY_DEFAULT, si.dir, si, null, false, false, BufferedIndexInput.BUFFER_SIZE, doOpenStores);
-  }
-
-  /**
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   */
-  public static SegmentReader get(SegmentInfo si, int readBufferSize) throws CorruptIndexException, IOException {
-    return get(READ_ONLY_DEFAULT, si.dir, si, null, false, false, readBufferSize, true);
-  }
-
-  /**
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   */
-  static SegmentReader get(SegmentInfo si, int readBufferSize, boolean doOpenStores) throws CorruptIndexException, IOException {
-    return get(READ_ONLY_DEFAULT, si.dir, si, null, false, false, readBufferSize, doOpenStores);
-  }
-
-  /**
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   */
-  static SegmentReader get(boolean readOnly, SegmentInfo si, int readBufferSize, boolean doOpenStores) throws CorruptIndexException, IOException {
-    return get(readOnly, si.dir, si, null, false, false, readBufferSize, doOpenStores);
-  }
-
-  /**
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   */
-  public static SegmentReader get(boolean readOnly, SegmentInfos sis, SegmentInfo si,
-                                  boolean closeDir) throws CorruptIndexException, IOException {
-    return get(readOnly, si.dir, si, sis, closeDir, true, BufferedIndexInput.BUFFER_SIZE, true);
-  }
-
-  /**
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   */
-  public static SegmentReader get(Directory dir, SegmentInfo si,
-                                  SegmentInfos sis,
-                                  boolean closeDir, boolean ownDir,
-                                  int readBufferSize)
-    throws CorruptIndexException, IOException {
-    return get(READ_ONLY_DEFAULT, dir, si, sis, closeDir, ownDir, readBufferSize, true);
-  }
-
-  /**
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   */
-  public static SegmentReader get(boolean readOnly,
-                                  Directory dir,
-                                  SegmentInfo si,
-                                  SegmentInfos sis,
-                                  boolean closeDir, boolean ownDir,
-                                  int readBufferSize,
-                                  boolean doOpenStores)
-    throws CorruptIndexException, IOException {
-    SegmentReader instance;
-    try {
-      if (readOnly)
-        instance = (SegmentReader)READONLY_IMPL.newInstance();
-      else
-        instance = (SegmentReader)IMPL.newInstance();
-    } catch (Exception e) {
-      throw new RuntimeException("cannot load SegmentReader class: " + e, e);
-    }
-    instance.init(dir, sis, closeDir, readOnly);
-    instance.initialize(si, readBufferSize, doOpenStores);
-    return instance;
-  }
-
-  private void initialize(SegmentInfo si, int readBufferSize, boolean doOpenStores) throws CorruptIndexException, IOException {
-    segment = si.name;
-    this.si = si;
-    this.readBufferSize = readBufferSize;
-
-    boolean success = false;
-
-    try {
-      // Use compound file directory for some files, if it exists
-      Directory cfsDir = directory();
-      if (si.getUseCompoundFile()) {
-        cfsReader = new CompoundFileReader(directory(), segment + "." + IndexFileNames.COMPOUND_FILE_EXTENSION, readBufferSize);
-        cfsDir = cfsReader;
-      }
-
-      final Directory storeDir;
-
-      if (doOpenStores) {
-        if (si.getDocStoreOffset() != -1) {
-          if (si.getDocStoreIsCompoundFile()) {
-            storeCFSReader = new CompoundFileReader(directory(), si.getDocStoreSegment() + "." + IndexFileNames.COMPOUND_FILE_STORE_EXTENSION, readBufferSize);
-            storeDir = storeCFSReader;
-          } else {
-            storeDir = directory();
-          }
-        } else {
-          storeDir = cfsDir;
-        }
-      } else
-        storeDir = null;
-
-      fieldInfos = new FieldInfos(cfsDir, segment + ".fnm");
-
-      boolean anyProx = false;
-      final int numFields = fieldInfos.size();
-      for(int i=0;!anyProx && i<numFields;i++)
-        if (!fieldInfos.fieldInfo(i).omitTf)
-          anyProx = true;
-
-      final String fieldsSegment;
-
-      if (si.getDocStoreOffset() != -1)
-        fieldsSegment = si.getDocStoreSegment();
-      else
-        fieldsSegment = segment;
-
-      if (doOpenStores) {
-        fieldsReader = new FieldsReader(storeDir, fieldsSegment, fieldInfos, readBufferSize,
-                                        si.getDocStoreOffset(), si.docCount);
-
-        // Verify two sources of "maxDoc" agree:
-        if (si.getDocStoreOffset() == -1 && fieldsReader.size() != si.docCount) {
-          throw new CorruptIndexException("doc counts differ for segment " + si.name + ": fieldsReader shows " + fieldsReader.size() + " but segmentInfo shows " + si.docCount);
-        }
-      }
-
-      tis = new TermInfosReader(cfsDir, segment, fieldInfos, readBufferSize);
-      
-      loadDeletedDocs();
-
-      // make sure that all index files have been read or are kept open
-      // so that if an index update removes them we'll still have them
-      freqStream = cfsDir.openInput(segment + ".frq", readBufferSize);
-      if (anyProx)
-        proxStream = cfsDir.openInput(segment + ".prx", readBufferSize);
-      openNorms(cfsDir, readBufferSize);
-
-      if (doOpenStores && fieldInfos.hasVectors()) { // open term vector files only as needed
-        final String vectorsSegment;
-        if (si.getDocStoreOffset() != -1)
-          vectorsSegment = si.getDocStoreSegment();
-        else
-          vectorsSegment = segment;
-        termVectorsReaderOrig = new TermVectorsReader(storeDir, vectorsSegment, fieldInfos, readBufferSize, si.getDocStoreOffset(), si.docCount);
-      }
-      success = true;
-    } finally {
-
-      // With lock-less commits, it's entirely possible (and
-      // fine) to hit a FileNotFound exception above.  In
-      // this case, we want to explicitly close any subset
-      // of things that were opened so that we don't have to
-      // wait for a GC to do so.
-      if (!success) {
-        doClose();
-      }
-    }
-  }
-  
-  private void loadDeletedDocs() throws IOException {
-    // NOTE: the bitvector is stored using the regular directory, not cfs
-    if (hasDeletions(si)) {
-      deletedDocs = new BitVector(directory(), si.getDelFileName());
-     
-      assert si.getDelCount() == deletedDocs.count() : 
-        "delete count mismatch: info=" + si.getDelCount() + " vs BitVector=" + deletedDocs.count();
-
-      // Verify # deletes does not exceed maxDoc for this
-      // segment:
-      assert si.getDelCount() <= maxDoc() : 
-        "delete count mismatch: " + deletedDocs.count() + ") exceeds max doc (" + maxDoc() + ") for segment " + si.name;
-
-    } else
-      assert si.getDelCount() == 0;
-  }
-  
-  protected synchronized DirectoryIndexReader doReopen(SegmentInfos infos) throws CorruptIndexException, IOException {
-    DirectoryIndexReader newReader;
-    
-    if (infos.size() == 1) {
-      SegmentInfo si = infos.info(0);
-      if (segment.equals(si.name) && si.getUseCompoundFile() == SegmentReader.this.si.getUseCompoundFile()) {
-        newReader = reopenSegment(si);
-      } else { 
-        // segment not referenced anymore, reopen not possible
-        // or segment format changed
-        newReader = SegmentReader.get(readOnly, infos, infos.info(0), false);
-      }
-    } else {
-      if (readOnly)
-        return new ReadOnlyMultiSegmentReader(directory, infos, closeDirectory, new SegmentReader[] {this}, null, null);
-      else
-        return new MultiSegmentReader(directory, infos, closeDirectory, new SegmentReader[] {this}, null, null, false);
-    }
-    
-    return newReader;
-  }
-  
-  synchronized SegmentReader reopenSegment(SegmentInfo si) throws CorruptIndexException, IOException {
-    boolean deletionsUpToDate = (this.si.hasDeletions() == si.hasDeletions()) 
-                                  && (!si.hasDeletions() || this.si.getDelFileName().equals(si.getDelFileName()));
-    boolean normsUpToDate = true;
-
-    
-    boolean[] fieldNormsChanged = new boolean[fieldInfos.size()];
-    if (normsUpToDate) {
-      for (int i = 0; i < fieldInfos.size(); i++) {
-        if (!this.si.getNormFileName(i).equals(si.getNormFileName(i))) {
-          normsUpToDate = false;
-          fieldNormsChanged[i] = true;
-        }
-      }
-    }
-
-    if (normsUpToDate && deletionsUpToDate) {
-      return this;
-    }    
-    
-
-      // clone reader
-    SegmentReader clone;
-    if (readOnly) 
-      clone = new ReadOnlySegmentReader();
-    else
-      clone = new SegmentReader();
-
-    boolean success = false;
-    try {
-      clone.readOnly = readOnly;
-      clone.directory = directory;
-      clone.si = si;
-      clone.segment = segment;
-      clone.readBufferSize = readBufferSize;
-      clone.cfsReader = cfsReader;
-      clone.storeCFSReader = storeCFSReader;
-  
-      clone.fieldInfos = fieldInfos;
-      clone.tis = tis;
-      clone.freqStream = freqStream;
-      clone.proxStream = proxStream;
-      clone.termVectorsReaderOrig = termVectorsReaderOrig;
-  
-      
-      // we have to open a new FieldsReader, because it is not thread-safe
-      // and can thus not be shared among multiple SegmentReaders
-      // TODO: Change this in case FieldsReader becomes thread-safe in the future
-      final String fieldsSegment;
-  
-      Directory storeDir = directory();
-      
-      if (si.getDocStoreOffset() != -1) {
-        fieldsSegment = si.getDocStoreSegment();
-        if (storeCFSReader != null) {
-          storeDir = storeCFSReader;
-        }
-      } else {
-        fieldsSegment = segment;
-        if (cfsReader != null) {
-          storeDir = cfsReader;
-        }
-      }
-  
-      if (fieldsReader != null) {
-        clone.fieldsReader = new FieldsReader(storeDir, fieldsSegment, fieldInfos, readBufferSize,
-                                        si.getDocStoreOffset(), si.docCount);
-      }
-      
-      
-      if (!deletionsUpToDate) {
-        // load deleted docs
-        clone.deletedDocs = null;
-        clone.loadDeletedDocs();
-      } else {
-        clone.deletedDocs = this.deletedDocs;
-      }
-  
-      clone.norms = new HashMap();
-      if (!normsUpToDate) {
-        // load norms
-        for (int i = 0; i < fieldNormsChanged.length; i++) {
-          // copy unchanged norms to the cloned reader and incRef those norms
-          if (!fieldNormsChanged[i]) {
-            String curField = fieldInfos.fieldInfo(i).name;
-            Norm norm = (Norm) this.norms.get(curField);
-            norm.incRef();
-            clone.norms.put(curField, norm);
-          }
-        }
-        
-        clone.openNorms(si.getUseCompoundFile() ? cfsReader : directory(), readBufferSize);
-      } else {
-        Iterator it = norms.keySet().iterator();
-        while (it.hasNext()) {
-          String field = (String) it.next();
-          Norm norm = (Norm) norms.get(field);
-          norm.incRef();
-          clone.norms.put(field, norm);
-        }
-      }
-  
-      if (clone.singleNormStream == null) {
-        for (int i = 0; i < fieldInfos.size(); i++) {
-          FieldInfo fi = fieldInfos.fieldInfo(i);
-          if (fi.isIndexed && !fi.omitNorms) {
-            Directory d = si.getUseCompoundFile() ? cfsReader : directory();
-            String fileName = si.getNormFileName(fi.number);
-            if (si.hasSeparateNorms(fi.number)) {
-              continue;
-            }  
-  
-            if (fileName.endsWith("." + IndexFileNames.NORMS_EXTENSION)) {
-              clone.singleNormStream = d.openInput(fileName, readBufferSize);    
-              break;
-            }
-          }
-        }  
-      }    
-  
-      success = true;
-    } finally {
-      if (this.referencedSegmentReader != null) {
-        // this reader shares resources with another SegmentReader,
-        // so we increment the other readers refCount. We don't
-        // increment the refCount of the norms because we did
-        // that already for the shared norms
-        clone.referencedSegmentReader = this.referencedSegmentReader;
-        referencedSegmentReader.incRefReaderNotNorms();
-      } else {
-        // this reader wasn't reopened, so we increment this
-        // readers refCount
-        clone.referencedSegmentReader = this;
-        incRefReaderNotNorms();
-      }
-      
-      if (!success) {
-        // An exception occured during reopen, we have to decRef the norms
-        // that we incRef'ed already and close singleNormsStream and FieldsReader
-        clone.decRef();
-      }
-    }
-    
-    return clone;
-  }
-
-  protected void commitChanges() throws IOException {
-    if (deletedDocsDirty) {               // re-write deleted
-      si.advanceDelGen();
-
-      // We can write directly to the actual name (vs to a
-      // .tmp & renaming it) because the file is not live
-      // until segments file is written:
-      deletedDocs.write(directory(), si.getDelFileName());
-      
-      si.setDelCount(si.getDelCount()+pendingDeleteCount);
-    }
-    if (undeleteAll && si.hasDeletions()) {
-      si.clearDelGen();
-      si.setDelCount(0);
-    }
-    if (normsDirty) {               // re-write norms
-      si.setNumFields(fieldInfos.size());
-      Iterator it = norms.values().iterator();
-      while (it.hasNext()) {
-        Norm norm = (Norm) it.next();
-        if (norm.dirty) {
-          norm.reWrite(si);
-        }
-      }
-    }
-    deletedDocsDirty = false;
-    normsDirty = false;
-    undeleteAll = false;
-  }
-
-  FieldsReader getFieldsReader() {
-    return fieldsReader;
-  }
-
-  protected void doClose() throws IOException {
-    boolean hasReferencedReader = (referencedSegmentReader != null);
-
-    termVectorsLocal.close();
-
-    if (hasReferencedReader) {
-      referencedSegmentReader.decRefReaderNotNorms();
-      referencedSegmentReader = null;
-    }
-
-    deletedDocs = null;
-
-    // close the single norms stream
-    if (singleNormStream != null) {
-      // we can close this stream, even if the norms
-      // are shared, because every reader has it's own 
-      // singleNormStream
-      singleNormStream.close();
-      singleNormStream = null;
-    }
-    
-    // re-opened SegmentReaders have their own instance of FieldsReader
-    if (fieldsReader != null) {
-      fieldsReader.close();
-    }
-
-    if (!hasReferencedReader) { 
-      // close everything, nothing is shared anymore with other readers
-      if (tis != null) {
-        tis.close();
-      }
-  
-      if (freqStream != null)
-        freqStream.close();
-      if (proxStream != null)
-        proxStream.close();
-  
-      if (termVectorsReaderOrig != null)
-        termVectorsReaderOrig.close();
-  
-      if (cfsReader != null)
-        cfsReader.close();
-  
-      if (storeCFSReader != null)
-        storeCFSReader.close();
-    }
-
-    // In DirectoryIndexReader.reopen, our directory
-    // instance was made private to us (cloned), so we
-    // always call super.doClose to possibly close the
-    // directory:
-    super.doClose();
-  }
-
-  static boolean hasDeletions(SegmentInfo si) throws IOException {
-    // Don't call ensureOpen() here (it could affect performance)
-    return si.hasDeletions();
-  }
-
-  public boolean hasDeletions() {
-    // Don't call ensureOpen() here (it could affect performance)
-    return deletedDocs != null;
-  }
-
-  static boolean usesCompoundFile(SegmentInfo si) throws IOException {
-    return si.getUseCompoundFile();
-  }
-
-  static boolean hasSeparateNorms(SegmentInfo si) throws IOException {
-    return si.hasSeparateNorms();
-  }
-
-  protected void doDelete(int docNum) {
-    if (deletedDocs == null)
-      deletedDocs = new BitVector(maxDoc());
-    deletedDocsDirty = true;
-    undeleteAll = false;
-    if (!deletedDocs.getAndSet(docNum))
-      pendingDeleteCount++;
-  }
-
-  protected void doUndeleteAll() {
-      deletedDocs = null;
-      deletedDocsDirty = false;
-      undeleteAll = true;
-  }
-
-  List files() throws IOException {
-    return new ArrayList(si.files());
-  }
-
-  public TermEnum terms() {
-    ensureOpen();
-    return tis.terms();
-  }
-
-  public TermEnum terms(Term t) throws IOException {
-    ensureOpen();
-    return tis.terms(t);
-  }
-
-  FieldInfos getFieldInfos() {
-    return fieldInfos;
-  }
-
-  /**
-   * @throws CorruptIndexException if the index is corrupt
-   * @throws IOException if there is a low-level IO error
-   */
-  public synchronized Document document(int n, FieldSelector fieldSelector) throws CorruptIndexException, IOException {
-    ensureOpen();
-    if (isDeleted(n))
-      throw new IllegalArgumentException
-              ("attempt to access a deleted document");
-    return fieldsReader.doc(n, fieldSelector);
-  }
-
-  public synchronized boolean isDeleted(int n) {
-    return (deletedDocs != null && deletedDocs.get(n));
-  }
-
-  public TermDocs termDocs() throws IOException {
-    ensureOpen();
-    return new SegmentTermDocs(this);
-  }
-
-  public TermPositions termPositions() throws IOException {
-    ensureOpen();
-    return new SegmentTermPositions(this);
-  }
-
-  public int docFreq(Term t) throws IOException {
-    ensureOpen();
-    TermInfo ti = tis.get(t);
-    if (ti != null)
-      return ti.docFreq;
-    else
-      return 0;
-  }
-
-  public int numDocs() {
-    // Don't call ensureOpen() here (it could affect performance)
-    int n = maxDoc();
-    if (deletedDocs != null)
-      n -= deletedDocs.count();
-    return n;
-  }
-
-  public int maxDoc() {
-    // Don't call ensureOpen() here (it could affect performance)
-    return si.docCount;
-  }
-
-  public void setTermInfosIndexDivisor(int indexDivisor) throws IllegalStateException {
-    tis.setIndexDivisor(indexDivisor);
-  }
-
-  public int getTermInfosIndexDivisor() {
-    return tis.getIndexDivisor();
-  }
-
-  /**
-   * @see IndexReader#getFieldNames(IndexReader.FieldOption fldOption)
-   */
-  public Collection getFieldNames(IndexReader.FieldOption fieldOption) {
-    ensureOpen();
-
-    Set fieldSet = new HashSet();
-    for (int i = 0; i < fieldInfos.size(); i++) {
-      FieldInfo fi = fieldInfos.fieldInfo(i);
-      if (fieldOption == IndexReader.FieldOption.ALL) {
-        fieldSet.add(fi.name);
-      }
-      else if (!fi.isIndexed && fieldOption == IndexReader.FieldOption.UNINDEXED) {
-        fieldSet.add(fi.name);
-      }
-      else if (fi.omitTf && fieldOption == IndexReader.FieldOption.OMIT_TF) {
-        fieldSet.add(fi.name);
-      }
-      else if (fi.storePayloads && fieldOption == IndexReader.FieldOption.STORES_PAYLOADS) {
-        fieldSet.add(fi.name);
-      }
-      else if (fi.isIndexed && fieldOption == IndexReader.FieldOption.INDEXED) {
-        fieldSet.add(fi.name);
-      }
-      else if (fi.isIndexed && fi.storeTermVector == false && fieldOption == IndexReader.FieldOption.INDEXED_NO_TERMVECTOR) {
-        fieldSet.add(fi.name);
-      }
-      else if (fi.storeTermVector == true &&
-               fi.storePositionWithTermVector == false &&
-               fi.storeOffsetWithTermVector == false &&
-               fieldOption == IndexReader.FieldOption.TERMVECTOR) {
-        fieldSet.add(fi.name);
-      }
-      else if (fi.isIndexed && fi.storeTermVector && fieldOption == IndexReader.FieldOption.INDEXED_WITH_TERMVECTOR) {
-        fieldSet.add(fi.name);
-      }
-      else if (fi.storePositionWithTermVector && fi.storeOffsetWithTermVector == false && fieldOption == IndexReader.FieldOption.TERMVECTOR_WITH_POSITION) {
-        fieldSet.add(fi.name);
-      }
-      else if (fi.storeOffsetWithTermVector && fi.storePositionWithTermVector == false && fieldOption == IndexReader.FieldOption.TERMVECTOR_WITH_OFFSET) {
-        fieldSet.add(fi.name);
-      }
-      else if ((fi.storeOffsetWithTermVector && fi.storePositionWithTermVector) &&
-                fieldOption == IndexReader.FieldOption.TERMVECTOR_WITH_POSITION_OFFSET) {
-        fieldSet.add(fi.name);
-      }
-    }
-    return fieldSet;
-  }
-
-
-  public synchronized boolean hasNorms(String field) {
-    ensureOpen();
-    return norms.containsKey(field);
-  }
-
-  static byte[] createFakeNorms(int size) {
-    byte[] ones = new byte[size];
-    Arrays.fill(ones, DefaultSimilarity.encodeNorm(1.0f));
-    return ones;
-  }
-
-  private byte[] ones;
-  private byte[] fakeNorms() {
-    if (ones==null) ones=createFakeNorms(maxDoc());
-    return ones;
-  }
-
-  // can return null if norms aren't stored
-  protected synchronized byte[] getNorms(String field) throws IOException {
-    Norm norm = (Norm) norms.get(field);
-    if (norm == null) return null;  // not indexed, or norms not stored
-    synchronized(norm) {
-      if (norm.bytes == null) {                     // value not yet read
-        byte[] bytes = new byte[maxDoc()];
-        norms(field, bytes, 0);
-        norm.bytes = bytes;                         // cache it
-        // it's OK to close the underlying IndexInput as we have cached the
-        // norms and will never read them again.
-        norm.close();
-      }
-      return norm.bytes;
-    }
-  }
-
-  // returns fake norms if norms aren't available
-  public synchronized byte[] norms(String field) throws IOException {
-    ensureOpen();
-    byte[] bytes = getNorms(field);
-    if (bytes==null) bytes=fakeNorms();
-    return bytes;
-  }
-
-  protected void doSetNorm(int doc, String field, byte value)
-          throws IOException {
-    Norm norm = (Norm) norms.get(field);
-    if (norm == null)                             // not an indexed field
-      return;
-
-    norm.dirty = true;                            // mark it dirty
-    normsDirty = true;
-
-    norms(field)[doc] = value;                    // set the value
-  }
-
-  /** Read norms into a pre-allocated array. */
-  public synchronized void norms(String field, byte[] bytes, int offset)
-    throws IOException {
-
-    ensureOpen();
-    Norm norm = (Norm) norms.get(field);
-    if (norm == null) {
-      System.arraycopy(fakeNorms(), 0, bytes, offset, maxDoc());
-      return;
-    }
-    
-    synchronized(norm) {
-      if (norm.bytes != null) {                     // can copy from cache
-        System.arraycopy(norm.bytes, 0, bytes, offset, maxDoc());
+    @Override
+    public void collect(int doc) throws IOException {
+
+      if (curDocs == null) {
+        // Cache was too large
+        cachedScorer.score = scorer.score();
+        cachedScorer.doc = doc;
+        other.collect(doc);
         return;
       }
 
-    // Read from disk.  norm.in may be shared across  multiple norms and
-    // should only be used in a synchronized context.
-      IndexInput normStream;
-      if (norm.useSingleNormStream) {
-        normStream = singleNormStream;
-      } else {
-        normStream = norm.in;
-      }
-      normStream.seek(norm.normSeek);
-      normStream.readBytes(bytes, offset, maxDoc());
-    }
-  }
+      // Allocate a bigger array or abort caching
+      if (upto == curDocs.length) {
+        base += upto;
+        
+        // Compute next array length - don't allocate too big arrays
+        int nextLength = 8*curDocs.length;
+        if (nextLength > MAX_ARRAY_SIZE) {
+          nextLength = MAX_ARRAY_SIZE;
+        }
 
-
-  private void openNorms(Directory cfsDir, int readBufferSize) throws IOException {
-    long nextNormSeek = SegmentMerger.NORMS_HEADER.length; //skip header (header unused for now)
-    int maxDoc = maxDoc();
-    for (int i = 0; i < fieldInfos.size(); i++) {
-      FieldInfo fi = fieldInfos.fieldInfo(i);
-      if (norms.containsKey(fi.name)) {
-        // in case this SegmentReader is being re-opened, we might be able to
-        // reuse some norm instances and skip loading them here
-        continue;
-      }
-      if (fi.isIndexed && !fi.omitNorms) {
-        Directory d = directory();
-        String fileName = si.getNormFileName(fi.number);
-        if (!si.hasSeparateNorms(fi.number)) {
-          d = cfsDir;
+        if (base + nextLength > maxDocsToCache) {
+          // try to allocate a smaller array
+          nextLength = maxDocsToCache - base;
+          if (nextLength <= 0) {
+            // Too many docs to collect -- clear cache
+            curDocs = null;
+            curScores = null;
+            cachedSegs.clear();
+            cachedDocs.clear();
+            cachedScores.clear();
+            cachedScorer.score = scorer.score();
+            cachedScorer.doc = doc;
+            other.collect(doc);
+            return;
+          }
         }
         
-        // singleNormFile means multiple norms share this file
-        boolean singleNormFile = fileName.endsWith("." + IndexFileNames.NORMS_EXTENSION);
-        IndexInput normInput = null;
-        long normSeek;
+        curDocs = new int[nextLength];
+        cachedDocs.add(curDocs);
+        curScores = new float[nextLength];
+        cachedScores.add(curScores);
+        upto = 0;
+      }
+      
+      curDocs[upto] = doc;
+      cachedScorer.score = curScores[upto] = scorer.score();
+      upto++;
+      cachedScorer.doc = doc;
+      other.collect(doc);
+    }
 
-        if (singleNormFile) {
-          normSeek = nextNormSeek;
-          if (singleNormStream==null) {
-            singleNormStream = d.openInput(fileName, readBufferSize);
+    @Override
+    public void replay(Collector other) throws IOException {
+      replayInit(other);
+      
+      int curUpto = 0;
+      int curBase = 0;
+      int chunkUpto = 0;
+      other.setScorer(cachedScorer);
+      curDocs = EMPTY_INT_ARRAY;
+      for (SegStart seg : cachedSegs) {
+        other.setNextReader(seg.readerContext);
+        while (curBase + curUpto < seg.end) {
+          if (curUpto == curDocs.length) {
+            curBase += curDocs.length;
+            curDocs = cachedDocs.get(chunkUpto);
+            curScores = cachedScores.get(chunkUpto);
+            chunkUpto++;
+            curUpto = 0;
           }
-          // All norms in the .nrm file can share a single IndexInput since
-          // they are only used in a synchronized context.
-          // If this were to change in the future, a clone could be done here.
-          normInput = singleNormStream;
-        } else {
-          normSeek = 0;
-          normInput = d.openInput(fileName);
+          cachedScorer.score = curScores[curUpto];
+          other.collect(curDocs[curUpto++]);
+        }
+      }
+    }
+
+    @Override
+    public void setScorer(Scorer scorer) throws IOException {
+      this.scorer = scorer;
+      other.setScorer(cachedScorer);
+    }
+
+    @Override
+    public String toString() {
+      if (isCached()) {
+        return "CachingCollector (" + (base+upto) + " docs & scores cached)";
+      } else {
+        return "CachingCollector (cache was cleared)";
+      }
+    }
+
+  }
+
+  // A CachingCollector which does not cache scores
+  private static final class NoScoreCachingCollector extends CachingCollector {
+    
+    NoScoreCachingCollector(Collector other, double maxRAMMB) {
+     super(other, maxRAMMB, false);
+    }
+    
+    @Override
+    public void collect(int doc) throws IOException {
+
+      if (curDocs == null) {
+        // Cache was too large
+        other.collect(doc);
+        return;
+      }
+
+      // Allocate a bigger array or abort caching
+      if (upto == curDocs.length) {
+        base += upto;
+        
+        // Compute next array length - don't allocate too big arrays
+        int nextLength = 8*curDocs.length;
+        if (nextLength > MAX_ARRAY_SIZE) {
+          nextLength = MAX_ARRAY_SIZE;
         }
 
-        norms.put(fi.name, new Norm(normInput, singleNormFile, fi.number, normSeek));
-        nextNormSeek += maxDoc; // increment also if some norms are separate
+        if (base + nextLength > maxDocsToCache) {
+          // try to allocate a smaller array
+          nextLength = maxDocsToCache - base;
+          if (nextLength <= 0) {
+            // Too many docs to collect -- clear cache
+            curDocs = null;
+            cachedSegs.clear();
+            cachedDocs.clear();
+            other.collect(doc);
+            return;
+          }
+        }
+        
+        curDocs = new int[nextLength];
+        cachedDocs.add(curDocs);
+        upto = 0;
+      }
+      
+      curDocs[upto] = doc;
+      upto++;
+      other.collect(doc);
+    }
+
+    @Override
+    public void replay(Collector other) throws IOException {
+      replayInit(other);
+      
+      int curUpto = 0;
+      int curbase = 0;
+      int chunkUpto = 0;
+      curDocs = EMPTY_INT_ARRAY;
+      for (SegStart seg : cachedSegs) {
+        other.setNextReader(seg.readerContext);
+        while (curbase + curUpto < seg.end) {
+          if (curUpto == curDocs.length) {
+            curbase += curDocs.length;
+            curDocs = cachedDocs.get(chunkUpto);
+            chunkUpto++;
+            curUpto = 0;
+          }
+          other.collect(curDocs[curUpto++]);
+        }
       }
     }
+
+    @Override
+    public void setScorer(Scorer scorer) throws IOException {
+      other.setScorer(scorer);
+    }
+
+    @Override
+    public String toString() {
+      if (isCached()) {
+        return "CachingCollector (" + (base+upto) + " docs cached)";
+      } else {
+        return "CachingCollector (cache was cleared)";
+      }
+    }
+
   }
 
-  // for testing only
-  boolean normsClosed() {
-    if (singleNormStream != null) {
-      return false;
-    }
-    Iterator it = norms.values().iterator();
-    while (it.hasNext()) {
-      Norm norm = (Norm) it.next();
-      if (norm.refCount > 0) {
-        return false;
-      }
-    }
-    return true;
-  }
+  // TODO: would be nice if a collector defined a
+  // needsScores() method so we can specialize / do checks
+  // up front. This is only relevant for the ScoreCaching
+  // version -- if the wrapped Collector does not need
+  // scores, it can avoid cachedScorer entirely.
+  protected final Collector other;
   
-  // for testing only
-  boolean normsClosed(String field) {
-      Norm norm = (Norm) norms.get(field);
-      return norm.refCount == 0;
+  protected final int maxDocsToCache;
+  protected final List<SegStart> cachedSegs = new ArrayList<SegStart>();
+  protected final List<int[]> cachedDocs;
+  
+  private AtomicReaderContext lastReaderContext;
+  
+  protected int[] curDocs;
+  protected int upto;
+  protected int base;
+  protected int lastDocBase;
+  
+  /**
+   * Creates a {@link CachingCollector} which does not wrap another collector.
+   * The cached documents and scores can later be {@link #replay(Collector)
+   * replayed}.
+   * 
+   * @param acceptDocsOutOfOrder
+   *          whether documents are allowed to be collected out-of-order
+   */
+  public static CachingCollector create(final boolean acceptDocsOutOfOrder, boolean cacheScores, double maxRAMMB) {
+    Collector other = new Collector() {
+      @Override
+      public boolean acceptsDocsOutOfOrder() {
+        return acceptDocsOutOfOrder;
+      }
+      
+      @Override
+      public void setScorer(Scorer scorer) throws IOException {}
+
+      @Override
+      public void collect(int doc) throws IOException {}
+
+      @Override
+      public void setNextReader(AtomicReaderContext context) throws IOException {}
+
+    };
+    return create(other, cacheScores, maxRAMMB);
   }
 
   /**
-   * Create a clone from the initial TermVectorsReader and store it in the ThreadLocal.
-   * @return TermVectorsReader
+   * Create a new {@link CachingCollector} that wraps the given collector and
+   * caches documents and scores up to the specified RAM threshold.
+   * 
+   * @param other
+   *          the Collector to wrap and delegate calls to.
+   * @param cacheScores
+   *          whether to cache scores in addition to document IDs. Note that
+   *          this increases the RAM consumed per doc
+   * @param maxRAMMB
+   *          the maximum RAM in MB to consume for caching the documents and
+   *          scores. If the collector exceeds the threshold, no documents and
+   *          scores are cached.
    */
-  private TermVectorsReader getTermVectorsReader() {
-    assert termVectorsReaderOrig != null;
-    TermVectorsReader tvReader = (TermVectorsReader)termVectorsLocal.get();
-    if (tvReader == null) {
-      try {
-        tvReader = (TermVectorsReader)termVectorsReaderOrig.clone();
-      } catch (CloneNotSupportedException cnse) {
-        return null;
-      }
-      termVectorsLocal.set(tvReader);
+  public static CachingCollector create(Collector other, boolean cacheScores, double maxRAMMB) {
+    return cacheScores ? new ScoreCachingCollector(other, maxRAMMB) : new NoScoreCachingCollector(other, maxRAMMB);
     }
-    return tvReader;
-  }
   
-  /** Return a term frequency vector for the specified document and field. The
-   *  vector returned contains term numbers and frequencies for all terms in
-   *  the specified field of this document, if the field had storeTermVector
-   *  flag set.  If the flag was not set, the method returns null.
-   * @throws IOException
-   */
-  public TermFreqVector getTermFreqVector(int docNumber, String field) throws IOException {
-    // Check if this field is invalid or has no stored term vector
-    ensureOpen();
-    FieldInfo fi = fieldInfos.fieldInfo(field);
-    if (fi == null || !fi.storeTermVector || termVectorsReaderOrig == null) 
-      return null;
+  // Prevent extension from non-internal classes
+  private CachingCollector(Collector other, double maxRAMMB, boolean cacheScores) {
+    this.other = other;
     
-    TermVectorsReader termVectorsReader = getTermVectorsReader();
-    if (termVectorsReader == null)
-      return null;
-    
-    return termVectorsReader.get(docNumber, field);
-  }
+    cachedDocs = new ArrayList<int[]>();
+    curDocs = new int[INITIAL_ARRAY_SIZE];
+    cachedDocs.add(curDocs);
 
-
-  public void getTermFreqVector(int docNumber, String field, TermVectorMapper mapper) throws IOException {
-    ensureOpen();
-    FieldInfo fi = fieldInfos.fieldInfo(field);
-    if (fi == null || !fi.storeTermVector || termVectorsReaderOrig == null)
-      return;
-
-    TermVectorsReader termVectorsReader = getTermVectorsReader();
-    if (termVectorsReader == null)
-    {
-      return;
+    int bytesPerDoc = RamUsageEstimator.NUM_BYTES_INT;
+    if (cacheScores) {
+      bytesPerDoc += RamUsageEstimator.NUM_BYTES_FLOAT;
     }
-
-
-    termVectorsReader.get(docNumber, field, mapper);
-  }
-
-
-  public void getTermFreqVector(int docNumber, TermVectorMapper mapper) throws IOException {
-    ensureOpen();
-    if (termVectorsReaderOrig == null)
-      return;
-
-    TermVectorsReader termVectorsReader = getTermVectorsReader();
-    if (termVectorsReader == null)
-      return;
-
-    termVectorsReader.get(docNumber, mapper);
-  }
-
-  /** Return an array of term frequency vectors for the specified document.
-   *  The array contains a vector for each vectorized field in the document.
-   *  Each vector vector contains term numbers and frequencies for all terms
-   *  in a given vectorized field.
-   *  If no such fields existed, the method returns null.
-   * @throws IOException
-   */
-  public TermFreqVector[] getTermFreqVectors(int docNumber) throws IOException {
-    ensureOpen();
-    if (termVectorsReaderOrig == null)
-      return null;
-    
-    TermVectorsReader termVectorsReader = getTermVectorsReader();
-    if (termVectorsReader == null)
-      return null;
-    
-    return termVectorsReader.get(docNumber);
+    maxDocsToCache = (int) ((maxRAMMB * 1024 * 1024) / bytesPerDoc);
   }
   
-  /** Returns the field infos of this segment */
-  FieldInfos fieldInfos() {
-    return fieldInfos;
+  @Override
+  public boolean acceptsDocsOutOfOrder() {
+    return other.acceptsDocsOutOfOrder();
   }
-  
+
+  public boolean isCached() {
+    return curDocs != null;
+  }
+
+  @Override  
+  public void setNextReader(AtomicReaderContext context) throws IOException {
+    other.setNextReader(context);
+    if (lastReaderContext != null) {
+      cachedSegs.add(new SegStart(lastReaderContext, base+upto));
+    }
+    lastReaderContext = context;
+  }
+
+  /** Reused by the specialized inner classes. */
+  void replayInit(Collector other) {
+    if (!isCached()) {
+      throw new IllegalStateException("cannot replay: cache was cleared because too much RAM was required");
+    }
+    
+    if (!other.acceptsDocsOutOfOrder() && this.other.acceptsDocsOutOfOrder()) {
+      throw new IllegalArgumentException(
+          "cannot replay: given collector does not support "
+              + "out-of-order collection, while the wrapped collector does. "
+              + "Therefore cached documents may be out-of-order.");
+    }
+    
+    //System.out.println("CC: replay totHits=" + (upto + base));
+    if (lastReaderContext != null) {
+      cachedSegs.add(new SegStart(lastReaderContext, base+upto));
+      lastReaderContext = null;
+    }
+  }
+
   /**
-   * Return the name of the segment this reader is reading.
+   * Replays the cached doc IDs (and scores) to the given Collector. If this
+   * instance does not cache scores, then Scorer is not set on
+   * {@code other.setScorer} as well as scores are not replayed.
+   * 
+   * @throws IllegalStateException
+   *           if this collector is not cached (i.e., if the RAM limits were too
+   *           low for the number of documents + scores to cache).
+   * @throws IllegalArgumentException
+   *           if the given Collect's does not support out-of-order collection,
+   *           while the collector passed to the ctor does.
    */
-  String getSegmentName() {
-    return segment;
-  }
+  public abstract void replay(Collector other) throws IOException;
   
-  /**
-   * Return the SegmentInfo of the segment this reader is reading.
-   */
-  SegmentInfo getSegmentInfo() {
-    return si;
-  }
-
-  void setSegmentInfo(SegmentInfo info) {
-    si = info;
-  }
-
-  void startCommit() {
-    super.startCommit();
-    rollbackDeletedDocsDirty = deletedDocsDirty;
-    rollbackNormsDirty = normsDirty;
-    rollbackUndeleteAll = undeleteAll;
-    rollbackPendingDeleteCount = pendingDeleteCount;
-    Iterator it = norms.values().iterator();
-    while (it.hasNext()) {
-      Norm norm = (Norm) it.next();
-      norm.rollbackDirty = norm.dirty;
-    }
-  }
-
-  void rollbackCommit() {
-    super.rollbackCommit();
-    deletedDocsDirty = rollbackDeletedDocsDirty;
-    normsDirty = rollbackNormsDirty;
-    undeleteAll = rollbackUndeleteAll;
-    pendingDeleteCount = rollbackPendingDeleteCount;
-    Iterator it = norms.values().iterator();
-    while (it.hasNext()) {
-      Norm norm = (Norm) it.next();
-      norm.dirty = norm.rollbackDirty;
-    }
-  }
 }

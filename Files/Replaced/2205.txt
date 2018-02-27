@@ -1,6 +1,8 @@
-docsEnum = termsEnum.docs(liveDocs, docsEnum, false);
+it.next().perThread.setInfoStream(infoStream);
 
-/*
+package org.apache.lucene.index;
+
+/**
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -17,559 +19,538 @@ docsEnum = termsEnum.docs(liveDocs, docsEnum, false);
  * limitations under the License.
  */
 
-package org.apache.solr.handler.component;
+import java.io.IOException;
+import java.io.PrintStream;
+import java.util.Collection;
+import java.util.Iterator;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Queue;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.lucene.analysis.Analyzer;
-import org.apache.lucene.analysis.TokenStream;
-import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
-import org.apache.lucene.index.*;
-import org.apache.lucene.search.*;
-import org.apache.lucene.util.Bits;
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.SentinelIntSet;
-import org.apache.solr.cloud.ZkController;
-import org.apache.solr.common.SolrException;
-import org.apache.solr.common.params.QueryElevationParams;
-import org.apache.solr.common.params.SolrParams;
-import org.apache.solr.util.DOMUtil;
-import org.apache.solr.common.util.NamedList;
-import org.apache.solr.common.util.SimpleOrderedMap;
-import org.apache.solr.core.Config;
-import org.apache.solr.core.SolrCore;
-import org.apache.solr.request.SolrQueryRequest;
-import org.apache.solr.response.transform.ElevatedMarkerFactory;
-import org.apache.solr.response.transform.ExcludedMarkerFactory;
-import org.apache.solr.schema.FieldType;
-import org.apache.solr.schema.SchemaField;
-import org.apache.solr.search.SolrIndexSearcher;
-import org.apache.solr.search.SortSpec;
-import org.apache.solr.util.RefCounted;
-import org.apache.solr.util.VersionedFile;
-import org.apache.solr.util.plugin.SolrCoreAware;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.w3c.dom.Node;
-import org.w3c.dom.NodeList;
-import org.xml.sax.InputSource;
-
-import javax.xml.xpath.XPath;
-import javax.xml.xpath.XPathConstants;
-import javax.xml.xpath.XPathExpressionException;
-import javax.xml.xpath.XPathFactory;
-import java.io.File;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.StringReader;
-import java.net.MalformedURLException;
-import java.net.URL;
-import java.util.*;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.index.DocumentsWriterPerThread.FlushedSegment;
+import org.apache.lucene.index.DocumentsWriterPerThread.IndexingChain;
+import org.apache.lucene.index.DocumentsWriterPerThreadPool.ThreadState;
+import org.apache.lucene.index.FieldInfos.FieldNumberBiMap;
+import org.apache.lucene.search.Query;
+import org.apache.lucene.search.SimilarityProvider;
+import org.apache.lucene.store.AlreadyClosedException;
+import org.apache.lucene.store.Directory;
 
 /**
- * A component to elevate some documents to the top of the result set.
+ * This class accepts multiple added documents and directly
+ * writes segment files.
  *
- * @since solr 1.3
+ * Each added document is passed to the {@link DocConsumer},
+ * which in turn processes the document and interacts with
+ * other consumers in the indexing chain.  Certain
+ * consumers, like {@link StoredFieldsWriter} and {@link
+ * TermVectorsTermsWriter}, digest a document and
+ * immediately write bytes to the "doc store" files (ie,
+ * they do not consume RAM per document, except while they
+ * are processing the document).
+ *
+ * Other consumers, eg {@link FreqProxTermsWriter} and
+ * {@link NormsWriter}, buffer bytes in RAM and flush only
+ * when a new segment is produced.
+
+ * Once we have used our allowed RAM buffer, or the number
+ * of added docs is large enough (in the case we are
+ * flushing by doc count instead of RAM usage), we create a
+ * real segment and flush it to the Directory.
+ *
+ * Threads:
+ *
+ * Multiple threads are allowed into addDocument at once.
+ * There is an initial synchronized call to getThreadState
+ * which allocates a ThreadState for this thread.  The same
+ * thread will get the same ThreadState over time (thread
+ * affinity) so that if there are consistent patterns (for
+ * example each thread is indexing a different content
+ * source) then we make better use of RAM.  Then
+ * processDocument is called on that ThreadState without
+ * synchronization (most of the "heavy lifting" is in this
+ * call).  Finally the synchronized "finishDocument" is
+ * called to flush changes to the directory.
+ *
+ * When flush is called by IndexWriter we forcefully idle
+ * all threads and flush only once they are all idle.  This
+ * means you can call flush with a given thread even while
+ * other threads are actively adding/deleting documents.
+ *
+ *
+ * Exceptions:
+ *
+ * Because this class directly updates in-memory posting
+ * lists, and flushes stored fields and term vectors
+ * directly to files in the directory, there are certain
+ * limited times when an exception can corrupt this state.
+ * For example, a disk full while flushing stored fields
+ * leaves this file in a corrupt state.  Or, an OOM
+ * exception while appending to the in-memory posting lists
+ * can corrupt that posting list.  We call such exceptions
+ * "aborting exceptions".  In these cases we must call
+ * abort() to discard all docs added since the last flush.
+ *
+ * All other exceptions ("non-aborting exceptions") can
+ * still partially update the index structures.  These
+ * updates are consistent, but, they represent only a part
+ * of the document seen up until the exception was hit.
+ * When this happens, we immediately mark the document as
+ * deleted so that the document is always atomically ("all
+ * or none") added to the index.
  */
-public class QueryElevationComponent extends SearchComponent implements SolrCoreAware {
-  private static Logger log = LoggerFactory.getLogger(QueryElevationComponent.class);
 
-  // Constants used in solrconfig.xml
-  static final String FIELD_TYPE = "queryFieldType";
-  static final String CONFIG_FILE = "config-file";
-  static final String EXCLUDE = "exclude";
-  public static final String BOOSTED = "BOOSTED";
-  public static final String EXCLUDED = "EXCLUDED";
+final class DocumentsWriter {
+  Directory directory;
 
-  // Runtime param -- should be in common?
+  private volatile boolean closed;
 
-  private SolrParams initArgs = null;
-  private Analyzer analyzer = null;
-  private String idField = null;
-  private FieldType idSchemaFT;
+  PrintStream infoStream;
+  SimilarityProvider similarityProvider;
 
-  boolean forceElevation = false;
-  // For each IndexReader, keep a query->elevation map
-  // When the configuration is loaded from the data directory.
-  // The key is null if loaded from the config directory, and
-  // is never re-loaded.
-  final Map<IndexReader, Map<String, ElevationObj>> elevationCache =
-      new WeakHashMap<IndexReader, Map<String, ElevationObj>>();
+  List<String> newFiles;
 
-  class ElevationObj {
-    final String text;
-    final String analyzed;
-    final TermQuery [] exclude;//just keep the term query, b/c we will not always explicitly exclude the item based on markExcludes query time param
-    final BooleanQuery include;
-    final Map<BytesRef, Integer> priority;
-    final Set<String> ids;
-    final Set<String> excludeIds;
+  final IndexWriter indexWriter;
 
-    ElevationObj(String qstr, List<String> elevate, List<String> exclude) throws IOException {
-      this.text = qstr;
-      this.analyzed = getAnalyzedQuery(this.text);
-      this.ids = new HashSet<String>();
-      this.excludeIds = new HashSet<String>();
+  private AtomicInteger numDocsInRAM = new AtomicInteger(0);
 
-      this.include = new BooleanQuery();
-      this.include.setBoost(0);
-      this.priority = new HashMap<BytesRef, Integer>();
-      int max = elevate.size() + 5;
-      for (String id : elevate) {
-        id = idSchemaFT.readableToIndexed(id);
-        ids.add(id);
-        TermQuery tq = new TermQuery(new Term(idField, id));
-        include.add(tq, BooleanClause.Occur.SHOULD);
-        this.priority.put(new BytesRef(id), max--);
-      }
+  // TODO: cut over to BytesRefHash in BufferedDeletes
+  volatile DocumentsWriterDeleteQueue deleteQueue = new DocumentsWriterDeleteQueue();
+  private final Queue<FlushTicket> ticketQueue = new LinkedList<DocumentsWriter.FlushTicket>();
 
-      if (exclude == null || exclude.isEmpty()) {
-        this.exclude = null;
-      } else {
-        this.exclude = new TermQuery[exclude.size()];
-        for (int i = 0; i < exclude.size(); i++) {
-          String id = idSchemaFT.readableToIndexed(exclude.get(i));
-          excludeIds.add(id);
-          this.exclude[i] = new TermQuery(new Term(idField, id));
-        }
-      }
+  private Collection<String> abortedFiles;               // List of files that were written before last abort()
+
+  final IndexingChain chain;
+
+  final DocumentsWriterPerThreadPool perThreadPool;
+  final FlushPolicy flushPolicy;
+  final DocumentsWriterFlushControl flushControl;
+  final Healthiness healthiness;
+  DocumentsWriter(IndexWriterConfig config, Directory directory, IndexWriter writer, FieldNumberBiMap globalFieldNumbers,
+      BufferedDeletesStream bufferedDeletesStream) throws IOException {
+    this.directory = directory;
+    this.indexWriter = writer;
+    this.similarityProvider = config.getSimilarityProvider();
+    this.perThreadPool = config.getIndexerThreadPool();
+    this.chain = config.getIndexingChain();
+    this.perThreadPool.initialize(this, globalFieldNumbers, config);
+    final FlushPolicy configuredPolicy = config.getFlushPolicy();
+    if (configuredPolicy == null) {
+      flushPolicy = new FlushByRamOrCountsPolicy();
+    } else {
+      flushPolicy = configuredPolicy;
+    }
+    flushPolicy.init(this);
+    
+    healthiness = new Healthiness();
+    final long maxRamPerDWPT = config.getRAMPerThreadHardLimitMB() * 1024 * 1024;
+    flushControl = new DocumentsWriterFlushControl(this, healthiness, maxRamPerDWPT);
+  }
+
+  synchronized void deleteQueries(final Query... queries) throws IOException {
+    deleteQueue.addDelete(queries);
+    flushControl.doOnDelete();
+    if (flushControl.doApplyAllDeletes()) {
+      applyAllDeletes(deleteQueue);
     }
   }
 
-  @Override
-  public void init(NamedList args) {
-    this.initArgs = SolrParams.toSolrParams(args);
-  }
-
-  public void inform(SolrCore core) {
-    String a = initArgs.get(FIELD_TYPE);
-    if (a != null) {
-      FieldType ft = core.getSchema().getFieldTypes().get(a);
-      if (ft == null) {
-        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
-            "Unknown FieldType: '" + a + "' used in QueryElevationComponent");
-      }
-      analyzer = ft.getQueryAnalyzer();
-    }
-
-    SchemaField sf = core.getSchema().getUniqueKeyField();
-    if( sf == null) {
-      throw new SolrException( SolrException.ErrorCode.SERVER_ERROR, 
-          "QueryElevationComponent requires the schema to have a uniqueKeyField." );
-    }
-    idSchemaFT = sf.getType();
-    idField = sf.getName();
-    //register the EditorialMarkerFactory
-    String excludeName = initArgs.get(QueryElevationParams.EXCLUDE_MARKER_FIELD_NAME, "excluded");
-    if (excludeName == null || excludeName.equals("") == true){
-      excludeName = "excluded";
-    }
-    ExcludedMarkerFactory excludedMarkerFactory = new ExcludedMarkerFactory();
-    core.addTransformerFactory(excludeName, excludedMarkerFactory);
-    ElevatedMarkerFactory elevatedMarkerFactory = new ElevatedMarkerFactory();
-    String markerName = initArgs.get(QueryElevationParams.EDITORIAL_MARKER_FIELD_NAME, "elevated");
-    if (markerName == null || markerName.equals("") == true) {
-      markerName = "elevated";
-    }
-    core.addTransformerFactory(markerName, elevatedMarkerFactory);
-    forceElevation = initArgs.getBool(QueryElevationParams.FORCE_ELEVATION, forceElevation);
-    try {
-      synchronized (elevationCache) {
-        elevationCache.clear();
-        String f = initArgs.get(CONFIG_FILE);
-        if (f == null) {
-          throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
-              "QueryElevationComponent must specify argument: '" + CONFIG_FILE
-                  + "' -- path to elevate.xml");
-        }
-        boolean exists = false;
-
-        // check if using ZooKeeper
-        ZkController zkController = core.getCoreDescriptor().getCoreContainer().getZkController();
-        if (zkController != null) {
-          // TODO : shouldn't have to keep reading the config name when it has been read before
-          exists = zkController.configFileExists(zkController.readConfigName(core.getCoreDescriptor().getCloudDescriptor().getCollectionName()), f);
-        } else {
-          File fC = new File(core.getResourceLoader().getConfigDir(), f);
-          File fD = new File(core.getDataDir(), f);
-          if (fC.exists() == fD.exists()) {
-            throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
-                "QueryElevationComponent missing config file: '" + f + "\n"
-                    + "either: " + fC.getAbsolutePath() + " or " + fD.getAbsolutePath() + " must exist, but not both.");
-          }
-          if (fC.exists()) {
-            exists = true;
-            log.info("Loading QueryElevation from: " + fC.getAbsolutePath());
-            Config cfg = new Config(core.getResourceLoader(), f);
-            elevationCache.put(null, loadElevationMap(cfg));
-          }
-        }
-        //in other words, we think this is in the data dir, not the conf dir
-        if (!exists) {
-          // preload the first data
-          RefCounted<SolrIndexSearcher> searchHolder = null;
-          try {
-            searchHolder = core.getNewestSearcher(false);
-            IndexReader reader = searchHolder.get().getIndexReader();
-            getElevationMap(reader, core);
-          } finally {
-            if (searchHolder != null) searchHolder.decref();
-          }
-        }
-      }
-    } catch (Exception ex) {
-      throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
-          "Error initializing QueryElevationComponent.", ex);
+  // TODO: we could check w/ FreqProxTermsWriter: if the
+  // term doesn't exist, don't bother buffering into the
+  // per-DWPT map (but still must go into the global map)
+  synchronized void deleteTerms(final Term... terms) throws IOException {
+    final DocumentsWriterDeleteQueue deleteQueue = this.deleteQueue;
+    deleteQueue.addDelete(terms);
+    flushControl.doOnDelete();
+    if (flushControl.doApplyAllDeletes()) {
+      applyAllDeletes(deleteQueue);
     }
   }
 
-  //get the elevation map from the data dir
-  Map<String, ElevationObj> getElevationMap(IndexReader reader, SolrCore core) throws Exception {
-    synchronized (elevationCache) {
-      Map<String, ElevationObj> map = elevationCache.get(null);
-      if (map != null) return map;
-
-      map = elevationCache.get(reader);
-      if (map == null) {
-        String f = initArgs.get(CONFIG_FILE);
-        if (f == null) {
-          throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
-              "QueryElevationComponent must specify argument: " + CONFIG_FILE);
-        }
-        log.info("Loading QueryElevation from data dir: " + f);
-        
-        Config cfg;
-        
-        ZkController zkController = core.getCoreDescriptor().getCoreContainer().getZkController();
-        if (zkController != null) {
-          cfg = new Config(core.getResourceLoader(), f, null, null);
-        } else {
-          InputStream is = VersionedFile.getLatestFile(core.getDataDir(), f);
-          cfg = new Config(core.getResourceLoader(), f, new InputSource(is), null);
-        }
+  DocumentsWriterDeleteQueue currentDeleteSession() {
+    return deleteQueue;
+  }
   
-        map = loadElevationMap(cfg);
-        elevationCache.put(reader, map);
+  private void applyAllDeletes(DocumentsWriterDeleteQueue deleteQueue) throws IOException {
+    if (deleteQueue != null) {
+      synchronized (ticketQueue) {
+        // Freeze and insert the delete flush ticket in the queue
+        ticketQueue.add(new FlushTicket(deleteQueue.freezeGlobalBuffer(null), false));
+        applyFlushTickets();
       }
-      return map;
+    }
+    indexWriter.applyAllDeletes();
+    indexWriter.flushCount.incrementAndGet();
+  }
+
+  synchronized void setInfoStream(PrintStream infoStream) {
+    this.infoStream = infoStream;
+    final Iterator<ThreadState> it = perThreadPool.getAllPerThreadsIterator();
+    while (it.hasNext()) {
+      it.next().perThread.docState.infoStream = infoStream;
     }
   }
 
-  //load up the elevation map
-  private Map<String, ElevationObj> loadElevationMap(Config cfg) throws IOException {
-    XPath xpath = XPathFactory.newInstance().newXPath();
-    Map<String, ElevationObj> map = new HashMap<String, ElevationObj>();
-    NodeList nodes = (NodeList) cfg.evaluate("elevate/query", XPathConstants.NODESET);
-    for (int i = 0; i < nodes.getLength(); i++) {
-      Node node = nodes.item(i);
-      String qstr = DOMUtil.getAttr(node, "text", "missing query 'text'");
-
-      NodeList children = null;
-      try {
-        children = (NodeList) xpath.evaluate("doc", node, XPathConstants.NODESET);
-      } catch (XPathExpressionException e) {
-        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
-            "query requires '<doc .../>' child");
-      }
-
-      ArrayList<String> include = new ArrayList<String>();
-      ArrayList<String> exclude = new ArrayList<String>();
-      for (int j = 0; j < children.getLength(); j++) {
-        Node child = children.item(j);
-        String id = DOMUtil.getAttr(child, "id", "missing 'id'");
-        String e = DOMUtil.getAttr(child, EXCLUDE, null);
-        if (e != null) {
-          if (Boolean.valueOf(e)) {
-            exclude.add(id);
-            continue;
-          }
-        }
-        include.add(id);
-      }
-
-      ElevationObj elev = new ElevationObj(qstr, include, exclude);
-      if (map.containsKey(elev.analyzed)) {
-        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
-            "Boosting query defined twice for query: '" + elev.text + "' (" + elev.analyzed + "')");
-      }
-      map.put(elev.analyzed, elev);
-    }
-    return map;
+  /** Returns how many docs are currently buffered in RAM. */
+  int getNumDocs() {
+    return numDocsInRAM.get();
   }
 
-  /**
-   * Helpful for testing without loading config.xml
-   *
-   * @throws IOException
-   */
-  void setTopQueryResults(IndexReader reader, String query, String[] ids, String[] ex) throws IOException {
-    if (ids == null) {
-      ids = new String[0];
-    }
-    if (ex == null) {
-      ex = new String[0];
-    }
-
-    Map<String, ElevationObj> elev = elevationCache.get(reader);
-    if (elev == null) {
-      elev = new HashMap<String, ElevationObj>();
-      elevationCache.put(reader, elev);
-    }
-    ElevationObj obj = new ElevationObj(query, Arrays.asList(ids), Arrays.asList(ex));
-    elev.put(obj.analyzed, obj);
+  Collection<String> abortedFiles() {
+    return abortedFiles;
   }
 
-  String getAnalyzedQuery(String query) throws IOException {
-    if (analyzer == null) {
-      return query;
+  // returns boolean for asserts
+  boolean message(String message) {
+    if (infoStream != null) {
+      indexWriter.message("DW: " + message);
     }
-    StringBuilder norm = new StringBuilder();
-    TokenStream tokens = analyzer.tokenStream("", new StringReader(query));
-    tokens.reset();
-
-    CharTermAttribute termAtt = tokens.addAttribute(CharTermAttribute.class);
-    while (tokens.incrementToken()) {
-      norm.append(termAtt.buffer(), 0, termAtt.length());
-    }
-    tokens.end();
-    tokens.close();
-    return norm.toString();
+    return true;
   }
 
-  //---------------------------------------------------------------------------------
-  // SearchComponent
-  //---------------------------------------------------------------------------------
+  private void ensureOpen() throws AlreadyClosedException {
+    if (closed) {
+      throw new AlreadyClosedException("this IndexWriter is closed");
+    }
+  }
 
-  @Override
-  public void prepare(ResponseBuilder rb) throws IOException {
-    SolrQueryRequest req = rb.req;
-    SolrParams params = req.getParams();
-    // A runtime param can skip 
-    if (!params.getBool(QueryElevationParams.ENABLE, true)) {
-      return;
+  /** Called if we hit an exception at a bad time (when
+   *  updating the index files) and must discard all
+   *  currently buffered docs.  This resets our state,
+   *  discarding any docs added since last flush. */
+  synchronized void abort() throws IOException {
+    boolean success = false;
+
+    synchronized (this) {
+      deleteQueue.clear();
     }
 
-    boolean exclusive = params.getBool(QueryElevationParams.EXCLUSIVE, false);
-    // A runtime parameter can alter the config value for forceElevation
-    boolean force = params.getBool(QueryElevationParams.FORCE_ELEVATION, forceElevation);
-    boolean markExcludes = params.getBool(QueryElevationParams.MARK_EXCLUDES, false);
-    Query query = rb.getQuery();
-    String qstr = rb.getQueryString();
-    if (query == null || qstr == null) {
-      return;
-    }
-
-    qstr = getAnalyzedQuery(qstr);
-    IndexReader reader = req.getSearcher().getIndexReader();
-    ElevationObj booster = null;
     try {
-      booster = getElevationMap(reader, req.getCore()).get(qstr);
-    } catch (Exception ex) {
-      throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,
-          "Error loading elevation", ex);
-    }
+      if (infoStream != null) {
+        message("docWriter: abort");
+      }
 
-    if (booster != null) {
-      rb.req.getContext().put(BOOSTED, booster.ids);
+      final Iterator<ThreadState> threadsIterator = perThreadPool.getActivePerThreadsIterator();
 
-      // Change the query to insert forced documents
-      if (exclusive == true) {
-        //we only want these results
-        rb.setQuery(booster.include);
-      } else {
-        BooleanQuery newq = new BooleanQuery(true);
-        newq.add(query, BooleanClause.Occur.SHOULD);
-        newq.add(booster.include, BooleanClause.Occur.SHOULD);
-        if (booster.exclude != null) {
-          if (markExcludes == false) {
-            for (TermQuery tq : booster.exclude) {
-              newq.add(new BooleanClause(tq, BooleanClause.Occur.MUST_NOT));
-            }
+      while (threadsIterator.hasNext()) {
+        ThreadState perThread = threadsIterator.next();
+        perThread.lock();
+        try {
+          if (perThread.isActive()) { // we might be closed
+            perThread.perThread.abort();
+            perThread.perThread.checkAndResetHasAborted();
           } else {
-            //we are only going to mark items as excluded, not actually exclude them.  This works
-            //with the EditorialMarkerFactory
-            rb.req.getContext().put(EXCLUDED, booster.excludeIds);
-            for (TermQuery tq : booster.exclude) {
-              newq.add(new BooleanClause(tq, BooleanClause.Occur.SHOULD));
-            }
+            assert closed;
           }
-        }
-        rb.setQuery(newq);
-      }
-
-      ElevationComparatorSource comparator = new ElevationComparatorSource(booster);
-      // if the sort is 'score desc' use a custom sorting method to 
-      // insert documents in their proper place 
-      SortSpec sortSpec = rb.getSortSpec();
-      if (sortSpec.getSort() == null) {
-        sortSpec.setSort(new Sort(new SortField[]{
-            new SortField("_elevate_", comparator, true),
-            new SortField(null, SortField.Type.SCORE, false)
-        }));
-      } else {
-        // Check if the sort is based on score
-        boolean modify = false;
-        SortField[] current = sortSpec.getSort().getSort();
-        ArrayList<SortField> sorts = new ArrayList<SortField>(current.length + 1);
-        // Perhaps force it to always sort by score
-        if (force && current[0].getType() != SortField.Type.SCORE) {
-          sorts.add(new SortField("_elevate_", comparator, true));
-          modify = true;
-        }
-        for (SortField sf : current) {
-          if (sf.getType() == SortField.Type.SCORE) {
-            sorts.add(new SortField("_elevate_", comparator, !sf.getReverse()));
-            modify = true;
-          }
-          sorts.add(sf);
-        }
-        if (modify) {
-          sortSpec.setSort(new Sort(sorts.toArray(new SortField[sorts.size()])));
-        }
-      }
-    }
-
-    // Add debugging information
-    if (rb.isDebug()) {
-      List<String> match = null;
-      if (booster != null) {
-        // Extract the elevated terms into a list
-        match = new ArrayList<String>(booster.priority.size());
-        for (Object o : booster.include.clauses()) {
-          TermQuery tq = (TermQuery) ((BooleanClause) o).getQuery();
-          match.add(tq.getTerm().text());
+        } finally {
+          perThread.unlock();
         }
       }
 
-      SimpleOrderedMap<Object> dbg = new SimpleOrderedMap<Object>();
-      dbg.add("q", qstr);
-      dbg.add("match", match);
-      if (rb.isDebugQuery()) {
-        rb.addDebugInfo("queryBoosting", dbg);
+      success = true;
+    } finally {
+      if (infoStream != null) {
+        message("docWriter: done abort; abortedFiles=" + abortedFiles + " success=" + success);
       }
     }
   }
 
-  @Override
-  public void process(ResponseBuilder rb) throws IOException {
-    // Do nothing -- the real work is modifying the input query
+  boolean anyChanges() {
+    return numDocsInRAM.get() != 0 || anyDeletions();
   }
 
-  //---------------------------------------------------------------------------------
-  // SolrInfoMBean
-  //---------------------------------------------------------------------------------
-
-  @Override
-  public String getDescription() {
-    return "Query Boosting -- boost particular documents for a given query";
+  public int getBufferedDeleteTermsSize() {
+    return deleteQueue.getBufferedDeleteTermsSize();
   }
 
-  @Override
-  public String getSource() {
-    return "$URL$";
+  //for testing
+  public int getNumBufferedDeleteTerms() {
+    return deleteQueue.numGlobalTermDeletes();
   }
 
-  @Override
-  public URL[] getDocs() {
+  public boolean anyDeletions() {
+    return deleteQueue.anyChanges();
+  }
+
+  void close() {
+    closed = true;
+    flushControl.setClosed();
+  }
+
+  boolean updateDocument(final Document doc, final Analyzer analyzer,
+      final Term delTerm) throws CorruptIndexException, IOException {
+    ensureOpen();
+    boolean maybeMerge = false;
+    final boolean isUpdate = delTerm != null;
+    if (healthiness.anyStalledThreads()) {
+
+      // Help out flushing any pending DWPTs so we can un-stall:
+      if (infoStream != null) {
+        message("WARNING DocumentsWriter has stalled threads; will hijack this thread to flush pending segment(s)");
+      }
+
+      // Try pick up pending threads here if possible
+      DocumentsWriterPerThread flushingDWPT;
+      while ((flushingDWPT = flushControl.nextPendingFlush()) != null) {
+        // Don't push the delete here since the update could fail!
+        maybeMerge = doFlush(flushingDWPT);
+        if (!healthiness.anyStalledThreads()) {
+          break;
+        }
+      }
+
+      if (infoStream != null && healthiness.anyStalledThreads()) {
+        message("WARNING DocumentsWriter still has stalled threads; waiting");
+      }
+
+      healthiness.waitIfStalled(); // block if stalled
+
+      if (infoStream != null && healthiness.anyStalledThreads()) {
+        message("WARNING DocumentsWriter done waiting");
+      }
+    }
+
+    final ThreadState perThread = perThreadPool.getAndLock(Thread.currentThread(),
+        this, doc);
+    final DocumentsWriterPerThread flushingDWPT;
+    
     try {
-      return new URL[]{
-          new URL("http://wiki.apache.org/solr/QueryElevationComponent")
-      };
-    } catch (MalformedURLException e) {
-      throw new RuntimeException(e);
-    }
-  }
-  class ElevationComparatorSource extends FieldComparatorSource {
-  private QueryElevationComponent.ElevationObj elevations;
-  private SentinelIntSet ordSet; //the key half of the map
-  private BytesRef[] termValues;//the value half of the map
 
-  public ElevationComparatorSource(final QueryElevationComponent.ElevationObj elevations) {
-    this.elevations = elevations;
-    int size = elevations.ids.size();
-    ordSet = new SentinelIntSet(size, -1);
-    termValues = new BytesRef[ordSet.keys.length];
-  }
-
-  @Override
-  public FieldComparator<Integer> newComparator(String fieldname, final int numHits, int sortPos, boolean reversed) throws IOException {
-    return new FieldComparator<Integer>() {
-      private final int[] values = new int[numHits];
-      private int bottomVal;
-      private TermsEnum termsEnum;
-      private DocsEnum docsEnum;
-      Set<String> seen = new HashSet<String>(elevations.ids.size());
-
-      @Override
-      public int compare(int slot1, int slot2) {
-        return values[slot1] - values[slot2];  // values will be small enough that there is no overflow concern
+      if (!perThread.isActive()) {
+        ensureOpen();
+        assert false: "perThread is not active but we are still open";
       }
-
-      @Override
-      public void setBottom(int slot) {
-        bottomVal = values[slot];
-      }
-
-      private int docVal(int doc) {
-        if (ordSet.size() > 0) {
-          int slot = ordSet.find(doc);
-          if (slot >= 0) {
-            BytesRef id = termValues[slot];
-            Integer prio = elevations.priority.get(id);
-            return prio == null ? 0 : prio.intValue();
-          }
+       
+      final DocumentsWriterPerThread dwpt = perThread.perThread;
+      try {
+        dwpt.updateDocument(doc, analyzer, delTerm); 
+        numDocsInRAM.incrementAndGet();
+      } finally {
+        if (dwpt.checkAndResetHasAborted()) {
+          flushControl.doOnAbort(perThread);
         }
-        return 0;
       }
-
-      @Override
-      public int compareBottom(int doc) {
-        return bottomVal - docVal(doc);
+      flushingDWPT = flushControl.doAfterDocument(perThread, isUpdate);
+    } finally {
+      perThread.unlock();
+    }
+    
+    if (flushingDWPT != null) {
+      maybeMerge |= doFlush(flushingDWPT);
+    } else {
+      final DocumentsWriterPerThread nextPendingFlush = flushControl.nextPendingFlush();
+      if (nextPendingFlush != null) {
+        maybeMerge |= doFlush(nextPendingFlush);
       }
+    }
+    return maybeMerge;
+  }
 
-      @Override
-      public void copy(int slot, int doc) {
-        values[slot] = docVal(doc);
-      }
-
-      @Override
-      public FieldComparator setNextReader(AtomicReaderContext context) throws IOException {
-        //convert the ids to Lucene doc ids, the ordSet and termValues needs to be the same size as the number of elevation docs we have
-        ordSet.clear();
-        Fields fields = context.reader().fields();
-        if (fields == null) return this;
-        Terms terms = fields.terms(idField);
-        if (terms == null) return this;
-        termsEnum = terms.iterator(termsEnum);
-        BytesRef term = new BytesRef();
-        Bits liveDocs = context.reader().getLiveDocs();
-
-        for (String id : elevations.ids) {
-          term.copyChars(id);
-          if (seen.contains(id) == false  && termsEnum.seekExact(term, false)) {
-            docsEnum = termsEnum.docs(liveDocs, docsEnum, 0);
-            if (docsEnum != null) {
-              int docId = docsEnum.nextDoc();
-              if (docId == DocIdSetIterator.NO_MORE_DOCS ) continue;  // must have been deleted
-              termValues[ordSet.put(docId)] = BytesRef.deepCopyOf(term);
-              seen.add(id);
-              assert docsEnum.nextDoc() == DocIdSetIterator.NO_MORE_DOCS;
+  private  boolean doFlush(DocumentsWriterPerThread flushingDWPT) throws IOException {
+    boolean maybeMerge = false;
+    while (flushingDWPT != null) {
+      maybeMerge = true;
+      boolean success = false;
+      FlushTicket ticket = null;
+      
+      try {
+        assert currentFullFlushDelQueue == null
+            || flushingDWPT.deleteQueue == currentFullFlushDelQueue : "expected: "
+            + currentFullFlushDelQueue + "but was: " + flushingDWPT.deleteQueue
+            + " " + flushControl.isFullFlush();
+        /*
+         * Since with DWPT the flush process is concurrent and several DWPT
+         * could flush at the same time we must maintain the order of the
+         * flushes before we can apply the flushed segment and the frozen global
+         * deletes it is buffering. The reason for this is that the global
+         * deletes mark a certain point in time where we took a DWPT out of
+         * rotation and freeze the global deletes.
+         * 
+         * Example: A flush 'A' starts and freezes the global deletes, then
+         * flush 'B' starts and freezes all deletes occurred since 'A' has
+         * started. if 'B' finishes before 'A' we need to wait until 'A' is done
+         * otherwise the deletes frozen by 'B' are not applied to 'A' and we
+         * might miss to deletes documents in 'A'.
+         */
+        try {
+          synchronized (ticketQueue) {
+            // Each flush is assigned a ticket in the order they accquire the ticketQueue lock
+            ticket =  new FlushTicket(flushingDWPT.prepareFlush(), true);
+            ticketQueue.add(ticket);
+          }
+  
+          // flush concurrently without locking
+          final FlushedSegment newSegment = flushingDWPT.flush();
+          synchronized (ticketQueue) {
+            ticket.segment = newSegment;
+          }
+          // flush was successful once we reached this point - new seg. has been assigned to the ticket!
+          success = true;
+        } finally {
+          if (!success && ticket != null) {
+            synchronized (ticketQueue) {
+              // In the case of a failure make sure we are making progress and
+              // apply all the deletes since the segment flush failed since the flush
+              // ticket could hold global deletes see FlushTicket#canPublish()
+              ticket.isSegmentFlush = false;
             }
           }
         }
-        return this;
+        /*
+         * Now we are done and try to flush the ticket queue if the head of the
+         * queue has already finished the flush.
+         */
+        applyFlushTickets();
+      } finally {
+        flushControl.doAfterFlush(flushingDWPT);
+        flushingDWPT.checkAndResetHasAborted();
+        indexWriter.flushCount.incrementAndGet();
       }
-
-      @Override
-      public Integer value(int slot) {
-        return values[slot];
-      }
-
-      @Override
-      public int compareDocToValue(int doc, Integer valueObj) {
-        final int value = valueObj.intValue();
-        final int docValue = docVal(doc);
-        return docValue - value;  // values will be small enough that there is no overflow concern
-      }
-    };
+     
+      flushingDWPT = flushControl.nextPendingFlush();
+    }
+    return maybeMerge;
   }
+
+  private void applyFlushTickets() throws IOException {
+    synchronized (ticketQueue) {
+      while (true) {
+        // Keep publishing eligible flushed segments:
+        final FlushTicket head = ticketQueue.peek();
+        if (head != null && head.canPublish()) {
+          ticketQueue.poll();
+          finishFlush(head.segment, head.frozenDeletes);
+        } else {
+          break;
+        }
+      }
+    }
+  }
+
+  private void finishFlush(FlushedSegment newSegment, FrozenBufferedDeletes bufferedDeletes)
+      throws IOException {
+    // Finish the flushed segment and publish it to IndexWriter
+    if (newSegment == null) {
+      assert bufferedDeletes != null;
+      if (bufferedDeletes != null && bufferedDeletes.any()) {
+        indexWriter.bufferedDeletesStream.push(bufferedDeletes);
+        if (infoStream != null) {
+          message("flush: push buffered deletes: " + bufferedDeletes);
+        }
+      }
+    } else {
+      publishFlushedSegment(newSegment, bufferedDeletes);  
+    }
+  }
+
+  final void subtractFlushedNumDocs(int numFlushed) {
+    int oldValue = numDocsInRAM.get();
+    while (!numDocsInRAM.compareAndSet(oldValue, oldValue - numFlushed)) {
+      oldValue = numDocsInRAM.get();
+    }
+  }
+  
+  /**
+   * Publishes the flushed segment, segment private deletes (if any) and its
+   * associated global delete (if present) to IndexWriter.  The actual
+   * publishing operation is synced on IW -> BDS so that the {@link SegmentInfo}'s
+   * delete generation is always GlobalPacket_deleteGeneration + 1
+   */
+  private void publishFlushedSegment(FlushedSegment newSegment, FrozenBufferedDeletes globalPacket)
+      throws IOException {
+    assert newSegment != null;
+    final SegmentInfo segInfo = indexWriter.prepareFlushedSegment(newSegment);
+    final BufferedDeletes deletes = newSegment.segmentDeletes;
+    FrozenBufferedDeletes packet = null;
+    if (deletes != null && deletes.any()) {
+      // Segment private delete
+      packet = new FrozenBufferedDeletes(deletes, true);
+      if (infoStream != null) {
+        message("flush: push buffered seg private deletes: " + packet);
+      }
+    }
+
+    // now publish!
+    indexWriter.publishFlushedSegment(segInfo, packet, globalPacket);
+  }
+  
+  // for asserts
+  private volatile DocumentsWriterDeleteQueue currentFullFlushDelQueue = null;
+  // for asserts
+  private synchronized boolean setFlushingDeleteQueue(DocumentsWriterDeleteQueue session) {
+    currentFullFlushDelQueue = session;
+    return true;
+  }
+  
+  /*
+   * FlushAllThreads is synced by IW fullFlushLock. Flushing all threads is a
+   * two stage operation; the caller must ensure (in try/finally) that finishFlush
+   * is called after this method, to release the flush lock in DWFlushControl
+   */
+  final boolean flushAllThreads()
+    throws IOException {
+    final DocumentsWriterDeleteQueue flushingDeleteQueue;
+
+    synchronized (this) {
+      flushingDeleteQueue = deleteQueue;
+      /* Cutover to a new delete queue.  This must be synced on the flush control
+       * otherwise a new DWPT could sneak into the loop with an already flushing
+       * delete queue */
+      flushControl.markForFullFlush(); // swaps the delQueue synced on FlushControl
+      assert setFlushingDeleteQueue(flushingDeleteQueue);
+    }
+    assert currentFullFlushDelQueue != null;
+    assert currentFullFlushDelQueue != deleteQueue;
+    
+    boolean anythingFlushed = false;
+    try {
+      DocumentsWriterPerThread flushingDWPT;
+      // Help out with flushing:
+      while ((flushingDWPT = flushControl.nextPendingFlush()) != null) {
+        anythingFlushed |= doFlush(flushingDWPT);
+      }
+      // If a concurrent flush is still in flight wait for it
+      while (flushControl.anyFlushing()) {
+        flushControl.waitForFlush();  
+      }
+      if (!anythingFlushed) { // apply deletes if we did not flush any document
+        synchronized (ticketQueue) {
+          ticketQueue.add(new FlushTicket(flushingDeleteQueue.freezeGlobalBuffer(null), false));
+        }
+        applyFlushTickets();
+      }
+    } finally {
+      assert flushingDeleteQueue == currentFullFlushDelQueue;
+    }
+    return anythingFlushed;
+  }
+  
+  final void finishFullFlush(boolean success) {
+    assert setFlushingDeleteQueue(null);
+    if (success) {
+      // Release the flush lock
+      flushControl.finishFullFlush();
+    } else {
+      flushControl.abortFullFlushes();
+    }
+  }
+
+  static final class FlushTicket {
+    final FrozenBufferedDeletes frozenDeletes;
+    /* access to non-final members must be synchronized on DW#ticketQueue */
+    FlushedSegment segment;
+    boolean isSegmentFlush;
+    
+    FlushTicket(FrozenBufferedDeletes frozenDeletes, boolean isSegmentFlush) {
+      this.frozenDeletes = frozenDeletes;
+      this.isSegmentFlush = isSegmentFlush;
+    }
+    
+    boolean canPublish() {
+      return (!isSegmentFlush || segment != null);  
+    }
   }
 }

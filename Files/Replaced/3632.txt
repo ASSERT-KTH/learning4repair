@@ -1,13 +1,14 @@
-writer.shutdown();
+w.shutdown();
 
 package org.apache.lucene.index;
 
-/**
- * Copyright 2004 The Apache Software Foundation
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -19,168 +20,236 @@ package org.apache.lucene.index;
  */
 
 import java.io.File;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 
-import org.apache.lucene.analysis.MockAnalyzer;
-import org.apache.lucene.document.*;
-import org.apache.lucene.store.*;
-import org.apache.lucene.util.*;
+import org.apache.lucene.index.IndexWriterConfig.OpenMode;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.FSDirectory;
+import org.apache.lucene.util.FixedBitSet;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.Version;
 
-public class TestAtomicUpdate extends LuceneTestCase {
+/**
+ * This tool splits input index into multiple equal parts. The method employed
+ * here uses {@link IndexWriter#addIndexes(IndexReader[])} where the input data
+ * comes from the input index with artificially applied deletes to the document
+ * id-s that fall outside the selected partition.
+ * <p>Note 1: Deletes are only applied to a buffered list of deleted docs and
+ * don't affect the source index - this tool works also with read-only indexes.
+ * <p>Note 2: the disadvantage of this tool is that source index needs to be
+ * read as many times as there are parts to be created, hence the name of this
+ * tool.
+ *
+ * <p><b>NOTE</b>: this tool is unaware of documents added
+ * atomically via {@link IndexWriter#addDocuments} or {@link
+ * IndexWriter#updateDocuments}, which means it can easily
+ * break up such document groups.
+ */
+public class MultiPassIndexSplitter {
   
-
-  private static abstract class TimedThread extends Thread {
-    volatile boolean failed;
-    int count;
-    private static float RUN_TIME_MSEC = atLeast(500);
-    private TimedThread[] allThreads;
-
-    abstract public void doWork() throws Throwable;
-
-    TimedThread(TimedThread[] threads) {
-      this.allThreads = threads;
+  /**
+   * Split source index into multiple parts.
+   * @param in source index, can have deletions, can have
+   * multiple segments (or multiple readers).
+   * @param outputs list of directories where the output parts will be stored.
+   * @param seq if true, then the source index will be split into equal
+   * increasing ranges of document id-s. If false, source document id-s will be
+   * assigned in a deterministic round-robin fashion to one of the output splits.
+   * @throws IOException If there is a low-level I/O error
+   */
+  public void split(Version version, IndexReader in, Directory[] outputs, boolean seq) throws IOException {
+    if (outputs == null || outputs.length < 2) {
+      throw new IOException("Invalid number of outputs.");
     }
-
-    @Override
-    public void run() {
-      final long stopTime = System.currentTimeMillis() + (long) RUN_TIME_MSEC;
-
-      count = 0;
-
-      try {
-        do {
-          if (anyErrors()) break;
-          doWork();
-          count++;
-        } while(System.currentTimeMillis() < stopTime);
-      } catch (Throwable e) {
-        System.out.println(Thread.currentThread().getName() + ": exc");
-        e.printStackTrace(System.out);
-        failed = true;
+    if (in == null || in.numDocs() < 2) {
+      throw new IOException("Not enough documents for splitting");
+    }
+    int numParts = outputs.length;
+    // wrap a potentially read-only input
+    // this way we don't have to preserve original deletions because neither
+    // deleteDocument(int) or undeleteAll() is applied to the wrapped input index.
+    FakeDeleteIndexReader input = new FakeDeleteIndexReader(in);
+    int maxDoc = input.maxDoc();
+    int partLen = maxDoc / numParts;
+    for (int i = 0; i < numParts; i++) {
+      input.undeleteAll();
+      if (seq) { // sequential range
+        int lo = partLen * i;
+        int hi = lo + partLen;
+        // below range
+        for (int j = 0; j < lo; j++) {
+          input.deleteDocument(j);
+        }
+        // above range - last part collects all id-s that remained due to
+        // integer rounding errors
+        if (i < numParts - 1) {
+          for (int j = hi; j < maxDoc; j++) {
+            input.deleteDocument(j);
+          }
+        }
+      } else {
+        // round-robin
+        for (int j = 0; j < maxDoc; j++) {
+          if ((j + numParts - i) % numParts != 0) {
+            input.deleteDocument(j);
+          }
+        }
+      }
+      IndexWriter w = new IndexWriter(outputs[i], new IndexWriterConfig(
+          version,
+          null)
+          .setOpenMode(OpenMode.CREATE));
+      System.err.println("Writing part " + (i + 1) + " ...");
+      // pass the subreaders directly, as our wrapper's numDocs/hasDeletetions are not up-to-date
+      final List<? extends FakeDeleteAtomicIndexReader> sr = input.getSequentialSubReaders();
+      w.addIndexes(sr.toArray(new IndexReader[sr.size()])); // TODO: maybe take List<IR> here?
+      w.close();
+    }
+    System.err.println("Done.");
+  }
+  
+  @SuppressWarnings("deprecation")
+  public static void main(String[] args) throws Exception {
+    if (args.length < 5) {
+      System.err.println("Usage: MultiPassIndexSplitter -out <outputDir> -num <numParts> [-seq] <inputIndex1> [<inputIndex2 ...]");
+      System.err.println("\tinputIndex\tpath to input index, multiple values are ok");
+      System.err.println("\t-out ouputDir\tpath to output directory to contain partial indexes");
+      System.err.println("\t-num numParts\tnumber of parts to produce");
+      System.err.println("\t-seq\tsequential docid-range split (default is round-robin)");
+      System.exit(-1);
+    }
+    ArrayList<IndexReader> indexes = new ArrayList<>();
+    String outDir = null;
+    int numParts = -1;
+    boolean seq = false;
+    for (int i = 0; i < args.length; i++) {
+      if (args[i].equals("-out")) {
+        outDir = args[++i];
+      } else if (args[i].equals("-num")) {
+        numParts = Integer.parseInt(args[++i]);
+      } else if (args[i].equals("-seq")) {
+        seq = true;
+      } else {
+        File file = new File(args[i]);
+        if (!file.exists() || !file.isDirectory()) {
+          System.err.println("Invalid input path - skipping: " + file);
+          continue;
+        }
+        Directory dir = FSDirectory.open(new File(args[i]));
+        try {
+          if (!DirectoryReader.indexExists(dir)) {
+            System.err.println("Invalid input index - skipping: " + file);
+            continue;
+          }
+        } catch (Exception e) {
+          System.err.println("Invalid input index - skipping: " + file);
+          continue;
+        }
+        indexes.add(DirectoryReader.open(dir));
       }
     }
-
-    private boolean anyErrors() {
-      for(int i=0;i<allThreads.length;i++)
-        if (allThreads[i] != null && allThreads[i].failed)
-          return true;
-      return false;
+    if (outDir == null) {
+      throw new Exception("Required argument missing: -out outputDir");
     }
+    if (numParts < 2) {
+      throw new Exception("Invalid value of required argument: -num numParts");
+    }
+    if (indexes.size() == 0) {
+      throw new Exception("No input indexes to process");
+    }
+    File out = new File(outDir);
+    if (!out.mkdirs()) {
+      throw new Exception("Can't create output directory: " + out);
+    }
+    Directory[] dirs = new Directory[numParts];
+    for (int i = 0; i < numParts; i++) {
+      dirs[i] = FSDirectory.open(new File(out, "part-" + i));
+    }
+    MultiPassIndexSplitter splitter = new MultiPassIndexSplitter();
+    IndexReader input;
+    if (indexes.size() == 1) {
+      input = indexes.get(0);
+    } else {
+      input = new MultiReader(indexes.toArray(new IndexReader[indexes.size()]));
+    }
+    splitter.split(Version.LUCENE_CURRENT, input, dirs, seq);
   }
+  
+  /**
+   * This class emulates deletions on the underlying index.
+   */
+  private static final class FakeDeleteIndexReader extends BaseCompositeReader<FakeDeleteAtomicIndexReader> {
 
-  private static class IndexerThread extends TimedThread {
-    IndexWriter writer;
-    public IndexerThread(IndexWriter writer, TimedThread[] threads) {
-      super(threads);
-      this.writer = writer;
+    public FakeDeleteIndexReader(IndexReader reader) {
+      super(initSubReaders(reader));
     }
-
-    @Override
-    public void doWork() throws Exception {
-      // Update all 100 docs...
-      for(int i=0; i<100; i++) {
-        Document d = new Document();
-        d.add(new StringField("id", Integer.toString(i), Field.Store.YES));
-        d.add(new TextField("contents", English.intToEnglish(i+10*count), Field.Store.NO));
-        writer.updateDocument(new Term("id", Integer.toString(i)), d);
-      }
-    }
-  }
-
-  private static class SearcherThread extends TimedThread {
-    private Directory directory;
-
-    public SearcherThread(Directory directory, TimedThread[] threads) {
-      super(threads);
-      this.directory = directory;
-    }
-
-    @Override
-    public void doWork() throws Throwable {
-      IndexReader r = DirectoryReader.open(directory);
-      assertEquals(100, r.numDocs());
-      r.close();
-    }
-  }
-
-  /*
-    Run one indexer and 2 searchers against single index as
-    stress test.
-  */
-  public void runTest(Directory directory) throws Exception {
-
-    TimedThread[] threads = new TimedThread[4];
-
-    IndexWriterConfig conf = new IndexWriterConfig(
-        TEST_VERSION_CURRENT, new MockAnalyzer(random()))
-        .setMaxBufferedDocs(7);
-    ((TieredMergePolicy) conf.getMergePolicy()).setMaxMergeAtOnce(3);
-    IndexWriter writer = RandomIndexWriter.mockIndexWriter(directory, conf, random());
-
-    // Establish a base index of 100 docs:
-    for(int i=0;i<100;i++) {
-      Document d = new Document();
-      d.add(newStringField("id", Integer.toString(i), Field.Store.YES));
-      d.add(newTextField("contents", English.intToEnglish(i), Field.Store.NO));
-      if ((i-1)%7 == 0) {
-        writer.commit();
-      }
-      writer.addDocument(d);
-    }
-    writer.commit();
-
-    IndexReader r = DirectoryReader.open(directory);
-    assertEquals(100, r.numDocs());
-    r.close();
-
-    IndexerThread indexerThread = new IndexerThread(writer, threads);
-    threads[0] = indexerThread;
-    indexerThread.start();
     
-    IndexerThread indexerThread2 = new IndexerThread(writer, threads);
-    threads[1] = indexerThread2;
-    indexerThread2.start();
-      
-    SearcherThread searcherThread1 = new SearcherThread(directory, threads);
-    threads[2] = searcherThread1;
-    searcherThread1.start();
+    private static FakeDeleteAtomicIndexReader[] initSubReaders(IndexReader reader) {
+      final List<AtomicReaderContext> leaves = reader.leaves();
+      final FakeDeleteAtomicIndexReader[] subs = new FakeDeleteAtomicIndexReader[leaves.size()];
+      int i = 0;
+      for (final AtomicReaderContext ctx : leaves) {
+        subs[i++] = new FakeDeleteAtomicIndexReader(ctx.reader());
+      }
+      return subs;
+    }
+        
+    public void deleteDocument(int docID) {
+      final int i = readerIndex(docID);
+      getSequentialSubReaders().get(i).deleteDocument(docID - readerBase(i));
+    }
 
-    SearcherThread searcherThread2 = new SearcherThread(directory, threads);
-    threads[3] = searcherThread2;
-    searcherThread2.start();
+    public void undeleteAll()  {
+      for (FakeDeleteAtomicIndexReader r : getSequentialSubReaders()) {
+        r.undeleteAll();
+      }
+    }
 
-    indexerThread.join();
-    indexerThread2.join();
-    searcherThread1.join();
-    searcherThread2.join();
+    @Override
+    protected void doClose() {}
 
-    writer.close();
-
-    assertTrue("hit unexpected exception in indexer", !indexerThread.failed);
-    assertTrue("hit unexpected exception in indexer2", !indexerThread2.failed);
-    assertTrue("hit unexpected exception in search1", !searcherThread1.failed);
-    assertTrue("hit unexpected exception in search2", !searcherThread2.failed);
-    //System.out.println("    Writer: " + indexerThread.count + " iterations");
-    //System.out.println("Searcher 1: " + searcherThread1.count + " searchers created");
-    //System.out.println("Searcher 2: " + searcherThread2.count + " searchers created");
+    // no need to override numDocs/hasDeletions,
+    // as we pass the subreaders directly to IW.addIndexes().
   }
+  
+  private static final class FakeDeleteAtomicIndexReader extends FilterAtomicReader {
+    FixedBitSet liveDocs;
 
-  /*
-    Run above stress test against RAMDirectory and then
-    FSDirectory.
-  */
-  public void testAtomicUpdates() throws Exception {
-    Directory directory;
+    public FakeDeleteAtomicIndexReader(AtomicReader reader) {
+      super(reader);
+      undeleteAll(); // initialize main bitset
+    }
 
-    // First in a RAM directory:
-    directory = new MockDirectoryWrapper(random(), new RAMDirectory());
-    runTest(directory);
-    directory.close();
+    @Override
+    public int numDocs() {
+      return liveDocs.cardinality();
+    }
 
-    // Second in an FSDirectory:
-    File dirPath = createTempDir("lucene.test.atomic");
-    directory = newFSDirectory(dirPath);
-    runTest(directory);
-    directory.close();
-    TestUtil.rm(dirPath);
+    public void undeleteAll()  {
+      final int maxDoc = in.maxDoc();
+      liveDocs = new FixedBitSet(in.maxDoc());
+      if (in.hasDeletions()) {
+        final Bits oldLiveDocs = in.getLiveDocs();
+        assert oldLiveDocs != null;
+        // this loop is a little bit ineffective, as Bits has no nextSetBit():
+        for (int i = 0; i < maxDoc; i++) {
+          if (oldLiveDocs.get(i)) liveDocs.set(i);
+        }
+      } else {
+        // mark all docs as valid
+        liveDocs.set(0, maxDoc);
+      }
+    }
+
+    public void deleteDocument(int n) {
+      liveDocs.clear(n);
+    }
+
+    @Override
+    public Bits getLiveDocs() {
+      return liveDocs;
+    }
   }
 }
