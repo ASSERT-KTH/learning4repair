@@ -7,8 +7,8 @@ def lossFunction(guess, solution):
     return abs(solution-guess)
 
 def main():
-    path_solutions = "../../Solutions/Replaced/"
-    path_files = "../../Files/Replaced/"
+    path_solutions = "/Users/zimin/Desktop/KTH/Master Thesis/one-liner-competition/Solutions/Replaced/"
+    path_files = "/Users/zimin/Desktop/KTH/Master Thesis/one-liner-competition/Files/Replaced/"
     total = 0
     correct = 0
     loss = 0
@@ -19,7 +19,7 @@ def main():
             solution = open(path_solutions+filename, "r")
 
             file_length = len(file.readlines())-2
-            if(int(line) < 1 or int(line) > file_length+1):
+            if(int(line) < 1 or int(line) > file_length):
                 raise LineOutOfRangeException("Line number out of range. Expected: 1<={line}<=" + str(file_length) + ", found: " + line)
 
             solution_line = solution.readline()

@@ -9,9 +9,9 @@ def maximumError(file, solution):
 
 def maximum():
     path = "../../Files/Replaced"
-    #for filename in glob.glob(os.path.join(path, "*.txt")):
-    for i in range(1,100):
-        filename=path+"/"+str(i)+".txt"
+    for filename in glob.glob(os.path.join(path, "*.txt")):
+    #for i in range(1,100):
+        #filename=path+"/"+str(i)+".txt"
         with open(filename, 'r') as file:
             with open(filename.replace("Files", "Solutions"), "r") as solution:
                 print(os.path.basename(filename) + " " + str(maximumError(file,int(solution.readline()))))

@@ -2,7 +2,7 @@ import os,glob,random
 
 def randomLineOfFile(file):
     total = len(file.readlines())-2
-    return random.randint(1,total+1)
+    return random.randint(1,total)
 
 def guess():
     path = "../../Files/Replaced"

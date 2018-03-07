@@ -26,7 +26,7 @@ def main():
             weight_insert = normalize(weight_insert)
 
             max = 0
-            max_line = 0
+            max_line = -1
             for i in range(0, len(lines)):
                 weight_delete = []
                 for j in range(0, len(insert)):
@@ -41,8 +41,8 @@ def main():
                 if(score > max):
                     max = score
                     max_line = i+1
-            if(max_line == 0): #Happens when the inserted line is unique
-                print(os.path.basename(filename) + " " + str(random.randint(1,len(lines))))
+            if(max_line == -1): #Happens when the inserted line is unique
+                print(os.path.basename(filename) + " " + str(random.randint(0,len(lines))))
             else:
                 print(os.path.basename(filename) + " " + str(max_line))
 
