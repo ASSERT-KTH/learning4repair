@@ -1,6 +1,23 @@
-import re,math,os,glob,random
+import re,math,os,glob,random,getopt,sys
+import numpy as np
 
-def main():
+def main(argv):
+    try:
+        opts, args = getopt.getopt(argv, "hk:")
+    except getopt.GetoptError:
+        print 'tfidf.py -k <Top k score>'
+        sys.exit(2)
+    for opt, arg in opts:
+        if opt == '-h':
+            print 'tfidf.py -k <Top k score>'
+            sys.exit()
+        elif opt in ("-k"):
+            try:
+                k = int(arg)
+            except ValueError:
+                print("Must be integer")
+                raise
+
     path = "../../Files/Added"
     for filename in glob.glob(os.path.join(path, "*.txt")):
     #for i in range (1,100):
@@ -25,8 +42,7 @@ def main():
                     weight_insert.append(math.log(len(lines)/(freq*1.0)))
             weight_insert = normalize(weight_insert)
 
-            max = 0
-            max_line = -1
+            score = np.zeros(shape=(len(lines)))
             for i in range(0, len(lines)):
                 weight_delete = []
                 for j in range(0, len(insert)):
@@ -37,14 +53,14 @@ def main():
                     else:
                         weight_delete.append(0)
                 weight_delete = normalize(weight_delete)
-                score = cosine_sim(weight_insert,weight_delete)
-                if(score > max):
-                    max = score
-                    max_line = i+1
-            if(max_line == -1): #Happens when the inserted line is unique
-                print(os.path.basename(filename) + " " + str(random.randint(0,len(lines))))
-            else:
-                print(os.path.basename(filename) + " " + str(max_line))
+                score[i] = cosine_sim(weight_insert,weight_delete)
+            guess = score.argsort()[-k:][::-1]
+            guess_string = ""
+            for ind in guess:
+                guess_string = guess_string + str(ind+1) + " "
+
+            print(os.path.basename(filename) + " " + guess_string)
+
 
 def cosine_sim(w1,w2):
     if(sum(w1) == 0 or sum(w2) == 0):
@@ -68,4 +84,4 @@ def normalize(w):
     return new_w
 
 if __name__=="__main__":
-    main()
+    main(sys.argv[1:])

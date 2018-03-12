@@ -110,4 +110,6 @@ Then your program should output: 3. (Replace line 3 with the inserted code)
 
 ## Competition structure
 
-All the competition data in Files/ and all solutions in Solutions/. e.g. solution to Files/Added/1.txt is Solutions/Added/1.txt
+All the competition data in Files/ and all solutions in Solutions/.
+
+e.g. solution to Files/Added/1.txt is Solutions/Added/1.txt

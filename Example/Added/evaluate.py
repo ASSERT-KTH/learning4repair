@@ -6,27 +6,37 @@ class LineOutOfRangeException(Exception):
 def lossFunction(guess, solution):
     return abs(solution-guess)
 
-def main():
-    path_solutions = "../../Solutions/Added/"
-    path_files = "../../Files/Added/"
+def main(argv):
+    k = 0 # Maximum number of solutions received
+
+    path_solutions = "/Users/zimin/Desktop/KTH/Master-Thesis/one-liner-competition/Solutions/Added/"
+    path_files = "/Users/zimin/Desktop/KTH/Master-Thesis/one-liner-competition/Files/Added/"
     total = 0
     correct = 0
-    loss = 0;
+    #loss = 0
     for line in sys.stdin:
-        [filename, line] = line.split()
+        input = line.split()
+        filename = input[0]
+        lines = input[1:]
+        if(len(lines) > k):
+            k = len(lines)
         try:
             file = open(path_files+filename, "r")
             solution = open(path_solutions+filename, "r")
 
             file_length = len(file.readlines())-2
-            if(int(line) < 0 or int(line) > file_length):
-                raise LineOutOfRangeException("Line number out of range. Expected: 0<={line}<=" + str(file_length) + ", found: " + line)
+
+            for line in lines:
+                if(int(line) < 0 or int(line) > file_length):
+                    raise LineOutOfRangeException("Line number out of range. Expected: 1<={line}<=" + str(file_length) + ", found: " + line)
 
             solution_line = solution.readline()
-            if(int(solution_line) == int(line)):
-                correct+=1
+            for line in lines:
+                if(int(solution_line) == int(line)):
+                    correct+=1
+                    break
             total+=1
-            loss+=lossFunction(int(line), int(solution_line))
+            #loss+=lossFunction(int(line), int(solution_line))
 
             file.close()
             solution.close()
@@ -37,8 +47,8 @@ def main():
             print(filename + " does not exist!")
             raise
     print("Total files: " + str(total))
-    print("Loss: " + str(loss))
-    print("Accuracy: " + str(correct/(total*1.0)))
+    #print("Loss: " + str(loss))
+    print("Top " + str(k) + " accuracy: " + str(correct/(total*1.0)))
 
 if __name__=="__main__":
-    main()
+    main(sys.argv[1:])
