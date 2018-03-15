@@ -1,7 +1,10 @@
-import sys
+import sys,math
 
 class LineOutOfRangeException(Exception):
     pass
+
+def lossFunction(guess, solution):
+    return math.tanh(abs(solution-guess))
 
 def main():
     k = 0 # Maximum number of solutions received

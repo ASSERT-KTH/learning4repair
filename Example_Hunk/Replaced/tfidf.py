@@ -67,7 +67,7 @@ def main(argv):
                             count+=1
 
             # Only looking for hunk with similar size
-            max_diff = len(insert) + len(insert)/2
+            max_diff = len(insert)
             score = {}
             for i in range(0, len(lines)+1):
                 for j in range(i+1, len(lines)+1):
