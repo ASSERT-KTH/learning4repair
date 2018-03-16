@@ -1,30 +1,35 @@
-import re,math,os,glob,random,getopt,sys
+import re
+import math
+import os
+import glob
+import random
+import getopt
+import sys
 import numpy as np
 
 def main(argv):
     try:
         opts, args = getopt.getopt(argv, "hk:")
     except getopt.GetoptError:
-        print 'tfidf.py -k <Top k score>'
-        sys.exit(2)
+        print("tfidf.py -k <Top k prediction>")
+        sys.exit()
     for opt, arg in opts:
-        if opt == '-h':
-            print 'tfidf.py -k <Top k score>'
+        if opt == "-h":
+            print("tfidf.py -k <Top k prediction>")
             sys.exit()
         elif opt in ("-k"):
             try:
                 k = int(arg)
             except ValueError:
-                print("Must be integer")
-                raise
+                print("k must be integer")
+                sys.exit()
 
-    path = "../../Files/Replaced"
-    for filename in glob.glob(os.path.join(path, "*.txt")):
-    #for i in range (1,100):
-        #filename=path+"/"+str(i)+".txt"
+    path_files = "../../Files/Replaced"
+    for filename in glob.glob(os.path.join(path_files, "*.txt")):
         with open(filename, 'r') as file:
             lines = file.readlines()
             insert = filter(None,re.split("[,.();_\t\n ]",lines[0]))
+
             lines = lines[2:]
             for i in range(0,len(lines)):
                 lines[i] = filter(None,re.split("[,.();_\t\n ]", lines[i]))
