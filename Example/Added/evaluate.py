@@ -60,7 +60,7 @@ def main():
             raise
 
     print("Total files: " + str(total_files))
-    print("Loss: " + str(loss) + " (the lower, the better)")
+    print("Cumulative line error: " + str(loss) + " (the lower, the better)")
     print("Top " + str(k) + " accuracy: " + str(correct_files/(total_files*1.0)) + " (the higher, the better)")
 
 if __name__=="__main__":
