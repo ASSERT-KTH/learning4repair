@@ -1,23 +1,23 @@
-import os,glob,random
+import os
+import glob
+import random
 
-def maximumError(file, solution):
-    total = len(file.readlines())-2
-    if(solution-1 > total-solution):
+def maximumError(program_length, solution_line):
+    if(solution_line-1 > program_length-solution_line):
         return 1
     else:
-        return total
-
-def maximum():
-    path = "../../Files/Replaced"
-    for filename in glob.glob(os.path.join(path, "*.txt")):
-    #for i in range(1,100):
-        #filename=path+"/"+str(i)+".txt"
-        with open(filename, 'r') as file:
-            with open(filename.replace("Files", "Solutions"), "r") as solution:
-                print(os.path.basename(filename) + " " + str(maximumError(file,int(solution.readline()))))
+        return program_length
 
 def main():
-    maximum()
+    path_files = "../../Files/Replaced"
+    for filename in glob.glob(os.path.join(path_files, "*.txt")):
+        with open(filename, 'r') as file:
+            with open(filename.replace("Files", "Solutions"), "r") as solution:
+                lines = file.readlines()
+                # Since first two lines are not part of the program
+                program_length = len(lines)-2
+                solution_line = int(solution.readline())
+                print(os.path.basename(filename) + " " + str(maximumError(program_length,solution_line)))
 
 if __name__=="__main__":
     main()

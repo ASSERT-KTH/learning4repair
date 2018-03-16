@@ -29,6 +29,7 @@ def main(argv):
         with open(filename, 'r') as file:
             lines = file.readlines()
 
+            # First line is the inserted line
             insert_tokens = filter(None,re.split("[,.();_\t\n ]",lines[0]))
 
             # TF of inserted tokens
