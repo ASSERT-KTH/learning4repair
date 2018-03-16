@@ -26,7 +26,7 @@ def main(argv):
         with open(filename, 'r') as file:
             length = len(file.readlines()) - 2
             try:
-                guess = random.sample(list(range(1,length)), min(length, k))
+                guess = random.sample(list(range(1,length+1)), min(length, k))
             except UnboundLocalError:
                 print("randomGuess.py -k <Top k prediction>")
                 sys.exit()

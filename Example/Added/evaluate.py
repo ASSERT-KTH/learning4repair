@@ -1,4 +1,5 @@
-import sys,math
+import sys
+import math
 
 class LineOutOfRangeException(Exception):
     pass
@@ -9,49 +10,58 @@ def lossFunction(guess, solution):
 def main():
     k = 0 # Maximum number of solutions received
 
-    path_solutions = "/Users/zimin/Desktop/KTH/Master-Thesis/one-liner-competition/Solutions/Added/"
-    path_files = "/Users/zimin/Desktop/KTH/Master-Thesis/one-liner-competition/Files/Added/"
-    total = 0
-    correct = 0
+    path_files = "../../Files/Added/"
+    path_solutions = "../../Solutions/Added/"
+
+    total_files = 0
+    correct_files = 0
     loss = 0
+
     for args in sys.stdin:
         inputs = args.split()
         filename = inputs[0]
-        lines = inputs[1:]
-        if(len(lines) > k):
-            k = len(lines)
+        answers = inputs[1:]
+        # Use maximum number of returned answer to show top k acc
+        if(len(answers) > k):
+            k = len(answers)
         try:
-            file = open(path_files+filename, "r")
-            solution = open(path_solutions+filename, "r")
+            code_file = open(path_files+filename, "r")
+            solution_file = open(path_solutions+filename, "r")
 
-            file_length = len(file.readlines())-2
+            # Ignore first two lines since they are not part of the program
+            code_file_length = len(code_file.readlines())-2
 
-            for line in lines:
-                if(int(line) < 1 or int(line) > file_length):
-                    raise LineOutOfRangeException("Line number out of range. Expected: 1<={line}<=" + str(file_length) + ", found: " + line)
+            for answer in answers:
+                if(int(answer) < 0 or int(answer) > code_file_length):
+                    raise LineOutOfRangeException("Line number out of range for file " + filename + "." +
+                    " Expected: 0<={line}<=" + str(code_file_length) + ", found: " + answer)
 
-            solution_line = solution.readline()
-            for line in lines:
+            solution = solution_file.readline()
+            for answer in answers:
+                # Use minimum loss among all answers to calculate loss
                 min_loss = float('Inf')
-                if(lossFunction(int(line), int(solution_line)) < min_loss):
-                    min_loss = lossFunction(int(line), int(solution_line))
-                if(int(solution_line) == int(line)):
-                    correct+=1
+                # Correct answer should have minimum loss, therefore we can break
+                if(lossFunction(int(answer), int(solution)) < min_loss):
+                    min_loss = lossFunction(int(answer), int(solution))
+                if(int(solution) == int(answer)):
+                    correct_files+=1
                     break
-            total+=1
+
+            total_files+=1
             loss+=min_loss
 
-            file.close()
-            solution.close()
+            code_file.close()
+            solution_file.close()
         except ValueError:
-            print(line + " should be integer")
+            print(answer + " should be integer")
             raise
         except IOError:
             print(filename + " does not exist!")
             raise
-    print("Total files: " + str(total))
+
+    print("Total files: " + str(total_files))
     print("Loss: " + str(loss) + " (the lower, the better)")
-    print("Top " + str(k) + " accuracy: " + str(correct/(total*1.0)) + " (the higher, the better)")
+    print("Top " + str(k) + " accuracy: " + str(correct_files/(total_files*1.0)) + " (the higher, the better)")
 
 if __name__=="__main__":
     main()
