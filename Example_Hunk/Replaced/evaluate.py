@@ -9,44 +9,44 @@ def lossFunction(guess, solution):
 def main():
     k = 0 # Maximum number of solutions received
 
-    path_solutions = "/Users/zimin/Desktop/KTH/Master-Thesis/one-liner-competition/Solutions_Hunk/Replaced/"
-    path_files = "/Users/zimin/Desktop/KTH/Master-Thesis/one-liner-competition/Files_Hunk/Replaced/"
+    path_files = "../../Files_Hunk/Replaced/"
+    path_solutions = "../../Solutions_Hunk/Replaced/"
 
     total = 0
     correct = 0
     #loss = 0
-    for line in sys.stdin:
-        input = line.split()
-        filename = input[0]
-        lines = input[1:]
-        if(len(lines)/2 > k):
-            k = len(lines)/2
+    for args in sys.stdin:
+        inputs = args.split()
+        filename = inputs[0]
+        answers = inputs[1:]
+        if(len(answers)/2 > k):
+            k = len(answers)/2
         try:
-            file = open(path_files+filename, "r")
-            solution = open(path_solutions+filename, "r")
+            code_file = open(path_files+filename, "r")
+            solution_file = open(path_solutions+filename, "r")
 
-            file_lines = file.readlines()
+            file_lines = code_file.readlines()
             for i in range(0,len(file_lines)):
                 if(file_lines[i].startswith("@@@")):
                     insert_end = i
                     break
 
-            file_length = len(file_lines)-insert_end-1
+            code_file_length = len(file_lines)-insert_end-1
 
-            for line in lines:
-                if(int(line) < 1 or int(line) > file_length):
+            for answer in answers:
+                if(int(answer) < 1 or int(answer) > code_file_length):
                     raise LineOutOfRangeException("Line number out of range. Expected: 1<={line}<=" + str(file_length) + ", found: " + line)
 
-            solution_line = solution.readline().split()
-            for i in range(0, len(lines)/2):
-                if(int(lines[2*i]) == int(solution_line[0]) and int(lines[2*i+1]) == int(solution_line[1])):
+            solution_line = solution_file.readline().split()
+            for i in range(0, len(answers)/2):
+                if(int(answers[2*i]) == int(solution_line[0]) and int(answers[2*i+1]) == int(solution_line[1])):
                     correct+=1
                     break
             total+=1
             #loss+=lossFunction(int(line), int(solution_line))
 
-            file.close()
-            solution.close()
+            code_file.close()
+            solution_file.close()
         except ValueError:
             print(line + " should be integer")
             raise

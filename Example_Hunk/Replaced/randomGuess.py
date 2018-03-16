@@ -9,7 +9,7 @@ def main(argv):
         opts, args = getopt.getopt(argv, "hk:")
     except getopt.GetoptError:
         print "randomGuess.py -k <Top k prediction>"
-        sys.exit(2)
+        sys.exit()
     for opt, arg in opts:
         if opt == "-h":
             print "randomGuess.py -k <Top k prediction>"
@@ -21,8 +21,8 @@ def main(argv):
                 print("k must be integer")
                 sys.exit()
 
-    path = "../../Files_Hunk/Replaced"
-    for filename in glob.glob(os.path.join(path, "*.txt")):
+    path_files = "../../Files_Hunk/Replaced"
+    for filename in glob.glob(os.path.join(path_files, "*.txt")):
         with open(filename, 'r') as file:
             lines = file.readlines()
 
@@ -32,13 +32,16 @@ def main(argv):
                     break
 
             insert = lines[:insert_end]
-            lines = lines[insert_end+1:]
-            max_diff = len(insert)
+            insert_length = len(insert)
 
+            lines = lines[insert_end+1:]
+            program_length = len(lines)
+
+            max_diff = insert_length
             guess_string = ""
             for i in range(0,k):
-                start = random.randint(1,len(lines))
-                end = min(len(lines), start+random.randint(0, max_diff))
+                start = random.randint(1,program_length)
+                end = min(program_length, start+random.randint(0, max_diff))
                 guess_string = guess_string + str(start) + " " + str(end) + " "
 
             print(os.path.basename(filename) + " " + guess_string)
