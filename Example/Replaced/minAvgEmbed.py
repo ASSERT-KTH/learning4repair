@@ -3,7 +3,6 @@ import numpy as np
 import pickle
 import os,glob
 import javalang
-from scipy import spatial
 import random
 import re
 import sys

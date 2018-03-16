@@ -30,7 +30,7 @@ def main(argv):
             lines = file.readlines()
 
             # First line is the inserted line
-            insert_tokens = filter(None,re.split("[,.();_\t\n ]",lines[0]))
+            insert_tokens = filter(None,re.split("[,.();_{}\t\n ]",lines[0]))
 
             # TF of inserted tokens
             insert_dict_tf = {}
@@ -45,7 +45,7 @@ def main(argv):
             program_length = len(lines)
             program_tokens = [[] for _ in range(0, program_length)]
             for i in range(0,program_length):
-                program_tokens[i] = filter(None,re.split("[,.();_\t\n ]", lines[i]))
+                program_tokens[i] = filter(None,re.split("[,.();_{}\t\n ]", lines[i]))
 
             program_dict_tf = [{} for _ in range(0, program_length)]
             # Compute TF for each line in the program

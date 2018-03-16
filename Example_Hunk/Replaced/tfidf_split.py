@@ -100,7 +100,7 @@ def main(argv):
                 tfidf_vectors[i] = tfidf_vec
 
             # Only looking for hunk with similar size
-            max_diff = insert_length
+            max_diff = 5*insert_length
             score = {}
             # Sum up tfidf for the hunk and compare
             for i in range(0, program_length+1):
