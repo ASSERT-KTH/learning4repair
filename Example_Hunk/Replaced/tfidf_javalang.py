@@ -5,6 +5,7 @@ import glob
 import random
 import getopt
 import sys
+import operator
 import javalang
 import numpy as np
 
@@ -12,11 +13,11 @@ def main(argv):
     try:
         opts, args = getopt.getopt(argv, "hk:")
     except getopt.GetoptError:
-        print("tfidf_javalang.py -k <Top k prediction>")
+        print "tfidf_javalang.py -k <Top k prediction>"
         sys.exit()
     for opt, arg in opts:
         if opt == "-h":
-            print("tfidf_javalang.py -k <Top k prediction>")
+            print "tfidf_javalang.py -k <Top k prediction>"
             sys.exit()
         elif opt in ("-k"):
             try:
@@ -25,13 +26,21 @@ def main(argv):
                 print("k must be integer")
                 sys.exit()
 
-    path_files = "../../Files/Added"
+    path_files = "../../Files_Hunk/Replaced"
     for filename in glob.glob(os.path.join(path_files, "*.txt")):
         with open(filename, 'r') as file:
             lines = file.readlines()
 
-            # First line is the inserted line
-            insert = lines[0]
+            # Get last line of inserted code
+            for i in range(0,len(lines)):
+                if(lines[i].startswith("@@@")):
+                    insert_end = i
+                    break
+
+            # Get inserted code hunk
+            insert = lines[:insert_end]
+            insert_length = len(insert)
+            insert = "".join(insert)
             insert_tokens = javalang.tokenizer.tokenize(insert)
 
             # TF of inserted tokens
@@ -46,7 +55,7 @@ def main(argv):
                 continue
 
             # Rest are the program
-            lines = lines[2:]
+            lines = lines[insert_end+1:]
             program_length = len(lines)
             lines = "".join(lines)
             program_tokens = javalang.tokenizer.tokenize(lines)
@@ -82,25 +91,40 @@ def main(argv):
                 insert_weight.append(insert_dict_tf[token]*insert_token_idf[token])
             insert_weight = normalize(insert_weight)
 
-            # Comput cosine similarity with each line
-            score = np.zeros(shape=(program_length))
+            # Precompute tfidf for each line
+            tfidf_vectors = np.zeros(shape=(program_length, len(insert_weight)))
             for i in range(0, program_length):
-                program_line_weight = []
+                tfidf_vec = []
                 for token in insert_dict_tf:
                     if(token in program_dict_tf[i]):
                         tf=program_dict_tf[i][token]
                         idf=insert_token_idf[token]
-                        program_line_weight.append(tf*idf)
+                        tfidf_vec.append(tf*idf)
                     else:
-                        program_line_weight.append(0)
-                program_line_weight = normalize(program_line_weight)
-                score[i] = cosine_sim(insert_weight,program_line_weight)
+                        tfidf_vec.append(0)
+                tfidf_vectors[i] = tfidf_vec
 
-            # Select top k result and print
-            guess = score.argsort()[-k:][::-1]
+            # Only looking for hunk with similar size
+            max_diff = insert_length
+            score = {}
+            # Sum up tfidf for the hunk and compare
+            for i in range(0, program_length+1):
+                for j in range(i+1, program_length+1):
+                    if(j-i > max_diff):
+                        break
+                    vec = np.zeros(shape=(len(insert_weight)))
+                    for n in range(i,j):
+                        vec = vec + tfidf_vectors[i]
+                    vec = normalize(vec)
+                    score[(i+1,j)] = cosine_sim(insert_weight, vec)
+
+            # First we compare cosine similarity, then we compare hunk size
+            score_cmp = lambda ((s1, e1), v1), ((s2,e2), v2):cmp((v1, e2-s2), (v2, e1-s1))
+            sorted_score = sorted(score.items(), cmp=score_cmp, reverse=True)
+
             guess_string = ""
-            for ind in guess:
-                guess_string = guess_string + str(ind+1) + " "
+            for i in range(0,min(k, len(sorted_score))):
+                guess_string = guess_string + str(sorted_score[i][0][0]) + " " + str(sorted_score[i][0][1]) + " "
 
             print(os.path.basename(filename) + " " + guess_string)
 

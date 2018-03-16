@@ -1,21 +1,25 @@
-import random,os,glob,getopt,sys
+import random
+import os
+import glob
+import getopt
+import sys
 
 def main(argv):
     try:
         opts, args = getopt.getopt(argv, "hk:")
     except getopt.GetoptError:
-        print 'randomGuess.py -k <Top k score>'
+        print "randomGuess.py -k <Top k prediction>"
         sys.exit(2)
     for opt, arg in opts:
-        if opt == '-h':
-            print 'randomGuess.py -k <Top k score>'
+        if opt == "-h":
+            print "randomGuess.py -k <Top k prediction>"
             sys.exit()
         elif opt in ("-k"):
             try:
                 k = int(arg)
             except ValueError:
-                print("Must be integer")
-                raise
+                print("k must be integer")
+                sys.exit()
 
     path = "../../Files_Hunk/Replaced"
     for filename in glob.glob(os.path.join(path, "*.txt")):
@@ -38,8 +42,6 @@ def main(argv):
                 guess_string = guess_string + str(start) + " " + str(end) + " "
 
             print(os.path.basename(filename) + " " + guess_string)
-
-
 
 
 if __name__=="__main__":
