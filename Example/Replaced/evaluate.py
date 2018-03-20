@@ -21,6 +21,7 @@ def main():
         inputs = args.split()
         filename = inputs[0]
         answers = inputs[1:]
+        answers = [int(answer) for answer in answers]
         # Use maximum number of returned answer to show top k acc
         if(len(answers) > k):
             k = len(answers)
@@ -32,18 +33,19 @@ def main():
             code_file_length = len(code_file.readlines())-2
 
             for answer in answers:
-                if(int(answer) < 1 or int(answer) > code_file_length):
+                if(answer < 1 or answer > code_file_length):
                     raise LineOutOfRangeException("Line number out of range for file " + filename + "." +
                     " Expected: 1<={line}<=" + str(code_file_length) + ", found: " + answer)
 
             solution = solution_file.readline()
+            solution = int(solution)
+            # Use minimum loss among all answers to calculate loss
+            min_loss = float('Inf')
             for answer in answers:
-                # Use minimum loss among all answers to calculate loss
-                min_loss = float('Inf')
                 # Correct answer should have minimum loss, therefore we can break
-                if(lossFunction(int(answer), int(solution)) < min_loss):
-                    min_loss = lossFunction(int(answer), int(solution))
-                if(int(solution) == int(answer)):
+                if(lossFunction(answer, solution) < min_loss):
+                    min_loss = lossFunction(answer, solution)
+                if(solution == answer):
                     correct_files+=1
                     break
 
