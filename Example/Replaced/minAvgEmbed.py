@@ -32,7 +32,7 @@ def main(argv):
 
     tf.reset_default_graph()
 
-    with open("Embedding/dictionary.pickle" , "rb") as f:
+    with open("Embedding_100000files_500dict/dictionary.pickle" , "rb") as f:
         [count,dictionary,reverse_dictionary,vocabulary_size] = pickle.load(f)
 
     embedding_size = 32
@@ -48,7 +48,7 @@ def main(argv):
     saver = tf.train.Saver()
 
     with tf.Session() as sess:
-        saver.restore(sess, "Embedding/model.ckpt")
+        saver.restore(sess, "Embedding_100000files_500dict/model.ckpt")
         embed = embeddings.eval()
 
     path_files = "../../Files/Replaced"

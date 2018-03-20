@@ -9,13 +9,13 @@ def lossFunction(guess, solution):
     else:
         correct_s = max(guess[0], solution[0])
         correct_e = min(guess[1], solution[1])
-        correct_lines = correct_e-correct_s+1
+        missed_correct_lines = (solution[1]-solution[0])-(correct_e-correct_s)
         wrong_lines = 0
         if(correct_s < solution[0]):
             wrong_lines += solution[0]-correct_s
         if(correct_e > solution[1]):
             wrong_lines += solution[1]-correct_e
-        return correct_lines - wrong_lines
+        return missed_correct_lines + wrong_lines
 
 def main():
     k = 0 # Maximum number of solutions received
@@ -47,7 +47,7 @@ def main():
 
             for answer in answers:
                 if(answer < 1 or answer > code_file_length):
-                    raise LineOutOfRangeException("Line number out of range. Expected: 1<={line}<=" + str(file_length) + ", found: " + line)
+                    raise LineOutOfRangeException("Line number out of range. Expected: 1<={line}<=" + str(code_file_length) + ", found: " + str(answer))
 
             solution_line = solution_file.readline().split()
             solution_line = [int(i) for i in solution_line]

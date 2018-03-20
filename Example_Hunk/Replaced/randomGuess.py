@@ -39,9 +39,15 @@ def main(argv):
 
             max_diff = insert_length
             guess_string = ""
+            '''
             for i in range(0,k):
                 start = random.randint(1,program_length)
                 end = min(program_length, start+random.randint(0, max_diff))
+                guess_string = guess_string + str(start) + " " + str(end) + " "
+            '''
+            for i in range(0,k):
+                start = random.randint(1, max(1,program_length-insert_length+1))
+                end = min(program_length, start+insert_length-1)
                 guess_string = guess_string + str(start) + " " + str(end) + " "
 
             print(os.path.basename(filename) + " " + guess_string)

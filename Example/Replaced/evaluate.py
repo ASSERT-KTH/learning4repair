@@ -5,6 +5,7 @@ class LineOutOfRangeException(Exception):
     pass
 
 def lossFunction(guess, solution):
+    #return abs(solution-guess)
     return math.tanh(abs(solution-guess))
 
 def main():
