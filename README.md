@@ -85,6 +85,8 @@ e.g. solution to Files/Added/1.txt is Solutions/Added/1.txt
 
 ## Performance of baseline algorithms
 
+Here are the performance of each baseline algorithms. Observe that different algorithms have different number of files, the reason can be 1) exception 2) speed of algorithm. e.g. minEditDistance is too slow to process all files. 
+
 |       Type        | Algorithm | Performance |
 | ----------------- | --------- | ----------- |
 | Replaced one line | maximumError | Total files: 4454<br>Cumulative line error: 4453.99989692 (the lower, the better)<br>Top 1 accuracy: 0.0 (the higher, the better) |
