@@ -89,3 +89,8 @@ e.g. solution to Files/Added/1.txt is Solutions/Added/1.txt
 | ----------------- | --------- | ----------- |
 | Replaced one line | maximumError | Total files: 4454<br>Cumulative line error: 4453.99989692 (the lower, the better)<br>Top 1 accuracy: 0.0 (the higher, the better) |
 | | minEditDistance | Total files: 100<br>Cumulative line error: 7.28478246779 (the lower, the better)<br>Top 5 accuracy: 0.92 (the higher, the better) |
+| | tfidf_javalang | Total files: 4444<br>Cumulative line error: 340.280612305 (the lower, the better)<br>Top 5 accuracy: 0.921917191719 (the higher, the better) |
+| | tfidf_split | Total files: 4454<br>Cumulative line error: 212.051775772 (the lower, the better)<br>Top 5 accuracy: 0.951279748541 (the higher, the better) |
+| | minAvgEmbed (50000 files, 200 vol) | Total files: 4425<br>Cumulative line error: 1120.2679289 (the lower, the better)<br>Top 5 accuracy: 0.740790960452 (the higher, the better) |
+| | minAvgEmbed (100000 files, 500 vol) | Total files: 4425<br>Cumulative line error: 997.53704855 (the lower, the better)<br>Top 5 accuracy: 0.766553672316 (the higher, the better) |
+| | randomGuess | Total files: 4454<br>Cumulative line error: 4254.41643804 (the lower, the better)<br>Top 5 accuracy: 0.0289627301302 (the higher, the better) | 
