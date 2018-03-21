@@ -5,7 +5,7 @@ class LineOutOfRangeException(Exception):
 
 def lossFunction(guess, solution):
     if(solution[0] > guess[1] or guess[0] > solution[1]):
-        return guess[1]-guess[0]+1
+        return math.tanh(guess[1]-guess[0]+1)
     else:
         correct_s = max(guess[0], solution[0])
         correct_e = min(guess[1], solution[1])
@@ -15,7 +15,7 @@ def lossFunction(guess, solution):
             wrong_lines += solution[0]-correct_s
         if(correct_e > solution[1]):
             wrong_lines += solution[1]-correct_e
-        return missed_correct_lines + wrong_lines
+        return math.tanh(missed_correct_lines) + math.tanh(wrong_lines)
 
 def main():
     k = 0 # Maximum number of solutions received

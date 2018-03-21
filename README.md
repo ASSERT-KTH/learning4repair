@@ -11,12 +11,6 @@ Can be used as benchmark for predicting added/removed/replaced one-liner change.
 +      return true;
 ```
 
-### Removed one-liner
-
-```
--import java.io.IOException;
-```
-
 ### Replaced one-liner
 
 ```
@@ -53,31 +47,6 @@ public class test{
 
 Then your program should output: 1. (Insert it after line 1)
 
-### Removed one-liner
-
-All data in Files/Removed/. Each file contains:
-```
-{The program}
-```
-The output should be a line number where the line should be removed. Line numbers starts from 1.
-
-Example:
-```
-public class test{
-  int a = 1
-  int b = 0.1
-}
-```
-
-And the correct answer is:
-```
-public class test{
-  int a = 1
-}
-```
-
-Then your program should output: 3. (Removed line 3)
-
 ### Replaced one-liner
 
 All data in Files/Replaced/. Each file contains:
@@ -113,3 +82,11 @@ Then your program should output: 3. (Replace line 3 with the inserted code)
 All the competition data in Files/ and all solutions in Solutions/.
 
 e.g. solution to Files/Added/1.txt is Solutions/Added/1.txt
+
+## Performance of baseline algorithms
+
+|       Type        | Algorithm | Performance |
+| ----------------- | --------- | ----------- |
+| Replaced one line | maximumError | Total files: 4454
+Cumulative line error: 4453.99989692 (the lower, the better)
+Top 1 accuracy: 0.0 (the higher, the better) |

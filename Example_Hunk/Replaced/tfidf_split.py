@@ -41,7 +41,7 @@ def main(argv):
             insert_length = len(insert)
             insert_tokens = [[] for _ in range(0, len(insert))]
             for i in range(0, insert_length):
-                insert_tokens[i] = filter(None,re.split("[,.();_\t\n ]",insert[i]))
+                insert_tokens[i] = filter(None,re.split("[,.();_{}\[\]\t\n ]",insert[i]))
 
             # TF of inserted tokens
             insert_dict_tf = {}
@@ -57,7 +57,7 @@ def main(argv):
             program_length = len(lines)
             program_tokens = [[] for _ in range(0, program_length)]
             for i in range(0,program_length):
-                program_tokens[i] = filter(None,re.split("[,.();_\t\n ]", lines[i]))
+                program_tokens[i] = filter(None,re.split("[,.();_{}\[\]\t\n ]", lines[i]))
 
             program_dict_tf = [{} for _ in range(0, program_length)]
             # Compute TF for each line in the program
