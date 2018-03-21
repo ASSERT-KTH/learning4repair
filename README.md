@@ -93,4 +93,9 @@ e.g. solution to Files/Added/1.txt is Solutions/Added/1.txt
 | | tfidf_split | Total files: 4454<br>Cumulative line error: 212.051775772 (the lower, the better)<br>Top 5 accuracy: 0.951279748541 (the higher, the better) |
 | | minAvgEmbed (50000 files, 200 vol) | Total files: 4425<br>Cumulative line error: 1120.2679289 (the lower, the better)<br>Top 5 accuracy: 0.740790960452 (the higher, the better) |
 | | minAvgEmbed (100000 files, 500 vol) | Total files: 4425<br>Cumulative line error: 997.53704855 (the lower, the better)<br>Top 5 accuracy: 0.766553672316 (the higher, the better) |
-| | randomGuess | Total files: 4454<br>Cumulative line error: 4254.41643804 (the lower, the better)<br>Top 5 accuracy: 0.0289627301302 (the higher, the better) | 
+| | randomGuess | Total files: 4454<br>Cumulative line error: 4254.41643804 (the lower, the better)<br>Top 5 accuracy: 0.0289627301302 (the higher, the better) |
+| Replaced one hunk | minAvgEmbed (50000 files, 200 vol) | Total files: 8970<br>Top 5 accuracy: 0.439687848384 |
+| | minAvgEmbed (100000 files, 500 vol) | Total files: 8970<br>Top 5 accuracy: 0.46220735786 |
+| | randomGuess.py | Total files: 9504<br>Top 5 accuracy: 0.0133627946128 |
+| | tfidf_javalang | Total files: 9306<br>Top 5 accuracy: 0.538899634644 |
+| | tfidf_split | Total files: 9504<br>Top 5 accuracy: 0.645728114478 |
