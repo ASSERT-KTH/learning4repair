@@ -87,4 +87,4 @@ e.g. solution to Files/Added/1.txt is Solutions/Added/1.txt
 
 |       Type        | Algorithm | Performance |
 | ----------------- | --------- | ----------- |
-| Replaced one line | maximumError | Total files: 4454 \nCumulative line error: 4453.99989692 (the lower, the better) \n Top 1 accuracy: 0.0 (the higher, the better) |
+| Replaced one line | maximumError | Total files: 4454<br>Cumulative line error: 4453.99989692 (the lower, the better)<br>Top 1 accuracy: 0.0 (the higher, the better) |
