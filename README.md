@@ -85,7 +85,7 @@ e.g. solution to Files/Added/1.txt is Solutions/Added/1.txt
 
 ## Performance of baseline algorithms
 
-Here are the performance of each baseline algorithms. Observe that different algorithms have different number of files, the reason can be 1) exception 2) speed of algorithm. e.g. minEditDistance is too slow to process all files. 
+Here are the performance of each baseline algorithms. Observe that different algorithms have different number of files, the reason can be 1) exception 2) speed of algorithm. e.g. minEditDistance is too slow to process all files.
 
 |       Type        | Algorithm | Performance |
 | ----------------- | --------- | ----------- |
@@ -95,6 +95,7 @@ Here are the performance of each baseline algorithms. Observe that different alg
 | | tfidf_split | Total files: 4454<br>Cumulative line error: 212.051775772 (the lower, the better)<br>Top 5 accuracy: 0.951279748541 (the higher, the better) |
 | | minAvgEmbed (50000 files, 200 vol) | Total files: 4425<br>Cumulative line error: 1120.2679289 (the lower, the better)<br>Top 5 accuracy: 0.740790960452 (the higher, the better) |
 | | minAvgEmbed (100000 files, 500 vol) | Total files: 4425<br>Cumulative line error: 997.53704855 (the lower, the better)<br>Top 5 accuracy: 0.766553672316 (the higher, the better) |
+| | minEmbedDistance (100000 files, 500 vol) | Total files: 4418<br>Cumulative line error: 961.688155817 (the lower, the better)<br>Top 5 accuracy: 0.77931190584 (the higher, the better) |
 | | randomGuess | Total files: 4454<br>Cumulative line error: 4254.41643804 (the lower, the better)<br>Top 5 accuracy: 0.0289627301302 (the higher, the better) |
 | Replaced one hunk | minAvgEmbed (50000 files, 200 vol) | Total files: 8970<br>Top 5 accuracy: 0.439687848384 |
 | | minAvgEmbed (100000 files, 500 vol) | Total files: 8970<br>Top 5 accuracy: 0.46220735786 |
