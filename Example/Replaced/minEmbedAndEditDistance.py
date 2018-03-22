@@ -56,7 +56,7 @@ def main(argv):
 
     path_files = "../../Files/Replaced"
     for filename in glob.glob(os.path.join(path_files, "*.txt")):
-    #for abc in range(1,101):
+    #for abc in range(1,201):
         #filename = path_files+"/"+str(abc)+".txt"
         with open(filename, 'r') as file:
             lines = file.readlines()
@@ -101,6 +101,8 @@ def main(argv):
 
             # Compute cosine similarity
             score = {}
+            minEdit = float('Inf')
+            minEmbed = float('Inf')
             for i in range(0, file_length):
                 if(not program_embed_vectors[i] and not program_unk[i]):
                     score[i+1] = float('Inf')
@@ -108,14 +110,29 @@ def main(argv):
                     if(not insert_embed):
                         score[i+1] = min_cum_edit_distance(insert_unk,program_unk[i])
                     else:
-                        score[i+1] = min_cum_edit_distance(insert_unk,program_unk[i])*10
+                        score[i+1] = min_cum_edit_distance(insert_unk,program_unk[i])*15
+                        if(score[i+1] < minEdit):
+                            minEdit = score[i+1]
                 elif(not program_unk[i]):
                     if(not insert_unk):
                         score[i+1] = min_cum_embed_distance(insert_embed,program_embed_vectors[i])
                     else:
-                        score[i+1] = min_cum_embed_distance(insert_embed,program_embed_vectors[i])*10
+                        score[i+1] = min_cum_embed_distance(insert_embed,program_embed_vectors[i])*15
+                        if(score[i+1] < minEmbed):
+                            minEmbed = score[i+1]
                 else:
                     score[i+1] = min_cum_edit_distance(insert_unk,program_unk[i])*min_cum_embed_distance(insert_embed,program_embed_vectors[i])
+
+            '''
+            print(str(minEdit) + " " + str(minEmbed))
+            for i in range(0, file_length):
+                if(not program_embed_vectors[i] and program_unk[i]):
+                    if(insert_embed and not minEmbed == float('Inf')):
+                        score[i+1] = score[i+1]*minEmbed
+                if(program_embed_vectors[i] and not program_unk[i]):
+                    if(insert_unk and not minEdit == float('Inf')):
+                        score[i+1] = score[i+1]*minEdit
+            '''
 
             sorted_score = sorted(score.items(), key=operator.itemgetter(1))
 

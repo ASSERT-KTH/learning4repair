@@ -97,6 +97,7 @@ Here are the performance of each baseline algorithms. Observe that different alg
 | | minAvgEmbed (100000 files, 500 vol) | Total files: 4425<br>Cumulative line error: 997.53704855 (the lower, the better)<br>Top 5 accuracy: 0.766553672316 (the higher, the better) |
 | | minAvgEmbed (100000 files, 10000 vol) | Total files: 4425<br>Cumulative line error: 648.657417465 (the lower, the better)<br>Top 5 accuracy: 0.849039548023 (the higher, the better) |
 | | minAvgEmbed (100000 files, 50000 vol) | Total files: 4425<br>Cumulative line error: 1026.05325866 (the lower, the better)<br>Top 5 accuracy: 0.760677966102 (the higher, the better) |
+| | minSumEmbed (100000 files, 10000 vol) | Total files: 4425<br>Cumulative line error: 648.657417465 (the lower, the better)<br>Top 5 accuracy: 0.849039548023 (the higher, the better) |
 | | minEmbedDistance (100000 files, 500 vol) | Total files: 4418<br>Cumulative line error: 961.688155817 (the lower, the better)<br>Top 5 accuracy: 0.77931190584 (the higher, the better) |
 | | minEmbedDistance (100000 files, 10000 vol) | Total files: 4420<br>Cumulative line error: 646.443742894 (the lower, the better)<br>Top 5 accuracy: 0.850904977376 (the higher, the better) |
 | | minEmbedAndEditDistance (100000 files, 10000 vol) | Total files: 4425<br>Cumulative line error: 393.993823742 (the lower, the better)<br>Top 5 accuracy: 0.908926553672 (the higher, the better) |
