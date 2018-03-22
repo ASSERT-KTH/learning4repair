@@ -92,7 +92,7 @@ Here are the performance of each baseline algorithms. Observe that different alg
 | Replaced one line | maximumError | Total files: 4454<br>Cumulative line error: 4453.99989692 (the lower, the better)<br>Top 1 accuracy: 0.0 (the higher, the better) |
 | | minEditDistance | Total files: 100<br>Cumulative line error: 7.28478246779 (the lower, the better)<br>Top 5 accuracy: 0.92 (the higher, the better) |
 | | tfidf_javalang | Total files: 4444<br>Cumulative line error: 340.280612305 (the lower, the better)<br>Top 5 accuracy: 0.921917191719 (the higher, the better) |
-| | tfidf_split | Total files: 4454<br>Cumulative line error: 212.051775772 (the lower, the better)<br>Top 5 accuracy: 0.951279748541 (the higher, the better) |
+| | tfidf_split | Total files: 4454<br>Cumulative line error: 188.373463108 (the lower, the better)<br>Top 5 accuracy: 0.956668163449 (the higher, the better) |
 | | minAvgEmbed (50000 files, 200 vol) | Total files: 4425<br>Cumulative line error: 1120.2679289 (the lower, the better)<br>Top 5 accuracy: 0.740790960452 (the higher, the better) |
 | | minAvgEmbed (100000 files, 500 vol) | Total files: 4425<br>Cumulative line error: 997.53704855 (the lower, the better)<br>Top 5 accuracy: 0.766553672316 (the higher, the better) |
 | | minAvgEmbed (100000 files, 10000 vol) | Total files: 4425<br>Cumulative line error: 648.657417465 (the lower, the better)<br>Top 5 accuracy: 0.849039548023 (the higher, the better) |
