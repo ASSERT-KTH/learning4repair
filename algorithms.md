@@ -16,4 +16,19 @@ Here are descriptions of all algorithm implemented:
 12. [tfidf_javalang.py](##tfidf_javalang.py)
 13. [tfidf_split.py](##tfidf_split.py)
 
-##guessFirst.py
+## guessFirst.py
+Always predict the first line
+
+## guessMiddle.py
+Always predict the line in the middle
+
+## guessLast.py
+Always predict the last line
+
+## randomGuess.py
+Predict random lines
+
+## maximumError.py
+Predict the farthest line from the solution
+
+##
