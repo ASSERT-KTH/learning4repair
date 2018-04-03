@@ -2,12 +2,12 @@
 
 Here are descriptions of all algorithm implemented:
 
-1. [guessFirst.py](#guessFirst.py)
-2. [guessMiddle.py](#guessMiddle.py)
-3. [guessLast.py](#guessLast.py)
-4. [randomGuess.py](#randomGuess.py)
-5. [maximumError.py](#maximumError.py)
-6. [maxLcsDistance.py](#maxLcsDistance.py)
+1. [guessFirst.py](#guessfirst.py)
+2. [guessMiddle.py](#guessmiddle.py)
+3. [guessLast.py](#guesslast.py)
+4. [randomGuess.py](#randomguess.py)
+5. [maximumError.py](#maximumerror.py)
+6. [maxLcsDistance.py](#maxlcsdistance.py)
 7. [minEditDistance.py](#minEditDistance)
 8. [minAvgEmbed.py](#minAvgEmbed.py)
 9. [minSumEmbed.py](#minSumEmbed.py)
