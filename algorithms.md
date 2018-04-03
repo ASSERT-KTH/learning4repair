@@ -3,11 +3,11 @@
 Here are descriptions of all algorithm implemented:
 
 1. [guessFirst.py](#guessfirst)
-2. [guessMiddle.py](#guessmiddle.py)
-3. [guessLast.py](#guesslast.py)
-4. [randomGuess.py](#randomguess.py)
-5. [maximumError.py](#maximumerror.py)
-6. [maxLcsDistance.py](#maxlcsdistance.py)
+2. [guessMiddle.py](#guessmiddle)
+3. [guessLast.py](#guesslast)
+4. [randomGuess.py](#randomguess)
+5. [maximumError.py](#maximumerror)
+6. [maxLcsDistance.py](#maxlcsdistance)
 7. [minEditDistance.py](#minEditDistance)
 8. [minAvgEmbed.py](#minAvgEmbed.py)
 9. [minSumEmbed.py](#minSumEmbed.py)
@@ -16,10 +16,10 @@ Here are descriptions of all algorithm implemented:
 12. [tfidf_javalang.py](#tfidf_javalang.py)
 13. [tfidf_split.py](#tfidf_split.py)
 
-## guessfirst
+## guessFirst
 Always predict the first line
 
-## guessMiddle.py
+## guessMiddle
 Always predict the line in the middle
 
 ## guessLast.py
