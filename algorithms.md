@@ -16,7 +16,7 @@ Here are descriptions of all algorithm implemented:
 12. [tfidf_javalang.py](#tfidf_javalang.py)
 13. [tfidf_split.py](#tfidf_split.py)
 
-## guessFirst.py
+## guessfirst.py
 Always predict the first line
 
 ## guessMiddle.py
