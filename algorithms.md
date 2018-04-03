@@ -2,7 +2,7 @@
 
 Here are descriptions of all algorithm implemented:
 
-1. [guessFirst.py](#guessfirst.py)
+1. [guessFirst.py](#guessfirst)
 2. [guessMiddle.py](#guessmiddle.py)
 3. [guessLast.py](#guesslast.py)
 4. [randomGuess.py](#randomguess.py)
@@ -16,7 +16,7 @@ Here are descriptions of all algorithm implemented:
 12. [tfidf_javalang.py](#tfidf_javalang.py)
 13. [tfidf_split.py](#tfidf_split.py)
 
-## guessfirst.py
+## guessfirst
 Always predict the first line
 
 ## guessMiddle.py
