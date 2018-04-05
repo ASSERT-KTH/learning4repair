@@ -138,6 +138,18 @@ def printStatistics(verbose):
     print("Top 1 accuracy: " + str(correct_files_top1/(total_files*1.0)) + " (the higher, the better)")
     print("Top " + str(k) + " accuracy: " + str(correct_files/(total_files*1.0)) + " (the higher, the better)")
 
+    if(verbose):
+        '''
+        print("Correctly predicted tasks and your ouputs: ")
+        for task in score:
+            if(score[task] == 0):
+                print(task + " " + " ".join(all_predictions[task]))
+        '''
+        print("Wrongly predicted tasks and your ouputs: ")
+        for task in score:
+            if(not score[task] == 0):
+                print(task + " " + " ".join(all_predictions[task]))
+
 def main():
     global total_files, score, correct_files, all_predictions, k
 

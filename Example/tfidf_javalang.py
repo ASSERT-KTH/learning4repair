@@ -75,8 +75,8 @@ def predict(path_to_task):
         # Rest are the program
         lines = lines[2:]
         program_length = len(lines)
-        lines = "".join(lines)
-        program_tokens = javalang.tokenizer.tokenize(lines)
+        lines_string = "".join(lines)
+        program_tokens = javalang.tokenizer.tokenize(lines_string)
 
         program_dict_tf = [{} for _ in range(0, program_length)]
         # Compute TF for each line in the program
@@ -121,7 +121,10 @@ def predict(path_to_task):
                 else:
                     program_line_weight.append(0)
             program_line_weight = normalize(program_line_weight)
-            score[i] = cosine_sim(insert_weight,program_line_weight)
+            if(''.join(insert.split()) == ''.join(lines[i].split())):
+                score[i] = 0
+            else:
+                score[i] = cosine_sim(insert_weight,program_line_weight)
 
         # Select top k result and print
         guess = score.argsort()[-k:][::-1]
