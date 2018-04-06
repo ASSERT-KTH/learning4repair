@@ -30,6 +30,7 @@ def main(argv):
         elif opt == "-d":
             chosen_datasets = arg.split(":")
 
+
     if(chosen_datasets):
         for path_to_dataset in chosen_datasets:
             path_to_tasks = os.path.join(path_to_dataset, "Tasks/")
@@ -49,6 +50,7 @@ def main(argv):
                     if(task.endswith(".txt")):
                         path_to_task = os.path.abspath(os.path.join(path_to_tasks, task))
                         predict(path_to_task)
+    #predict("/Users/zimin/Desktop/KTH/Master-Thesis/one-liner-competition.nosync/Datasets/Dataset2/Tasks/1.txt")
 
 def predict(path_to_task):
     global k
@@ -102,7 +104,7 @@ def predict(path_to_task):
         insert_weight = normalize(insert_weight)
 
         # Comput cosine similarity with each line
-        score = np.zeros(shape=(program_length))
+        score={}
         for i in range(0, program_length):
             program_line_weight = []
             for token in insert_dict_tf:
@@ -116,15 +118,15 @@ def predict(path_to_task):
 
 
             if(''.join(insert.split()) == ''.join(lines[i].split())):
-                score[i] = 0
+                score[i+1] = 0
             else:
-                score[i] = cosine_sim(insert_weight,program_line_weight)
+                score[i+1] = cosine_sim(insert_weight,program_line_weight)
 
         # Select top k result and print
-        guess = score.argsort()[-k:][::-1]
+        sorted_score = sorted(score.items(), key=operator.itemgetter(1), reverse=True)
         guess_string = ""
-        for ind in guess:
-            guess_string = guess_string + str(ind+1) + " "
+        for i in range(0,min(k, len(sorted_score))):
+            guess_string = guess_string + str(sorted_score[i][0]) + " "
 
         print(path_to_task + " " + guess_string)
 

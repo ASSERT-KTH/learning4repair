@@ -103,8 +103,8 @@ def predict(path_to_task, embedding_size, dictionary, embed):
         # The rest is the program
         lines = lines[2:]
         file_length = len(lines)
-        lines = "".join(lines)
-        program_tokens = javalang.tokenizer.tokenize(lines)
+        lines_string = "".join(lines)
+        program_tokens = javalang.tokenizer.tokenize(lines_string)
 
         # Calculate the avg embedding of each line
         program_embed_vectors = np.zeros(shape=(file_length, embedding_size))
@@ -122,7 +122,11 @@ def predict(path_to_task, embedding_size, dictionary, embed):
             if(not program_embed_vectors[i].any()):
                 continue
             program_embed_vectors[i] = normalize(program_embed_vectors[i])
-            score[i+1] = cosine_sim(insert_sum_embed, program_embed_vectors[i])
+            if(''.join(insert.split()) == ''.join(lines[i].split())):
+                score[i+1] = 0
+            else:
+                score[i+1] = cosine_sim(insert_sum_embed, program_embed_vectors[i])
+            #score[i+1] = cosine_sim(insert_sum_embed, program_embed_vectors[i])
 
         sorted_score = sorted(score.items(), key=operator.itemgetter(1), reverse=True)
 

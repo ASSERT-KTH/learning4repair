@@ -2,6 +2,7 @@ import sys
 import os
 import glob
 import getopt
+import operator
 import numpy as np
 
 k = 1
@@ -83,14 +84,18 @@ def predict(path_to_task):
         lines = lines[2:]
         program_length = len(lines)
 
-        score = np.zeros(shape=(program_length))
+        score = {}
         for i in range(0, program_length):
-            score[i] = lcs(insert, lines[i].strip())
+            if(''.join(insert.split()) == ''.join(lines[i].split())):
+                score[i+1] = 0
+            else:
+                score[i+1] = lcs(insert, lines[i].strip())
 
-        guess = score.argsort()[-k:][::-1]
+        # Select top k result and print
+        sorted_score = sorted(score.items(), key=operator.itemgetter(1), reverse=True)
         guess_string = ""
-        for ind in guess:
-            guess_string = guess_string + str(ind+1) + " "
+        for i in range(0,min(k, len(sorted_score))):
+            guess_string = guess_string + str(sorted_score[i][0]) + " "
 
         print(path_to_task + " " + guess_string)
 

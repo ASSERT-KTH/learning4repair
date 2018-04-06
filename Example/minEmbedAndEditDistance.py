@@ -107,8 +107,8 @@ def predict(path_to_task, embedding_size, dictionary, embed):
         # The rest is the program
         lines = lines[2:]
         file_length = len(lines)
-        lines = "".join(lines)
-        program_tokens = javalang.tokenizer.tokenize(lines)
+        lines_string = "".join(lines)
+        program_tokens = javalang.tokenizer.tokenize(lines_string)
 
         # Calculate the avg embedding of each line
         program_embed_vectors = [[] for _ in range(file_length)]
@@ -133,20 +133,35 @@ def predict(path_to_task, embedding_size, dictionary, embed):
                 score[i+1] = float('Inf')
             elif(not program_embed_vectors[i]):
                 if(not insert_embed):
-                    score[i+1] = min_cum_edit_distance(insert_unk,program_unk[i])
+                    if(''.join(insert.split()) == ''.join(lines[i].split())):
+                        score[i+1] = 0
+                    else:
+                        score[i+1] = min_cum_edit_distance(insert_unk,program_unk[i])
                 else:
-                    score[i+1] = min_cum_edit_distance(insert_unk,program_unk[i])
+                    if(''.join(insert.split()) == ''.join(lines[i].split())):
+                        score[i+1] = 0
+                    else:
+                        score[i+1] = min_cum_edit_distance(insert_unk,program_unk[i])
                     if(score[i+1] > maxEdit):
                         maxEdit = score[i+1]
             elif(not program_unk[i]):
                 if(not insert_unk):
-                    score[i+1] = min_cum_embed_distance(insert_embed,program_embed_vectors[i])
+                    if(''.join(insert.split()) == ''.join(lines[i].split())):
+                        score[i+1] = 0
+                    else:
+                        score[i+1] = min_cum_embed_distance(insert_embed,program_embed_vectors[i])
                 else:
-                    score[i+1] = min_cum_embed_distance(insert_embed,program_embed_vectors[i])
+                    if(''.join(insert.split()) == ''.join(lines[i].split())):
+                        score[i+1] = 0
+                    else:
+                        score[i+1] = min_cum_embed_distance(insert_embed,program_embed_vectors[i])
                     if(score[i+1] > maxEmbed):
                         maxEmbed = score[i+1]
             else:
-                score[i+1] = math.sqrt(min_cum_edit_distance(insert_unk,program_unk[i])*min_cum_embed_distance(insert_embed,program_embed_vectors[i]))
+                if(''.join(insert.split()) == ''.join(lines[i].split())):
+                    score[i+1] = 0
+                else:
+                    score[i+1] = math.sqrt(min_cum_edit_distance(insert_unk,program_unk[i])*min_cum_embed_distance(insert_embed,program_embed_vectors[i]))
 
 
         #print(str(minEdit) + " " + str(minEmbed))
