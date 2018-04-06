@@ -5,6 +5,7 @@ import glob
 import random
 import getopt
 import sys
+import operator
 import numpy as np
 
 k = 1

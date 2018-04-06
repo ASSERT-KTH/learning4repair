@@ -38,7 +38,7 @@ def main(argv):
 
     tf.reset_default_graph()
 
-    with open("Embedding_100000files_10000vol_split/dictionary.pickle" , "rb") as f:
+    with open("Embedding_100000files_10000vol/dictionary.pickle" , "rb") as f:
         [count,dictionary,reverse_dictionary,vocabulary_size] = pickle.load(f)
 
     embedding_size = 32
@@ -54,7 +54,7 @@ def main(argv):
     saver = tf.train.Saver()
 
     with tf.Session() as sess:
-        saver.restore(sess, "Embedding_100000files_10000vol_split/model.ckpt")
+        saver.restore(sess, "Embedding_100000files_10000vol/model.ckpt")
         embed = embeddings.eval()
 
     if(chosen_datasets):
@@ -195,7 +195,7 @@ def predict_embedDistance(path_to_task, embedding_size, dictionary, embed):
 
         # Get inserted code
         insert = lines[0]
-        insert_tokens = filter(None,re.split("[,.();{}_\[\]\+\-\*\/&|\t\n\r ]",insert))
+        insert_tokens = javalang.tokenizer.tokenize(insert)
 
         # The rest is the program
         lines = lines[2:]
@@ -221,8 +221,6 @@ def predict_embedDistance(path_to_task, embedding_size, dictionary, embed):
                 score[i+1] = 0
             return score
 
-
-        # Calculate the avg embedding of each line
         program_embed_vectors = [[] for _ in range(file_length)]
         try:
             for token in program_tokens:
